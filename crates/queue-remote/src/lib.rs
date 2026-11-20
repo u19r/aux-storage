@@ -4,5 +4,13 @@
 #![doc(hidden)]
 
 mod provider;
+mod settings;
 
 pub use provider::RemoteQueueProvider;
+pub use settings::{
+    RemoteCredentialStrategy, RemoteQueueSettings, RemoteSigv4Settings, RemoteStaticCredentials,
+    RemoteTimeoutOverrides,
+};
+
+#[cfg(test)]
+mod settings_tests;

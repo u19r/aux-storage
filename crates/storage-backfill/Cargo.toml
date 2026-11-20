@@ -7,27 +7,15 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
-futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
-sha2 = { workspace = true }
 smallvec = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
 
-metrics-facade = { workspace = true }
-scheduled-bg-jobs = { workspace = true }
 storage-common = { path = "../storage-common" }
 storage-types = { path = "../storage-types" }
-stream-provider = { path = "../stream-provider" }
 
 [dev-dependencies]
-alloc-counter = { workspace = true }
-anyhow = { workspace = true }
-tracing-test = { workspace = true }
+storage-types = { path = "../storage-types", features = ["test-support"] }
 
 [lints]
 workspace = true

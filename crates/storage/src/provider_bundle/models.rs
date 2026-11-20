@@ -2,57 +2,45 @@ use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::time::Duration;
 
+use storage_common::native_admission::AdmittedStore;
 use storage_provider::{
-    DynamoOperations, StorageStreamOperations, StreamRetentionRepository,
-    SystemStreamTrimRepository, TableReclaimRepository,
-    maintenance::{
-        ExpirationRepository, GsiBuildRepository, GsiLifecycleRepository,
-        PartitionReconciliationRepository, PartitionReconciliationSource,
-    },
+    MaintenanceOperations, StorageStreamOperations,
+    maintenance::{PartitionReconciliationRepository, PartitionReconciliationSource},
 };
-
-use crate::newtypes::DatabaseTrait;
 
 #[derive(Clone)]
 pub(crate) struct MaintenanceRepositories {
     pub job_catalog: scheduled_bg_jobs::JobCatalog,
-    pub expiration_repository: Arc<dyn ExpirationRepository>,
-    pub stream_initialization_repository:
-        Arc<dyn storage_provider::TableStreamInitializationRepository>,
-    pub gsi_build_repository: Arc<dyn GsiBuildRepository>,
+    /// Every scheduled maintenance step of this store value.
+    pub operations: Arc<dyn MaintenanceOperations>,
     pub partition_reconciliation_repository: Option<Arc<dyn PartitionReconciliationRepository>>,
     pub queue_message_cleanup_repository:
         Option<Arc<dyn queue_provider::QueueMessageCleanupRepository>>,
-    pub retention_repository: Arc<dyn StreamRetentionRepository + Send + Sync>,
+    /// The pubsub facade of this store; the stale pending-subscription sweep
+    /// calls `PubsubProvider::sweep_stale_subscriptions`.
+    pub pubsub_stale_subscriptions: Option<Arc<dyn pubsub_provider::PubsubProvider>>,
 }
 
-pub struct StorageProviderBundle {
-    pub(crate) native_attempt_capacity: Option<storage_types::NativeAttemptCapacity>,
-    #[cfg(feature = "regional")]
-    pub(crate) regional_services: Option<regional_replication::runtime::PreparedRegionalServices>,
-    pub(crate) database: Option<Arc<dyn DatabaseTrait>>,
-    pub(crate) dynamo: Arc<dyn DynamoOperations>,
-    pub(crate) stream: Option<Arc<dyn StorageStreamOperations>>,
-
-    pub(crate) ttl_sweep_repository: Option<Arc<dyn storage_provider::TtlSweepRepository>>,
-    pub(crate) system_stream_trim_repository: Option<Arc<dyn SystemStreamTrimRepository>>,
-    pub(crate) table_reclaim_repository: Option<Arc<dyn TableReclaimRepository>>,
-    pub(crate) gsi_lifecycle_repository: Arc<dyn GsiLifecycleRepository>,
-    pub(crate) queue: Option<Arc<dyn queue_provider::QueueOperations>>,
-    pub(crate) pubsub: Option<Arc<dyn pubsub_provider::PubsubProvider>>,
-    pub(crate) delivery_source: Option<Arc<dyn super::delivery::DeliveryProviderSource>>,
-    pub(crate) maintenance: Option<MaintenanceRepositories>,
-    pub(crate) maintenance_source: Option<Arc<dyn super::maintenance::MaintenanceProviderSource>>,
-    pub(crate) scheduled_job_store: bg_job_store::ScheduledJobStore,
+/// One initialized store before its connection exists. A caller that opened a
+/// native store itself passes it to `DatabaseManager::from_initialized_store`.
+pub struct InitializedStore {
+    pub(crate) kind: StoreKind,
 }
 
-impl StorageProviderBundle {
-    pub fn try_from_initialized_store<S>(
-        store: Arc<S>,
-        config: bg_job_store::ScheduledJobStoreConfig,
-    ) -> storage_types::StorageResult<Self>
+pub(crate) enum StoreKind {
+    Native(Box<dyn super::native_store::NativeStore>),
+    #[cfg(feature = "remote")]
+    Remote {
+        provider: Arc<storage_remote::RemoteStorageProvider>,
+        jobs: bg_job_store::ScheduledJobStore,
+    },
+}
+
+impl InitializedStore {
+    pub fn native<S>(store: Arc<S>) -> Self
     where
-        S: storage_provider::native_admission::NativeAttemptSource
+        S: storage_common::native_admission::NativeAttemptSource
+            + AdmittedStore
             + storage_provider::DynamoPort
             + bg_job_store::ScheduledJobStoreSource
             + StorageStreamOperations
@@ -61,55 +49,15 @@ impl StorageProviderBundle {
             + pubsub_provider::PubsubProvider
             + pubsub_provider::PubsubPort
             + queue_provider::QueuePort
-            + ExpirationRepository
-            + GsiBuildRepository
             + PartitionReconciliationSource
-            + GsiLifecycleRepository
-            + StreamRetentionRepository
-            + SystemStreamTrimRepository
-            + TableReclaimRepository
-            + storage_provider::TtlSweepRepository
+            + MaintenanceOperations
             + 'static,
         for<'native> <S as storage_provider::DynamoPort>::Attempt<'native>:
-            storage_provider::PrimaryStateScanAttempt
-                + storage_provider::maintenance::ExpirationPort
-                + storage_provider::maintenance::GsiPort
-                + storage_provider::maintenance::StreamRetentionPort
-                + storage_provider::TableReclaimAttempt,
+            storage_provider::PrimaryStateScanAttempt + storage_provider::RegionalPairingAttempt,
     {
-        let native_attempt_capacity = Some(store.attempt_capacity()?);
-        let scheduled_job_store = store.scheduled_job_store(config)?;
-        Ok(Self {
-            native_attempt_capacity,
-            #[cfg(feature = "regional")]
-            regional_services: None,
-            database: None,
-            dynamo: store.clone(),
-            stream: Some(store.clone()),
-
-            ttl_sweep_repository: Some(store.clone()),
-            system_stream_trim_repository: Some(store.clone()),
-            table_reclaim_repository: Some(store.clone()),
-            gsi_lifecycle_repository: store.clone(),
-            queue: Some(store.clone()),
-            pubsub: Some(store.clone()),
-            delivery_source: Some(Arc::new(super::delivery::NativeDeliverySource::new(
-                store.clone(),
-            ))),
-            maintenance_source: Some(Arc::new(super::maintenance::NativeMaintenanceSource::new(
-                store.clone(),
-            ))),
-            maintenance: Some(MaintenanceRepositories {
-                job_catalog: scheduled_bg_jobs::JobCatalog::new(),
-                partition_reconciliation_repository: store.clone().partition_reconciliation(),
-                expiration_repository: store.clone(),
-                stream_initialization_repository: store.clone(),
-                gsi_build_repository: store.clone(),
-                queue_message_cleanup_repository: Some(store.clone()),
-                retention_repository: store,
-            }),
-            scheduled_job_store,
-        })
+        Self {
+            kind: StoreKind::Native(Box::new(super::native_store::InitializedNativeStore(store))),
+        }
     }
 }
 

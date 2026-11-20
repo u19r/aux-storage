@@ -64,8 +64,32 @@ impl RustWorkload for TableAtomicityWorkload {
                 self.gsi_audit_count,
             ),
             metric_val_u64(
-                "aux_storage_table_atomicity_gsi_unclassified_partition_count",
-                self.gsi_unclassified_partitions.len() as u64,
+                "aux_storage_table_atomicity_gsi_build_started",
+                self.gsi_build_started,
+            ),
+            metric_val_u64(
+                "aux_storage_table_atomicity_gsi_start_unknown",
+                self.gsi_start_unknown,
+            ),
+            metric_val_u64(
+                "aux_storage_table_atomicity_gsi_start_recovered",
+                self.gsi_start_recovered,
+            ),
+            metric_val_u64(
+                "aux_storage_table_atomicity_gsi_build_pages",
+                self.gsi_build_pages,
+            ),
+            metric_val_u64(
+                "aux_storage_table_atomicity_gsi_build_unknown",
+                self.gsi_build_unknown,
+            ),
+            metric_val_u64(
+                "aux_storage_table_atomicity_gsi_build_writes",
+                self.gsi_build_writes,
+            ),
+            metric_val_u64(
+                "aux_storage_table_atomicity_gsi_build_active",
+                self.gsi_build_active,
             ),
             metric_val_u64(
                 "aux_storage_table_atomicity_trim_audit_count",
@@ -80,12 +104,12 @@ impl RustWorkload for TableAtomicityWorkload {
                 self.stream_audit_count,
             ),
             metric_val_u64(
-                "aux_storage_table_atomicity_direct_stream_pointer_audit_count",
-                self.direct_stream_pointer_audit_count,
+                "aux_storage_table_atomicity_stream_entry_audit_count",
+                self.stream_entry_audit_count,
             ),
             metric_val_u64(
-                "aux_storage_table_atomicity_direct_stream_pointer_decoupled_target_count",
-                self.direct_stream_pointer_decoupled_target_count,
+                "aux_storage_table_atomicity_stream_image_chain_comparison_count",
+                self.stream_image_chain_comparison_count,
             ),
             metric_val_u64("aux_storage_table_atomicity_error_count", self.error_count),
             metric_val_u64(

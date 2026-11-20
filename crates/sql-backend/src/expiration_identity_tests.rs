@@ -6,15 +6,15 @@ use std::sync::{
 };
 
 use storage_provider::{
-    DynamoOperations, DynamoPort, RequestTableBindings,
+    DynamoOperations, RequestTableBindings,
     maintenance::{
         DirectExpirationTransaction, ExpirationAttempt, ExpirationPort, ExpirationTargetRead,
         ExpirationTransaction,
     },
 };
 use storage_types::{
-    AttemptMode, Clock, StorageEnum, StorageError, StorageResult, TableName, TimestampMillis,
-    context::WrappedError as _,
+    AttemptMode, AttemptPlan, Clock, DeadlineClass, StorageEnum, StorageError, StorageResult,
+    TableName, TimestampMillis, context::WrappedError as _,
 };
 
 struct MetadataAbort(AtomicBool);
@@ -24,9 +24,9 @@ impl crate::SqlFaultProbe for MetadataAbort {
             && self.0.swap(false, Ordering::SeqCst)
         {
             return Some(
-                StorageEnum::TransactionConflict {
-                    message: "injected metadata abort".into(),
-                }
+                StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(
+                    storage_types::ConflictCause::Logical("injected metadata abort"),
+                ))
                 .into(),
             );
         }
@@ -68,14 +68,21 @@ async fn given_native_ttl_metadata_abort_when_name_is_recreated_then_direct_and_
         let clock = Arc::new(TestClock(AtomicI64::new(
             TimestampMillis::now().timestamp_millis(),
         )));
-        let backend = crate::sqlite::SqliteBackend::initialize(":memory:")
-            .await
-            .unwrap()
-            .with_fault_probe(probe.clone());
-        let store = crate::SqlStore::initialize_schema(backend)
-            .await
-            .unwrap()
-            .with_clock(clock.clone());
+        let backend = crate::sqlite::SqliteBackend::initialize(
+            ":memory:",
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .unwrap()
+        .with_fault_probe(probe.clone());
+        let store = crate::SqlStore::initialize_schema(
+            backend,
+            storage_types::InitialStreamLineages::ONE,
+            true,
+        )
+        .await
+        .unwrap()
+        .with_clock(clock.clone());
         let create: storage_types::CreateTableRequest = serde_json::from_value(serde_json::json!({
             "TableName": "target", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
@@ -89,15 +96,18 @@ async fn given_native_ttl_metadata_abort_when_name_is_recreated_then_direct_and_
         let bindings = RequestTableBindings::default();
         probe.0.store(true, Ordering::SeqCst);
         let first = bindings.clone();
-        let error = store
-            .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(read_target(attempt, first, scheduled))
-            })
-            .await
-            .unwrap_err();
+        let error = storage_provider::DynamoPort::with_attempt(
+            &store,
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+                storage_types::AttemptDeadlineSource::attempt_deadlines(&store),
+            ),
+            move |attempt| Box::pin(read_target(attempt, first, scheduled)),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             error.to_enum(),
-            StorageEnum::TransactionConflict { .. }
+            StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(_))
         ));
         store
             .delete_table(storage_types::DeleteTableRequest {
@@ -110,12 +120,15 @@ async fn given_native_ttl_metadata_abort_when_name_is_recreated_then_direct_and_
         store.create_table(create).await.unwrap();
         store.update_time_to_live(ttl).await.unwrap();
         store.put_item(serde_json::from_value(serde_json::json!({"TableName": "target", "Item": {"pk": {"S": "new"}, "ttl": {"N": "1"}}})).unwrap()).await.unwrap();
-        let error = store
-            .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(read_target(attempt, bindings, scheduled))
-            })
-            .await
-            .unwrap_err();
+        let error = storage_provider::DynamoPort::with_attempt(
+            &store,
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+                storage_types::AttemptDeadlineSource::attempt_deadlines(&store),
+            ),
+            move |attempt| Box::pin(read_target(attempt, bindings, scheduled)),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error.to_enum(), StorageEnum::TableNotFound { .. }));
         let item = store
             .get_item(

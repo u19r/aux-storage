@@ -30,7 +30,6 @@ pub(super) async fn create_index(fixture: &TestStore, table: &str) -> anyhow::Re
         .has_enabled_stream()
     {
         super::table_stream_eligibility_tests::set_stream(fixture, &name, true).await?;
-        super::table_stream_eligibility_tests::finish_initialization(fixture, &name).await?;
     }
     let indexes = table_request(table).global_secondary_indexes.unwrap();
     let request: UpdateTableRequest = serde_json::from_value(json!({
@@ -50,9 +49,10 @@ pub(super) async fn finish_backfill(
     let mut advances = 0;
     for _ in 0..48 {
         match fixture
-            .gsi_build_repository
+            .maintenance
             .advance_gsi_build(request.clone())
-            .await?
+            .await
+            .map_err(|error| anyhow::anyhow!("GSI page: {:?}", error.as_ref()))?
         {
             StepResult::Complete => return Ok(advances),
             StepResult::Advanced(()) => advances += 1,
@@ -85,7 +85,7 @@ async fn given_concurrent_move_and_delete_when_backfilled_then_index_converges()
         seed_table(&fixture, "gsi_move", &[("A", "x"), ("B", "x"), ("C", "x")]).await?;
         create_index(&fixture, "gsi_move").await?;
         let first = fixture
-            .gsi_build_repository
+            .maintenance
             .advance_gsi_build(build_request(1))
             .await?;
         anyhow::ensure!(
@@ -147,7 +147,7 @@ async fn given_restart_when_backfill_redriven_then_no_duplication() -> anyhow::R
         seed_table(&fixture, "gsi_restart", &[("A", "x"), ("B", "x")]).await?;
         create_index(&fixture, "gsi_restart").await?;
         let step = fixture
-            .gsi_build_repository
+            .maintenance
             .advance_gsi_build(build_request(1))
             .await?;
         anyhow::ensure!(matches!(step, StepResult::Advanced(())));
@@ -161,7 +161,7 @@ async fn given_restart_when_backfill_redriven_then_no_duplication() -> anyhow::R
     let fixture = fixture.reopen().await;
     let outcome = async {
         finish_backfill(&fixture, 1).await?;
-        fixture.gsi_build_repository.advance_gsi_build(build_request(1)).await?;
+        fixture.maintenance.advance_gsi_build(build_request(1)).await?;
         anyhow::ensure!(group_keys(&fixture, "gsi_restart", "x").await? == ["A", "B"]);
         let page = fixture.operations.query(QueryRequest::try_from(json!({
             "TableName": "gsi_restart", "IndexName": "by_group", "KeyConditionExpression": "gsi_pk = :g",
@@ -183,13 +183,13 @@ async fn given_claim_loss_when_fence_changes_then_no_corruption() -> anyhow::Res
         seed_table(&fixture, "gsi_fence_identity", &[("A", "x")]).await?;
         create_index(&fixture, "gsi_fence_identity").await?;
         fixture
-            .gsi_build_repository
+            .maintenance
             .advance_gsi_build(build_request(1))
             .await?;
         let mut foreign = build_request(2);
         foreign.job = [9; 16].into();
         let error = fixture
-            .gsi_build_repository
+            .maintenance
             .advance_gsi_build(foreign)
             .await
             .expect_err("foreign job cannot take catalog authority");
@@ -211,19 +211,24 @@ async fn given_index_deleted_and_recreated_when_backfilled_then_new_index_serves
 -> anyhow::Result<()> {
     let fixture = TestStore::new().await;
     let outcome = async {
-        seed_table(&fixture, "gsi_recreate", &[("A", "x")]).await?;
+        seed_table(&fixture, "gsi_recreate", &[]).await?;
+        let expected = (0..100).map(|ordinal| format!("k{ordinal:03}")).collect::<Vec<_>>();
+        for key in &expected { put_group(&fixture, "gsi_recreate", key, "x").await?; }
         create_index(&fixture, "gsi_recreate").await?;
-        finish_backfill(&fixture, 8).await?;
-        anyhow::ensure!(group_keys(&fixture, "gsi_recreate", "x").await? == ["A"]);
+        finish_backfill(&fixture, 64).await?;
+        anyhow::ensure!(group_keys(&fixture, "gsi_recreate", "x").await? == expected);
         let deleted = fixture.operations.update_table(serde_json::from_value(json!({
             "TableName": "gsi_recreate", "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "by_group"}}]
         }))?).await?;
         anyhow::ensure!(deleted.table_description.stream_specification.is_some_and(|spec| spec.stream_enabled),
             "removing the last GSI changed the explicit stream setting");
+        for key in &expected { put_group(&fixture, "gsi_recreate", key, "y").await?; }
+        for _ in 0..8 { fixture.maintenance.reclaim_table_page().await?; }
         fixture.advance_time(std::time::Duration::from_secs(30));
         create_index(&fixture, "gsi_recreate").await?;
-        finish_backfill(&fixture, 1).await?;
-        anyhow::ensure!(group_keys(&fixture, "gsi_recreate", "x").await? == ["A"]);
+        finish_backfill(&fixture, 64).await?;
+        anyhow::ensure!(group_keys(&fixture, "gsi_recreate", "x").await?.is_empty());
+        anyhow::ensure!(group_keys(&fixture, "gsi_recreate", "y").await? == expected);
         Ok(())
     }.await;
     fixture.finish().await;

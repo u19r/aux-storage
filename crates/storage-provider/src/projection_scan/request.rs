@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use storage_common::{DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT};
+use storage_common::MAX_SCAN_LIMIT;
 use storage_types::{BoundTableInfo, IndexName, ScanTableRequest, StorageResult};
 
 use crate::{BoundRangeReadPage, BoundRangeReadPlan, RangeReadPlan, RangeReadiness};
@@ -44,7 +44,7 @@ impl GsiProjectionScan {
         &self,
         bound: &'a BoundRangeReadPlan<'a>,
     ) -> StorageResult<BoundRangeReadPage<'a>> {
-        bound.page(DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT)
+        bound.page(MAX_SCAN_LIMIT)
     }
 }
 

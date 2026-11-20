@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use storage_common::{TtlSweepPageCommand, TtlSweepPageResult};
-use storage_types::{ItemProvenance, StorageEnum, StorageError, StorageResult};
+use storage_types::{StorageEnum, StorageError, StorageResult};
 
 use super::{
     DirectExpirationPageWrite, DirectExpirationScanRead, DirectExpirationTransaction,
@@ -18,7 +18,7 @@ use crate::{AcceptedDeleteItem, prepare_accepted_delete};
 /// ```no_run
 /// use storage_common::TtlSweepPageCommand;
 /// use storage_provider::maintenance::{ExpirationAttempt, ExpirationPort};
-/// use storage_types::{ItemProvenance, StorageResult};
+/// use storage_types::StorageResult;
 /// async fn apply<P: ExpirationPort>(
 ///     attempt: &mut P,
 ///     command: &TtlSweepPageCommand,
@@ -26,8 +26,7 @@ use crate::{AcceptedDeleteItem, prepare_accepted_delete};
 ///     let page = ExpirationAttempt::new(attempt, Default::default())
 ///         .prepare_direct_expiration(command)
 ///         .await?;
-///     let provenance = vec![ItemProvenance::default(); page.items().len()];
-///     page.apply(&provenance).await?;
+///     page.apply().await?;
 ///     drop(ExpirationAttempt::new(attempt, Default::default()));
 ///     Ok(())
 /// }
@@ -45,7 +44,7 @@ use crate::{AcceptedDeleteItem, prepare_accepted_delete};
 /// ) -> StorageResult<()> {
 ///     let page = ExpirationAttempt::new(attempt, Default::default()).prepare_direct_expiration(command).await?;
 ///     let other = ExpirationAttempt::new(attempt, Default::default());
-///     page.apply(&[]).await?;
+///     page.apply().await?;
 ///     drop(other);
 ///     Ok(())
 /// }
@@ -92,22 +91,23 @@ impl<P: ExpirationPort> AcceptedDirectExpirationPage<'_, P> {
         &self.write.result
     }
 
-    /// Count validation precedes effects. All effects, TTL index cleanup and
+    /// All effects, TTL index cleanup and
     /// continuation remain in the original borrowed native attempt.
-    pub async fn apply(self, provenance: &[ItemProvenance]) -> StorageResult<TtlSweepPageResult> {
+    pub async fn apply(self) -> StorageResult<TtlSweepPageResult> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self.attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            if provenance.len() != self.items.len() {
-                return Err(StorageError::validation(
-                    "expiration provenance count differs from accepted deletions",
-                ));
+            if self
+                .items
+                .iter()
+                .any(|item| item.old_item.is_some() && item.history_route.is_some())
+            {
+                crate::prepare_writer_routes_in_attempt(attempt, None).await?;
             }
-            for (mut item, winner) in self.items.into_iter().zip(provenance) {
+            for mut item in self.items {
                 item.user_identity = Some(storage_types::StreamUserIdentity::service_ttl());
-                prepare_accepted_delete(attempt, &item, self.write.captured_at, winner.clone())
-                    .await?;
+                prepare_accepted_delete(attempt, &mut item, self.write.captured_at).await?;
             }
             attempt.flush_dynamo_write().await?;
             let table = Arc::new(self.write.table_info);
@@ -117,7 +117,9 @@ impl<P: ExpirationPort> AcceptedDirectExpirationPage<'_, P> {
                     expiration_index_deletes(self.write.deletions.index_entries),
                 )
                 .await?;
-            attempt.write_ttl_config(&table, self.write.config).await?;
+            attempt
+                .write_ttl_checkpoint(&table, self.write.config)
+                .await?;
             Ok(self.write.result)
         }
         .await;

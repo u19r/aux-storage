@@ -42,7 +42,7 @@ pub(super) fn record_capacity<B: KvBackend>(
 }
 
 pub(crate) async fn initialize_layout<A: KvAttempt>(attempt: &mut A) -> StorageResult<[u8; 16]> {
-    if let Some(identity) = load_identity(attempt).await? {
+    if let Some(identity) = load_identity(attempt, ReadProtection::Conflict).await? {
         return Ok(identity);
     }
     let range = KvRange::try_for_prefix(
@@ -56,7 +56,7 @@ pub(crate) async fn initialize_layout<A: KvAttempt>(attempt: &mut A) -> StorageR
     {
         return Err(invalid_layout());
     }
-    let identity = uuid::Uuid::new_v4().into_bytes();
+    let identity = storage_types::ambient::uuid_v4().into_bytes();
     let mut bytes = vec![INFRASTRUCTURE_LAYOUT_VERSION];
     bytes.extend_from_slice(&identity);
     attempt.stage(vec![KvMutation::Put {
@@ -66,15 +66,14 @@ pub(crate) async fn initialize_layout<A: KvAttempt>(attempt: &mut A) -> StorageR
     Ok(identity)
 }
 
-async fn load_identity<A: KvAttempt>(attempt: &A) -> StorageResult<Option<[u8; 16]>> {
+pub(crate) async fn load_identity<A: KvAttempt>(
+    attempt: &A,
+    protection: ReadProtection,
+) -> StorageResult<Option<[u8; 16]>> {
     let budget =
         NonZeroUsize::new(1 + std::mem::size_of::<[u8; 16]>()).ok_or_else(invalid_layout)?;
     let mut values = attempt
-        .get_batch_bounded(
-            vec![INFRASTRUCTURE_FORMAT_KEY.to_vec()],
-            ReadProtection::Conflict,
-            budget,
-        )
+        .get_batch_bounded(vec![INFRASTRUCTURE_FORMAT_KEY.to_vec()], protection, budget)
         .await?;
     if values.len() != 1 {
         return Err(invalid_layout());

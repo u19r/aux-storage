@@ -3,7 +3,8 @@ use utoipa::ToSchema;
 
 use crate::{AttributeMap, KeyAttributes, SystemStreamPosition, TableName};
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct StreamRecord {
     #[serde(skip)]

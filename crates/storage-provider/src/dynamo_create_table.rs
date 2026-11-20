@@ -20,9 +20,7 @@ pub struct CreateTableLayout<Seed> {
 
 /// Family lowerers read and persist physical effects on the native attempt
 /// already lent by their backend. The shared executor owns name availability.
-pub trait CreateTableAttempt:
-    infrastructure_provider::physical_attempt::PhysicalRecordAttempt
-{
+pub trait CreateTableAttempt: crate::StreamLabelClockAttempt {
     type Identity: Send;
     type LayoutSeed: Send;
 
@@ -36,6 +34,7 @@ pub trait CreateTableAttempt:
         &mut self,
         table: &StoredTableInfo,
         seed: Self::LayoutSeed,
+        regional: Option<std::sync::Arc<storage_types::RegionalBinding>>,
     ) -> impl Future<Output = StorageResult<Option<Self::Identity>>> + Send;
 
     fn table_history_id(&self, identity: &Self::Identity) -> TableHistoryId;
@@ -72,6 +71,32 @@ pub async fn create_table_in_attempt<A: CreateTableAttempt>(
     attempt: &mut A,
     table: StoredTableInfo,
 ) -> StorageResult<SemanticDecision<CreateTableResponse>> {
+    Ok(
+        match create_bound_table_in_attempt(attempt, table, None).await? {
+            SemanticDecision::Accepted(bound) => SemanticDecision::Accepted(CreateTableResponse {
+                table_description: TableDescription::from_bound_table_info(
+                    BoundTableInfo {
+                        binding: Default::default(),
+                        ..bound
+                    },
+                    // AWS answers CREATING; the stored table is ACTIVE because
+                    // the create is synchronous.
+                    TableStatus::Creating,
+                ),
+            }),
+            SemanticDecision::Rejected(error) => SemanticDecision::Rejected(error),
+        },
+    )
+}
+
+/// The created incarnation (its binding carries `regional`); the caller stages
+/// more effects. The `TableBinding` is used only for history id, info and pair:
+/// callers must not read GSI phases from it.
+pub(crate) async fn create_bound_table_in_attempt<A: CreateTableAttempt>(
+    attempt: &mut A,
+    mut table: StoredTableInfo,
+    regional: Option<std::sync::Arc<storage_types::RegionalBinding>>,
+) -> StorageResult<SemanticDecision<BoundTableInfo>> {
     let mut settlement =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
@@ -82,8 +107,12 @@ pub async fn create_table_in_attempt<A: CreateTableAttempt>(
                 StorageError::table_already_exists(&table.table_name),
             ));
         }
+        if table.has_public_stream_request() {
+            table.stream_enabled_at =
+                Some(crate::issue_stream_enable_stamp(attempt, table.created_at, None).await?);
+        }
         let identity = attempt
-            .insert_layout(&table, layout.seed)
+            .insert_layout(&table, layout.seed, regional.clone())
             .await?
             .ok_or_else(|| StorageError::table_already_exists(&table.table_name))?;
         let history_id = attempt.table_history_id(&identity);
@@ -104,14 +133,13 @@ pub async fn create_table_in_attempt<A: CreateTableAttempt>(
         // SQL uses one connection, so concurrent calls cannot reduce latency.
         attempt.write_retention(&identity, retention).await?;
         register_initial_gsis(attempt, &table, identity, source_high).await?;
-        Ok(SemanticDecision::Accepted(CreateTableResponse {
-            table_description: TableDescription::from_bound_table_info(
-                BoundTableInfo {
-                    history_id,
-                    info: std::sync::Arc::new(table),
-                },
-                TableStatus::Active,
-            ),
+        Ok(SemanticDecision::Accepted(BoundTableInfo {
+            history_id,
+            info: std::sync::Arc::new(table),
+            binding: storage_types::TableBinding {
+                regional,
+                ..Default::default()
+            },
         }))
     }
     .await;

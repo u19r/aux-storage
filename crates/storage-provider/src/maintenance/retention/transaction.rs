@@ -8,8 +8,8 @@ use storage_types::{StorageResult, TimestampMillis};
 use stream_provider::StreamAttempt;
 
 use super::{
-    StreamDurationTrimStats, StreamRetentionFinish, StreamTrimDueMarker, StreamTrimPageLimit,
-    StreamTrimScope, StreamTrimState,
+    StreamDurationTrimStats, StreamTrimDueMarker, StreamTrimPageLimit, StreamTrimScope,
+    StreamTrimState,
 };
 
 /// One bounded marker wave, with at most one marker for each scope.
@@ -43,18 +43,27 @@ impl From<(bool, Option<StreamTrimState>)> for StreamRetentionObservation {
 /// Physical retention I/O joined to the initialized store's native attempt.
 pub trait StreamRetentionPort:
     StreamAttempt
-    + crate::GetItemAttempt
+    + crate::CatalogAttempt
     + stream_provider::TableHistoryIndexAttempt
-    + super::ItemHistoryMetadataAttempt
-    + stream_provider::HistoryRowDeleteAttempt
+    + stream_provider::StreamEntryDeleteAttempt
+    + crate::RegionalProgressAttempt
 {
     fn load_stream_trim_observations(
         &mut self,
         markers: &[StreamTrimDueMarker],
-    ) -> impl Future<Output = StorageResult<Vec<StreamRetentionObservation>>> + Send;
-    fn finish_stream_trim_markers(
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<StreamRetentionObservation>>> + Send;
+    /// Physical compare-and-delete: for each finish, in order, delete its
+    /// marker when the stored marker equals `marker_blob` and, when
+    /// `record.expected_state_blob` is `Some`, the stored state of
+    /// `marker.scope` equals it. Returns `true` for each deleted marker.
+    fn delete_stream_trim_markers(
         &mut self,
-        finishes: Vec<StreamRetentionFinish>,
+        finishes: &[super::PreparedRetentionFinish],
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<bool>>> + Send;
+    /// Physical store of each state record and its `next_marker`.
+    fn store_stream_trim_states(
+        &mut self,
+        states: Vec<super::RetentionStateWrite>,
     ) -> impl Future<Output = StorageResult<()>> + Send;
     fn list_due_stream_trim_markers(
         &mut self,
@@ -65,6 +74,14 @@ pub trait StreamRetentionPort:
         &mut self,
         scopes: &[StreamTrimScope],
     ) -> impl Future<Output = StorageResult<Vec<Option<StreamTrimState>>>> + Send;
+
+    /// Writers request conflict protection; readers use their coherent native
+    /// snapshot.
+    fn load_table_history_retention(
+        &mut self,
+        table: &storage_types::BoundTableInfo,
+        protection: storage_types::ReadProtection,
+    ) -> impl Future<Output = StorageResult<Option<crate::StreamTrimState>>> + Send;
 }
 
 impl StreamRetentionWave {

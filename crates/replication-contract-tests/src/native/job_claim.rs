@@ -11,7 +11,7 @@ use scheduled_bg_jobs::{
 };
 use storage_provider::{
     DynamoPort,
-    maintenance::{ExpirationHandler, ExpirationPort},
+    maintenance::{ExpirationHandler, MaintenanceOperations},
 };
 
 use crate::HarnessResult;
@@ -24,8 +24,7 @@ fn build_system<P>(
     payload: bytes::Bytes,
 ) -> HarnessResult<JobSystem<ScheduledJobStore>>
 where
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
 {
     let mut catalog = JobCatalog::new().with_manifest(
         scheduled_bg_jobs::CatalogManifest::try_new(
@@ -75,8 +74,7 @@ pub(crate) async fn prepare_claim<S, P>(
 )>
 where
     S: ScheduledJobStoreSource,
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
 {
     prepare_payload_claim(
         scheduler,
@@ -101,8 +99,7 @@ pub(crate) async fn prepare_payload_claim<S, P>(
 )>
 where
     S: ScheduledJobStoreSource,
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
 {
     let store = scheduler.scheduled_job_store(super::fixture::scheduled_job_config())?;
     let original = build_system(

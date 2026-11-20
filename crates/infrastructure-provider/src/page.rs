@@ -102,7 +102,7 @@ impl RecordPage {
             bytes = next_bytes;
             retained
                 .try_reserve(1)
-                .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             retained.push(record);
         }
         let continuation = if more {

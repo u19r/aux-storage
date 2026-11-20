@@ -2,11 +2,11 @@
 
 use std::borrow::Cow;
 
-use storage_condition::Condition;
 use storage_provider::{BoundRangeReadPage, BoundRangeReadPlan};
 use storage_types::{
     AttributeName, AttributeValue, BoundTableInfo, KeyAttributeType, KeySchemaElement,
-    StorageError, StorageResult, maintenance::TargetIncarnation,
+    StorageError, StorageResult,
+    condition::{AttributePath, Condition},
 };
 
 use super::projection::RangeProjection;
@@ -18,24 +18,35 @@ pub(super) struct KeyColumn {
     pub kind: KeyAttributeType,
 }
 
+/// The page key in index order. A GSI page reads the item relation through
+/// the GSI partial index: `(gsi pk[, gsi sk], pk[, sk])`.
 pub(super) fn ordered_columns(
     table: &BoundTableInfo,
     bound: &BoundRangeReadPlan<'_>,
-) -> Vec<KeyColumn> {
+) -> StorageResult<Vec<KeyColumn>> {
     let mut columns = Vec::new();
     if let Some(index) = bound.index.as_ref() {
-        columns.extend(schema_columns(table, &index.key_schema, ""));
-        columns.extend(schema_columns(table, &table.info.key_schema, "table_"));
-    } else {
-        columns.extend(schema_columns(table, &table.info.key_schema, ""));
+        let gsi = table
+            .binding
+            .gsi(&index.index_name)
+            .ok_or_else(|| StorageError::internal("SQL GSI is absent from the catalog binding"))?;
+        columns.extend(
+            crate::item_schema::ordered_gsi_columns(&table.info, gsi)?
+                .into_iter()
+                .map(|column| KeyColumn {
+                    logical: column.attribute.clone(),
+                    physical: crate::item_schema::key_column_identifier(column),
+                    kind: column.kind,
+                }),
+        );
     }
-    columns
+    columns.extend(schema_columns(table, &table.info.key_schema));
+    Ok(columns)
 }
 
 fn schema_columns(
     table: &BoundTableInfo,
     schema: &[KeySchemaElement],
-    prefix: &str,
 ) -> impl Iterator<Item = KeyColumn> {
     KeySchemaElement::ordered(schema).map(move |key| {
         let kind = table
@@ -44,15 +55,49 @@ fn schema_columns(
             .iter()
             .find(|definition| definition.attribute_name == key.attribute_name)
             .map_or(KeyAttributeType::S, |definition| definition.attribute_type);
-        let sanitized = AttributeName::new(&key.attribute_name)
-            .sanitized()
-            .to_owned();
         KeyColumn {
             logical: key.attribute_name.clone(),
-            physical: format!("{prefix}{sanitized}"),
+            physical: AttributeName::new(&key.attribute_name)
+                .sanitized()
+                .to_owned(),
             kind,
         }
     })
+}
+
+/// The GSI projection that a GSI page applies before the FilterExpression,
+/// the page byte limit. `KEYS_ONLY` selects only key
+/// columns, so the partial index covers the page.
+pub(super) enum GsiRowShape {
+    KeysOnly,
+    Include(Vec<String>),
+    All,
+}
+
+impl GsiRowShape {
+    pub(super) fn for_index(
+        table: &BoundTableInfo,
+        index: &storage_types::GlobalSecondaryIndex,
+    ) -> Self {
+        match index.projection.projection_type.as_ref() {
+            Some(storage_types::ProjectionType::KeysOnly) => Self::KeysOnly,
+            Some(storage_types::ProjectionType::Include) => Self::Include(
+                storage_common::gsi_projection_fields(
+                    Some(&index.projection),
+                    &table.info.key_schema,
+                    &index.key_schema,
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            Some(storage_types::ProjectionType::All) | None => Self::All,
+        }
+    }
+
+    pub(super) const fn reads_image(&self) -> bool {
+        !matches!(self, Self::KeysOnly)
+    }
 }
 
 pub(super) struct RangeStatementInput<'a, 'b> {
@@ -60,7 +105,7 @@ pub(super) struct RangeStatementInput<'a, 'b> {
     pub bound: &'a BoundRangeReadPlan<'b>,
     pub page: &'a BoundRangeReadPage<'b>,
     pub columns: &'a [KeyColumn],
-    pub incarnation: Option<&'a TargetIncarnation>,
+    pub gsi: Option<&'a GsiRowShape>,
 }
 
 pub(super) fn range_statement<P: RangeProjection>(
@@ -72,19 +117,18 @@ pub(super) fn range_statement<P: RangeProjection>(
         bound,
         page,
         columns,
-        incarnation,
+        gsi,
     } = input;
-    let physical = if bound.index.is_some() {
-        let incarnation = incarnation
-            .ok_or_else(|| StorageError::internal("SQL GSI page has no physical incarnation"))?;
-        engine.gsi_table_name(incarnation)
-    } else {
-        engine.item_table_name(table.history_id)
-    };
+    let physical = engine.item_table_name(table.history_id);
     let mut binds = Vec::new();
     let mut predicates = Vec::new();
-    if bound.index.is_some() {
-        predicates.push(P::TOMBSTONE_PREDICATE.to_owned());
+    if let Some(index) = bound.index.as_ref() {
+        // The predicate of the partial index; sparse items are absent.
+        predicates.extend(
+            columns[..index.key_schema.len()]
+                .iter()
+                .map(|column| format!("\"{}\" IS NOT NULL", column.physical)),
+        );
     }
     if let Some(condition) = page.condition {
         let condition_columns = if let Some(index) = bound.index.as_ref() {
@@ -121,20 +165,23 @@ pub(super) fn range_statement<P: RangeProjection>(
     } else {
         format!("WHERE {}", predicates.join(" AND "))
     };
-    let selected = columns
-        .iter()
-        .enumerate()
-        .map(|(ordinal, column)| {
-            let physical = format!("\"{}\"", column.physical);
-            if engine.engine() == SqlEngine::Postgres && column.kind == KeyAttributeType::N {
-                format!("CAST({physical} AS TEXT) AS \"__aux_decoded_key_{ordinal}\"")
-            } else {
-                physical
-            }
-        })
-        .chain([P::EVALUATED_BYTES.to_owned(), P::COLUMNS.to_owned()])
-        .collect::<Vec<_>>()
-        .join(", ");
+    let keys = columns.iter().enumerate().map(|(ordinal, column)| {
+        let physical = format!("\"{}\"", column.physical);
+        if engine.engine() == SqlEngine::Postgres && column.kind == KeyAttributeType::N {
+            format!("CAST({physical} AS TEXT) AS \"__aux_decoded_key_{ordinal}\"")
+        } else {
+            physical
+        }
+    });
+    let selected = match gsi {
+        Some(shape) => keys
+            .chain(shape.reads_image().then(|| "item_value".to_owned()))
+            .collect::<Vec<_>>(),
+        None => keys
+            .chain([P::EVALUATED_BYTES.to_owned(), P::COLUMNS.to_owned()])
+            .collect::<Vec<_>>(),
+    }
+    .join(", ");
     let direction = if page.forward { "ASC" } else { "DESC" };
     let order = columns
         .iter()
@@ -164,14 +211,19 @@ fn compile_condition(
                 StorageError::internal("bound key condition field is absent from the key schema")
             })
     };
-    let comparison = |name: &str, op: &str, value: &str, binds: &mut Vec<SqlValue>| {
-        let column = field(name)?;
+    fn top(path: &AttributePath) -> StorageResult<&str> {
+        path.top_level().ok_or_else(|| {
+            StorageError::internal("bound key condition names a nested attribute path")
+        })
+    }
+    let comparison = |name: &AttributePath, op: &str, value: &str, binds: &mut Vec<SqlValue>| {
+        let column = field(top(name)?)?;
         let placeholder = bind_raw(engine, column, value, binds)?;
         Ok::<_, StorageError>(format!("\"{}\" {op} {placeholder}", column.physical))
     };
     match condition {
         Condition::Equal { field: name, value } => {
-            let column = field(name)?;
+            let column = field(top(name)?)?;
             let placeholder = bind_key(engine, column, value, binds)?;
             Ok(format!("\"{}\" = {placeholder}", column.physical))
         }
@@ -184,7 +236,7 @@ fn compile_condition(
             min,
             max,
         } => {
-            let column = field(name)?;
+            let column = field(top(name)?)?;
             let lower = bind_raw(engine, column, min, binds)?;
             let upper = bind_raw(engine, column, max, binds)?;
             Ok(format!(
@@ -196,7 +248,7 @@ fn compile_condition(
             field: name,
             prefix,
         } => {
-            let column = field(name)?;
+            let column = field(top(name)?)?;
             match (column.kind, prefix) {
                 (KeyAttributeType::S, AttributeValue::S(value)) => {
                     let lower = bind_raw(engine, column, value, binds)?;

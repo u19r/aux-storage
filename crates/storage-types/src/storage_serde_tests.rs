@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 
-use crate::{AttributeValue, context::WrappedError as _, storage_serde};
+use crate::{AttributeMap, AttributeValue, context::WrappedError as _, storage_serde};
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct TestRecord {
@@ -121,7 +121,7 @@ fn given_ordered_maps_when_stored_then_serializer_order_is_preserved() {
 
 #[test]
 fn given_nested_dynamo_maps_when_stored_then_values_round_trip() {
-    let value = AttributeValue::M(HashMap::from([
+    let value = AttributeValue::M(AttributeMap::from(HashMap::from([
         (
             "z".to_string(),
             AttributeValue::L(vec![
@@ -131,7 +131,7 @@ fn given_nested_dynamo_maps_when_stored_then_values_round_trip() {
         ),
         (
             "a".to_string(),
-            AttributeValue::M(HashMap::from([
+            AttributeValue::M(AttributeMap::from(HashMap::from([
                 (
                     "z-inner".to_string(),
                     AttributeValue::N("-4E-2".to_string()),
@@ -140,9 +140,9 @@ fn given_nested_dynamo_maps_when_stored_then_values_round_trip() {
                     "a-inner".to_string(),
                     AttributeValue::S("value".to_string()),
                 ),
-            ])),
+            ]))),
         ),
-    ]));
+    ])));
     let encoded = storage_serde::to_bytes(&value).expect("encode nested map");
     let json = storage_serde::decompress_bytes(&encoded).expect("decode nested map");
 
@@ -280,72 +280,5 @@ fn given_raw_and_compressed_wrong_types_when_decoded_then_serialization_errors_a
             actual.to_enum(),
             crate::StorageEnum::Serialization(error) if error.as_ref().to_string() == expected.to_string()
         ));
-    }
-}
-
-fn measure_storage_decode(
-    bytes: &[u8],
-    decode: fn(&[u8]) -> crate::StorageResult<serde_json::Value>,
-) -> alloc_counter::AllocationReport<'static> {
-    let guard = alloc_counter::AllocationGuard::start(
-        module_path!(),
-        "storage_decode",
-        file!(),
-        line!(),
-        None,
-    );
-    for _ in 0..128 {
-        std::hint::black_box(decode(std::hint::black_box(bytes)).unwrap());
-    }
-    guard.finish()
-}
-
-#[test]
-#[ignore = "manual storage decode allocation and runtime probe"]
-fn given_stored_payloads_when_decoded_then_allocation_work_is_measured() {
-    for (label, bytes) in storage_decode_fixtures() {
-        for repetition in 0..3 {
-            let baseline = measure_storage_decode(&bytes, decode_copied_payload);
-            let current = measure_storage_decode(&bytes, storage_serde::from_bytes);
-            println!(
-                "storage_decode {label} rep={repetition} encoded_bytes={} baseline_allocations={} \
-                 current_allocations={} baseline_bytes={} current_bytes={}",
-                bytes.len(),
-                baseline.allocation_count / 128,
-                current.allocation_count / 128,
-                baseline.allocated_bytes / 128,
-                current.allocated_bytes / 128,
-            );
-            let is_raw = bytes.starts_with(&crate::constants::RAW_JSON_PREFIX);
-            assert_eq!(
-                baseline.allocation_count - current.allocation_count,
-                u64::from(is_raw) * 128,
-            );
-            let copied_bytes = if is_raw {
-                bytes.len() - crate::constants::STORAGE_SERDE_ENCODED_PREFIX_LEN
-            } else {
-                0
-            };
-            assert_eq!(
-                baseline.allocated_bytes - current.allocated_bytes,
-                copied_bytes as u64 * 128,
-            );
-        }
-        for (name, decode) in [
-            (
-                "baseline",
-                decode_copied_payload as fn(&[u8]) -> crate::StorageResult<serde_json::Value>,
-            ),
-            ("current", storage_serde::from_bytes),
-        ] {
-            let started = std::time::Instant::now();
-            for _ in 0..5_000 {
-                std::hint::black_box(decode(std::hint::black_box(&bytes)).unwrap());
-            }
-            println!(
-                "storage_decode_runtime {label} {name} ns_per_op={}",
-                started.elapsed().as_nanos() / 5_000
-            );
-        }
     }
 }

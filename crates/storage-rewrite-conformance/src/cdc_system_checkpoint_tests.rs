@@ -108,14 +108,15 @@ async fn given_wrong_scope_generation_or_forged_checkpoint_when_system_cdc_is_re
 }
 
 // Concurrency and performance rules: simultaneous readers of one frontier
-// publish one durable checkpoint token rather than one token per request.
+// publish one durable token for each identical checkpoint. Native clocks may
+// advance between requests when other tests commit unrelated writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn given_concurrent_empty_system_cdc_reads_when_checkpoint_is_issued_then_every_reader_receives_one_token()
  {
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let scope = store.stream_operations.system_stream_scope().await.unwrap();
-        let request = SystemStreamPageRequest::try_new(scope, None, 1).unwrap();
+        let request = SystemStreamPageRequest::try_new(scope.clone(), None, 1).unwrap();
         let barrier = Arc::new(Barrier::new(8));
         let readers = (0..8).map(|_| {
             let operations = store.stream_operations.clone();
@@ -127,7 +128,7 @@ async fn given_concurrent_empty_system_cdc_reads_when_checkpoint_is_issued_then_
             })
         });
 
-        let mut issued_token = None;
+        let mut issued_checkpoints = Vec::new();
         for result in join_all(readers).await {
             let observed = result.unwrap();
             observed.assert_no_warning_or_error();
@@ -140,11 +141,28 @@ async fn given_concurrent_empty_system_cdc_reads_when_checkpoint_is_issued_then_
             );
             let page = observed.result.unwrap();
             assert!(page.records().is_empty());
-            assert!(page.terminal());
-            match &issued_token {
-                Some(token) => assert_eq!(page.issued_checkpoint().token(), token),
-                None => issued_token = Some(page.issued_checkpoint().token().clone()),
+            let issued = page.issued_checkpoint();
+            if let Some((_, token)) = issued_checkpoints
+                .iter()
+                .find(|(checkpoint, _)| checkpoint == issued.checkpoint())
+            {
+                assert_eq!(issued.token(), token);
+            } else {
+                issued_checkpoints.push((issued.checkpoint().clone(), issued.token().clone()));
             }
+            let resumed = store
+                .stream_operations
+                .get_system_stream_page(
+                    SystemStreamPageRequest::try_new(
+                        scope.clone(),
+                        Some(issued.token().clone()),
+                        100,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resumed.records().is_empty());
         }
     })
     .catch_unwind()

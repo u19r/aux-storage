@@ -1,6 +1,6 @@
 //! Consuming value preparation separates operand admission from payload copies.
 
-use storage_types::{InfrastructureResultKind, StorageResult};
+use storage_types::StorageResult;
 
 use crate::constants::{
     KV_CHUNK_BYTES, KV_CHUNK_HEADER_BYTES, KV_MAX_VALUE_BYTES, KV_VALUE_CHUNKED_TAG,
@@ -94,5 +94,5 @@ impl ValueEncoding {
 }
 
 fn capacity_rejected() -> storage_types::StorageError {
-    InfrastructureResultKind::NativeCapacityRejected.into()
+    storage_types::AttemptFailure::CAPACITY.into()
 }

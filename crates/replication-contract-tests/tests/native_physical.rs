@@ -15,14 +15,14 @@ use infrastructure_provider::{
 };
 use replication_contract_tests::{HarnessResult, native::fixture};
 use storage_provider::{
-    DescribeTimeToLiveAttempt as _, DynamoOperations as _, DynamoPort,
+    DynamoOperations as _, DynamoPort, TtlPolicyAttempt as _,
     maintenance::{ExpirationPort, ExpirationScanRead},
     resolve_table_in_attempt,
 };
 use storage_types::{
-    AttemptMode, CreateTableRequest, GetItemRequest, GetStreamRecordsRequest,
-    InfrastructureContext, InfrastructureResultKind, PutItemRequest, QueryRequest, StorageEnum,
-    StorageError, StorageResult, TableName, UpdateTimeToLiveRequest,
+    AttemptMode, AttemptPlan, CreateTableRequest, DeadlineClass, GetItemRequest,
+    GetStreamRecordsRequest, InfrastructureContext, InfrastructureResultKind, PutItemRequest,
+    QueryRequest, StorageEnum, StorageError, StorageResult, TableName, UpdateTimeToLiveRequest,
     maintenance::TargetIncarnation,
 };
 use stream_provider::{StreamOperations as _, StreamPort, SystemStreamPageRequest};
@@ -31,9 +31,7 @@ use stream_provider::{StreamOperations as _, StreamPort, SystemStreamPageRequest
 #[tokio::test]
 async fn given_memory_sqlite_when_put_and_sidecar_share_an_attempt_then_all_effects_commit_or_rollback()
 -> HarnessResult<()> {
-    let stamp = verify_domain_join(&fixture::memory_sqlite().await?).await?;
-    assert!(stamp.is_none());
-    Ok(())
+    verify_domain_join(&fixture::memory_sqlite().await?).await
 }
 
 #[cfg(feature = "native-sqlite")]
@@ -41,9 +39,7 @@ async fn given_memory_sqlite_when_put_and_sidecar_share_an_attempt_then_all_effe
 async fn given_file_sqlite_when_put_and_sidecar_share_an_attempt_then_all_effects_commit_or_rollback()
 -> HarnessResult<()> {
     let fixture = fixture::FileSqlite::try_new().await?;
-    let stamp = verify_domain_join(&fixture.store).await?;
-    assert!(stamp.is_none());
-    Ok(())
+    verify_domain_join(&fixture.store).await
 }
 
 #[cfg(feature = "native-postgres")]
@@ -53,8 +49,7 @@ async fn given_postgres_when_put_and_sidecar_share_an_attempt_then_all_effects_c
     let fixture = fixture::Postgres::try_new().await?;
     let result = verify_domain_join(&fixture.store).await;
     fixture.finish().await?;
-    assert!(result?.is_none());
-    Ok(())
+    result
 }
 
 #[cfg(feature = "native-turso")]
@@ -62,9 +57,7 @@ async fn given_postgres_when_put_and_sidecar_share_an_attempt_then_all_effects_c
 async fn given_turso_when_put_and_sidecar_share_an_attempt_then_all_effects_commit_or_rollback()
 -> HarnessResult<()> {
     let fixture = replication_contract_tests::native::turso::FileTurso::try_new().await?;
-    let stamp = verify_domain_join(&fixture.store).await?;
-    assert!(stamp.is_none());
-    Ok(())
+    verify_domain_join(&fixture.store).await
 }
 
 #[cfg(feature = "native-rocksdb")]
@@ -72,9 +65,7 @@ async fn given_turso_when_put_and_sidecar_share_an_attempt_then_all_effects_comm
 async fn given_rocksdb_when_put_and_sidecar_share_an_attempt_then_all_effects_commit_or_rollback()
 -> HarnessResult<()> {
     let fixture = replication_contract_tests::native::rocksdb::RocksDb::try_new().await?;
-    let stamp = verify_domain_join(&fixture.store).await?;
-    assert!(stamp.is_none());
-    Ok(())
+    verify_domain_join(&fixture.store).await
 }
 
 #[cfg(feature = "native-foundationdb")]
@@ -84,66 +75,10 @@ async fn given_foundationdb_when_put_and_sidecar_share_an_attempt_then_all_effec
     let fixture = replication_contract_tests::native::foundationdb::FoundationDb::try_new().await?;
     let result = verify_domain_join(&fixture.store).await;
     fixture.finish().await?;
-    assert!(result?.is_some());
-    Ok(())
-}
-
-#[cfg(feature = "native-sqlite")]
-#[tokio::test]
-async fn given_sqlite_attempt_without_writes_when_commit_completes_then_result_has_no_native_stamp()
--> HarnessResult<()> {
-    verify_commit_without_writes(&fixture::FileSqlite::try_new().await?.store).await
-}
-
-#[cfg(feature = "native-postgres")]
-#[tokio::test]
-async fn given_postgres_attempt_without_writes_when_commit_completes_then_result_has_no_native_stamp()
--> HarnessResult<()> {
-    let fixture = fixture::Postgres::try_new().await?;
-    let result = verify_commit_without_writes(&fixture.store).await;
-    fixture.finish().await?;
     result
 }
 
-#[cfg(feature = "native-turso")]
-#[tokio::test]
-async fn given_turso_attempt_without_writes_when_commit_completes_then_result_has_no_native_stamp()
--> HarnessResult<()> {
-    let fixture = replication_contract_tests::native::turso::FileTurso::try_new().await?;
-    verify_commit_without_writes(&fixture.store).await
-}
-
-#[cfg(feature = "native-rocksdb")]
-#[tokio::test]
-async fn given_rocksdb_attempt_without_writes_when_commit_completes_then_result_has_no_native_stamp()
--> HarnessResult<()> {
-    let fixture = replication_contract_tests::native::rocksdb::RocksDb::try_new().await?;
-    verify_commit_without_writes(&fixture.store).await
-}
-
-#[cfg(feature = "native-foundationdb")]
-#[tokio::test]
-async fn given_foundationdb_attempt_without_writes_when_commit_completes_then_result_has_no_native_stamp()
--> HarnessResult<()> {
-    let fixture = replication_contract_tests::native::foundationdb::FoundationDb::try_new().await?;
-    let result = verify_commit_without_writes(&fixture.store).await;
-    fixture.finish().await?;
-    result
-}
-
-async fn verify_commit_without_writes<P: DynamoPort>(store: &P) -> HarnessResult<()> {
-    let (response, stamp) = store
-        .with_committed_dynamo_attempt(|_| Box::pin(async { Ok(7_u8) }))
-        .await?;
-    assert_eq!(7, response);
-    assert!(
-        stamp.is_none(),
-        "a read-only commit minted a new native stamp"
-    );
-    Ok(())
-}
-
-async fn verify_domain_join<P>(store: &P) -> HarnessResult<Option<[u8; 10]>>
+async fn verify_domain_join<P>(store: &P) -> HarnessResult<()>
 where
     P: DynamoPort + StreamPort + 'static,
     for<'native> <P as DynamoPort>::Attempt<'native>: PhysicalRecordAttempt + ExpirationPort,
@@ -179,7 +114,6 @@ where
     let mut settled_streams = verify_domain_effects(store, &name, 0)
         .await
         .map_err(|error| format!("empty effects: {error:?}"))?;
-    let mut committed_stamp = None;
     for (id, commit) in [
         ("rolled_back", false),
         ("committed", true),
@@ -201,8 +135,12 @@ where
                 bytes: Arc::from(&b"joined"[..]),
             },
         }];
-        let result = store
-            .with_committed_dynamo_attempt(move |attempt| {
+        let result = storage_provider::DynamoPort::with_attempt(
+            store,
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+                storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+            ),
+            move |attempt| {
                 Box::pin(async move {
                     fixture::put_item_in_catalog(attempt, &cache, put, captured_at).await?;
                     let changes = RecordBatch::try_new(&write, fixture::limits()?)?;
@@ -216,11 +154,11 @@ where
                         Err(rollback_witness())
                     }
                 })
-            })
-            .await;
+            },
+        )
+        .await;
         if commit {
-            let ((), stamp) = result?;
-            committed_stamp = stamp;
+            result?;
         } else {
             assert!(
                 matches!((result).as_ref(), Err(error) if matches!(error.as_ref(), StorageEnum::InfrastructureResult(InfrastructureResultKind::Encoding { context: InfrastructureContext::AttemptSettlement }))),
@@ -270,7 +208,7 @@ where
             );
         }
     }
-    Ok(committed_stamp)
+    Ok(())
 }
 
 async fn verify_domain_effects<P>(

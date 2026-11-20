@@ -1,15 +1,13 @@
 use storage_types::{
-    AttributeValue, GlobalSecondaryIndex, IndexName, IndexerDeclaration, ItemRevision,
-    KeyAttributes, KeySchemaElement, KeyType, ProjectionType, StorageError, StorageResult,
-    StoredTableInfo, WireItem,
+    AttributeValue, GlobalSecondaryIndex, IndexName, IndexerDeclaration, KeyAttributes,
+    KeySchemaElement, KeyType, ProjectionType, StorageError, StorageResult, StoredTableInfo,
+    WireItem,
 };
 
 use super::{
-    GsiFailureReason, GsiIndexWriteActions, GsiKeyPart, GsiKeyParts, GsiProjectedRow,
-    GsiProjection, GsiProjectionChange, GsiProjectionKey, GsiProjectionStateRead,
-    GsiScannedSourceItem, GsiSourceProjection, GsiWriteAction,
+    GsiIndexWriteActions, GsiKeyPart, GsiKeyParts, GsiProjectedRow, GsiProjectionKey,
+    GsiProjectionWrite, GsiProjectionWriteBatch, GsiScannedSourceItem, GsiWriteAction,
 };
-
 impl GsiProjectionKey {
     /// The logical projection owns its combined secondary and primary shape;
     /// providers only encode the resulting native key.
@@ -41,33 +39,27 @@ impl GsiProjectionKey {
     }
 }
 
-impl GsiSourceProjection {
-    #[must_use]
-    pub fn item_version(&self) -> ItemRevision {
-        match self {
-            Self::Missing { item_version, .. } | Self::Present { item_version, .. } => {
-                *item_version
-            }
-        }
-    }
-
+impl GsiProjectedRow {
     pub fn project_scanned_items(
         table: &StoredTableInfo,
         index_name: &IndexName,
         items: Vec<GsiScannedSourceItem>,
-    ) -> StorageResult<Vec<Self>> {
+    ) -> StorageResult<GsiProjectionWriteBatch> {
         items
             .into_iter()
-            .map(|source| {
-                Self::from_item(
-                    table,
-                    index_name,
-                    source.item,
-                    source.indexers,
-                    source.revision,
+            .map(|source| Self::from_item(table, index_name, source.item, source.indexers))
+            .collect::<StorageResult<Vec<_>>>()
+            .map(|rows| {
+                GsiProjectionWriteBatch(
+                    rows.into_iter()
+                        .flatten()
+                        .map(|row| GsiProjectionWrite {
+                            key: row.key.clone(),
+                            row: Some(row),
+                        })
+                        .collect(),
                 )
             })
-            .collect()
     }
 
     pub fn from_item(
@@ -75,8 +67,7 @@ impl GsiSourceProjection {
         index_name: &IndexName,
         item: WireItem,
         indexers: Vec<String>,
-        item_version: ItemRevision,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Option<Self>> {
         let index = table
             .global_secondary_indexes
             .as_deref()
@@ -86,14 +77,16 @@ impl GsiSourceProjection {
             })?;
         let indexers = IndexerDeclaration::try_new(indexers, table.max_indexers)?;
         if index_name.is_ttl_index() {
-            return project_ttl_item(table, index, item, indexers, item_version);
+            return project_ttl_item(table, index, item, indexers);
+        }
+        // An item whose index key attribute has another type than the index
+        // declares is not indexed; it stays in the base table.
+        if !index_key_types_match(table, index, &item)? {
+            return Ok(None);
         }
         let mut actions = plan_gsi_write_actions_for(table, &[index], None, Some(&item))?;
         let Some(action) = actions.pop() else {
-            return Ok(Self::Missing {
-                item_version,
-                previous_key: None,
-            });
+            return Ok(None);
         };
         let GsiWriteAction::Put {
             gsi_key,
@@ -106,59 +99,45 @@ impl GsiSourceProjection {
                 "GSI source projection produced an unexpected delete",
             ));
         };
-        Ok(Self::Present {
-            item_version,
-            row: Box::new(GsiProjectedRow {
-                key: GsiProjectionKey {
-                    index_name: index.index_name.clone(),
-                    index_key: key_attributes(gsi_key),
-                    table_item_key: key_attributes(table_key),
-                    ttl_index_key: None,
-                },
-                source_item: item,
-                projection,
-                indexers,
-            }),
-        })
+        Ok(Some(GsiProjectedRow {
+            key: GsiProjectionKey {
+                index_name: index.index_name.clone(),
+                index_key: key_attributes(gsi_key),
+                table_item_key: key_attributes(table_key),
+                ttl_index_key: None,
+            },
+            source_item: item,
+            projection,
+            indexers,
+        }))
     }
+}
 
-    pub fn from_stream_images(
-        table: &StoredTableInfo,
-        index_name: &IndexName,
-        old_item: Option<WireItem>,
-        new_item: Option<WireItem>,
-        indexers: Vec<String>,
-        item_version: ItemRevision,
-    ) -> StorageResult<Vec<Self>> {
-        let new_projection = new_item
-            .map(|item| Self::from_item(table, index_name, item, indexers, item_version))
-            .transpose()?;
-        let old_projection = old_item
-            .map(|item| Self::from_item(table, index_name, item, Vec::new(), item_version))
-            .transpose()?;
-        let old_key = match old_projection {
-            Some(Self::Present { row, .. }) => Some(row.key),
-            Some(Self::Missing { .. }) | None => None,
+fn index_key_types_match(
+    table: &StoredTableInfo,
+    index: &GlobalSecondaryIndex,
+    item: &WireItem,
+) -> StorageResult<bool> {
+    let fields = index
+        .key_schema
+        .iter()
+        .map(|key| key.attribute_name.as_str())
+        .collect::<Vec<_>>();
+    let values = item.select_attribute_values(&fields)?;
+    for (key, value) in index.key_schema.iter().zip(values) {
+        let Some(value) = value else {
+            continue;
         };
-        let new_key = match &new_projection {
-            Some(Self::Present { row, .. }) => Some(&row.key),
-            Some(Self::Missing { .. }) | None => None,
-        };
-        let mut projections = Vec::with_capacity(2);
-        if old_key
-            .as_ref()
-            .is_some_and(|old_key| Some(old_key) != new_key)
-        {
-            projections.push(Self::Missing {
-                item_version,
-                previous_key: old_key.map(Box::new),
-            });
+        let expected = table
+            .attribute_definitions
+            .iter()
+            .find(|definition| definition.attribute_name == key.attribute_name)
+            .ok_or_else(|| StorageError::internal("GSI key attribute has no table definition"))?;
+        if !value.matches_key_type(&expected.attribute_type) {
+            return Ok(false);
         }
-        if let Some(projection) = new_projection {
-            projections.push(projection);
-        }
-        Ok(projections)
     }
+    Ok(true)
 }
 
 fn project_ttl_item(
@@ -166,8 +145,7 @@ fn project_ttl_item(
     index: &GlobalSecondaryIndex,
     item: WireItem,
     indexers: IndexerDeclaration,
-    item_version: ItemRevision,
-) -> StorageResult<GsiSourceProjection> {
+) -> StorageResult<Option<GsiProjectedRow>> {
     let ttl_attribute = index
         .key_schema
         .iter()
@@ -176,73 +154,19 @@ fn project_ttl_item(
     let Some(ttl_index_key) =
         storage_common::TtlIndexKey::for_wire_item(table, &ttl_attribute.attribute_name, &item)?
     else {
-        return Ok(GsiSourceProjection::Missing {
-            item_version,
-            previous_key: None,
-        });
+        return Ok(None);
     };
-    Ok(GsiSourceProjection::Present {
-        item_version,
-        row: Box::new(GsiProjectedRow {
-            key: GsiProjectionKey {
-                index_name: index.index_name.clone(),
-                index_key: KeyAttributes::new(),
-                table_item_key: KeyAttributes::new(),
-                ttl_index_key: Some(ttl_index_key),
-            },
-            projection: storage_types::FrozenImageProjection::All,
-            source_item: item,
-            indexers,
-        }),
-    })
-}
-
-impl TryFrom<&GsiSourceProjection> for GsiProjectionKey {
-    type Error = StorageError;
-
-    fn try_from(source: &GsiSourceProjection) -> StorageResult<Self> {
-        let key = match source {
-            GsiSourceProjection::Present { row, .. } => &row.key,
-            GsiSourceProjection::Missing {
-                previous_key: Some(key),
-                ..
-            } => key,
-            GsiSourceProjection::Missing {
-                previous_key: None, ..
-            } => {
-                return Err(StorageError::internal(
-                    "GSI source projection key is unavailable",
-                ));
-            }
-        };
-        Ok(key.clone())
-    }
-}
-
-impl<'a> GsiProjectionStateRead<'a> {
-    #[must_use]
-    pub fn plan(sources: &'a [GsiSourceProjection]) -> Vec<Self> {
-        sources
-            .iter()
-            .enumerate()
-            .filter_map(|(source_ordinal, source)| {
-                let key = match source {
-                    GsiSourceProjection::Present { row, .. } => Some(&row.key),
-                    GsiSourceProjection::Missing {
-                        previous_key: Some(key),
-                        ..
-                    } => Some(key.as_ref()),
-                    GsiSourceProjection::Missing {
-                        previous_key: None, ..
-                    } => None,
-                }?;
-                Some(Self {
-                    source_ordinal,
-                    key,
-                })
-            })
-            .collect()
-    }
+    Ok(Some(GsiProjectedRow {
+        key: GsiProjectionKey {
+            index_name: index.index_name.clone(),
+            index_key: KeyAttributes::new(),
+            table_item_key: KeyAttributes::new(),
+            ttl_index_key: Some(ttl_index_key),
+        },
+        projection: storage_types::FrozenImageProjection::All,
+        source_item: item,
+        indexers,
+    }))
 }
 
 fn key_attributes(parts: GsiKeyParts<'_>) -> KeyAttributes {
@@ -250,49 +174,6 @@ fn key_attributes(parts: GsiKeyParts<'_>) -> KeyAttributes {
         .into_iter()
         .map(|part| (part.name.to_string(), part.value))
         .collect()
-}
-
-impl<Key: PartialEq> GsiProjection<Key> {
-    #[must_use]
-    pub fn decide_against(self, current: Option<Self>) -> GsiProjectionChange<Key> {
-        let Some(current) = current else {
-            return GsiProjectionChange::Replace {
-                remove: None,
-                write: self.projection,
-                item_version: self.item_version,
-            };
-        };
-        if self.item_version < current.item_version {
-            return GsiProjectionChange::IgnoreStale;
-        }
-        if self.item_version == current.item_version {
-            return if self.projection == current.projection {
-                GsiProjectionChange::Replay
-            } else {
-                GsiProjectionChange::FailClosed(GsiFailureReason::ProjectionConflict)
-            };
-        }
-        GsiProjectionChange::Replace {
-            remove: current.projection,
-            write: self.projection,
-            item_version: self.item_version,
-        }
-    }
-}
-
-impl GsiProjection<GsiProjectionKey> {
-    pub fn from_stored_state(
-        source: &GsiSourceProjection,
-        item_version: ItemRevision,
-        live: bool,
-    ) -> StorageResult<Self> {
-        Ok(Self {
-            item_version,
-            projection: live
-                .then(|| GsiProjectionKey::try_from(source))
-                .transpose()?,
-        })
-    }
 }
 
 pub(super) fn plan_gsi_write_actions_for<'a>(
@@ -382,11 +263,17 @@ pub(super) fn validate_gsi_key_values(
                 })?;
             if !value.matches_key_type(&expected.attribute_type) {
                 return Err(StorageError::validation(format!(
-                    "Type mismatch for Index Key {} Expected: {:?} IndexName: {}",
-                    key.attribute_name, expected.attribute_type, index.index_name,
+                    "One or more parameter values were invalid: Type mismatch for Index Key {} \
+                     Expected: {:?} Actual: {} IndexName: {}",
+                    key.attribute_name,
+                    expected.attribute_type,
+                    value.variant_name(),
+                    index.index_name,
                 )));
             }
-            storage_types::validate_key_attribute_value_for_schema(key, &value)?;
+            storage_types::validate_key_attribute_value_for_schema(key, &value).map_err(
+                |error| error.for_index_key_put(index.index_name.as_ref(), &key.attribute_name),
+            )?;
         }
     }
     Ok(())

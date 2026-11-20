@@ -4,7 +4,7 @@
 use std::num::NonZeroU32;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use storage_types::{StorageError, StorageResult, TimestampMillis};
+use storage_types::{ReadProtection, StorageError, StorageResult, TimestampMillis};
 
 use crate::{
     MessageId, QueueAttempt, QueueCleanupCursor, QueueCleanupRequest, QueueIncarnation,
@@ -55,20 +55,16 @@ impl QueueCleanupSelection {
             .read_message_cleanup_page(&request)
             .await?
             .finish(&request)?;
-        let queue = read_queue_by_url(attempt, &input.queue_url).await?;
+        let queue = read_queue_by_url(attempt, &input.queue_url, ReadProtection::Conflict).await?;
         let is_retired = queue.is_none_or(|queue| queue.incarnation != input.incarnation);
         let mut ids = Vec::with_capacity(rows.len());
         for row in &rows {
+            // The incarnation is the destination; message URLs are not.
             if row.incarnation != input.incarnation {
                 break;
             }
-            if row.message.queue_url != input.queue_url {
-                return Err(StorageError::internal(
-                    "queue cleanup destination differs from message",
-                ));
-            }
             if is_retired || row.expires_at <= input.captured_at {
-                ids.push(row.message.message_id);
+                ids.push(row.message_id);
             }
         }
         // A global physical scan can reach another incarnation. It never
@@ -104,24 +100,18 @@ impl QueueCleanupSelection {
         if self.0.ids.is_empty() {
             return Ok(self.0.next);
         }
-        let queue = read_queue_by_url(attempt, &self.0.queue_url).await?;
+        let queue = read_queue_by_url(attempt, &self.0.queue_url, ReadProtection::Conflict).await?;
         let is_retired = queue.is_none_or(|queue| queue.incarnation != self.0.incarnation);
         let rows = attempt
-            .read_messages_by_id(self.0.incarnation, self.0.ids.clone())
+            .read_message_states_by_id(self.0.incarnation, self.0.ids.clone())
             .await?;
-        if rows.len() != self.0.ids.len() {
-            return Err(StorageError::internal(
-                "queue cleanup selection batch count differs",
-            ));
-        }
         let mut stale = Vec::with_capacity(rows.len());
         for (id, row) in self.0.ids.iter().zip(rows) {
             let Some(row) = row else {
                 continue;
             };
             if row.incarnation != self.0.incarnation
-                || row.message.message_id != *id
-                || row.message.queue_url != self.0.queue_url
+                || row.message_id != *id
                 || (!is_retired && row.expires_at > self.0.captured_at)
             {
                 return Err(StorageError::internal(
@@ -130,7 +120,7 @@ impl QueueCleanupSelection {
             }
             stale.push(row);
         }
-        attempt.delete_message_records(stale).await?;
+        attempt.delete_messages(stale).await?;
         Ok(self.0.next)
     }
 

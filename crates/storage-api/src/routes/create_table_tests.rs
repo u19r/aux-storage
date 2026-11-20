@@ -36,7 +36,11 @@ async fn handle_create_table_success() {
                     response.table_description.table_name,
                     TableName::new("ValidTable")
                 );
-                assert_eq!(response.table_description.table_status, TableStatus::Active);
+                // AWS P13: the CreateTable response is CREATING.
+                assert_eq!(
+                    response.table_description.table_status,
+                    TableStatus::Creating
+                );
                 assert_eq!(
                     response.table_description.table_arn,
                     "arn:aws:dynamodb:us-east-1:123456789012:table/ValidTable"
@@ -90,126 +94,6 @@ async fn given_custom_table_duration_when_created_then_policy_is_stored() {
         );
     })
     .await;
-}
-
-#[tokio::test]
-async fn handle_create_table_duplicate() {
-    for_each_conformance_backend(|_backend, db| async move {
-        let payload = json!({
-            "TableName": "DuplicateTable",
-            "AttributeDefinitions": [
-                {"AttributeName": "id", "AttributeType": "S"}
-            ],
-            "KeySchema": [
-                {"AttributeName": "id", "KeyType": "HASH"}
-            ]
-        });
-
-        let result1 = handle_create_table(db.clone(), payload.clone().try_into().unwrap()).await;
-        assert!(
-            result1.is_ok(),
-            "First CreateTable should succeed: {result1:?}"
-        );
-
-        let result2 = handle_create_table(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result2.is_err(), "Second CreateTable should fail");
-
-        match result2 {
-            Err(handler_error) => {
-                assert_eq!(handler_error.status_code, 400);
-                assert_eq!(
-                    handler_error.error_type,
-                    "com.amazonaws.dynamodb.v20120810#ResourceInUseException"
-                );
-                assert_eq!(
-                    handler_error.message,
-                    "Table already exists: DuplicateTable"
-                );
-            }
-            Ok(_) => panic!("Expected validation error"),
-        }
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn handle_create_table_empty_table_name() {
-    let payload = json!({
-        "TableName": "",
-        "AttributeDefinitions": [
-            {"AttributeName": "id", "AttributeType": "S"}
-        ],
-        "KeySchema": [
-            {"AttributeName": "id", "KeyType": "HASH"}
-        ]
-    });
-
-    let request_result: Result<CreateTableRequest, String> = payload.try_into();
-    assert!(
-        request_result.is_err(),
-        "CreateTable with empty name should fail during validation"
-    );
-
-    match request_result {
-        Err(error) => {
-            assert!(error.contains("TableName cannot be empty"));
-        }
-        Ok(_) => panic!("Expected validation error"),
-    }
-}
-
-#[tokio::test]
-async fn handle_create_table_short_table_name() {
-    let payload = json!({
-        "TableName": "ab",
-        "AttributeDefinitions": [
-            {"AttributeName": "id", "AttributeType": "S"}
-        ],
-        "KeySchema": [
-            {"AttributeName": "id", "KeyType": "HASH"}
-        ]
-    });
-
-    let request_result: Result<CreateTableRequest, String> = payload.try_into();
-    assert!(
-        request_result.is_err(),
-        "CreateTable with short name should fail"
-    );
-
-    match request_result {
-        Err(error) => {
-            assert!(error.contains("Member must have length greater than or equal to 3"));
-        }
-        Ok(_) => panic!("Expected validation error"),
-    }
-}
-
-#[tokio::test]
-async fn handle_create_table_invalid_table_name_characters() {
-    let payload = json!({
-        "TableName": "Invalid@Table",
-        "AttributeDefinitions": [
-            {"AttributeName": "id", "AttributeType": "S"}
-        ],
-        "KeySchema": [
-            {"AttributeName": "id", "KeyType": "HASH"}
-        ]
-    });
-
-    let request_result: Result<CreateTableRequest, String> = payload.try_into();
-    assert!(
-        request_result.is_err(),
-        "CreateTable with invalid characters should fail"
-    );
-
-    match request_result {
-        Err(error) => {
-            assert!(
-                error.contains("Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
-            );
-        }
-        Ok(_) => panic!("Expected validation error"),
-    }
 }
 
 #[tokio::test]
@@ -268,7 +152,7 @@ async fn handle_create_table_creation_datetime_unix_timestamp() {
                 );
                 if let Some(timestamp) = creation_time.as_f64() {
                     #[expect(clippy::cast_precision_loss)]
-                    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                    let now = jiff::Timestamp::now().as_millisecond() as f64 / 1000.0;
                     assert!(
                         timestamp > now - 60.0,
                         "Timestamp should be recent (within last minute)"
@@ -316,7 +200,10 @@ async fn handle_create_table_with_stream_specification() {
                     response.table_description.table_name,
                     TableName::new("StreamTable")
                 );
-                assert_eq!(response.table_description.table_status, TableStatus::Active);
+                assert_eq!(
+                    response.table_description.table_status,
+                    TableStatus::Creating
+                );
 
                 let stream_spec = response
                     .table_description

@@ -1,28 +1,21 @@
 //! Reclamation of one deleted table incarnation outside the customer attempt.
 
-use std::{future::Future, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use scheduled_bg_jobs::{ExecutionContext, HandlerFuture, JobHandler, JobOutcome};
 use serde::{Deserialize, Serialize};
 use storage_backfill::GsiBuildTarget;
-use storage_common::retry::retry_native_conflicts;
 use storage_types::{StorageError, StorageResult, TableHistoryId, TableName};
-
-use crate::{DYNAMO_WRITE_RETRY, DynamoPort};
 
 /// The order is durable: each phase is drained before the next begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum TableReclaimPhase {
     ExternalData,
     MetadataCleanup,
-    SystemHistory,
-    TableHistory,
+    StreamEntries,
     ExplicitAppends,
     PrimaryItems,
-    PrimaryTombstones,
     GsiProjections,
-    GsiTombstones,
     TtlIndex,
     GsiNameLocks,
 }
@@ -32,14 +25,11 @@ impl TableReclaimPhase {
     pub const fn next(self) -> Option<Self> {
         match self {
             Self::ExternalData => Some(Self::MetadataCleanup),
-            Self::MetadataCleanup => Some(Self::SystemHistory),
-            Self::SystemHistory => Some(Self::ExplicitAppends),
-            Self::ExplicitAppends => Some(Self::TableHistory),
-            Self::TableHistory => Some(Self::PrimaryItems),
-            Self::PrimaryItems => Some(Self::PrimaryTombstones),
-            Self::PrimaryTombstones => Some(Self::GsiProjections),
-            Self::GsiProjections => Some(Self::GsiTombstones),
-            Self::GsiTombstones => Some(Self::TtlIndex),
+            Self::MetadataCleanup => Some(Self::StreamEntries),
+            Self::StreamEntries => Some(Self::ExplicitAppends),
+            Self::ExplicitAppends => Some(Self::PrimaryItems),
+            Self::PrimaryItems => Some(Self::GsiProjections),
+            Self::GsiProjections => Some(Self::TtlIndex),
             Self::TtlIndex => Some(Self::GsiNameLocks),
             Self::GsiNameLocks => None,
         }
@@ -63,26 +53,12 @@ pub enum TableReclaimStep {
     Complete,
 }
 
-/// Compact source observations selected through one immutable table-ID index.
-pub struct TableSystemHistoryPage {
-    pub records: Vec<storage_types::SystemHistoryRecord>,
-    pub more: bool,
-}
-
+/// Physical index binding observations and exact bounded family deletion.
+///
 /// One protected attempt. Physical stores only discover, delete, and persist.
-pub trait TableReclaimAttempt: crate::GsiReclaimAttempt {
-    fn load_table_system_rows(
-        &mut self,
-        history: TableHistoryId,
-        limit: NonZeroU32,
-    ) -> impl Future<Output = StorageResult<TableSystemHistoryPage>> + Send;
-
-    fn store_table_system_removals(
-        &mut self,
-        history: TableHistoryId,
-        rows: &[storage_types::SystemHistoryRecord],
-    ) -> impl Future<Output = StorageResult<()>> + Send;
-
+pub trait ReclaimAttempt:
+    crate::CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt
+{
     fn load_reclaim_target(
         &mut self,
     ) -> impl Future<Output = StorageResult<Option<TableReclaimTarget>>> + Send;
@@ -98,11 +74,23 @@ pub trait TableReclaimAttempt: crate::GsiReclaimAttempt {
         target: &TableReclaimTarget,
         next: Option<TableReclaimPhase>,
     ) -> impl Future<Output = StorageResult<()>> + Send;
+
+    fn load_index_incarnation(
+        &mut self,
+        history: TableHistoryId,
+        target: &GsiBuildTarget,
+    ) -> impl Future<Output = StorageResult<Option<storage_types::maintenance::TargetIncarnation>>> + Send;
+    fn delete_index_page(
+        &mut self,
+        history: TableHistoryId,
+        target: &GsiBuildTarget,
+        native: Option<crate::NativeGsiRetirement>,
+    ) -> impl Future<Output = StorageResult<TableReclaimStep>> + Send;
 }
 
 /// One shared phase transition inside the caller's protected native attempt.
 pub async fn reclaim_table_page(
-    attempt: &mut impl TableReclaimAttempt,
+    attempt: &mut impl ReclaimAttempt,
 ) -> StorageResult<TableReclaimStep> {
     let mut settlement =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -125,11 +113,7 @@ pub async fn reclaim_table_page(
                     target.table_name, gsi.index_name, gsi.table_name,
                 )));
             }
-            let step = if target.phase == TableReclaimPhase::SystemHistory {
-                remove_table_system_references(attempt, target.history_id).await?
-            } else {
-                attempt.delete_reclaim_page(&target).await?
-            };
+            let step = attempt.delete_reclaim_page(&target).await?;
             match step {
                 TableReclaimStep::Advanced => Ok(TableReclaimStep::Advanced),
                 TableReclaimStep::Complete => {
@@ -143,63 +127,14 @@ pub async fn reclaim_table_page(
     settlement.complete(result)
 }
 
-async fn remove_table_system_references(
-    attempt: &mut impl TableReclaimAttempt,
-    history: TableHistoryId,
-) -> StorageResult<TableReclaimStep> {
-    let limit = crate::constants::TABLE_RECLAIM_SYSTEM_ROWS;
-    let page = attempt.load_table_system_rows(history, limit).await?;
-    if page.records.len() > limit.get() as usize
-        || page.more && page.records.is_empty()
-        || page
-            .records
-            .iter()
-            .any(|record| record.table_history_id() != Some(history))
-    {
-        return Err(StorageError::internal(
-            "Table system-history page differs from its immutable ID",
-        ));
-    }
-    let removals = page
-        .records
-        .into_iter()
-        .map(storage_types::SystemHistoryRecord::into_removed)
-        .collect::<Vec<_>>();
-    attempt
-        .store_table_system_removals(history, &removals)
-        .await?;
-    Ok(if page.more {
-        TableReclaimStep::Advanced
-    } else {
-        TableReclaimStep::Complete
-    })
-}
-
-#[async_trait]
-pub trait TableReclaimRepository: Send + Sync {
-    async fn reclaim_table_page(&self) -> StorageResult<TableReclaimStep>;
-}
-
-#[async_trait]
-impl<P: DynamoPort> TableReclaimRepository for P
-where for<'native> P::Attempt<'native>: TableReclaimAttempt
-{
-    async fn reclaim_table_page(&self) -> StorageResult<TableReclaimStep> {
-        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
-            self.with_dynamo_schema_attempt(move |attempt| Box::pin(reclaim_table_page(attempt)))
-        })
-        .await
-    }
-}
-
 pub struct TableReclaimHandler {
-    repository: Arc<dyn TableReclaimRepository>,
+    repository: Arc<dyn crate::maintenance::MaintenanceOperations>,
     interval: Duration,
 }
 
 impl TableReclaimHandler {
     pub fn try_new(
-        repository: Arc<dyn TableReclaimRepository>,
+        repository: Arc<dyn crate::maintenance::MaintenanceOperations>,
         interval: Duration,
     ) -> StorageResult<Self> {
         if interval.is_zero() {

@@ -102,13 +102,11 @@ async fn new_server() -> RunningStorageApi {
 
 fn sqlite_config(database_path: &Path) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(database_path.to_string_lossy().into_owned()),
         file_path: None,
-        sqlite: Some(SqliteSettings {
-            force_file_backed_database: true,
-            immediate_gsi_consistency: true,
-        }),
+        sqlite: Some(SqliteSettings {}),
         postgres: None,
         turso: None,
         rocksdb: None,
@@ -590,7 +588,6 @@ fn write_process_config(path: &Path, port: u16, backend: &Value) {
         }
     }
     let config = json!({
-        "version": "1.0",
         "http": {"bind_addr": format!("127.0.0.1:{port}")},
         "features": {
             "backends": backends,
@@ -607,7 +604,9 @@ fn write_process_config(path: &Path, port: u16, backend: &Value) {
 }
 
 #[cfg(feature = "postgres")]
-const REMOTE_PROOF_POSTGRES_DSN: &str = "postgresql://ross@localhost/postgres";
+fn remote_proof_postgres_dsn() -> String {
+    std::env::var("TEST_POSTGRES_DSN").expect("TEST_POSTGRES_DSN names an owned Postgres fixture")
+}
 
 #[cfg(feature = "postgres")]
 struct PostgresJobFixture {
@@ -618,8 +617,9 @@ struct PostgresJobFixture {
 #[cfg(feature = "postgres")]
 impl PostgresJobFixture {
     async fn new() -> Self {
+        let base_dsn = remote_proof_postgres_dsn();
         let schema = format!("remote_job_{}", Uuid::new_v4().simple());
-        let (client, connection) = tokio_postgres::connect(REMOTE_PROOF_POSTGRES_DSN, NoTls)
+        let (client, connection) = tokio_postgres::connect(&base_dsn, NoTls)
             .await
             .expect("connect PostgreSQL remote proof fixture");
         tokio::spawn(async move {
@@ -630,7 +630,7 @@ impl PostgresJobFixture {
             .await
             .expect("create PostgreSQL remote proof schema");
         Self {
-            dsn: format!("{REMOTE_PROOF_POSTGRES_DSN}?options=-csearch_path%3D{schema}"),
+            dsn: format!("{base_dsn}?options=-csearch_path%3D{schema}"),
             schema,
         }
     }
@@ -641,15 +641,13 @@ impl PostgresJobFixture {
             "postgres": {
                 "dsn": self.dsn,
                 "max_pool_size": admission.minimum_concurrency + admission.control_reserve_concurrency,
-                "background_max_pool_size": 2,
-                "tls": false,
-                "immediate_gsi_consistency": true
+                "tls": false
             }
         })
     }
 
     async fn cleanup(self) {
-        let (client, connection) = tokio_postgres::connect(REMOTE_PROOF_POSTGRES_DSN, NoTls)
+        let (client, connection) = tokio_postgres::connect(&remote_proof_postgres_dsn(), NoTls)
             .await
             .expect("reconnect PostgreSQL remote proof fixture");
         tokio::spawn(async move {
@@ -667,25 +665,14 @@ impl PostgresJobFixture {
 
 #[cfg(feature = "foundationdb")]
 fn foundationdb_backend_config() -> Value {
-    let cluster_file = std::env::var_os("FDB_CLUSTER_FILE")
+    let cluster_file = std::env::var_os("TEST_FDB_CLUSTER_FILE")
         .map(PathBuf::from)
-        .or_else(|| {
-            [
-                "/usr/local/etc/foundationdb/fdb.cluster",
-                "/opt/homebrew/etc/foundationdb/fdb.cluster",
-                "/etc/foundationdb/fdb.cluster",
-            ]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|path| path.is_file())
-        })
-        .expect("FoundationDB remote proof requires a local cluster file");
+        .expect("FoundationDB remote proof requires TEST_FDB_CLUSTER_FILE");
     json!({
         "foundationdb": {
             "cluster_file": cluster_file,
             "subspace_prefix": format!("scheduled-http/{}/", Uuid::now_v7()),
-            "cache_read_version_ms": 0,
-            "immediate_gsi_consistency": true
+            "cache_read_version_ms": 0
         }
     })
 }

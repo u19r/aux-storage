@@ -19,25 +19,33 @@ impl NativeFixture {
             .expect("connect native fixture");
         tokio::spawn(async move { connection.await.expect("native fixture connection") });
         let schema = format!("native_attempt_{}", uuid::Uuid::new_v4().simple());
+        eprintln!("native_fixture_schema={schema} phase=creating");
         admin
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
             .await
             .expect("owned schema");
+        eprintln!("native_fixture_schema={schema} phase=created");
         let (base, query) = dsn.split_once('?').unwrap_or((&dsn, ""));
-        let retained = query
+        let mut pairs = query
             .split('&')
-            .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("options"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let mut scoped_dsn = format!("{base}?options=-csearch_path%3D{schema}");
-        if !retained.is_empty() {
-            scoped_dsn.push('&');
-            scoped_dsn.push_str(&retained);
+            .filter(|pair| !pair.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if let Some(options) = pairs.iter_mut().find(|pair| pair.starts_with("options=")) {
+            options.push_str(&format!("%20-csearch_path%3D{schema}"));
+        } else {
+            pairs.push(format!("options=-csearch_path%3D{schema}"));
         }
+        let scoped_dsn = format!("{base}?{}", pairs.join("&"));
         let backend = Arc::new(
-            PostgresBackend::initialize(&scoped_dsn, 1, false)
-                .await
-                .expect("native backend"),
+            PostgresBackend::initialize(
+                &scoped_dsn,
+                1,
+                false,
+                storage_types::AttemptDeadlines::default(),
+            )
+            .await
+            .expect("native backend"),
         );
         backend
             .with_schema_attempt(|attempt| {
@@ -69,9 +77,14 @@ impl NativeFixture {
 
     #[cfg(feature = "fault-injection")]
     pub(crate) async fn open_independent_backend(&self) -> PostgresBackend {
-        PostgresBackend::initialize(&self.scoped_dsn, 1, false)
-            .await
-            .expect("independent backend")
+        PostgresBackend::initialize(
+            &self.scoped_dsn,
+            1,
+            false,
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .expect("independent backend")
     }
 
     pub(super) async fn count_records(&self) -> i64 {

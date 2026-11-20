@@ -105,6 +105,16 @@ impl AdmissionController {
         connection_id: impl Into<Arc<str>>,
         config: AdmissionConfig,
     ) -> Result<Self, AdmissionConfigError> {
+        Self::try_new_with_window(connection_id, config, WINDOW)
+    }
+
+    /// Build a controller with a custom sampling window. Tests shorten it so
+    /// multi-window recovery runs in milliseconds.
+    pub(super) fn try_new_with_window(
+        connection_id: impl Into<Arc<str>>,
+        config: AdmissionConfig,
+        window: Duration,
+    ) -> Result<Self, AdmissionConfigError> {
         Self::validate_config(config)?;
         let now = Instant::now();
         let bootstrap = if config.enabled {
@@ -123,6 +133,7 @@ impl AdmissionController {
             inner: Arc::new(Inner {
                 connection_id,
                 config,
+                window,
                 metrics,
                 state: Mutex::new(ControllerState {
                     desired_limit: bootstrap,
@@ -255,13 +266,9 @@ impl AdmissionController {
             }
             Err(_) => {
                 let mut state = lock_state(&self.inner);
+                // Queue timeout marks the window saturated; the window
+                // boundary decides whether latency makes it congestion.
                 state.window.queue_timeout = true;
-                // Queue timeout is an explicit overload signal, just like a
-                // provider throttle. Evaluate it immediately so a fresh
-                // window cannot continue admitting at the old limit for a
-                // full sampling interval.
-                let now = Instant::now();
-                evaluate_pressure(&self.inner.config, &mut state, now);
                 let rejection = AdmissionRejection::new(
                     AdmissionRejectionReason::QueueTimedOut,
                     self.inner.config.max_queue_wait_ms,
@@ -352,13 +359,14 @@ impl AdmissionController {
         let previous_state = state.state;
         let previous_limit = state.desired_limit;
         let mut limit_change = None;
-        let evaluation = if now.saturating_duration_since(state.window.started_at) >= WINDOW {
-            Some(evaluate_window(&self.inner.config, &mut state, now))
-        } else if outcome.is_pressure() {
-            Some(evaluate_pressure(&self.inner.config, &mut state, now))
-        } else {
-            None
-        };
+        let evaluation =
+            if now.saturating_duration_since(state.window.started_at) >= self.inner.window {
+                Some(evaluate_window(&self.inner.config, &mut state, now))
+            } else if outcome.is_pressure() {
+                Some(evaluate_pressure(&self.inner.config, &mut state, now))
+            } else {
+                None
+            };
         if let Some((saturated, pressure, gradient, window_goodput)) = evaluation
             && state.desired_limit != previous_limit
         {

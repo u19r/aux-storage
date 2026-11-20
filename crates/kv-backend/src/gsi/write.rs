@@ -2,17 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use foundationdb_tuple::{TupleDepth, TupleUnpack, pack_into, unpack};
 use storage_backfill::{GsiProjectionKey, GsiProjectionWriteBatch};
-use storage_provider::GsiWriteSource;
-use storage_types::{BoundTableInfo, ItemRevision, StorageError, StorageResult, WireItem};
+use storage_types::{BoundTableInfo, StorageError, StorageResult, WireItem};
 
-use super::key_layout::{ProjectionKeys, projection_suffix};
-use crate::catalog::{KvIndexKind, KvTableIdentity};
+use super::key_layout::{entry_key, projection_suffix};
+use crate::catalog::table_id_from_history;
 
 #[derive(Default)]
 pub(crate) struct ProjectionChanges {
-    pub(super) rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl ProjectionChanges {
@@ -20,14 +18,11 @@ impl ProjectionChanges {
         let mut mutations = Vec::new();
         mutations
             .try_reserve_exact(self.rows.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for (key, value) in self.rows {
-            let is_image = key.first() == Some(&crate::constants::GSI_PROJECTION_FAMILY);
-            mutations.push(match (is_image, value) {
-                (true, Some(value)) => crate::KvMutation::Put { key, value },
-                (true, None) => crate::KvMutation::Delete { key },
-                (false, Some(value)) => crate::KvMutation::PutUnchunked { key, value },
-                (false, None) => crate::KvMutation::DeleteUnchunked { key },
+            mutations.push(match value {
+                Some(value) => crate::KvMutation::Put { key, value },
+                None => crate::KvMutation::Delete { key },
             });
         }
         Ok(mutations)
@@ -35,15 +30,12 @@ impl ProjectionChanges {
 }
 
 pub(crate) struct GsiWriteInput<'a> {
-    pub identity: &'a KvTableIdentity,
     pub table: &'a BoundTableInfo,
-    pub source: GsiWriteSource<'a>,
     pub writes: GsiProjectionWriteBatch,
     pub prepared: &'a mut Vec<PreparedGsiWrite>,
 }
 
-/// Encode the writes already decided by the shared GSI executor. Its
-/// destination observations were protected in this native attempt.
+/// Encode effects derived from the source observed in this native attempt.
 pub(crate) fn prepare_gsi_writes<A: crate::KvAttempt>(
     catalog: &mut crate::catalog::KvCatalogAttempt<'_, A>,
     input: GsiWriteInput<'_>,
@@ -52,7 +44,9 @@ pub(crate) fn prepare_gsi_writes<A: crate::KvAttempt>(
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(catalog);
     let catalog = operation.as_mut();
     let result = (|| {
-        for row in bind_gsi_writes(input)? {
+        let table = input.table;
+        for (item_key, row) in bind_gsi_writes(input)? {
+            note_inline_entry(&mut catalog.primary_layouts, table, &item_key, &row.key)?;
             row.store(&mut catalog.projection_changes)?;
         }
         Ok(())
@@ -60,13 +54,45 @@ pub(crate) fn prepare_gsi_writes<A: crate::KvAttempt>(
     operation.complete(result)
 }
 
-fn bind_gsi_writes(input: GsiWriteInput<'_>) -> StorageResult<Vec<BoundGsiWrite>> {
+/// A GSI entry is a projection of its source item and is never larger than
+/// the item's primary record. When this attempt observed the source item
+/// inline (or absent), the entry at this key holds no chunks, so its put or
+/// delete needs no chunk clear.
+fn note_inline_entry(
+    layouts: &mut Vec<(Vec<u8>, bool)>,
+    table: &BoundTableInfo,
+    item_key: &storage_types::KeyAttributes,
+    entry: &[u8],
+) -> StorageResult<()> {
+    // Engines without chunks retain no layouts.
+    if layouts.is_empty() || layouts.iter().any(|(known, _)| known.as_slice() == entry) {
+        return Ok(());
+    }
+    let primary = crate::item_read::primary_item_key(
+        table_id_from_history(table.history_id)?,
+        table,
+        item_key,
+    )?;
+    if layouts
+        .iter()
+        .any(|(known, has_chunks)| *known == primary && !has_chunks)
+    {
+        layouts
+            .try_reserve(1)
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+        layouts.push((entry.to_vec(), false));
+    }
+    Ok(())
+}
+
+fn bind_gsi_writes(
+    input: GsiWriteInput<'_>,
+) -> StorageResult<Vec<(storage_types::KeyAttributes, BoundGsiWrite)>> {
     let mut rows = Vec::new();
     let writes = input.writes.into_iter();
     rows.try_reserve_exact(writes.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for write in writes {
-        input.source.validate(&write)?;
         let prepared = if write.row.is_some() {
             input
                 .prepared
@@ -79,12 +105,12 @@ fn bind_gsi_writes(input: GsiWriteInput<'_>) -> StorageResult<Vec<BoundGsiWrite>
             Some(position) => input.prepared.swap_remove(position),
             None => PreparedGsiWrite::try_new(input.table, &write.key, write.row.as_ref())?,
         };
-        rows.push(prepared.bind(input.identity, write.item_version)?);
+        rows.push((write.key.table_item_key, prepared.bind(input.table)?));
     }
     Ok(rows)
 }
 
-/// A new live image or an old-image tombstone, without its protected revision.
+/// A prepared projection put or clear bound to the catalog index identity.
 pub(crate) struct PreparedGsiWrite {
     pub(crate) history_id: storage_types::TableHistoryId,
     pub(crate) key: GsiProjectionKey,
@@ -120,151 +146,60 @@ impl PreparedGsiWrite {
         })
     }
 
-    fn bind(
-        self,
-        identity: &KvTableIdentity,
-        revision: ItemRevision,
-    ) -> StorageResult<BoundGsiWrite> {
-        let index_id = identity
-            .indexes
-            .iter()
-            .find(|index| {
-                index.index_name == self.key.index_name && index.index_kind == KvIndexKind::UserGsi
-            })
-            .ok_or_else(|| StorageError::internal("GSI projection has no KV index identity"))?
-            .index_id;
-        let keys = ProjectionKeys::try_from_suffix(identity.table_id, index_id, self.suffix)?;
+    fn bind(self, table: &BoundTableInfo) -> StorageResult<BoundGsiWrite> {
+        let index = table
+            .binding
+            .gsi(&self.key.index_name)
+            .ok_or_else(|| StorageError::internal("GSI projection has no bound index"))?;
         Ok(BoundGsiWrite {
-            keys,
-            revision,
+            key: entry_key(
+                table_id_from_history(table.history_id)?,
+                index.index_id,
+                &self.suffix,
+            )?,
             image: self.image,
         })
     }
 }
 
 struct BoundGsiWrite {
-    keys: ProjectionKeys,
-    revision: ItemRevision,
+    key: Vec<u8>,
     image: Option<Vec<u8>>,
 }
 
 impl BoundGsiWrite {
     fn store(self, changes: &mut ProjectionChanges) -> StorageResult<()> {
-        let (value, tombstone) = match self.image {
-            Some(image) => {
-                let bytes = 10usize
-                    .checked_add(image.len())
-                    .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-                let mut value = Vec::new();
-                value
-                    .try_reserve_exact(bytes)
-                    .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-                value.push(crate::constants::GSI_PROJECTION_FORMAT);
-                pack_into(&self.revision.get(), &mut value);
-                value.extend_from_slice(&image);
-                (Some(value), None)
-            }
-            None => (
-                None,
-                Some(copy_projection_bytes(&self.revision.get().to_be_bytes())?),
-            ),
-        };
-        changes.rows.insert(self.keys.live, value);
-        changes.rows.insert(self.keys.tombstone, tombstone);
+        let value = self.image.map(|image| {
+            let mut value = Vec::with_capacity(1 + image.len());
+            value.push(crate::constants::GSI_PROJECTION_FORMAT);
+            value.extend_from_slice(&image);
+            value
+        });
+        changes.rows.insert(self.key, value);
         Ok(())
     }
 }
 
-pub(super) fn copy_projection_bytes(bytes: &[u8]) -> StorageResult<Vec<u8>> {
-    let mut copied = Vec::new();
-    copied
-        .try_reserve_exact(bytes.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    copied.extend_from_slice(bytes);
-    Ok(copied)
-}
-
-pub(super) enum PhysicalProjection {
-    Live(ItemRevision),
-    Tombstone(ItemRevision),
-}
-
-pub(super) fn decode_projection_state(
-    table: &BoundTableInfo,
-    live: Option<&[u8]>,
-    tombstone: Option<&[u8]>,
-) -> StorageResult<Option<PhysicalProjection>> {
-    match (live, tombstone) {
-        (Some(_), Some(_)) => Err(StorageError::internal("GSI has live and tombstone rows")),
-        (Some(bytes), None) => {
-            let projection = ProjectionEnvelope::decode(bytes)?;
-            storage_types::MaterializedItemRecord::decode(
-                projection.item,
-                table.history_id,
-                storage_types::MaterializedItemRecord::encoded_length_bound(),
-            )?;
-            ItemRevision::try_from(projection.revision)
-                .map(PhysicalProjection::Live)
-                .map(Some)
-        }
-        (None, Some(bytes)) => {
-            let revision: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| StorageError::internal("GSI tombstone revision is malformed"))?;
-            ItemRevision::try_from(u64::from_be_bytes(revision))
-                .map(PhysicalProjection::Tombstone)
-                .map(Some)
-        }
-        (None, None) => Ok(None),
-    }
-}
-
-// A tuple revision prefixes the codec-owned image, which is intentionally
-// opaque.
-struct ProjectionEnvelope<'a> {
-    revision: u64,
-    item: &'a [u8],
-}
-
 pub(crate) struct DecodedProjection {
     pub image: WireItem,
-    pub revision: ItemRevision,
-}
-
-impl<'a> ProjectionEnvelope<'a> {
-    fn decode(bytes: &'a [u8]) -> StorageResult<Self> {
-        let (&format, bytes) = bytes
-            .split_first()
-            .ok_or_else(|| StorageError::internal("GSI envelope is empty"))?;
-        if format != crate::constants::GSI_PROJECTION_FORMAT {
-            return Err(StorageError::internal("GSI envelope format is invalid"));
-        }
-        unpack(bytes).map_err(|_| StorageError::internal("GSI live revision is malformed"))
-    }
 }
 
 pub(super) fn decode_projection(
     table: &BoundTableInfo,
     value: &[u8],
 ) -> StorageResult<DecodedProjection> {
-    let envelope = ProjectionEnvelope::decode(value)?;
-    let revision = ItemRevision::try_from(envelope.revision)?;
+    let (&format, image) = value
+        .split_first()
+        .ok_or_else(|| StorageError::internal("GSI envelope is empty"))?;
+    if format != crate::constants::GSI_PROJECTION_FORMAT {
+        return Err(StorageError::internal("GSI envelope format is invalid"));
+    }
     let image = storage_types::MaterializedItemRecord::decode(
-        envelope.item,
+        image,
         table.history_id,
         storage_types::MaterializedItemRecord::encoded_length_bound(),
     )?
     .into_stored(storage_types::MaxIndexers::ZERO)?
     .item;
-    Ok(DecodedProjection { image, revision })
-}
-
-impl<'a> TupleUnpack<'a> for ProjectionEnvelope<'a> {
-    fn unpack(
-        input: &'a [u8],
-        depth: TupleDepth,
-    ) -> foundationdb_tuple::PackResult<(&'a [u8], Self)> {
-        let (item, revision) = u64::unpack(input, depth)?;
-        Ok((&[], Self { revision, item }))
-    }
+    Ok(DecodedProjection { image })
 }

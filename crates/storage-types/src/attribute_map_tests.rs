@@ -1,6 +1,5 @@
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 
-use alloc_counter::AllocationGuard;
 use serde_json::json;
 
 use crate::{AttributeMap, AttributeValue, AttributeValueLookup};
@@ -77,23 +76,6 @@ fn allocation_fixture() -> HashMap<String, AttributeValue> {
         .collect()
 }
 
-fn measure_conversion(
-    label: &'static str,
-    convert: fn(HashMap<String, AttributeValue>) -> AttributeMap,
-) -> alloc_counter::AllocationReport<'static> {
-    let source = allocation_fixture();
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "attribute_map_from_hashmap_allocation_profile_tests",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    let converted = convert(source.clone());
-    std::hint::black_box(converted);
-    guard.finish()
-}
-
 #[test]
 fn attribute_map_from_hashmap_preserves_unique_entries_without_duplicate_scan() {
     let source = allocation_fixture();
@@ -103,36 +85,6 @@ fn attribute_map_from_hashmap_preserves_unique_entries_without_duplicate_scan() 
     for (name, value) in direct.iter() {
         assert_eq!(legacy.get(name), Some(value));
     }
-}
-
-#[test]
-#[ignore = "manual allocation profile; run in an isolated process"]
-fn attribute_map_from_hashmap_allocation_profile() {
-    let legacy = measure_conversion("legacy_insert_scan", legacy_from_hashmap);
-    let direct = measure_conversion("direct_unique_entries", AttributeMap::from);
-    let _ = alloc_counter::emit_report(&legacy);
-    let _ = alloc_counter::emit_report(&direct);
-}
-
-fn measure_runtime(
-    convert: fn(HashMap<String, AttributeValue>) -> AttributeMap,
-    source: &HashMap<String, AttributeValue>,
-) -> std::time::Duration {
-    let started = Instant::now();
-    for _ in 0..32 {
-        std::hint::black_box(convert(source.clone()));
-    }
-    started.elapsed()
-}
-
-#[test]
-#[ignore = "manual runtime probe for the known-unique HashMap conversion"]
-fn attribute_map_from_hashmap_runtime_probe() {
-    let source = allocation_fixture();
-    let legacy = measure_runtime(legacy_from_hashmap, &source);
-    let direct = measure_runtime(AttributeMap::from, &source);
-    println!("attribute_map_from_hashmap legacy={legacy:?} direct={direct:?}");
-    assert!(direct < legacy, "direct={direct:?} legacy={legacy:?}");
 }
 
 #[test]
@@ -155,4 +107,39 @@ fn given_borrowed_unique_entries_when_converted_then_own_names_and_preserve_repl
     let decoded: AttributeMap = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, converted);
     assert!(AttributeMap::from(crate::VecMap::<&str, AttributeValue>::new()).is_empty());
+}
+
+#[test]
+fn from_distinct_keeps_order() {
+    let map = AttributeMap::from_distinct([
+        ("z".to_string(), AttributeValue::S("1".to_string())),
+        ("a".to_string(), AttributeValue::S("2".to_string())),
+    ]);
+    assert_eq!(
+        map.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        ["z", "a"]
+    );
+}
+
+#[test]
+fn get_mut_changes_value() {
+    let mut map = AttributeMap::new();
+    map.insert("a", AttributeValue::S("1".to_string()));
+    *map.get_mut("a").expect("present") = AttributeValue::S("2".to_string());
+    assert_eq!(map.get("a"), Some(&AttributeValue::S("2".to_string())));
+    assert!(map.get_mut("missing").is_none());
+}
+
+#[test]
+fn get_or_insert_with_inserts_once() {
+    let mut map = AttributeMap::new();
+    let mut calls = 0;
+    for _ in 0..2 {
+        map.get_or_insert_with("a", || {
+            calls += 1;
+            AttributeValue::S("v".to_string())
+        });
+    }
+    assert_eq!(calls, 1);
+    assert_eq!(map.len(), 1);
 }

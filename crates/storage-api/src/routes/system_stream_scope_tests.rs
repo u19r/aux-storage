@@ -174,13 +174,11 @@ async fn put_terminal_poll_item(state: Arc<AppState>, table: &str, key: &str) {
 async fn public_system_stream_scope_action_is_stable_after_sqlite_reopen() {
     let path = crate::storage_api_test_support_tests::unique_path("system-stream-scope-api");
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(path.to_string_lossy().into_owned()),
         file_path: None,
-        sqlite: Some(SqliteSettings {
-            force_file_backed_database: true,
-            ..SqliteSettings::default()
-        }),
+        sqlite: Some(SqliteSettings {}),
         postgres: None,
         turso: None,
         rocksdb: None,
@@ -206,15 +204,14 @@ async fn public_system_stream_scope_action_is_stable_after_sqlite_reopen() {
 async fn public_system_stream_scope_action_returns_scope_for_rocksdb() {
     let path = crate::storage_api_test_support_tests::unique_path("system-stream-scope-rocks");
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::RocksDB,
         connection_string: None,
         file_path: Some(path.to_string_lossy().into_owned()),
         sqlite: None,
         postgres: None,
         turso: None,
-        rocksdb: Some(RocksdbSettings {
-            immediate_gsi_consistency: true,
-        }),
+        rocksdb: Some(RocksdbSettings::default()),
         foundationdb: None,
         remote: None,
     };
@@ -281,17 +278,16 @@ async fn public_system_stream_page_without_scope_remains_a_bad_request() {
 #[cfg(feature = "remote")]
 #[tokio::test]
 async fn public_system_stream_scope_action_reports_typed_unsupported_backend_error() {
-    let provider = storage::RemoteStorageProvider::new(RemoteStorageSettings {
-        endpoint_urls: vec!["http://127.0.0.1:1".to_string()],
-        region: None,
-        tls: false,
-        credentials: RemoteCredentialStrategy::DefaultChain,
-        timeouts: None,
-    })
-    .await
-    .expect("construct remote provider");
     let db = Arc::new(
-        DatabaseManager::new_with_mocks(Arc::new(provider)).expect("construct remote manager"),
+        DatabaseManager::new_for_test_with_remote(RemoteStorageSettings {
+            endpoint_urls: vec!["http://127.0.0.1:1".to_string()],
+            region: None,
+            tls: false,
+            credentials: RemoteCredentialStrategy::DefaultChain,
+            timeouts: None,
+        })
+        .await
+        .expect("construct remote manager"),
     );
     let error = execute_json(
         Arc::new(AppState::new(db)),

@@ -34,3 +34,21 @@ fn text(binds: &[crate::SqlValue]) -> &str {
     };
     value
 }
+
+#[test]
+fn given_one_or_three_targets_when_locking_then_statement_text_is_identical() {
+    let table = crate::test_support::table();
+    let keys = ["a", "b", "c"].map(|value| {
+        let mut key = KeyAttributes::new();
+        key.insert("pk", AttributeValue::S(value.to_owned()));
+        key
+    });
+    let (one, _) = item_lock_statement(keys[..1].iter().map(|key| (&table, key)))
+        .unwrap()
+        .into_parts();
+    let (three, binds) = item_lock_statement(keys.iter().map(|key| (&table, key)))
+        .unwrap()
+        .into_parts();
+    assert_eq!(one, three);
+    assert_eq!(binds.len(), 1);
+}

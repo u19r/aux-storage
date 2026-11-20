@@ -256,7 +256,7 @@ fn prepare_keys<'a>(
     let mut physical = Vec::new();
     physical
         .try_reserve_exact(keys.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for key in keys {
         physical.push(key_layout::encode_key(key)?);
     }
@@ -267,7 +267,7 @@ fn prepare_changes(changes: &[RecordChange]) -> StorageResult<Vec<KvMutation>> {
     let mut mutations = Vec::new();
     mutations
         .try_reserve_exact(changes.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for change in changes {
         mutations.push(encode_change(change)?);
     }

@@ -358,6 +358,13 @@ batch_get_case!(given_field_request_items_400_parity_extra_key_attribute_when_ba
 batch_get_case!(given_field_request_items_400_parity_missing_sort_key_when_batch_get_item_runs_then_conformance_response_matches, "field-request_items/400/parity_missing_sort_key.json");
 batch_get_case!(given_field_request_items_400_parity_too_many_keys_when_batch_get_item_runs_then_conformance_response_matches, "field-request_items/400/parity_too_many_keys.json");
 batch_get_case!(given_field_request_items_400_parity_wrong_partition_key_type_when_batch_get_item_runs_then_conformance_response_matches, "field-request_items/400/parity_wrong_partition_key_type.json");
+// AWS probe P11 (GetItem text).
+batch_get_case!(
+    given_attributes_to_get_and_projection_when_batch_get_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/\
+     given_attributes_to_get_and_projection_when_batch_get_runs_then_mixed_parameters_are_rejected.\
+     json"
+);
 
 fn sized_batch_keys(count: usize) -> Vec<storage_types::KeyAttributes> {
     (0..count)
@@ -549,8 +556,8 @@ async fn given_missing_catalog_table_when_batch_get_runs_then_request_fails_and_
                 .await
                 .expect_err("missing table is fatal");
             assert!(
-                matches!(error.as_ref(), storage_types::StorageEnum::TableNotFound { name, .. }
-                if name == missing.as_ref()),
+                matches!(error.as_ref(), storage_types::StorageEnum::ResourceNotFound { resource_id, .. }
+                if resource_id == missing.as_ref()),
                 "wrong error: {error}"
             );
         }
@@ -615,3 +622,18 @@ async fn given_mixed_consistency_batch_when_batch_get_runs_then_present_and_miss
         resume_unwind(panic);
     }
 }
+
+// AWS behavioural suite
+batch_get_case!(given_check_batch_get_item_expression_and_legacy_parameter_rules_projection_with_attributes_to_get_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_expression_and_legacy_parameter_rules--projection-with-attributes-to-get.json");
+batch_get_case!(given_check_batch_get_item_expression_and_legacy_parameter_rules_names_without_projection_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_expression_and_legacy_parameter_rules--names-without-projection.json");
+batch_get_case!(given_check_batch_get_item_expression_and_legacy_parameter_rules_names_beside_other_attributes_to_get_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_expression_and_legacy_parameter_rules--names-beside-other-attributes-to-get.json");
+batch_get_case!(given_check_batch_get_item_expression_and_legacy_parameter_rules_unused_name_refused_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_expression_and_legacy_parameter_rules--unused-name-refused.json");
+batch_get_case!(given_check_batch_get_item_expression_and_legacy_parameter_rules_legacy_attributes_to_get_both_tables_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_expression_and_legacy_parameter_rules--legacy-attributes-to-get-both-tables.json");
+batch_get_case!(given_check_batch_get_item_expression_and_legacy_parameter_rules_projection_single_name_succeeds_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_expression_and_legacy_parameter_rules--projection-single-name-succeeds.json");
+batch_get_case!(given_check_batch_get_item_multi_table_absent_keys_return_empty_list_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_item_multi_table_absent_keys_return_empty_list.json");
+batch_get_case!(given_check_batch_get_multi_table_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_get_multi_table.json");
+batch_get_case!(given_check_batch_request_shape_defects_rejected_empty_request_items_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_request_shape_defects_rejected--empty-request-items.json");
+batch_get_case!(given_check_batch_request_shape_defects_rejected_keys_number_hash_key_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_request_shape_defects_rejected--keys-number-hash-key.json");
+batch_get_case!(given_check_batch_request_shape_defects_rejected_keys_missing_sort_key_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_request_shape_defects_rejected--keys-missing-sort-key.json");
+batch_get_case!(given_check_batch_request_shape_defects_rejected_keys_extra_attribute_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_request_shape_defects_rejected--keys-extra-attribute.json");
+batch_get_case!(given_check_legacy_attributes_to_get_empty_item_and_whole_nested_values_batch_get_empty_entry_when_batch_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_legacy_attributes_to_get_empty_item_and_whole_nested_values--batch-get-empty-entry.json");

@@ -135,6 +135,7 @@ async fn given_transactional_indexers_when_one_is_invalid_then_no_item_gsi_or_cd
                 "ScannedCount": 1
             })
         );
+        store.wait_until_changes_are_readable().await;
         let after = store.stream_operations.get_system_stream_page(request).await.unwrap();
         assert_eq!(after.records().len(), 2);
     })

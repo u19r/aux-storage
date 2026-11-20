@@ -48,6 +48,17 @@ pub(super) fn read_identity(engine: impl SqlLayout) -> SqlStatement {
     )
 }
 
+pub(super) fn admission_lock(kind: MaintenanceKind) -> SqlStatement {
+    SqlStatement::new(
+        format!(
+            "SELECT count(*) FROM (SELECT pg_advisory_xact_lock({}, {})) AS locked",
+            crate::constants::POSTGRES_MAINTENANCE_LOCK_CLASS,
+            i32::from(kind.storage_tag()),
+        ),
+        vec![],
+    )
+}
+
 pub(super) fn create_progress(engine: impl SqlLayout) -> SqlStatement {
     let blob = engine.engine().blob_type();
     let integer = engine.engine().integer_type();

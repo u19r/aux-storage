@@ -36,6 +36,7 @@ async fn given_a_handler_longer_than_visibility_when_the_queue_runner_executes_t
         .create_queue(CreateQueueRequest {
             queue_name: "leased-jobs".into(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -47,6 +48,7 @@ async fn given_a_handler_longer_than_visibility_when_the_queue_runner_executes_t
                 r#"{"dispatch_id":"test","job_name":"test","table_name":"test","key":{}}"#.into(),
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -56,6 +58,7 @@ async fn given_a_handler_longer_than_visibility_when_the_queue_runner_executes_t
             message_body: "waiting-delivery".into(),
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -73,7 +76,7 @@ async fn given_a_handler_longer_than_visibility_when_the_queue_runner_executes_t
         handler.clone(),
         ImmediateJobRunnerConfig {
             maximum_job_workers: 0,
-            visibility_timeout_secs: 3,
+            visibility_timeout_secs: 1,
             ..ImmediateJobRunnerConfig::default()
         },
     )
@@ -103,7 +106,7 @@ async fn given_a_handler_longer_than_visibility_when_the_queue_runner_executes_t
             .await
             .unwrap();
     }
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let competing = manager
         .receive_message(ReceiveMessageRequest {
             queue_url: queue_url.clone(),
@@ -131,7 +134,7 @@ async fn given_a_handler_longer_than_visibility_when_the_queue_runner_executes_t
             let attributes = manager
                 .get_queue_attributes(GetQueueAttributesRequest {
                     queue_url: queue_url.clone(),
-                    attribute_names: None,
+                    attribute_names: Some(vec!["All".to_owned()]),
                 })
                 .await
                 .unwrap()
@@ -178,6 +181,7 @@ async fn given_a_queue_backlog_when_failure_diagnostics_load_then_counts_include
                 message_body: "diagnostic fixture".into(),
                 delay_seconds: delay,
                 message_attributes: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -233,6 +237,7 @@ async fn prepare_retry_queues(
                 .create_queue(CreateQueueRequest {
                     queue_name: name.into(),
                     attributes: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -245,6 +250,7 @@ async fn prepare_retry_queues(
             message_body: "retained-work".into(),
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -346,7 +352,7 @@ async fn given_repeated_failures_across_worker_restarts_when_attempts_exhaust_th
                 max_number_of_messages: Some(1),
                 visibility_timeout: Some(30),
                 attribute_names: None,
-                message_attribute_names: None
+                message_attribute_names: None,
             })
             .await
             .unwrap()
@@ -397,7 +403,7 @@ async fn given_failed_dlq_publication_when_redelivered_then_source_survives_and_
                 max_number_of_messages: Some(1),
                 visibility_timeout: Some(30),
                 attribute_names: None,
-                message_attribute_names: None
+                message_attribute_names: None,
             })
             .await
             .unwrap()

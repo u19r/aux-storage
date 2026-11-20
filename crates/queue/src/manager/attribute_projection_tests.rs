@@ -1,8 +1,6 @@
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 
-use queue_provider::{
-    CreateQueueRequest, GetQueueAttributesRequest, QueueMessageCounts, SendMessageRequest,
-};
+use queue_provider::{GetQueueAttributesRequest, QueueMessageCounts};
 
 use crate::{
     manager::selected_queue_attributes, queue_test_support_tests::create_selected_test_service,
@@ -28,8 +26,8 @@ fn given_stored_attributes_when_attribute_projection_then_defaults_counts_and_cu
         not_visible: 5,
         delayed: 7,
     };
-    let all = selected_queue_attributes(stored.clone(), counts.clone(), None);
-    assert_eq!(all.len(), 9);
+    let all = selected_queue_attributes(stored.clone(), counts.clone(), &names(&["All"]));
+    assert_eq!(all.len(), 10);
     assert_eq!(all["VisibilityTimeout"], "77");
     assert_eq!(all["DelaySeconds"], "0");
     assert_eq!(all["ApproximateNumberOfMessages"], "3");
@@ -57,7 +55,7 @@ fn given_stored_attributes_when_attribute_projection_then_defaults_counts_and_cu
                 .collect()
         };
         assert_eq!(
-            selected_queue_attributes(stored.clone(), counts.clone(), Some(&requested)),
+            selected_queue_attributes(stored.clone(), counts.clone(), &requested),
             expected
         );
     }
@@ -69,7 +67,6 @@ async fn given_missing_queue_when_attribute_projection_then_every_projection_ret
     for requested in [
         None,
         Some(vec![]),
-        Some(names(&["Unknown"])),
         Some(names(&["VisibilityTimeout"])),
         Some(names(&["All"])),
         Some(names(&["ApproximateNumberOfMessages"])),
@@ -90,72 +87,6 @@ async fn given_missing_queue_when_attribute_projection_then_every_projection_ret
     }
 }
 
-#[tokio::test]
-#[ignore = "operation measurement; run exclusively with --ignored --nocapture"]
-async fn given_queue_depths_when_attribute_projection_then_measure_full_manager_operation() {
-    let cases = [
-        ("static", Some(names(&["VisibilityTimeout"]))),
-        ("empty", Some(vec![])),
-        ("unknown", Some(names(&["Unknown"]))),
-        (
-            "mixed",
-            Some(names(&["DelaySeconds", "ApproximateNumberOfMessages"])),
-        ),
-        ("count", Some(names(&["ApproximateNumberOfMessages"]))),
-        ("all", Some(names(&["All"]))),
-        ("omitted", None),
-    ];
-    for depth in [0, 100, 10_000] {
-        let manager = create_selected_test_service("attribute-projection-measure").await;
-        let queue_url = manager
-            .create_queue(CreateQueueRequest {
-                queue_name: format!("attributes-{depth}"),
-                attributes: None,
-            })
-            .await
-            .unwrap()
-            .queue_url;
-        for _ in 0..depth {
-            manager
-                .send_message(SendMessageRequest {
-                    queue_url: queue_url.clone(),
-                    message_body: "x".repeat(1150),
-                    delay_seconds: None,
-                    message_attributes: None,
-                })
-                .await
-                .unwrap();
-        }
-        for round in 0..7 {
-            for offset in 0..cases.len() {
-                let (label, requested) = &cases[(round + offset) % cases.len()];
-                let request = GetQueueAttributesRequest {
-                    queue_url: queue_url.clone(),
-                    attribute_names: requested.clone(),
-                };
-                let first = manager.get_queue_attributes(request.clone()).await.unwrap();
-                if first.attributes.contains_key("ApproximateNumberOfMessages") {
-                    assert_eq!(
-                        first.attributes["ApproximateNumberOfMessages"],
-                        depth.to_string()
-                    );
-                }
-                let start = Instant::now();
-                for _ in 0..100 {
-                    std::hint::black_box(
-                        manager.get_queue_attributes(request.clone()).await.unwrap(),
-                    );
-                }
-                println!(
-                    "attribute_projection depth={depth} case={label} round={round} iterations=100 \
-                     ns_per_op={}",
-                    start.elapsed().as_nanos() / 100
-                );
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 struct AttributeProvider {
     should_fail_counts: bool,
@@ -169,6 +100,7 @@ fn fixture_queue(queue_url: &str, visibility: &str) -> queue_provider::Queue {
         queue_url: queue_url.to_string(),
         attributes: HashMap::from([("VisibilityTimeout".to_string(), visibility.to_string())]),
         created_at: storage_types::TimestampMillis::now(),
+        ..Default::default()
     }
 }
 
@@ -214,13 +146,29 @@ impl queue_provider::QueueOperations for AttributeProvider {
     ) -> queue_provider::QueueResult<Option<queue_provider::Queue>> {
         unreachable!()
     }
-    async fn list_queues(
+    async fn list_queue_page(
         &self,
         _: Option<&str>,
-    ) -> queue_provider::QueueResult<Vec<queue_provider::Queue>> {
+        _: Option<&str>,
+        _: std::num::NonZeroU32,
+    ) -> queue_provider::QueueResult<(Vec<queue_provider::Queue>, Option<String>)> {
         unreachable!()
     }
     async fn delete_queue(&self, _: &str) -> queue_provider::QueueResult<()> {
+        unreachable!()
+    }
+    async fn change_queue_tags(
+        &self,
+        _: &str,
+        _: std::collections::BTreeMap<String, String>,
+        _: Vec<String>,
+    ) -> queue_provider::QueueResult<()> {
+        unreachable!()
+    }
+    async fn list_queue_tags(
+        &self,
+        _: &str,
+    ) -> queue_provider::QueueResult<Option<std::collections::BTreeMap<String, String>>> {
         unreachable!()
     }
     async fn purge_queue(&self, _: &str) -> queue_provider::QueueResult<()> {
@@ -231,6 +179,15 @@ impl queue_provider::QueueOperations for AttributeProvider {
         _: &str,
         _: HashMap<String, String>,
     ) -> queue_provider::QueueResult<()> {
+        unreachable!()
+    }
+    async fn list_dead_letter_source_queues(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: std::num::NonZeroU32,
+    ) -> queue_provider::QueueResult<Option<queue_provider::ListDeadLetterSourceQueuesResponse>>
+    {
         unreachable!()
     }
     async fn publish_message(
@@ -274,9 +231,15 @@ impl queue_provider::QueueOperations for AttributeProvider {
         &self,
         _: &str,
         _: u32,
-        _: storage_types::DurationSeconds,
-        _: storage_types::DurationSeconds,
-    ) -> queue_provider::QueueResult<Vec<queue_provider::MessageResponse>> {
+        _: Option<storage_types::DurationSeconds>,
+        _: Option<storage_types::DurationSeconds>,
+    ) -> queue_provider::QueueResult<queue_provider::ReceivedMessages> {
+        unreachable!()
+    }
+    async fn probe_receive(
+        &self,
+        _: &str,
+    ) -> queue_provider::QueueResult<Option<queue_provider::ReceiveProbe>> {
         unreachable!()
     }
     async fn delete_message(
@@ -309,14 +272,13 @@ async fn given_attribute_projection_when_reading_attributes_then_only_demanded_c
  {
     for (requested, needs_counts) in [
         (Some(vec![]), false),
-        (Some(names(&["Unknown"])), false),
         (
             Some(names(&["VisibilityTimeout", "VisibilityTimeout"])),
             false,
         ),
         (Some(names(&["All"])), true),
-        (None, true),
-        (Some(names(&["Unknown", "All"])), true),
+        // Probe 7: no names select nothing and need no count scan.
+        (None, false),
         (Some(names(&["ApproximateNumberOfMessages"])), true),
         (
             Some(names(&["ApproximateNumberOfMessagesNotVisible"])),
@@ -370,8 +332,7 @@ async fn given_failed_count_storage_when_attribute_projection_then_only_demanded
     for (requested, needs_counts) in [
         (Some(names(&["VisibilityTimeout"])), false),
         (Some(vec![]), false),
-        (Some(names(&["Unknown"])), false),
-        (None, true),
+        (None, false),
         (Some(names(&["All"])), true),
         (
             Some(names(&["ApproximateNumberOfMessages", "DelaySeconds"])),

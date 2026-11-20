@@ -16,6 +16,15 @@ use super::{
 };
 
 #[test]
+fn given_file_defaults_when_admission_defaults_are_read_then_they_are_the_file_values() {
+    assert_eq!(
+        AdmissionConfig::default(),
+        AdmissionConfig::from_config(&config::StorageAdmissionConfig::default()).unwrap()
+    );
+    assert_eq!(AdmissionConfig::default().maximum_concurrency, 1_024);
+}
+
+#[test]
 fn defaults_bootstrap_from_littles_law() {
     let config = AdmissionConfig::default();
     assert_eq!(config.initial_sustainable_throughput_rps, 20_000);
@@ -138,7 +147,6 @@ fn provider_pressure_enters_emergency_without_waiting_for_a_full_window() {
 }
 
 #[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
 fn immediate_admission_path_has_no_per_request_metric_allocations() {
     const ISOLATED_ENV: &str = "AUX_STORAGE_ADMISSION_ALLOCATION_ISOLATED";
     if std::env::var_os(ISOLATED_ENV).is_none() {
@@ -149,7 +157,6 @@ fn immediate_admission_path_has_no_per_request_metric_allocations() {
         .arg("--exact")
         .arg("admission::admission_tests::immediate_admission_path_has_no_per_request_metric_allocations")
         .arg("--nocapture")
-        .arg("--ignored")
         .env(ISOLATED_ENV, "1")
         .status()
         .unwrap();
@@ -411,7 +418,8 @@ async fn timed_out_waiter_is_removed_without_leaking_capacity() {
     let rejection = waiter.await.expect("waiter task");
     assert_eq!(rejection.reason, AdmissionRejectionReason::QueueTimedOut);
     assert_eq!(controller.snapshot().queue_depth, 0);
-    assert_eq!(
+    // A queue timeout is local saturation, not provider pressure.
+    assert_ne!(
         controller.snapshot().state,
         super::AdmissionState::Emergency
     );

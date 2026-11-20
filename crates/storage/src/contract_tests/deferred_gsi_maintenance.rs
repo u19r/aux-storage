@@ -54,6 +54,7 @@ fn unique_suffix() -> u128 {
 async fn postgres_config() -> StorageConfig {
     let dsn = isolated_postgres_dsn().await;
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::Postgres,
         connection_string: Some(dsn.clone()),
         file_path: None,
@@ -77,6 +78,7 @@ fn turso_config() -> (StorageConfig, String) {
         .to_string_lossy()
         .into_owned();
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::Turso,
         connection_string: Some(path.clone()),
         file_path: None,

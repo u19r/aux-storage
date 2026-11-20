@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde::{
     Deserialize, Serialize,
@@ -16,7 +16,8 @@ use crate::{
     dynamodb_binary::SENTINEL_KEY,
 };
 
-#[derive(Debug, Clone, ToSchema, PartialEq, Eq)]
+#[derive(Clone, ToSchema, PartialEq, Eq)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[schema(no_recursion)]
 pub enum AttributeValue {
     S(String),
@@ -28,9 +29,8 @@ pub enum AttributeValue {
     BOOL(bool),
     NULL(bool),
     L(Vec<AttributeValue>),
-    // TODO: compare nested-map allocation costs with AttributeMap using
-    // equal-work benchmarks.
-    M(HashMap<String, AttributeValue>),
+    #[schema(value_type = HashMap<String, AttributeValue>)]
+    M(crate::AttributeMap),
 }
 
 impl AttributeValue {
@@ -66,7 +66,7 @@ impl AttributeValue {
         }
     }
 
-    pub(crate) fn variant_name(&self) -> &'static str {
+    pub fn variant_name(&self) -> &'static str {
         match self {
             AttributeValue::S(_) => "S",
             AttributeValue::N(_) => "N",
@@ -120,6 +120,21 @@ impl Serialize for CanonicalDynamoMap<'_> {
     }
 }
 
+struct SortedAttributeMap<'a>(&'a crate::AttributeMap);
+
+impl Serialize for SortedAttributeMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        let mut entries = self.0.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (name, value) in entries {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
 // TODO: measure serialization allocations and CPU in complete provider
 // responses.
 impl Serialize for AttributeValue {
@@ -139,10 +154,30 @@ impl Serialize for AttributeValue {
             AttributeValue::NULL(value) => map.serialize_entry("NULL", value)?,
             AttributeValue::L(value) => map.serialize_entry("L", value)?,
             // Nested maps also participate in deterministic stream digests.
-            AttributeValue::M(value) => map.serialize_entry("M", &CanonicalDynamoMap(value))?,
+            AttributeValue::M(value) => map.serialize_entry("M", &SortedAttributeMap(value))?,
         }
         map.end()
     }
+}
+
+/// AWS text for an attribute value with no type member.
+pub(crate) const ATTRIBUTE_VALUE_EMPTY_MESSAGE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+/// AWS text for an attribute value with several type members.
+pub(crate) const ATTRIBUTE_VALUE_MULTIPLE_MESSAGE: &str = "Supplied AttributeValue has more than \
+                                                           one datatypes set, must contain \
+                                                           exactly one of the supported datatypes";
+
+/// The AWS text when a decoding error reports the wrong number of type
+/// members.
+pub(crate) fn attribute_value_arity_message(error: &str) -> Option<&'static str> {
+    [
+        ATTRIBUTE_VALUE_EMPTY_MESSAGE,
+        ATTRIBUTE_VALUE_MULTIPLE_MESSAGE,
+    ]
+    .into_iter()
+    .find(|message| error.contains(message))
 }
 
 impl<'de> Deserialize<'de> for AttributeValue {
@@ -168,14 +203,12 @@ impl<'de> Deserialize<'de> for AttributeValue {
 
                     // Ensure there are no additional fields
                     if map.next_key::<String>()?.is_some() {
-                        return Err(serde::de::Error::custom(
-                            "AttributeValue must have exactly one field",
-                        ));
+                        return Err(serde::de::Error::custom(ATTRIBUTE_VALUE_MULTIPLE_MESSAGE));
                     }
 
                     Ok(value)
                 } else {
-                    Err(serde::de::Error::custom("AttributeValue cannot be empty"))
+                    Err(serde::de::Error::custom(ATTRIBUTE_VALUE_EMPTY_MESSAGE))
                 }
             }
         }
@@ -213,9 +246,7 @@ where
         "NS" => Ok(AttributeValue::NS(map.next_value()?)),
         "BS" => Ok(AttributeValue::BS(map.next_value()?)),
         "L" => Ok(AttributeValue::L(map.next_value()?)),
-        "M" => Ok(AttributeValue::M(
-            map.next_value::<crate::AttributeMap>()?.into_hashmap(),
-        )),
+        "M" => Ok(AttributeValue::M(map.next_value::<crate::AttributeMap>()?)),
         _ => Err(serde::de::Error::unknown_field(
             tag,
             &["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"],
@@ -258,11 +289,13 @@ impl AttributeValue {
                 {
                     return Ok(AttributeValue::B(encoded.clone()));
                 }
-                let mut map = HashMap::with_capacity(obj.len());
+                let mut entries = Vec::with_capacity(obj.len());
                 for (key, value) in obj {
-                    map.insert(key, Self::from_json_value(value)?);
+                    entries.push((key, Self::from_json_value(value)?));
                 }
-                Ok(AttributeValue::M(map))
+                Ok(AttributeValue::M(crate::AttributeMap::from_distinct(
+                    entries,
+                )))
             }
         }
     }
@@ -320,10 +353,11 @@ impl AttributeValue {
                 Ok(JsonValue::Array(items))
             }
             AttributeValue::M(map) => {
-                let mut obj = serde_json::Map::with_capacity(map.len());
-                let ordered: BTreeMap<_, _> = map.iter().collect();
+                let mut ordered = map.iter().collect::<Vec<_>>();
+                ordered.sort_unstable_by_key(|(key, _)| *key);
+                let mut obj = serde_json::Map::with_capacity(ordered.len());
                 for (key, value) in ordered {
-                    obj.insert(key.clone(), value.to_json_value()?);
+                    obj.insert(key.to_owned(), value.to_json_value()?);
                 }
                 Ok(JsonValue::Object(obj))
             }
@@ -368,7 +402,10 @@ impl AttributeValue {
                 .collect::<Result<Vec<_>, _>>()
                 .map(JsonValue::Array),
             AttributeValue::M(values) => {
-                let mut entries = values.into_iter().collect::<Vec<_>>();
+                let mut entries = values
+                    .into_iter()
+                    .map(|entry| (entry.name, entry.value))
+                    .collect::<Vec<_>>();
                 entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
 
                 let mut object = serde_json::Map::with_capacity(entries.len());
@@ -423,13 +460,11 @@ impl Serialize for PlainJsonAttributeValue<'_> {
                 seq.end()
             }
             AttributeValue::M(map) => {
-                let mut keys = map.keys().collect::<Vec<_>>();
-                keys.sort();
-                let mut json_map = serializer.serialize_map(Some(keys.len()))?;
-                for key in keys {
-                    if let Some(value) = map.get(key) {
-                        json_map.serialize_entry(key, &PlainJsonAttributeValue(value))?;
-                    }
+                let mut entries = map.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                let mut json_map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    json_map.serialize_entry(key, &PlainJsonAttributeValue(value))?;
                 }
                 json_map.end()
             }
@@ -453,7 +488,15 @@ where T: Serialize {
         }
         _ => Err(ConversionError::TypeMismatch {
             expected: "Object".to_string(),
-            got: format!("{json_value:?}"),
+            got: match json_value {
+                JsonValue::Null => "Null",
+                JsonValue::Bool(_) => "Bool",
+                JsonValue::Number(_) => "Number",
+                JsonValue::String(_) => "String",
+                JsonValue::Array(_) => "Array",
+                JsonValue::Object(_) => "Object",
+            }
+            .to_string(),
         }),
     }
 }

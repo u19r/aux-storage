@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use storage_common::ttl::{TtlSweepPageCommand, TtlSweepPageResult, TtlSweepRequest};
 use storage_types::{StorageError, StorageResult, TimestampMillis};
 
@@ -8,11 +10,16 @@ impl DatabaseManager {
         &self,
         request: TtlSweepRequest,
     ) -> StorageResult<TtlSweepPageCommand> {
-        let repository = self.ttl_sweep_repository.clone().ok_or_else(|| {
-            StorageError::unsupported(
-                "configured backend does not support deterministic TTL sweep commands",
-            )
-        })?;
+        let repository = self
+            .default_connection
+            .native
+            .as_ref()
+            .map(|native| Arc::clone(&native.maintenance))
+            .ok_or_else(|| {
+                StorageError::unsupported(
+                    "configured backend does not support deterministic TTL sweep commands",
+                )
+            })?;
         self.run_scoped_control(ROUTED_DEFAULT_CONNECTION_ID, || async move {
             let policy = repository
                 .read_ttl_sweep_policy(&request.table_name)
@@ -29,11 +36,16 @@ impl DatabaseManager {
         &self,
         command: TtlSweepPageCommand,
     ) -> StorageResult<TtlSweepPageResult> {
-        let repository = self.ttl_sweep_repository.clone().ok_or_else(|| {
-            StorageError::unsupported(
-                "configured backend does not support deterministic TTL sweep commands",
-            )
-        })?;
+        let repository = self
+            .default_connection
+            .native
+            .as_ref()
+            .map(|native| Arc::clone(&native.maintenance))
+            .ok_or_else(|| {
+                StorageError::unsupported(
+                    "configured backend does not support deterministic TTL sweep commands",
+                )
+            })?;
         self.run_scoped_control(ROUTED_DEFAULT_CONNECTION_ID, || async move {
             repository.execute_ttl_sweep_page(command).await
         })
@@ -44,11 +56,16 @@ impl DatabaseManager {
         &self,
         request: TtlSweepRequest,
     ) -> StorageResult<TtlSweepPageResult> {
-        let repository = self.ttl_sweep_repository.clone().ok_or_else(|| {
-            StorageError::unsupported(
-                "configured backend does not support deterministic TTL sweep commands",
-            )
-        })?;
+        let repository = self
+            .default_connection
+            .native
+            .as_ref()
+            .map(|native| Arc::clone(&native.maintenance))
+            .ok_or_else(|| {
+                StorageError::unsupported(
+                    "configured backend does not support deterministic TTL sweep commands",
+                )
+            })?;
         self.run_scoped_control(ROUTED_DEFAULT_CONNECTION_ID, || async move {
             repository.execute_ttl_sweep_request(request).await
         })

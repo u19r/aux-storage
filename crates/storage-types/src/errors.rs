@@ -3,7 +3,8 @@ use std::fmt::Error;
 use thiserror::Error;
 
 use crate::{
-    AttributeMap, InfrastructureResultKind, ItemKeyError, context::WrappedError as _,
+    AttemptFailure, AttributeMap, CancellationCode, CancellationReason, ErrorClass,
+    InfrastructureResultKind, ItemKeyError, context::WrappedError as _,
     dynamodb_table_not_found_message, err_context,
 };
 
@@ -82,7 +83,7 @@ impl From<&str> for StorageValidationInput {
     }
 }
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Clone)]
 pub enum StorageEnum {
     // Not a DynamoDB error type – internal helper. Keep message but mark
     // internal.
@@ -98,6 +99,11 @@ pub enum StorageEnum {
 
     #[error("{0}")]
     InfrastructureResult(#[from] InfrastructureResultKind),
+
+    /// A failed native attempt. Display prints its cause; the wire text is
+    /// chosen by the API mapping.
+    #[error("{0}")]
+    Attempt(#[from] AttemptFailure),
 
     // Maps to ResourceNotFoundException (DynamoDB). Dynamo message is generic;
     // we store context separately.
@@ -115,11 +121,11 @@ pub enum StorageEnum {
         resource_id: String,
     },
 
-    // Dynamo would also surface this as ResourceNotFoundException; keep for
-    // internal diagnostics.
-    #[error("Requested resource not found")]
+    // ResourceNotFoundException for an index the request names but the table
+    // does not have (UpdateTable delete or update of an absent index).
+    #[error("Requested resource not found: Index {index_name} for table {table_name}")]
     IndexNotFound {
-        index_name: &'static str,
+        index_name: String,
         table_name: String,
     },
 
@@ -128,8 +134,9 @@ pub enum StorageEnum {
     #[error("{0}")]
     KeyValidation(#[from] ItemKeyError),
 
-    // InternalServerError (DynamoDB) canonical message.
-    #[error("DynamoDB could not process your request.")]
+    // The cause; the wire text is DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE
+    // (http-error).
+    #[error("internal error: {message}")]
     InternalServerError { message: String },
 
     /// A protected logical history has missing or inconsistent durable
@@ -157,12 +164,12 @@ pub enum StorageEnum {
 
     // Internal cache-authority guard conflict. Manager paths must translate
     // this to durable fallback, not Dynamo condition failure.
-    #[error("Durable guard conflict.")]
+    #[error("Durable guard conflict: {message}")]
     GuardConflict { message: String },
 
     // Internal provider capability boundary. Manager paths must fail closed
     // or use the existing durable path.
-    #[error("Unsupported storage provider operation.")]
+    #[error("Unsupported storage provider operation: {message}")]
     Unsupported { message: String },
 
     // ResourceInUseException when table exists: canonical DynamoDB phrasing.
@@ -190,10 +197,6 @@ pub enum StorageEnum {
     #[error("{message}")]
     DeletionProtectionEnabled { table_name: String, message: String },
 
-    // TransactionConflictException canonical message.
-    #[error("Operation was rejected because there is an ongoing transaction for the item.")]
-    TransactionConflict { message: String },
-
     // TransactionInProgressException canonical message.
     #[error("The transaction with the given request token is already in progress.")]
     TransactionInProgress { message: String },
@@ -201,8 +204,8 @@ pub enum StorageEnum {
     // IdempotentParameterMismatchException for a reused token with different
     // request parameters.
     #[error(
-        "The request was rejected because the same client request token was used with different \
-         parameters."
+        "Specified idempotent token was used with different request parameters within the \
+         idempotency window"
     )]
     IdempotentParameterMismatch,
 
@@ -215,7 +218,7 @@ pub enum StorageEnum {
     // TransactionCanceledException canonical message (British spelling
     // 'cancelled' matches AWS response text).
     #[error("Transaction cancelled, please refer cancellation reasons for specific reasons.")]
-    TransactionCanceled { reasons: Vec<String> },
+    TransactionCanceled { reasons: Vec<CancellationReason> },
 
     #[error(
         "You exceeded your maximum allowed provisioned throughput for a table or for one or more \
@@ -234,17 +237,6 @@ pub enum StorageEnum {
     ServiceUnavailable {
         message: String,
         retry_after_seconds: u64,
-    },
-
-    /// Public compatibility for consumers that classify this error; ordinary
-    /// and regional storage never originate it.
-    #[error("Storage sync node is not the current leader.")]
-    SyncNotLeader { leader_hint: Option<String> },
-
-    #[error("Sync proposal outcome is ambiguous: {message}")]
-    SyncSubmissionAmbiguous {
-        proposal_id: Option<String>,
-        message: String,
     },
 
     #[error("Too many operations for a given subscriber.")]
@@ -273,22 +265,167 @@ pub enum StorageEnum {
     },
 }
 
+/// Hand-written so that no variant prints item data: a condition failure with
+/// an item prints its attribute count only, and cancellation reasons use their
+/// own redacting `Debug`.
+impl std::fmt::Debug for StorageEnum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => f.debug_tuple("Database").field(error).finish(),
+            Self::AwsSerialization(message) => {
+                f.debug_tuple("AwsSerialization").field(message).finish()
+            }
+            Self::Serialization(cause) => f.debug_tuple("Serialization").field(cause).finish(),
+            Self::InfrastructureResult(kind) => {
+                f.debug_tuple("InfrastructureResult").field(kind).finish()
+            }
+            Self::Attempt(failure) => f.debug_tuple("Attempt").field(failure).finish(),
+            Self::ResourceNotFound {
+                resource_type,
+                resource_id,
+            } => f
+                .debug_struct("ResourceNotFound")
+                .field("resource_type", resource_type)
+                .field("resource_id", resource_id)
+                .finish(),
+            Self::ResourceExists {
+                resource_type,
+                resource_id,
+            } => f
+                .debug_struct("ResourceExists")
+                .field("resource_type", resource_type)
+                .field("resource_id", resource_id)
+                .finish(),
+            Self::IndexNotFound {
+                index_name,
+                table_name,
+            } => f
+                .debug_struct("IndexNotFound")
+                .field("index_name", index_name)
+                .field("table_name", table_name)
+                .finish(),
+            Self::KeyValidation(error) => f.debug_tuple("KeyValidation").field(error).finish(),
+            Self::InternalServerError { message } => f
+                .debug_struct("InternalServerError")
+                .field("message", message)
+                .finish(),
+            Self::HistoryUnavailable => f.write_str("HistoryUnavailable"),
+            Self::HistoryExpired => f.write_str("HistoryExpired"),
+            Self::TrimmedDataAccess => f.write_str("TrimmedDataAccess"),
+            Self::ConditionalCheckFailed => f.write_str("ConditionalCheckFailed"),
+            Self::ConditionalCheckFailedWithItem { item } => f
+                .debug_struct("ConditionalCheckFailedWithItem")
+                .field("item", &format_args!("<{} attributes>", item.len()))
+                .finish(),
+            Self::GuardConflict { message } => f
+                .debug_struct("GuardConflict")
+                .field("message", message)
+                .finish(),
+            Self::Unsupported { message } => f
+                .debug_struct("Unsupported")
+                .field("message", message)
+                .finish(),
+            Self::TableAlreadyExists { name } => f
+                .debug_struct("TableAlreadyExists")
+                .field("name", name)
+                .finish(),
+            Self::TableNotFound { name, message } => f
+                .debug_struct("TableNotFound")
+                .field("name", name)
+                .field("message", message)
+                .finish(),
+            Self::Validation { kind, message } => f
+                .debug_struct("Validation")
+                .field("kind", kind)
+                .field("message", message)
+                .finish(),
+            Self::RawValidation { message } => f
+                .debug_struct("RawValidation")
+                .field("message", message)
+                .finish(),
+            Self::DeletionProtectionEnabled {
+                table_name,
+                message,
+            } => f
+                .debug_struct("DeletionProtectionEnabled")
+                .field("table_name", table_name)
+                .field("message", message)
+                .finish(),
+            Self::TransactionInProgress { message } => f
+                .debug_struct("TransactionInProgress")
+                .field("message", message)
+                .finish(),
+            Self::IdempotentParameterMismatch => f.write_str("IdempotentParameterMismatch"),
+            Self::IdempotencyReplay { response } => f
+                .debug_struct("IdempotencyReplay")
+                .field("response", response)
+                .finish(),
+            Self::TransactionCanceled { reasons } => f
+                .debug_struct("TransactionCanceled")
+                .field("reasons", reasons)
+                .finish(),
+            Self::ProvisionedThroughputExceeded { message } => f
+                .debug_struct("ProvisionedThroughputExceeded")
+                .field("message", message)
+                .finish(),
+            Self::Throttled { message } => f
+                .debug_struct("Throttled")
+                .field("message", message)
+                .finish(),
+            Self::ServiceUnavailable {
+                message,
+                retry_after_seconds,
+            } => f
+                .debug_struct("ServiceUnavailable")
+                .field("message", message)
+                .field("retry_after_seconds", retry_after_seconds)
+                .finish(),
+            Self::LimitExceeded { message } => f
+                .debug_struct("LimitExceeded")
+                .field("message", message)
+                .finish(),
+            Self::Authentication { message } => f
+                .debug_struct("Authentication")
+                .field("message", message)
+                .finish(),
+            Self::AccessDenied { message } => f
+                .debug_struct("AccessDenied")
+                .field("message", message)
+                .finish(),
+            Self::RequestLimitExceeded => f.write_str("RequestLimitExceeded"),
+            Self::MissingAuthenticationToken => f.write_str("MissingAuthenticationToken"),
+            Self::AwsService { code, message } => f
+                .debug_struct("AwsService")
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
 err_context!(StorageError, StorageEnum);
 
 impl StorageError {
     #[must_use]
     pub fn is_commit_unknown(&self) -> bool {
-        matches!(self.to_enum(), StorageEnum::SyncSubmissionAmbiguous { .. })
+        self.attempt_kind() == Some(crate::AttemptKind::CommitUnknown)
+    }
+
+    /// The member reasons of a `TransactionCanceled`; `None` for any other
+    /// error.
+    #[must_use]
+    pub fn cancellation_reasons(&self) -> Option<&[CancellationReason]> {
+        match self.to_enum() {
+            StorageEnum::TransactionCanceled { reasons } => Some(reasons),
+            _ => None,
+        }
     }
 
     #[must_use]
     pub fn is_canceled_condition_check_failed(&self, index: usize) -> bool {
-        let StorageEnum::TransactionCanceled { reasons } = self.to_enum() else {
-            return false;
-        };
-        reasons.get(index).is_some_and(|reason| {
-            reason == "ConditionalCheckFailed" || reason.starts_with("ConditionalCheckFailed\t")
-        })
+        self.cancellation_reasons()
+            .and_then(|reasons| reasons.get(index))
+            .is_some_and(CancellationReason::is_conditional_check_failed)
     }
 
     #[must_use]
@@ -297,36 +434,118 @@ impl StorageError {
             StorageEnum::ConditionalCheckFailed
             | StorageEnum::ConditionalCheckFailedWithItem { .. } => true,
             StorageEnum::TransactionCanceled { reasons } => {
-                let mut has_conditional_failure = false;
-                let only_conditional_reasons = reasons.iter().all(|reason| {
-                    if reason == "None" {
-                        return true;
-                    }
-                    if reason == "ConditionalCheckFailed"
-                        || reason.starts_with("ConditionalCheckFailed\t")
-                    {
-                        has_conditional_failure = true;
-                        return true;
-                    }
-                    false
-                });
-                only_conditional_reasons && has_conditional_failure
+                reasons
+                    .iter()
+                    .any(CancellationReason::is_conditional_check_failed)
+                    && reasons.iter().all(|reason| {
+                        matches!(
+                            reason.code,
+                            CancellationCode::None | CancellationCode::ConditionalCheckFailed
+                        )
+                    })
             }
             _ => false,
         }
     }
 
+    /// The class every retry owner and wire mapping starts from.
     #[must_use]
-    pub fn is_retryable_write(&self) -> bool {
-        matches!(
-            self.to_enum(),
-            StorageEnum::TransactionConflict { .. }
-                | StorageEnum::TransactionInProgress { .. }
-                | StorageEnum::ProvisionedThroughputExceeded { .. }
-                | StorageEnum::Throttled { .. }
-                | StorageEnum::RequestLimitExceeded
-                | StorageEnum::LimitExceeded { .. }
-        )
+    pub fn class(&self) -> ErrorClass {
+        if let Some(kind) = self.attempt_kind() {
+            return match kind {
+                crate::AttemptKind::CommitUnknown => ErrorClass::CommitUnknown,
+                crate::AttemptKind::Capacity | crate::AttemptKind::TransactionBytes => {
+                    ErrorClass::Capacity
+                }
+                crate::AttemptKind::Conflict
+                | crate::AttemptKind::FreshValidation
+                | crate::AttemptKind::Unavailable
+                | crate::AttemptKind::Deadline => ErrorClass::Retryable,
+            };
+        }
+        match self.to_enum() {
+            StorageEnum::TransactionInProgress { .. }
+            | StorageEnum::ProvisionedThroughputExceeded { .. }
+            | StorageEnum::Throttled { .. }
+            | StorageEnum::ServiceUnavailable { .. }
+            | StorageEnum::LimitExceeded { .. }
+            | StorageEnum::RequestLimitExceeded => ErrorClass::Retryable,
+            StorageEnum::ResourceNotFound { .. }
+            | StorageEnum::ResourceExists { .. }
+            | StorageEnum::IndexNotFound { .. }
+            | StorageEnum::KeyValidation(_)
+            | StorageEnum::HistoryExpired
+            | StorageEnum::TrimmedDataAccess
+            | StorageEnum::ConditionalCheckFailed
+            | StorageEnum::ConditionalCheckFailedWithItem { .. }
+            | StorageEnum::TableAlreadyExists { .. }
+            | StorageEnum::TableNotFound { .. }
+            | StorageEnum::Validation { .. }
+            | StorageEnum::RawValidation { .. }
+            | StorageEnum::DeletionProtectionEnabled { .. }
+            | StorageEnum::IdempotentParameterMismatch
+            | StorageEnum::TransactionCanceled { .. }
+            | StorageEnum::Authentication { .. }
+            | StorageEnum::AccessDenied { .. }
+            | StorageEnum::MissingAuthenticationToken => ErrorClass::Client,
+            StorageEnum::Database(_)
+            | StorageEnum::AwsSerialization(_)
+            | StorageEnum::Serialization(_)
+            | StorageEnum::InfrastructureResult(_)
+            | StorageEnum::InternalServerError { .. }
+            | StorageEnum::HistoryUnavailable
+            | StorageEnum::GuardConflict { .. }
+            | StorageEnum::Unsupported { .. }
+            | StorageEnum::IdempotencyReplay { .. }
+            | StorageEnum::AwsService { .. }
+            // Covered by `attempt_kind` above.
+            | StorageEnum::Attempt(_)
+            => ErrorClass::Internal,
+        }
+    }
+
+    /// Fixed-cardinality name of this error for logs and metric labels. Never
+    /// a message: safe on paths that handle item data.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self.to_enum() {
+            StorageEnum::Database(_) => "database",
+            StorageEnum::AwsSerialization(_) => "aws_serialization",
+            StorageEnum::Serialization(_) => "serialization",
+            StorageEnum::ResourceNotFound { .. } => "resource_not_found",
+            StorageEnum::ResourceExists { .. } => "resource_exists",
+            StorageEnum::IndexNotFound { .. } => "index_not_found",
+            StorageEnum::KeyValidation(_) => "key_validation",
+            StorageEnum::InternalServerError { .. } | StorageEnum::InfrastructureResult(_) => {
+                "internal_server_error"
+            }
+            StorageEnum::HistoryUnavailable => "history_unavailable",
+            StorageEnum::HistoryExpired => "history_expired",
+            StorageEnum::TrimmedDataAccess => "trimmed_data_access",
+            StorageEnum::GuardConflict { .. } => "guard_conflict",
+            StorageEnum::Unsupported { .. } => "unsupported",
+            StorageEnum::ConditionalCheckFailed
+            | StorageEnum::ConditionalCheckFailedWithItem { .. } => "conditional_check_failed",
+            StorageEnum::TableAlreadyExists { .. } => "table_exists",
+            StorageEnum::TableNotFound { .. } => "table_not_found",
+            StorageEnum::Validation { .. }
+            | StorageEnum::RawValidation { .. }
+            | StorageEnum::DeletionProtectionEnabled { .. } => "validation",
+            StorageEnum::Attempt(failure) => failure.kind().as_str(),
+            StorageEnum::TransactionInProgress { .. } => "transaction_in_progress",
+            StorageEnum::IdempotentParameterMismatch => "idempotent_parameter_mismatch",
+            StorageEnum::IdempotencyReplay { .. } => "idempotency_replay",
+            StorageEnum::TransactionCanceled { .. } => "transaction_canceled",
+            StorageEnum::ProvisionedThroughputExceeded { .. } => "provisioned_throughput",
+            StorageEnum::Throttled { .. } => "throttled",
+            StorageEnum::LimitExceeded { .. } => "limit_exceeded",
+            StorageEnum::RequestLimitExceeded => "request_limit_exceeded",
+            StorageEnum::ServiceUnavailable { .. } => "service_unavailable",
+            StorageEnum::Authentication { .. } => "authentication",
+            StorageEnum::MissingAuthenticationToken => "missing_authentication_token",
+            StorageEnum::AccessDenied { .. } => "access_denied",
+            StorageEnum::AwsService { .. } => "aws_service",
+        }
     }
 
     pub fn validation(input: impl Into<StorageValidationInput>) -> Self {
@@ -346,6 +565,56 @@ impl StorageError {
             kind,
             message: message.into(),
         })
+    }
+
+    /// The kind and value type of an empty key attribute error.
+    fn empty_key_kind(&self) -> Option<(StorageValidationKind, &'static str)> {
+        match self.to_enum() {
+            StorageEnum::Validation {
+                kind: kind @ StorageValidationKind::EmptyStringKey,
+                ..
+            } => Some((*kind, "string")),
+            StorageEnum::Validation {
+                kind: kind @ StorageValidationKind::EmptyBinaryKey,
+                ..
+            } => Some((*kind, "binary")),
+            _ => None,
+        }
+    }
+
+    /// An empty value for a secondary index key attribute written by a put
+    /// names the index; other errors pass through.
+    #[must_use]
+    pub fn for_index_key_put(self, index_name: &str, attribute: &str) -> Self {
+        let Some((kind, value_type)) = self.empty_key_kind() else {
+            return self;
+        };
+        Self::validation_detail(
+            kind,
+            format!(
+                "One or more parameter values are not valid. A value specified for a secondary \
+                 index key is not supported. The AttributeValue for a key attribute cannot \
+                 contain an empty {value_type} value. IndexName: {index_name}, IndexKey: \
+                 {attribute}"
+            ),
+        )
+    }
+
+    /// An empty value for a secondary index key attribute set by an update
+    /// expression; other errors pass through.
+    #[must_use]
+    pub fn for_index_key_update(self) -> Self {
+        let Some((kind, value_type)) = self.empty_key_kind() else {
+            return self;
+        };
+        Self::validation_detail(
+            kind,
+            format!(
+                "One or more parameter values are not valid. The update expression attempted to \
+                 update a secondary index key to a value that is not supported. The \
+                 AttributeValue for a key attribute cannot contain an empty {value_type} value."
+            ),
+        )
     }
 
     #[must_use]
@@ -374,6 +643,17 @@ impl StorageError {
                 | StorageValidationKind::NumberPrecision
                 | StorageValidationKind::NumberUnderflow
         )
+    }
+
+    /// An empty key attribute value rejected while a transaction member is
+    /// evaluated, such as an empty secondary index key, fails the whole
+    /// request as a validation error rather than cancelling the member.
+    pub fn into_transact_empty_key_validation(self) -> Result<Self, Self> {
+        if self.empty_key_kind().is_some() {
+            Ok(self.into_raw_validation())
+        } else {
+            Err(self)
+        }
     }
 
     #[must_use]
@@ -408,8 +688,8 @@ impl StorageError {
     }
 
     pub fn internal(message: &(impl ToString + ?Sized)) -> Self {
-        // Message stored for diagnostics but not exposed in Display (AWS
-        // parity).
+        // Display prints the message: it must not contain item data, keys or
+        // secrets (ARCH-1-c 1).
         Self::from(StorageEnum::InternalServerError {
             message: message.to_string(),
         })
@@ -430,20 +710,6 @@ impl StorageError {
         Self::from(StorageEnum::IdempotencyReplay { response })
     }
 
-    pub fn sync_not_leader(leader_hint: Option<String>) -> Self {
-        Self::from(StorageEnum::SyncNotLeader { leader_hint })
-    }
-
-    pub fn sync_submission_ambiguous(
-        proposal_id: Option<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self::from(StorageEnum::SyncSubmissionAmbiguous {
-            proposal_id,
-            message: message.into(),
-        })
-    }
-
     pub fn guard_conflict(message: &(impl ToString + ?Sized)) -> Self {
         Self::from(StorageEnum::GuardConflict {
             message: message.to_string(),
@@ -460,6 +726,16 @@ impl StorageError {
         Self::unsupported("custom stream duration is not supported by this storage provider")
     }
 
+    /// Whether this is the item-over-the-size-limit refusal, which PutItem
+    /// answers only after the table lookup.
+    pub fn is_item_too_large(&self) -> bool {
+        matches!(
+            self.to_enum(),
+            StorageEnum::Validation { message, .. }
+                if message == crate::logical_item_size::ITEM_TOO_LARGE_MESSAGE
+        )
+    }
+
     pub fn table_already_exists(name: &(impl ToString + ?Sized)) -> Self {
         Self::from(StorageEnum::TableAlreadyExists {
             name: name.to_string(),
@@ -471,6 +747,31 @@ impl StorageError {
         Self::from(StorageEnum::TableNotFound {
             message: dynamodb_table_not_found_message(&name),
             name,
+        })
+    }
+
+    /// The single owner of the data-plane wire text: DynamoDB answers a
+    /// missing table to item operations (GetItem, PutItem, UpdateItem,
+    /// DeleteItem, Query, Scan, BatchGetItem, BatchWriteItem, TransactGetItems)
+    /// with the bare "Requested resource not found". Control-plane operations
+    /// keep the `Table: <name> not found` text of `table_not_found`.
+    pub fn into_data_plane_table_not_found(self) -> Self {
+        if let StorageEnum::TableNotFound { name, .. } = self.to_enum() {
+            return Self::from(StorageEnum::ResourceNotFound {
+                resource_type: "table",
+                resource_id: name.clone(),
+            });
+        }
+        self
+    }
+
+    pub fn index_not_found(
+        index_name: &(impl ToString + ?Sized),
+        table_name: &(impl ToString + ?Sized),
+    ) -> Self {
+        Self::from(StorageEnum::IndexNotFound {
+            index_name: index_name.to_string(),
+            table_name: table_name.to_string(),
         })
     }
 

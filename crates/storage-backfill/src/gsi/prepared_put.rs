@@ -1,8 +1,6 @@
 //! New-image projection prepared independently of transactional observations.
 
-use storage_types::{
-    AttributeValue, ItemRevision, StorageError, StorageResult, StoredTableInfo, WireItem,
-};
+use storage_types::{AttributeValue, StorageError, StorageResult, StoredTableInfo, WireItem};
 
 use super::{
     GsiProjectedRow, GsiProjectionKey, GsiProjectionLifecycle, GsiProjectionWrite,
@@ -51,9 +49,8 @@ impl PreparedGsiPut {
         lifecycle: &GsiProjectionLifecycle,
         table: &StoredTableInfo,
         old: Option<&WireItem>,
-        revision: ItemRevision,
     ) -> StorageResult<GsiProjectionWriteBatch> {
-        let mut deletes = lifecycle.plan_deletes(table, old, revision)?;
+        let mut deletes = lifecycle.plan_deletes(table, old)?;
         let mut writes = Vec::with_capacity(self.writes.len() + deletes.len());
         for put in self.writes {
             if !lifecycle.writable_targets().iter().any(|target| {
@@ -71,7 +68,6 @@ impl PreparedGsiPut {
             writes.push(GsiProjectionWrite {
                 key: put.key,
                 row: Some(put.row),
-                item_version: revision,
             });
         }
         deletes.extend(writes);

@@ -1,11 +1,12 @@
 //! SQL text and bindings for the scheduled-job physical store.
 use scheduled_bg_jobs::store::{RangeDirection, RangeRequest, StoreKey};
-use storage_types::{InfrastructureResultKind, StorageResult};
+use storage_types::StorageResult;
 
 use crate::{
     SqlEngine, SqlStatement, SqlValue, constants::SCHEDULED_JOB_DATA_TABLE, statement::SqlText,
 };
 
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
 pub(super) fn schema(engine: SqlEngine) -> StorageResult<[SqlStatement; 1]> {
     let blob = engine.blob_type();
     let suffix = engine.table_suffix();
@@ -74,7 +75,7 @@ pub(super) fn range(engine: SqlEngine, request: &RangeRequest) -> StorageResult<
     Ok(SqlStatement::new(sql.finish()?, binds))
 }
 
-pub(super) fn put(engine: SqlEngine, key: &[u8], value: &[u8]) -> StorageResult<SqlStatement> {
+pub(crate) fn put(engine: SqlEngine, key: &[u8], value: &[u8]) -> StorageResult<SqlStatement> {
     let mut sql = SqlText::default();
     sql.append(format_args!(
         "INSERT INTO {SCHEDULED_JOB_DATA_TABLE} (key, value) VALUES ("
@@ -102,11 +103,68 @@ pub(super) fn delete(engine: SqlEngine, key: &[u8]) -> StorageResult<SqlStatemen
     Ok(SqlStatement::new(sql.finish()?, binds))
 }
 
+/// Removes one effect receipt group: every key in `[begin, end)`.
+pub(super) fn delete_range(
+    engine: SqlEngine,
+    begin: &[u8],
+    end: &[u8],
+) -> StorageResult<SqlStatement> {
+    let mut sql = SqlText::default();
+    sql.append(format_args!(
+        "DELETE FROM {SCHEDULED_JOB_DATA_TABLE} WHERE key >= "
+    ))?;
+    sql.append_parameter(engine, 1, false)?;
+    sql.append(format_args!(" AND key < "))?;
+    sql.append_parameter(engine, 2, false)?;
+    let mut binds = bind_slots(2)?;
+    binds.push(SqlValue::Blob(copy_blob(begin)?));
+    binds.push(SqlValue::Blob(copy_blob(end)?));
+    Ok(SqlStatement::new(sql.finish()?, binds))
+}
+
+/// Postgres: lock one job-store row with a no-op write and return it. A
+/// SERIALIZABLE transaction that later writes the row fails and retries
+/// instead of committing on a snapshot that predates this transaction.
+pub(crate) fn lock_point(engine: SqlEngine, key: &StoreKey) -> StorageResult<SqlStatement> {
+    let mut sql = SqlText::default();
+    sql.append(format_args!(
+        "UPDATE {SCHEDULED_JOB_DATA_TABLE} SET value = value WHERE key = "
+    ))?;
+    sql.append_parameter(engine, 1, false)?;
+    sql.append(format_args!(" RETURNING key, value"))?;
+    let mut binds = bind_slots(1)?;
+    binds.push(SqlValue::Blob(copy_blob(key.as_bytes())?));
+    Ok(SqlStatement::new(sql.finish()?, binds))
+}
+
+/// The job-effect receipt write of a counted Dynamo commit (Postgres).
+pub(crate) fn counted_put(
+    engine: SqlEngine,
+    key: &[u8],
+    value: Vec<u8>,
+) -> StorageResult<crate::SqlCountedWrite> {
+    let mut sql = SqlText::start_counted_write()?;
+    sql.append(format_args!(
+        "INSERT INTO {SCHEDULED_JOB_DATA_TABLE} (key, value) VALUES ("
+    ))?;
+    sql.append_parameter(engine, 1, false)?;
+    sql.append(format_args!(", "))?;
+    sql.append_parameter(engine, 2, false)?;
+    sql.append(format_args!(
+        ") ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))?;
+    sql.finish_counted_write(
+        vec![SqlValue::Blob(copy_blob(key)?), SqlValue::Blob(value)],
+        crate::catalog::SqlDynamoCount::ExactlyOne,
+        crate::transact_write::receipt_count_error,
+    )
+}
+
 pub(crate) fn copy_blob(value: &[u8]) -> StorageResult<Vec<u8>> {
     let mut owned = Vec::new();
     owned
         .try_reserve_exact(value.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     owned.extend_from_slice(value);
     Ok(owned)
 }
@@ -115,6 +173,6 @@ fn bind_slots(count: usize) -> StorageResult<Vec<SqlValue>> {
     let mut binds = Vec::new();
     binds
         .try_reserve_exact(count)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     Ok(binds)
 }

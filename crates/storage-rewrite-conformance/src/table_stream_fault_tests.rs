@@ -1,5 +1,5 @@
-//! Native aborts and unknown enable acknowledgements preserve resumable
-//! capture.
+//! Native aborts retry; unknown acknowledgements preserve committed
+//! publication.
 
 use std::sync::{
     Arc,
@@ -7,22 +7,22 @@ use std::sync::{
 };
 
 use futures::future::BoxFuture;
-use sql_backend::{SqlCommitBoundary, SqlFaultCall, SqlFaultOperation, SqlFaultProbe};
-use storage_types::{BoundTableInfo, StorageError, StorageResult, TableHistoryId};
-use stream_provider::StreamRowKind;
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+use sql_backend::{SqlCommitBoundary, SqlFaultProbe};
+use storage_types::{StorageError, StorageResult};
 
 use super::{
-    table_stream_eligibility_tests::{finish_initialization, set_stream},
+    table_stream_eligibility_tests::set_stream,
     test_support::{TestStore, hash_table_request, unique_table_name},
 };
 
 #[derive(Default)]
-struct InitializationFailure {
+struct PublicationFailure {
     point: AtomicU8,
     fired: AtomicUsize,
 }
 
-impl InitializationFailure {
+impl PublicationFailure {
     fn fire(&self, point: u8) -> bool {
         if self
             .point
@@ -37,15 +37,17 @@ impl InitializationFailure {
     }
 }
 
-impl SqlFaultProbe for InitializationFailure {
-    fn fail(&self, call: SqlFaultCall<'_>) -> Option<StorageError> {
-        (call.operation == SqlFaultOperation::Execute
-            && call.sql.starts_with("INSERT INTO sys_dynamo_stream_items")
-            && self.fire(3))
-        .then(|| StorageError::internal("injected initialization anchor failure"))
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+impl SqlFaultProbe for PublicationFailure {
+    fn fail(&self, _: sql_backend::SqlFaultCall<'_>) -> Option<StorageError> {
+        None
     }
 
-    fn at_commit_boundary(&self, boundary: SqlCommitBoundary) -> BoxFuture<'_, StorageResult<()>> {
+    fn at_commit_boundary(
+        &self,
+        boundary: SqlCommitBoundary,
+        _mode: storage_types::AttemptMode,
+    ) -> BoxFuture<'_, StorageResult<()>> {
         let point = match boundary {
             SqlCommitBoundary::BeforeCommit => 1,
             SqlCommitBoundary::AfterDurableAcknowledgement => 2,
@@ -54,7 +56,35 @@ impl SqlFaultProbe for InitializationFailure {
         Box::pin(async move {
             if failed {
                 Err(StorageError::internal(
-                    "injected initialization acknowledgement failure",
+                    "injected publication acknowledgement failure",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+impl kv_backend::KvFaultProbe for PublicationFailure {
+    fn fail(&self, _: kv_backend::KvFaultCall) -> Option<StorageError> {
+        None
+    }
+
+    fn at_commit_boundary(
+        &self,
+        boundary: kv_backend::KvCommitBoundary,
+        _mode: storage_types::AttemptMode,
+    ) -> BoxFuture<'_, StorageResult<()>> {
+        let point = match boundary {
+            kv_backend::KvCommitBoundary::BeforeCommit => 1,
+            kv_backend::KvCommitBoundary::AfterDurableAcknowledgement => 2,
+        };
+        let failed = self.fire(point);
+        Box::pin(async move {
+            if failed {
+                Err(StorageError::internal(
+                    "injected publication acknowledgement failure",
                 ))
             } else {
                 Ok(())
@@ -64,13 +94,19 @@ impl SqlFaultProbe for InitializationFailure {
 }
 
 #[tokio::test]
-async fn given_native_abort_or_lost_ack_when_enable_resumes_then_initial_values_are_captured_once()
+async fn given_native_abort_or_lost_ack_when_enabling_then_only_real_mutations_are_published()
 -> anyhow::Result<()> {
-    for point in [1, 2, 3] {
-        let probe = Arc::new(InitializationFailure::default());
-        let store = TestStore::new_sql_with_fault_probe(probe.clone()).await;
+    for point in [1, 2] {
+        let probe = Arc::new(PublicationFailure::default());
+        let store = TestStore::new_with_native_probes(
+            #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+            probe.clone(),
+            #[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+            probe.clone(),
+        )
+        .await;
         let table = unique_table_name();
-        let created = store
+        store
             .operations
             .create_table(hash_table_request(table.clone()))
             .await?;
@@ -87,56 +123,57 @@ async fn given_native_abort_or_lost_ack_when_enable_resumes_then_initial_values_
         } else {
             enabled?;
         }
-        if point == 3 {
-            anyhow::ensure!(
-                store
-                    .stream_initialization_repository
-                    .advance_table_stream_initialization()
-                    .await
-                    .is_err()
-            );
-            anyhow::ensure!(
-                !store
-                    .operations
-                    .describe_table(storage_types::DescribeTableRequest {
-                        table_name: table.clone()
-                    })
-                    .await?
-                    .table
-                    .stream_specification
-                    .unwrap()
-                    .stream_enabled
-            );
-        }
-        finish_initialization(&store, &table).await?;
+        anyhow::ensure!(probe.fired.load(Ordering::SeqCst) == 1);
         anyhow::ensure!(
-            probe.fired.load(Ordering::SeqCst) == 1,
-            "native fault did not fire once"
+            store
+                .operations
+                .get_table_info(table.clone())
+                .await?
+                .has_enabled_stream()
         );
-        let bound = BoundTableInfo {
-            history_id: TableHistoryId::from(
-                *uuid::Uuid::parse_str(&created.table_description.table_id)?.as_bytes(),
-            ),
-            info: store.operations.get_table_info(table.clone()).await?,
-        };
-        let key = serde_json::from_value(serde_json::json!({"pk": {"S": "one"}}))?;
-        let address = stream_provider::dynamo_item_history_address(&bound, &key)?;
-        let rows = store
-            .stream_operations
-            .read_forward(
-                StreamRowKind::Item(address.physical_stream_name()?),
-                None,
-                100,
-            )
-            .await?;
         anyhow::ensure!(
-            rows.items.len() == 1,
-            "resumption duplicated or omitted the current image"
+            super::image_retention_tests::table_records(&store, &table)
+                .await?
+                .is_empty()
         );
         anyhow::ensure!(
             super::cdc_stream_tests::system_records(&store, 100)
                 .await?
                 .is_empty()
+        );
+        probe.point.store(point, Ordering::SeqCst);
+        let written = store
+            .operations
+            .put_item(
+                storage_types::PutItemRequest::try_from(serde_json::json!({
+                    "TableName": table, "Item": {"pk": {"S": "one"}, "value": {"S": "after"}}
+                }))
+                .map_err(anyhow::Error::msg)?,
+            )
+            .await;
+        if point == 2 {
+            anyhow::ensure!(written.unwrap_err().is_commit_unknown());
+        } else {
+            written?;
+        }
+        anyhow::ensure!(probe.fired.load(Ordering::SeqCst) == 2);
+        store.wait_until_changes_are_readable().await;
+        let arn = store
+            .operations
+            .describe_table(storage_types::DescribeTableRequest {
+                table_name: table.clone(),
+            })
+            .await?
+            .table
+            .latest_stream_arn
+            .unwrap();
+        let records = super::table_history_retention_tests::read_standard(&store, &arn).await?;
+        anyhow::ensure!(records.len() == 1 && records[0].event_name == "MODIFY");
+        anyhow::ensure!(
+            records[0].dynamodb.old_image
+                == Some(serde_json::from_value(
+                    serde_json::json!({"pk": {"S": "one"}, "value": {"S": "initial"}})
+                )?)
         );
         store.finish().await;
     }

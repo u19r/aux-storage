@@ -53,7 +53,9 @@ pub(crate) async fn read_candidate_binding<A: SqlAttempt>(
     let page = attempt
         .query(
             sql_statements::candidate_binding_statement(engine, &build.target),
-            ReadProtection::Conflict,
+            // The catalog lock protects the binding, and the transition
+            // condition protects this job record. No xid is needed to read it.
+            ReadProtection::Snapshot,
             CATALOG_READ_BYTES,
         )
         .await?;

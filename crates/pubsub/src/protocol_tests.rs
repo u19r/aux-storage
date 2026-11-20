@@ -17,9 +17,12 @@ fn decode_query_create_topic_attributes() {
     .unwrap();
 
     match action {
-        PubsubAction::CreateTopic { name, attributes } => {
-            assert_eq!(name.as_str(), "orders");
-            assert_eq!(attributes.get("DisplayName"), Some(&"Orders".to_string()));
+        PubsubAction::CreateTopic(request) => {
+            assert_eq!(request.name.as_str(), "orders");
+            assert_eq!(
+                request.attributes.get("DisplayName"),
+                Some(&"Orders".to_string())
+            );
         }
         other => panic!("unexpected action: {other:?}"),
     }
@@ -33,7 +36,7 @@ fn decode_query_subscribe_with_extra_json() {
     .unwrap();
 
     match action {
-        PubsubAction::Subscribe(request) => {
+        PubsubAction::Subscribe { request, .. } => {
             assert_eq!(request.protocol, SubscriptionProtocol::Https);
             assert_eq!(request.extra_json["token_ref"], "secret");
         }
@@ -159,17 +162,24 @@ fn render_query_list_subscriptions_member_shape() {
             .unwrap();
     let xml = render_query_success(
         &PubsubSuccess::ListSubscriptions {
+            by_topic: true,
             subscriptions: vec![SubscriptionView {
                 topic_arn,
                 subscription_arn,
                 protocol: SubscriptionProtocol::Https,
                 endpoint: "https://example.com/hook".to_string(),
+                owner: "000000000000".to_string(),
+                pending: false,
             }],
+            next_token: Some("dG9rZW4".to_owned()),
         },
         "request-id",
     );
 
-    assert!(xml.contains("<Subscriptions><member>"));
+    assert!(xml.contains("<ListSubscriptionsByTopicResult><Subscriptions><member>"));
+    assert!(xml.contains(
+        "</Subscriptions><NextToken>dG9rZW4</NextToken></ListSubscriptionsByTopicResult>"
+    ));
     assert!(xml.contains("<Protocol>https</Protocol>"));
     assert!(xml.contains("<Endpoint>https://example.com/hook</Endpoint>"));
 }
@@ -351,4 +361,169 @@ fn decode_query_publish_rejects_invalid_number_and_binary_attributes() {
 #[test]
 fn given_json_message_structure_when_decoded_then_unsupported_routing_is_rejected() {
     assert!(decode_query_request(b"Action=Publish&TopicArn=arn:aws:sns:us-east-1:000000000000:orders&Message=%7B%22default%22%3A%22hello%22%7D&MessageStructure=json").is_err());
+}
+
+fn batch_body(entries: &[(&str, &str)], extra: &str) -> Vec<u8> {
+    let mut body = String::from(
+        "Action=PublishBatch&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%3Aorders",
+    );
+    for (index, (id, message)) in entries.iter().enumerate() {
+        let n = index + 1;
+        body.push_str(&format!(
+            "&PublishBatchRequestEntries.member.{n}.Id={id}&PublishBatchRequestEntries.member.{n}.\
+             Message={message}"
+        ));
+    }
+    body.push_str(extra);
+    body.into_bytes()
+}
+
+fn batch_error(body: &[u8]) -> HttpApiError {
+    HttpApiError::from(&decode_query_request(body).unwrap_err())
+}
+
+/// W3 test 26 (request part): the request errors of `PublishBatch` with
+/// the codes and texts of probe A7.
+#[test]
+fn given_invalid_publish_batch_requests_when_decoded_then_aws_request_errors_return() {
+    let error = batch_error(&batch_body(&[], ""));
+    assert_eq!(error.error_type, "ValidationError");
+    assert!(
+        error
+            .message
+            .contains("Value null at 'publishBatchRequestEntries'")
+    );
+
+    let eleven: Vec<(String, &str)> = (0..11).map(|index| (format!("e{index}"), "m")).collect();
+    let eleven: Vec<(&str, &str)> = eleven
+        .iter()
+        .map(|(id, message)| (id.as_str(), *message))
+        .collect();
+    let error = batch_error(&batch_body(&eleven, ""));
+    assert_eq!(error.error_type, "TooManyEntriesInBatchRequest");
+    assert_eq!(
+        error.message,
+        "The batch request contains more entries than permissible."
+    );
+
+    let error = batch_error(&batch_body(&[("same", "a"), ("same", "b")], ""));
+    assert_eq!(error.error_type, "BatchEntryIdsNotDistinct");
+
+    let long = "x".repeat(81);
+    let error = batch_error(&batch_body(&[(&long, "a")], ""));
+    assert_eq!(error.error_type, "InvalidBatchEntryId");
+    assert!(error.message.ends_with(&format!("is too long: {long}")));
+    let error = batch_error(&batch_body(&[("a.b", "a")], ""));
+    assert_eq!(error.error_type, "InvalidBatchEntryId");
+    assert!(error.message.contains("impermissible character: a.b"));
+
+    let error = batch_error(&batch_body(
+        &[("ok", "a")],
+        "&PublishBatchRequestEntries.member.2.Id=missing",
+    ));
+    assert_eq!(error.error_type, "ValidationError");
+    assert!(
+        error
+            .message
+            .contains("'publishBatchRequestEntries.2.member.message'")
+    );
+
+    let error = batch_error(&batch_body(
+        &[("ok", "a")],
+        "&PublishBatchRequestEntries.member.1.MessageAttributes.entry.1.Name=k&\
+         PublishBatchRequestEntries.member.1.MessageAttributes.entry.1.Value.DataType=Bogus&\
+         PublishBatchRequestEntries.member.1.MessageAttributes.entry.1.Value.StringValue=v",
+    ));
+    assert_eq!(error.error_type, "ParameterValueInvalid");
+    assert!(
+        error
+            .message
+            .starts_with("The message attribute 'k' has an invalid")
+    );
+
+    let half = "a".repeat(131_072);
+    assert!(decode_query_request(&batch_body(&[("a", &half), ("b", &half)], "")).is_ok());
+    let over = "a".repeat(131_073);
+    let error = batch_error(&batch_body(&[("a", &half), ("b", &over)], ""));
+    assert_eq!(error.error_type, "BatchRequestTooLong");
+    assert_eq!(
+        error.message,
+        "The length of all the messages put together is more than the limit."
+    );
+}
+
+#[test]
+fn given_message_group_id_on_standard_topic_when_decoded_then_entry_is_accepted() {
+    let action = decode_query_request(&batch_body(
+        &[("a", "one"), ("b", "two")],
+        "&PublishBatchRequestEntries.member.2.MessageGroupId=g&PublishBatchRequestEntries.member.\
+         2.Subject=s",
+    ))
+    .unwrap();
+    let PubsubAction::PublishBatch { entries, .. } = action else {
+        panic!("PublishBatch");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].id, "b");
+    assert_eq!(entries[1].request.subject.as_deref(), Some("s"));
+}
+
+#[test]
+fn given_batch_results_when_rendered_then_members_follow_the_aws_order() {
+    let message_id = PubsubMessageId::new();
+    let xml = render_query_success(
+        &PubsubSuccess::PublishBatch {
+            successful: vec![("ok".to_owned(), message_id.clone())],
+            failed: vec![crate::protocol::PublishBatchFailure {
+                id: "bad".to_owned(),
+                code: "InvalidParameter",
+                message: "Invalid parameter: Empty message".to_owned(),
+                sender_fault: true,
+            }],
+        },
+        "request-id",
+    );
+    assert!(xml.contains(&format!(
+        "<PublishBatchResult><Successful><member><MessageId>{}</MessageId><Id>ok</Id></member></\
+         Successful>",
+        message_id.as_str()
+    )));
+    assert!(xml.contains(
+        "<Failed><member><Code>InvalidParameter</Code><SenderFault>true</SenderFault><Id>bad</\
+         Id><Message>Invalid parameter: Empty message</Message></member></Failed>"
+    ));
+    let empty = render_query_success(
+        &PubsubSuccess::PublishBatch {
+            successful: Vec::new(),
+            failed: Vec::new(),
+        },
+        "request-id",
+    );
+    assert!(empty.contains("<Successful/><Failed/>"));
+}
+
+/// Review D10: a binary attribute counts its decoded bytes, not its base64
+/// text; a malformed member field name is a `ValidationError`.
+#[test]
+fn given_binary_attribute_when_batch_is_counted_then_decoded_bytes_count() {
+    // 3,000 bytes of 7 decode from 4,000 base64 characters ("BwcH" is 7 7 7).
+    let binary = "BwcH".repeat(1_000);
+    let encoded: String = url::form_urlencoded::byte_serialize(binary.as_bytes()).collect();
+    let attribute = format!(
+        "&PublishBatchRequestEntries.member.1.MessageAttributes.entry.1.Name=b&\
+         PublishBatchRequestEntries.member.1.MessageAttributes.entry.1.Value.DataType=Binary&\
+         PublishBatchRequestEntries.member.1.MessageAttributes.entry.1.Value.BinaryValue={encoded}"
+    );
+    // Body 259,137 + name 1 + type 6 + value 3,000 = 262,144: at the limit.
+    let body = "a".repeat(262_144 - 3_000 - 7);
+    assert!(decode_query_request(&batch_body(&[("a", &body)], &attribute)).is_ok());
+    let over = "a".repeat(262_144 - 3_000 - 6);
+    let error = batch_error(&batch_body(&[("a", &over)], &attribute));
+    assert_eq!(error.error_type, "BatchRequestTooLong");
+
+    let error = batch_error(&batch_body(
+        &[("a", "m")],
+        "&PublishBatchRequestEntries.member.x=1",
+    ));
+    assert_eq!(error.error_type, "ValidationError");
 }

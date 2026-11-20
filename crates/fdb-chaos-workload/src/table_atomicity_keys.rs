@@ -57,16 +57,6 @@ impl TableAtomicityWorkload {
         ))
     }
 
-    pub(crate) fn gsi_entry_from_item(
-        &self,
-        item: &impl storage_types::AttributeValueLookup,
-    ) -> Result<GsiEntry, String> {
-        let key = string_attr(item, "pk")?;
-        let value = string_attr(item, "payload")?;
-        let sort = number_attr(item, GSI_SCORE_ATTR)?;
-        Ok(GsiEntry::new(key, sort, value))
-    }
-
     pub(crate) fn key_attributes(&self, key: &str) -> KeyAttributes {
         KeyAttributes::from([("pk".to_string(), AttributeValue::S(key.to_string()))])
     }
@@ -81,7 +71,10 @@ impl TableAtomicityWorkload {
         };
         match item.get("payload") {
             Some(AttributeValue::S(value)) => Ok(Some(value.clone())),
-            Some(other) => Err(format!("key {key} payload has non-string value: {other:?}")),
+            Some(other) => Err(format!(
+                "key {key} payload has non-string value of type {}",
+                other.variant_name()
+            )),
             None => Err(format!("key {key} is present without payload attribute")),
         }
     }

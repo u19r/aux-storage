@@ -21,7 +21,7 @@ impl<'a> RecordBatch<'a> {
         limits.check_batch(changes.len(), 0)?;
         let mut keys = HashSet::new();
         keys.try_reserve(changes.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         let mut bytes = 0usize;
         for change in changes {
             if !keys.insert(change.key()) {
@@ -49,10 +49,10 @@ impl<'a> RecordBatch<'a> {
         let count = groups
             .iter()
             .try_fold(0usize, |count, group| count.checked_add(group.len()))
-            .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         let mut keys = HashSet::new();
         keys.try_reserve(count)
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         let mut waves: [Vec<Self>; N] = std::array::from_fn(|_| Vec::new());
         for (changes, waves) in groups.into_iter().zip(&mut waves) {
             Self::prepare_group_waves(changes, limits, &mut keys, waves)?;
@@ -84,7 +84,7 @@ impl<'a> RecordBatch<'a> {
             if position - start == limits.max_records().get() || next > limits.max_bytes().get() {
                 waves
                     .try_reserve(1)
-                    .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+                    .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
                 waves.push(Self {
                     changes: &changes[start..position],
                     limits,
@@ -98,7 +98,7 @@ impl<'a> RecordBatch<'a> {
         if start < changes.len() {
             waves
                 .try_reserve(1)
-                .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             waves.push(Self {
                 changes: &changes[start..],
                 limits,

@@ -1,83 +1,53 @@
 use std::collections::{HashMap, HashSet};
 
 use pubsub_provider::{
-    ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryClaimLimit, DeliveryRecord,
-    DeliveryRecordId, DeliveryRecordKind, DeliveryRecordUpdate, DeliveryStatus, DeliveryTarget,
-    GetSubscriptionAttributesRequest, GetTopicAttributesRequest, ListSubscriptionsRequest,
-    ListTopicsRequest, PublishRequest, PubsubMessageId, SetSubscriptionAttributesRequest,
-    SetTopicAttributesRequest, SubscribeRequest, SubscriptionArn, SubscriptionProtocol, TopicName,
+    CreateTopicRequest, DeliveryRecordId, DeliveryTarget, GetSubscriptionAttributesRequest,
+    GetTopicAttributesRequest, ListSubscriptionsRequest, ListTopicsRequest, PublishRequest,
+    PubsubMessageId, SetTopicAttributesRequest, SubscribeRequest, Subscription, SubscriptionArn,
+    SubscriptionAttributes, SubscriptionProtocol, TopicName,
 };
-use storage_types::TimestampMillis;
+use storage_types::{MessagingIdentity, TimestampMillis};
 
-use super::test_support::TestStore;
+use super::{pubsub_delivery_contract_tests::claim_at, test_support::TestStore};
 
-fn fixed_time(millis: i64) -> TimestampMillis {
-    TimestampMillis::from_timestamp(millis)
-}
-
-fn orders_subscription_arn() -> SubscriptionArn {
-    SubscriptionArn::new("arn:aws:sns:us-east-1:000000000000:orders:sub").unwrap()
-}
-
-fn delivery_record(
-    id: &str,
-    status: DeliveryStatus,
-    next_attempt_at: Option<TimestampMillis>,
-    lease_expires_at: Option<TimestampMillis>,
-) -> DeliveryRecord {
-    let now = fixed_time(1_000);
-    DeliveryRecord {
-        id: DeliveryRecordId(id.to_string()),
-        kind: DeliveryRecordKind::Notification,
-        message_id: PubsubMessageId::new(),
-        subscription_arn: orders_subscription_arn(),
-        subscription: None,
-        message_body: None,
-        subject: None,
-        message_attributes: Default::default(),
-        target: DeliveryTarget::BuiltIn,
-        status,
-        attempts: 1,
-        claim_generation: 0,
-        next_attempt_at,
-        lease_owner: lease_expires_at.map(|_| "worker-a".to_string()),
-        lease_expires_at,
-        last_error: None,
-        created_at: now,
-        updated_at: now,
-    }
-}
-
-fn delivery_update(
-    record: &DeliveryRecord,
-    status: DeliveryStatus,
-    updated_at: TimestampMillis,
-) -> DeliveryRecordUpdate {
-    DeliveryRecordUpdate {
-        record_id: record.id.clone(),
-        expected_claim_generation: record.claim_generation,
-        expected_lease_owner: record.lease_owner.clone().expect("claimed delivery owner"),
-        status,
-        attempts: record.attempts.saturating_add(1),
-        next_attempt_at: None,
-        last_error: None,
-        updated_at,
-    }
-}
-
-async fn create_topic(
+pub(super) async fn create_topic(
     fixture: &TestStore,
     name: &str,
     attributes: HashMap<String, String>,
 ) -> anyhow::Result<pubsub_provider::Topic> {
-    fixture
-        .pubsub_provider
-        .create_topic(CreateTopicRequest {
+    let topic = pubsub_provider::Topic::try_new(
+        CreateTopicRequest {
             name: TopicName::new(name)?,
             attributes,
-        })
+            tags: std::collections::BTreeMap::new(),
+        },
+        &MessagingIdentity::default(),
+    )
+    .map_err(|err| anyhow::anyhow!("topic request: {err:?}"))?;
+    fixture
+        .pubsub_provider
+        .create_topic(topic)
         .await
         .map_err(|err| anyhow::anyhow!("create topic failed: {err:?}"))
+}
+
+/// The SQS endpoint form that SNS accepts: a queue ARN (AWS, section 13).
+pub(super) fn queue_arn(name: &str) -> String {
+    format!("arn:aws:sqs:us-east-1:000000000000:{name}")
+}
+
+/// `Subscribe` as the manager performs it: validate, then store.
+pub(super) async fn subscribe(
+    fixture: &TestStore,
+    request: SubscribeRequest,
+) -> anyhow::Result<pubsub_provider::Subscription> {
+    let subscription = Subscription::try_new(request, &MessagingIdentity::default())
+        .map_err(|err| anyhow::anyhow!("subscribe request: {err:?}"))?;
+    fixture
+        .pubsub_provider
+        .create_subscription(subscription)
+        .await
+        .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))
 }
 
 async fn create_queue_subscription(
@@ -87,17 +57,17 @@ async fn create_queue_subscription(
     attributes: HashMap<String, String>,
     extra_json: serde_json::Value,
 ) -> anyhow::Result<pubsub_provider::Subscription> {
-    fixture
-        .pubsub_provider
-        .create_subscription(SubscribeRequest {
+    subscribe(
+        fixture,
+        SubscribeRequest {
             topic_arn: topic_arn.clone(),
             protocol: SubscriptionProtocol::Queue,
-            endpoint: endpoint.to_string(),
+            endpoint: queue_arn(endpoint),
             attributes,
             extra_json,
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))
+        },
+    )
+    .await
 }
 
 #[tokio::test]
@@ -105,25 +75,21 @@ async fn given_topic_when_publish_then_delivery_claimed() -> anyhow::Result<()> 
     let result: anyhow::Result<()> = async {
         let fixture = TestStore::new().await;
         let outcome = async {
-            let topic = fixture
-                .pubsub_provider
-                .create_topic(CreateTopicRequest {
-                    name: TopicName::new("orders")?,
-                    attributes: HashMap::new(),
-                })
+            let topic = create_topic(&fixture, "orders", HashMap::new())
                 .await
                 .map_err(|err| anyhow::anyhow!("create topic failed: {err:?}"))?;
-            let subscription = fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            let subscription = subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: topic.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Queue,
-                    endpoint: "http://localhost/000000000000/orders".to_string(),
+                    endpoint: queue_arn("orders"),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
             fixture
                 .pubsub_provider
                 .accept_publish(
@@ -142,27 +108,20 @@ async fn given_topic_when_publish_then_delivery_claimed() -> anyhow::Result<()> 
                 .pubsub_provider
                 .materialize_publish_intents(10)
                 .await
-                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?;
+                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?
+                .records;
             anyhow::ensure!(
                 materialized == 1,
                 "expected one materialized publish, got {materialized}"
             );
             // Claim the actual delivery lease and check the accepted
             // publication, the subscription destination and the payload.
-            let claimed = fixture
-                .pubsub_provider
-                .claim_delivery_records(pubsub_provider::ClaimDeliveryRecordsRequest {
-                    owner: "conformance".to_string(),
-                    now: storage_types::TimestampMillis::from_timestamp(1_800_000_000_000),
-                    lease_expires_at: storage_types::TimestampMillis::from_timestamp(
-                        1_800_006_000_000,
-                    ),
-                    limit: pubsub_provider::DeliveryClaimLimit::try_from(10usize)
-                        .map_err(|err| anyhow::anyhow!("claim limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("claim failed: {err:?}"))?
-                .records;
+            let claimed = claim_at(
+                &fixture,
+                "conformance",
+                storage_types::TimestampMillis::from_timestamp(1_800_000_000_000),
+            )
+            .await;
             anyhow::ensure!(
                 claimed.len() == 1,
                 "expected one claimed delivery, got {}",
@@ -170,16 +129,21 @@ async fn given_topic_when_publish_then_delivery_claimed() -> anyhow::Result<()> 
             );
             let delivery = &claimed[0];
             anyhow::ensure!(
-                delivery.subscription_arn == subscription.subscription_arn,
+                delivery.state.subscription_arn == subscription.subscription_arn,
                 "delivery targets the wrong subscription"
             );
             anyhow::ensure!(
-                delivery.message_body.as_deref() == Some("body"),
+                delivery.payload.message_body.as_deref() == Some("body"),
                 "delivery payload mismatch: {:?}",
-                delivery.message_body
+                delivery.payload.message_body
             );
             anyhow::ensure!(
-                delivery.lease_owner.as_deref() == Some("conformance"),
+                delivery
+                    .state
+                    .lease
+                    .as_ref()
+                    .map(|lease| lease.owner.as_str())
+                    == Some("conformance"),
                 "delivery lease not held by the claimant"
             );
             Ok(())
@@ -346,26 +310,28 @@ async fn given_subscription_when_attributes_then_identity_preserved() -> anyhow:
         let fixture = TestStore::new().await;
         let outcome = async {
             let topic = create_topic(&fixture, "sns-subattr", HashMap::new()).await?;
-            let subscription = fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            let subscription = subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: topic.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Https,
                     endpoint: "https://example.com/hook".to_string(),
                     attributes: HashMap::new(),
                     extra_json: serde_json::json!({"token_ref":"secret/oauth/orders"}),
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
             let updated = fixture
                 .pubsub_provider
-                .set_subscription_attributes(SetSubscriptionAttributesRequest {
-                    subscription_arn: subscription.subscription_arn.clone(),
-                    attributes: HashMap::from([(
-                        "RawMessageDelivery".to_string(),
-                        "true".to_string(),
-                    )]),
-                })
+                .set_subscription_attributes(
+                    &subscription.subscription_arn.clone(),
+                    SubscriptionAttributes::parse(
+                        &HashMap::from([("RawMessageDelivery".to_string(), "true".to_string())]),
+                        &MessagingIdentity::default(),
+                    )
+                    .map_err(|err| anyhow::anyhow!("attributes: {err:?}"))?,
+                )
                 .await
                 .map_err(|err| anyhow::anyhow!("set sub attrs failed: {err:?}"))?;
             anyhow::ensure!(
@@ -424,28 +390,30 @@ async fn given_topics_when_prefix_overlaps_then_list_isolated() -> anyhow::Resul
         let outcome = async {
             let short = create_topic(&fixture, "px-short", HashMap::new()).await?;
             let long = create_topic(&fixture, "px-short-long", HashMap::new()).await?;
-            fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: short.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Https,
                     endpoint: "https://example.test/short".to_string(),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("short subscribe failed: {err:?}"))?;
-            fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("short subscribe failed: {err:?}"))?;
+            subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: long.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Https,
                     endpoint: "https://example.test/long".to_string(),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("long subscribe failed: {err:?}"))?;
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("long subscribe failed: {err:?}"))?;
             let short_subs = fixture
                 .pubsub_provider
                 .list_subscriptions(ListSubscriptionsRequest {
@@ -518,18 +486,20 @@ async fn given_publish_when_subscription_deleted_before_materialize_then_snapsho
                 .pubsub_provider
                 .materialize_publish_intents(10)
                 .await
-                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?;
+                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?
+                .records;
             anyhow::ensure!(
                 materialized == 1,
                 "expected 1 materialized, got {materialized}"
             );
             let record = fixture
                 .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId(format!(
+                .get_delivery(&DeliveryRecordId(format!(
                     "{}:{message_id}",
                     subscription.subscription_arn
                 )))
                 .await
+                .map(|row| row.map(|(_, payload)| payload))
                 .map_err(|err| anyhow::anyhow!("get delivery failed: {err:?}"))?
                 .ok_or_else(|| anyhow::anyhow!("accepted delivery missing"))?;
             anyhow::ensure!(
@@ -568,17 +538,18 @@ async fn given_publish_when_protocols_mixed_then_targets_and_pending_filtered() 
                 serde_json::Value::Null,
             )
             .await?;
-            let confirmed = fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            let confirmed = subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: topic.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Http,
                     endpoint: "http://confirmed.example/hook".to_string(),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("confirmed subscribe failed: {err:?}"))?;
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("confirmed subscribe failed: {err:?}"))?;
             let token = confirmed
                 .confirmation
                 .token()
@@ -592,17 +563,18 @@ async fn given_publish_when_protocols_mixed_then_targets_and_pending_filtered() 
                 })
                 .await
                 .map_err(|err| anyhow::anyhow!("confirm failed: {err:?}"))?;
-            let pending = fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            let pending = subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: topic.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Http,
                     endpoint: "http://pending.example/hook".to_string(),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("pending subscribe failed: {err:?}"))?;
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("pending subscribe failed: {err:?}"))?;
             let message_id = PubsubMessageId::new_from_string("message-protocol")
                 .map_err(|err| anyhow::anyhow!("message id failed: {err:?}"))?;
             fixture
@@ -623,18 +595,20 @@ async fn given_publish_when_protocols_mixed_then_targets_and_pending_filtered() 
                 .pubsub_provider
                 .materialize_publish_intents(10)
                 .await
-                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?;
+                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?
+                .records;
             anyhow::ensure!(
                 materialized == 2,
                 "expected 2 deliveries, got {materialized}"
             );
             let queue_record = fixture
                 .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId(format!(
+                .get_delivery(&DeliveryRecordId(format!(
                     "{}:{message_id}",
                     queue.subscription_arn
                 )))
                 .await
+                .map(|row| row.map(|(_, payload)| payload))
                 .map_err(|err| anyhow::anyhow!("queue delivery missing: {err:?}"))?
                 .ok_or_else(|| anyhow::anyhow!("queue delivery absent"))?;
             anyhow::ensure!(
@@ -644,11 +618,12 @@ async fn given_publish_when_protocols_mixed_then_targets_and_pending_filtered() 
             );
             let http_record = fixture
                 .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId(format!(
+                .get_delivery(&DeliveryRecordId(format!(
                     "{}:{message_id}",
                     confirmed.subscription_arn
                 )))
                 .await
+                .map(|row| row.map(|(_, payload)| payload))
                 .map_err(|err| anyhow::anyhow!("http delivery missing: {err:?}"))?
                 .ok_or_else(|| anyhow::anyhow!("confirmed delivery absent"))?;
             anyhow::ensure!(
@@ -658,11 +633,12 @@ async fn given_publish_when_protocols_mixed_then_targets_and_pending_filtered() 
             );
             let pending_record = fixture
                 .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId(format!(
+                .get_delivery(&DeliveryRecordId(format!(
                     "{}:{message_id}",
                     pending.subscription_arn
                 )))
                 .await
+                .map(|row| row.map(|(_, payload)| payload))
                 .map_err(|err| anyhow::anyhow!("pending lookup failed: {err:?}"))?;
             anyhow::ensure!(
                 pending_record.is_none(),
@@ -717,20 +693,7 @@ async fn given_publish_when_accepted_then_not_claimable_before_materialize() -> 
                 .await
                 .map_err(|err| anyhow::anyhow!("accept failed: {err:?}"))?;
             let now = TimestampMillis::now();
-            let claim_limit = DeliveryClaimLimit::try_from(10usize)
-                .map_err(|err| anyhow::anyhow!("claim limit: {err:?}"))?;
-            let claim_request = |owner: &str| ClaimDeliveryRecordsRequest {
-                owner: owner.to_string(),
-                now,
-                lease_expires_at: TimestampMillis::from_timestamp(now.timestamp_millis() + 30_000),
-                limit: claim_limit,
-            };
-            let before = fixture
-                .pubsub_provider
-                .claim_delivery_records(claim_request("before-materialize"))
-                .await
-                .map_err(|err| anyhow::anyhow!("claim before failed: {err:?}"))?
-                .records;
+            let before = claim_at(&fixture, "before-materialize", now).await;
             anyhow::ensure!(
                 before.is_empty(),
                 "intents claimable before materialization"
@@ -739,16 +702,13 @@ async fn given_publish_when_accepted_then_not_claimable_before_materialize() -> 
                 .pubsub_provider
                 .materialize_publish_intents(10)
                 .await
-                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?;
+                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?
+                .records;
             anyhow::ensure!(materialized == 2, "expected 2, got {materialized}");
-            let mut actual = fixture
-                .pubsub_provider
-                .claim_delivery_records(claim_request("after-materialize"))
+            let mut actual = claim_at(&fixture, "after-materialize", now)
                 .await
-                .map_err(|err| anyhow::anyhow!("claim after failed: {err:?}"))?
-                .records
                 .into_iter()
-                .map(|record| record.id)
+                .map(|claimed| claimed.state.id)
                 .collect::<Vec<_>>();
             actual.sort_by(|left, right| left.0.cmp(&right.0));
             let mut expected_ids = expected
@@ -757,487 +717,6 @@ async fn given_publish_when_accepted_then_not_claimable_before_materialize() -> 
                 .collect::<Vec<_>>();
             expected_ids.sort_by(|left, right| left.0.cmp(&right.0));
             anyhow::ensure!(actual == expected_ids, "claimed ids diverged");
-            Ok(())
-        }
-        .await;
-        fixture.finish().await;
-        outcome
-    }
-    .await;
-    result?;
-    Ok(())
-}
-
-/// SNS-CLAIM-01: due records are claimed once in id order; future and
-/// terminal records are filtered.
-///
-/// Ports `sqlite_pubsub_provider_claims_due_delivery_records_once` (order
-/// + once) and `memory_tests.rs`
-///   `claim_delivery_records_leases_due_records_only_once` (future + delivered
-///   filtering).
-#[tokio::test]
-async fn given_deliveries_when_claimed_then_once_and_ordered() -> anyhow::Result<()> {
-    let result: anyhow::Result<()> = async {
-        let fixture = TestStore::new().await;
-        let outcome = async {
-            let now = fixed_time(1_000);
-            fixture
-                .pubsub_provider
-                .put_delivery_record(delivery_record(
-                    "sns-due-b",
-                    DeliveryStatus::Pending,
-                    Some(now),
-                    None,
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("put due-b failed: {err:?}"))?;
-            fixture
-                .pubsub_provider
-                .put_delivery_record(delivery_record(
-                    "sns-due-a",
-                    DeliveryStatus::Pending,
-                    Some(now),
-                    None,
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("put due-a failed: {err:?}"))?;
-            fixture
-                .pubsub_provider
-                .put_delivery_record(delivery_record(
-                    "sns-future",
-                    DeliveryStatus::Pending,
-                    Some(fixed_time(3_000)),
-                    None,
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("put future failed: {err:?}"))?;
-            fixture
-                .pubsub_provider
-                .put_delivery_record(delivery_record(
-                    "sns-delivered",
-                    DeliveryStatus::Delivered,
-                    None,
-                    None,
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("put delivered failed: {err:?}"))?;
-            let first = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-a".to_string(),
-                    now,
-                    lease_expires_at: fixed_time(2_000),
-                    limit: DeliveryClaimLimit::try_from(10usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("first claim failed: {err:?}"))?
-                .records;
-            anyhow::ensure!(first.len() == 2, "expected 2 due, got {}", first.len());
-            anyhow::ensure!(
-                first[0].id.0 == "sns-due-a" && first[1].id.0 == "sns-due-b",
-                "claim order wrong: {:?}",
-                first.iter().map(|record| &record.id.0).collect::<Vec<_>>()
-            );
-            anyhow::ensure!(
-                first
-                    .iter()
-                    .all(|record| record.lease_owner.as_deref() == Some("worker-a")),
-                "claim owner wrong"
-            );
-            let second = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-b".to_string(),
-                    now,
-                    lease_expires_at: fixed_time(2_000),
-                    limit: DeliveryClaimLimit::try_from(10usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("second claim failed: {err:?}"))?
-                .records;
-            anyhow::ensure!(second.is_empty(), "claimed records leaked to second worker");
-            Ok(())
-        }
-        .await;
-        fixture.finish().await;
-        outcome
-    }
-    .await;
-    result?;
-    Ok(())
-}
-
-/// SNS-CLAIM-02: competing workers never double-claim.
-///
-/// Ports `sorted_kv_pubsub_provider_competing_workers_never_double_claim`.
-#[tokio::test]
-async fn given_deliveries_when_claimed_concurrently_then_never_double_claimed() -> anyhow::Result<()>
-{
-    let result: anyhow::Result<()> = async {
-        let fixture = TestStore::new().await;
-        let outcome = async {
-            let now = fixed_time(1_000);
-            let mut records = Vec::new();
-            for index in 0..10 {
-                records.push(delivery_record(
-                    &format!("sns-competing-{index}"),
-                    DeliveryStatus::Pending,
-                    Some(now),
-                    None,
-                ));
-            }
-            fixture
-                .pubsub_provider
-                .put_delivery_records(records)
-                .await
-                .map_err(|err| anyhow::anyhow!("put batch failed: {err:?}"))?;
-            let first =
-                fixture
-                    .pubsub_provider
-                    .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                        owner: "worker-a".to_string(),
-                        now,
-                        lease_expires_at: fixed_time(2_000),
-                        limit: DeliveryClaimLimit::try_from(10usize)
-                            .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                    });
-            let second =
-                fixture
-                    .pubsub_provider
-                    .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                        owner: "worker-b".to_string(),
-                        now,
-                        lease_expires_at: fixed_time(2_000),
-                        limit: DeliveryClaimLimit::try_from(10usize)
-                            .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                    });
-            let (first, second) = tokio::join!(first, second);
-            let first = first
-                .map_err(|err| anyhow::anyhow!("first concurrent claim: {err:?}"))?
-                .records;
-            let second = second
-                .map_err(|err| anyhow::anyhow!("second concurrent claim: {err:?}"))?
-                .records;
-            let unique = first
-                .iter()
-                .chain(&second)
-                .map(|record| record.id.0.clone())
-                .collect::<HashSet<_>>();
-            anyhow::ensure!(
-                first.len() + second.len() == 10,
-                "concurrent claims lost work: {} + {}",
-                first.len(),
-                second.len()
-            );
-            anyhow::ensure!(unique.len() == 10, "concurrent claims duplicated");
-            Ok(())
-        }
-        .await;
-        fixture.finish().await;
-        outcome
-    }
-    .await;
-    result?;
-    Ok(())
-}
-
-/// SNS-LEASE-01: expired leases are recoverable by another worker.
-///
-/// Ports `sqlite_pubsub_provider_recovers_expired_delivery_leases`,
-/// `sorted_kv_..._recovers_expired_delivery_leases` and
-/// `memory_tests.rs` `claim_delivery_records_recovers_expired_leases`.
-#[tokio::test]
-async fn given_delivery_when_lease_expired_then_recoverable() -> anyhow::Result<()> {
-    let result: anyhow::Result<()> = async {
-        let fixture = TestStore::new().await;
-        let outcome = async {
-            fixture
-                .pubsub_provider
-                .put_delivery_record(delivery_record(
-                    "sns-expired",
-                    DeliveryStatus::RetryScheduled,
-                    Some(fixed_time(1_000)),
-                    Some(fixed_time(1_500)),
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("put expired failed: {err:?}"))?;
-            let records = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-b".to_string(),
-                    now: fixed_time(2_000),
-                    lease_expires_at: fixed_time(3_000),
-                    limit: DeliveryClaimLimit::try_from(10usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("recovery claim failed: {err:?}"))?
-                .records;
-            anyhow::ensure!(records.len() == 1, "expired lease not recovered");
-            anyhow::ensure!(
-                records[0].lease_owner.as_deref() == Some("worker-b"),
-                "recovery owner wrong"
-            );
-            Ok(())
-        }
-        .await;
-        fixture.finish().await;
-        outcome
-    }
-    .await;
-    result?;
-    Ok(())
-}
-
-/// SNS-STALE-01 (negative): stale claims are rejected without
-/// resurrection; payloads are immutable.
-///
-/// Ports `sqlite_delivery_update_rejects_stale_claim_without_resurrection`,
-/// `sorted_kv_pubsub_provider_rejects_stale_and_aba_delivery_updates`
-/// (stale half) and `memory_tests.rs`
-/// `update_delivery_record_rejects_stale_claim_without_resurrection`.
-/// Repeated puts use insert-if-absent semantics and must not overwrite
-/// the active claim.
-#[tokio::test]
-async fn given_delivery_when_stale_claim_then_rejected_without_resurrection() -> anyhow::Result<()>
-{
-    let result: anyhow::Result<()> = async {
-        let fixture = TestStore::new().await;
-        let outcome = async {
-            let mut record = delivery_record(
-                "sns-stale-claim",
-                DeliveryStatus::Pending,
-                Some(fixed_time(1_000)),
-                None,
-            );
-            record.message_body = Some("immutable-body".to_string());
-            fixture
-                .pubsub_provider
-                .put_delivery_record(record.clone())
-                .await
-                .map_err(|err| anyhow::anyhow!("put failed: {err:?}"))?;
-            let first = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-a".to_string(),
-                    now: fixed_time(1_000),
-                    lease_expires_at: fixed_time(2_000),
-                    limit: DeliveryClaimLimit::try_from(1usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("first claim failed: {err:?}"))?
-                .records
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("first claim empty"))?;
-            anyhow::ensure!(first.claim_generation == 1, "first generation wrong");
-            let second = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-b".to_string(),
-                    now: fixed_time(2_000),
-                    lease_expires_at: fixed_time(3_000),
-                    limit: DeliveryClaimLimit::try_from(1usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("second claim failed: {err:?}"))?
-                .records
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("second claim empty"))?;
-            anyhow::ensure!(second.claim_generation == 2, "second generation wrong");
-            // Repeated creation must not overwrite the active claim.
-            let mut repeated = record;
-            repeated.status = DeliveryStatus::Failed;
-            fixture
-                .pubsub_provider
-                .put_delivery_record(repeated)
-                .await
-                .map_err(|err| anyhow::anyhow!("repeated put failed: {err:?}"))?;
-            let stale = fixture
-                .pubsub_provider
-                .update_delivery_record(delivery_update(
-                    &first,
-                    DeliveryStatus::RetryScheduled,
-                    fixed_time(2_001),
-                ))
-                .await;
-            match stale {
-                Err(pubsub_provider::PubsubError::DeliveryClaimLost { ref delivery_id })
-                    if delivery_id == "sns-stale-claim" => {}
-                Err(other) => anyhow::bail!("stale update wrong error: {other:?}"),
-                Ok(()) => anyhow::bail!("stale update unexpectedly succeeded"),
-            }
-            let current = fixture
-                .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId("sns-stale-claim".to_string()))
-                .await
-                .map_err(|err| anyhow::anyhow!("get current failed: {err:?}"))?
-                .ok_or_else(|| anyhow::anyhow!("current delivery missing"))?;
-            anyhow::ensure!(
-                current.lease_owner.as_deref() == Some("worker-b"),
-                "stale update stole ownership"
-            );
-            anyhow::ensure!(
-                current.message_body.as_deref() == Some("immutable-body"),
-                "stale update mutated payload"
-            );
-            // The current claim can still complete.
-            fixture
-                .pubsub_provider
-                .update_delivery_record(delivery_update(
-                    &second,
-                    DeliveryStatus::Delivered,
-                    fixed_time(2_002),
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("current update failed: {err:?}"))?;
-            let delivered = fixture
-                .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId("sns-stale-claim".to_string()))
-                .await
-                .map_err(|err| anyhow::anyhow!("get delivered failed: {err:?}"))?
-                .ok_or_else(|| anyhow::anyhow!("delivered missing"))?;
-            anyhow::ensure!(
-                delivered.status == DeliveryStatus::Delivered,
-                "current update lost: {:?}",
-                delivered.status
-            );
-            Ok(())
-        }
-        .await;
-        fixture.finish().await;
-        outcome
-    }
-    .await;
-    result?;
-    Ok(())
-}
-
-/// SNS-ABA-01 (negative): same-worker ABA updates are rejected by
-/// generation.
-///
-/// Ports `sqlite_delivery_update_generation_rejects_same_worker_aba` and
-/// the ABA half of the KV/memory stale tests.
-#[tokio::test]
-async fn given_delivery_when_same_worker_aba_then_rejected() -> anyhow::Result<()> {
-    let result: anyhow::Result<()> = async {
-        let fixture = TestStore::new().await;
-        let outcome = async {
-            fixture
-                .pubsub_provider
-                .put_delivery_record(delivery_record(
-                    "sns-same-worker-aba",
-                    DeliveryStatus::Pending,
-                    Some(fixed_time(1_000)),
-                    None,
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("put failed: {err:?}"))?;
-            let first = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-a".to_string(),
-                    now: fixed_time(1_000),
-                    lease_expires_at: fixed_time(2_000),
-                    limit: DeliveryClaimLimit::try_from(1usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("first claim failed: {err:?}"))?
-                .records
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("first claim empty"))?;
-            let current = fixture
-                .pubsub_provider
-                .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                    owner: "worker-a".to_string(),
-                    now: fixed_time(2_000),
-                    lease_expires_at: fixed_time(3_000),
-                    limit: DeliveryClaimLimit::try_from(1usize)
-                        .map_err(|err| anyhow::anyhow!("limit: {err:?}"))?,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("second claim failed: {err:?}"))?
-                .records
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("second claim empty"))?;
-            anyhow::ensure!(
-                first.claim_generation != current.claim_generation,
-                "ABA generations did not advance"
-            );
-            let stale = fixture
-                .pubsub_provider
-                .update_delivery_record(delivery_update(
-                    &first,
-                    DeliveryStatus::RetryScheduled,
-                    fixed_time(2_001),
-                ))
-                .await;
-            anyhow::ensure!(
-                matches!(
-                    stale,
-                    Err(pubsub_provider::PubsubError::DeliveryClaimLost { .. })
-                ),
-                "ABA stale update unexpectedly succeeded"
-            );
-            fixture
-                .pubsub_provider
-                .update_delivery_record(delivery_update(
-                    &current,
-                    DeliveryStatus::Delivered,
-                    fixed_time(2_002),
-                ))
-                .await
-                .map_err(|err| anyhow::anyhow!("current update failed: {err:?}"))?;
-            let final_record = fixture
-                .pubsub_provider
-                .get_delivery_record(&DeliveryRecordId("sns-same-worker-aba".to_string()))
-                .await
-                .map_err(|err| anyhow::anyhow!("get final failed: {err:?}"))?
-                .ok_or_else(|| anyhow::anyhow!("final missing"))?;
-            anyhow::ensure!(
-                final_record.status == DeliveryStatus::Delivered,
-                "ABA current update lost"
-            );
-            Ok(())
-        }
-        .await;
-        fixture.finish().await;
-        outcome
-    }
-    .await;
-    result?;
-    Ok(())
-}
-
-/// SNS-BATCH-01 (negative): one invalid delivery poisons the whole batch.
-///
-/// Ports `sqlite_delivery_batch_rolls_back_every_record_when_one_is_invalid`.
-#[tokio::test]
-async fn given_deliveries_when_batch_invalid_then_all_rollback() -> anyhow::Result<()> {
-    let result: anyhow::Result<()> = async {
-        let fixture = TestStore::new().await;
-        let outcome = async {
-            let first = delivery_record("sns-batch-valid", DeliveryStatus::Pending, None, None);
-            let mut invalid =
-                delivery_record("sns-batch-invalid", DeliveryStatus::Pending, None, None);
-            invalid.claim_generation = u64::MAX;
-            let result = fixture
-                .pubsub_provider
-                .put_delivery_records(vec![first.clone(), invalid.clone()])
-                .await;
-            anyhow::ensure!(result.is_err(), "invalid batch unexpectedly succeeded");
-            for id in [first.id, invalid.id] {
-                let found = fixture
-                    .pubsub_provider
-                    .get_delivery_record(&id)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("get after rollback failed: {err:?}"))?;
-                anyhow::ensure!(found.is_none(), "batch rollback left record {}", id.0);
-            }
             Ok(())
         }
         .await;
@@ -1258,27 +737,42 @@ async fn given_delivery_when_topic_deleted_then_accepted_preserved() -> anyhow::
         let fixture = TestStore::new().await;
         let outcome = async {
             let topic = create_topic(&fixture, "sns-delete", HashMap::new()).await?;
-            let subscription = fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
-                    topic_arn: topic.topic_arn.clone(),
-                    protocol: SubscriptionProtocol::Https,
-                    endpoint: "https://example.test/delete".to_string(),
-                    attributes: HashMap::new(),
-                    extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
-            let mut record = delivery_record("sns-retained", DeliveryStatus::Pending, None, None);
-            // delivery_record defaults to Pending with no next-attempt; use an
-            // explicit created-at helper shape instead of status juggling.
-            record.subscription_arn = subscription.subscription_arn.clone();
-            let expected = record.clone();
+            let subscription = create_queue_subscription(
+                &fixture,
+                &topic.topic_arn,
+                "sns-delete",
+                HashMap::new(),
+                serde_json::Value::Null,
+            )
+            .await?;
+            let message_id = PubsubMessageId::new();
             fixture
                 .pubsub_provider
-                .put_delivery_record(record)
+                .accept_publish(
+                    PublishRequest {
+                        topic_arn: topic.topic_arn.clone(),
+                        message: "retained".to_owned(),
+                        subject: None,
+                        message_attributes: HashMap::new(),
+                    },
+                    message_id.clone(),
+                    false,
+                )
                 .await
-                .map_err(|err| anyhow::anyhow!("put failed: {err:?}"))?;
+                .map_err(|err| anyhow::anyhow!("publish failed: {err:?}"))?;
+            fixture
+                .pubsub_provider
+                .materialize_publish_intents(10)
+                .await
+                .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?;
+            let id = DeliveryRecordId(format!("{}:{message_id}", subscription.subscription_arn));
+            let expected = fixture
+                .pubsub_provider
+                .get_delivery(&id)
+                .await
+                .map(|row| row.map(|(_, payload)| payload))
+                .map_err(|err| anyhow::anyhow!("get delivery failed: {err:?}"))?
+                .ok_or_else(|| anyhow::anyhow!("materialized delivery missing"))?;
             fixture
                 .pubsub_provider
                 .delete_topic(&topic.topic_arn)
@@ -1292,8 +786,9 @@ async fn given_delivery_when_topic_deleted_then_accepted_preserved() -> anyhow::
             anyhow::ensure!(sub.is_none(), "topic delete left subscription");
             let retained = fixture
                 .pubsub_provider
-                .get_delivery_record(&expected.id)
+                .get_delivery(&expected.id)
                 .await
+                .map(|row| row.map(|(_, payload)| payload))
                 .map_err(|err| anyhow::anyhow!("get delivery failed: {err:?}"))?;
             anyhow::ensure!(
                 retained == Some(expected),
@@ -1356,13 +851,14 @@ async fn given_publish_when_many_subscriptions_then_snapshots_immutable_and_drai
             // stay frozen at acceptance time.
             fixture
                 .pubsub_provider
-                .set_subscription_attributes(SetSubscriptionAttributesRequest {
-                    subscription_arn: subscriptions[0].subscription_arn.clone(),
-                    attributes: HashMap::from([(
-                        "RawMessageDelivery".to_string(),
-                        "true".to_string(),
-                    )]),
-                })
+                .set_subscription_attributes(
+                    &subscriptions[0].subscription_arn.clone(),
+                    SubscriptionAttributes::parse(
+                        &HashMap::from([("RawMessageDelivery".to_string(), "true".to_string())]),
+                        &MessagingIdentity::default(),
+                    )
+                    .map_err(|err| anyhow::anyhow!("attributes: {err:?}"))?,
+                )
                 .await
                 .map_err(|err| anyhow::anyhow!("mutate failed: {err:?}"))?;
             fixture
@@ -1376,7 +872,8 @@ async fn given_publish_when_many_subscriptions_then_snapshots_immutable_and_drai
                     .pubsub_provider
                     .materialize_publish_intents(10)
                     .await
-                    .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?;
+                    .map_err(|err| anyhow::anyhow!("materialize failed: {err:?}"))?
+                    .records;
                 total += advanced;
                 if advanced == 0 {
                     break;
@@ -1386,11 +883,12 @@ async fn given_publish_when_many_subscriptions_then_snapshots_immutable_and_drai
             for (index, subscription) in subscriptions.iter().enumerate() {
                 let record = fixture
                     .pubsub_provider
-                    .get_delivery_record(&DeliveryRecordId(format!(
+                    .get_delivery(&DeliveryRecordId(format!(
                         "{}:{message_id}",
                         subscription.subscription_arn
                     )))
                     .await
+                    .map(|row| row.map(|(_, payload)| payload))
                     .map_err(|err| anyhow::anyhow!("get delivery failed: {err:?}"))?
                     .ok_or_else(|| anyhow::anyhow!("chunk delivery missing"))?;
                 let snapshot = record
@@ -1402,7 +900,7 @@ async fn given_publish_when_many_subscriptions_then_snapshots_immutable_and_drai
                     "snapshot ARN diverged"
                 );
                 anyhow::ensure!(
-                    snapshot.endpoint == format!("chunk-queue-{index}"),
+                    snapshot.endpoint == queue_arn(&format!("chunk-queue-{index}")),
                     "snapshot endpoint diverged"
                 );
                 anyhow::ensure!(
@@ -1466,17 +964,18 @@ async fn given_missing_when_observed_then_fail_closed_without_effect() -> anyhow
             anyhow::ensure!(sub.is_none(), "missing subscription resolved");
             // Bad confirm token on a real pending subscription fails closed.
             let topic = create_topic(&fixture, "sns-badtoken", HashMap::new()).await?;
-            fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: topic.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Https,
                     endpoint: "https://example.test/badtoken".to_string(),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("subscribe failed: {err:?}"))?;
             let bad = fixture
                 .pubsub_provider
                 .confirm_subscription(pubsub_provider::ConfirmSubscriptionRequest {
@@ -1510,13 +1009,7 @@ async fn given_native_publish_when_attributes_are_validated_then_types_and_limit
 -> anyhow::Result<()> {
     let fixture = TestStore::new().await;
     let result = async {
-        let topic = fixture
-            .pubsub_provider
-            .create_topic(CreateTopicRequest {
-                name: TopicName::new("typed-attributes")?,
-                attributes: HashMap::new(),
-            })
-            .await?;
+        let topic = create_topic(&fixture, "typed-attributes", HashMap::new()).await?;
         let mut request = PublishRequest {
             topic_arn: topic.topic_arn,
             message: "body".to_owned(),
@@ -1600,24 +1093,19 @@ async fn given_large_binary_attribute_when_fanout_is_materialized_then_all_value
 -> anyhow::Result<()> {
     let fixture = TestStore::new().await;
     let result = async {
-        let topic = fixture
-            .pubsub_provider
-            .create_topic(CreateTopicRequest {
-                name: TopicName::new("large-binary-fanout")?,
-                attributes: HashMap::new(),
-            })
-            .await?;
+        let topic = create_topic(&fixture, "large-binary-fanout", HashMap::new()).await?;
         for index in 0..10 {
-            fixture
-                .pubsub_provider
-                .create_subscription(SubscribeRequest {
+            subscribe(
+                &fixture,
+                SubscribeRequest {
                     topic_arn: topic.topic_arn.clone(),
                     protocol: SubscriptionProtocol::Queue,
-                    endpoint: format!("http://localhost/000000000000/large-{index}"),
+                    endpoint: queue_arn(&format!("large-{index}")),
                     attributes: HashMap::new(),
                     extra_json: serde_json::Value::Null,
-                })
-                .await?;
+                },
+            )
+            .await?;
         }
         let mut entropy = 1_u64;
         let bytes = (0..262_000)
@@ -1645,31 +1133,23 @@ async fn given_large_binary_attribute_when_fanout_is_materialized_then_all_value
         anyhow::ensure!(
             fixture
                 .pubsub_provider
-                .materialize_publish_intents(100)
+                .materialize_publish_intents(32)
                 .await?
+                .records
                 == 10
         );
         let now = TimestampMillis::now() + 1_000;
-        let request = ClaimDeliveryRecordsRequest {
-            owner: "large-binary-test".into(),
-            now,
-            lease_expires_at: now + 60_000,
-            limit: DeliveryClaimLimit::try_from(10_usize)?,
-        };
         let mut claimed_ids = HashSet::new();
         // Providers can return a short claim page at their byte budget.
         for _ in 0..10 {
-            let claimed = fixture
-                .pubsub_provider
-                .claim_delivery_records(request.clone())
-                .await?;
-            if claimed.records.is_empty() {
+            let claimed = claim_at(&fixture, "large-binary-test", now).await;
+            if claimed.is_empty() {
                 break;
             }
-            for record in claimed.records {
-                anyhow::ensure!(record.message_attributes.get("blob") == Some(&attribute));
+            for record in claimed {
+                anyhow::ensure!(record.payload.message_attributes.get("blob") == Some(&attribute));
                 anyhow::ensure!(
-                    claimed_ids.insert(record.id.0),
+                    claimed_ids.insert(record.state.id.0),
                     "delivery was claimed twice"
                 );
             }

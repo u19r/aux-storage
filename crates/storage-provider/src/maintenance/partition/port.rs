@@ -7,18 +7,6 @@ use storage_types::{StorageResult, StreamName};
 use super::PartitionReconciliationRepository;
 
 pub trait PartitionReconciliationSource: Send + Sync + 'static {
-    fn admitted_partition_reconciliation(
-        self: Arc<Self>,
-        _binding: Arc<crate::native_admission::NativeAdmissionBinding>,
-    ) -> StorageResult<Option<Arc<dyn PartitionReconciliationRepository>>> {
-        if self.partition_reconciliation().is_some() {
-            return Err(storage_types::StorageError::unsupported(
-                "partition source has no admitted native repository",
-            ));
-        }
-        Ok(None)
-    }
-
     fn partition_reconciliation(
         self: Arc<Self>,
     ) -> Option<Arc<dyn PartitionReconciliationRepository>>;

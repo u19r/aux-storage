@@ -11,8 +11,7 @@ use futures::FutureExt as _;
 use serde_json::{Value, json};
 use storage_observability_test_support::observation::observe;
 use storage_types::{
-    AttributeMap, CreateTableRequest, GetItemRequest, KeyAttributes, PutItemRequest, QueryRequest,
-    TableName,
+    AttributeMap, GetItemRequest, KeyAttributes, PutItemRequest, QueryRequest, TableName,
 };
 
 use crate::test_support::{ConformanceFixtures, TestStore, unique_table_name};
@@ -23,42 +22,19 @@ fn fixture(source: &str) -> Value {
     FIXTURES.case(include_str!("../fixtures/query_cases.jsonl"), source)
 }
 
-async fn create_fixture_table(store: &TestStore, kind: &str, table: TableName) {
-    if kind != "basic_with_gsi" {
-        store.create_conformance_table(kind, table).await;
-        return;
-    }
-    let request = CreateTableRequest::try_from(json!({
-        "TableName": table.to_string(),
-        "AttributeDefinitions": [
-            {"AttributeName": "pk", "AttributeType": "S"},
-            {"AttributeName": "sk", "AttributeType": "S"},
-            {"AttributeName": "gsi_pk", "AttributeType": "S"},
-            {"AttributeName": "gsi_sk", "AttributeType": "S"}
-        ],
-        "KeySchema": [
-            {"AttributeName": "pk", "KeyType": "HASH"},
-            {"AttributeName": "sk", "KeyType": "RANGE"}
-        ],
-        "GlobalSecondaryIndexes": [{
-            "IndexName": "gsi1",
-            "KeySchema": [
-                {"AttributeName": "gsi_pk", "KeyType": "HASH"},
-                {"AttributeName": "gsi_sk", "KeyType": "RANGE"}
-            ],
-            "Projection": {"ProjectionType": "ALL"}
-        }],
-        "BillingMode": "PAY_PER_REQUEST"
-    }))
-    .unwrap();
-    store.operations.create_table(request).await.unwrap();
-}
-
 async fn run_case(store: &TestStore, case: &Value) {
     assert_eq!(case["operation"], "Query", "fixture operation");
-    let table_kind = case["tables"][0].as_str().unwrap();
+    // A local case with `"tables": []` runs against no table (missing-table and
+    // empty-name rules).
+    let table_kind = case["tables"]
+        .as_array()
+        .unwrap()
+        .first()
+        .map(|kind| kind.as_str().unwrap());
     let table = TableName::new(case["request"]["TableName"].as_str().unwrap());
-    create_fixture_table(store, table_kind, table.clone()).await;
+    if let Some(kind) = table_kind {
+        store.create_conformance_table(kind, table.clone()).await;
+    }
 
     let preconditions = case["preconditions"].as_array().unwrap();
     for precondition in preconditions {
@@ -121,13 +97,13 @@ async fn run_case(store: &TestStore, case: &Value) {
     for precondition in preconditions {
         let item = &precondition["request"]["Item"];
         let mut key = serde_json::Map::new();
-        let partition = if table_kind == "count_hash_key" {
+        let partition = if table_kind == Some("count_hash_key") {
             "COUNT"
         } else {
             "pk"
         };
         key.insert(partition.to_owned(), item[partition].clone());
-        if table_kind != "count_hash_key" {
+        if !matches!(table_kind, Some("count_hash_key" | "basic_pk")) {
             key.insert("sk".to_owned(), item["sk"].clone());
         }
         let read = store
@@ -435,7 +411,9 @@ async fn given_gsi_items_when_querying_one_partition_then_full_items_follow_inde
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = unique_table_name();
-        create_fixture_table(&store, "basic_with_gsi", table.clone()).await;
+        store
+            .create_conformance_table("basic_with_gsi", table.clone())
+            .await;
         for (pk, sk, gsi_pk, gsi_sk, value) in [
             ("a", "1", "group", "20", "second"),
             ("b", "2", "group", "10", "first"),
@@ -512,7 +490,7 @@ async fn given_zero_limit_when_query_runs_then_aws_limit_error_is_exact() {
             serde_json::to_value(body).unwrap(),
             json!({
                 "__type": "com.amazon.coral.validate#ValidationException",
-                "message": "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+                "message": "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
             })
         );
     })
@@ -523,3 +501,508 @@ async fn given_zero_limit_when_query_runs_then_aws_limit_error_is_exact() {
         resume_unwind(panic);
     }
 }
+
+// Negative rule from Cucumber "Query non-existent table": a missing table is
+// ResourceNotFound.
+query_case!(
+    given_missing_table_when_query_runs_then_resource_not_found_is_exact,
+    "local/missing_table.json"
+);
+
+// Validation rule from Cucumber "Query with empty TableName".
+query_case!(
+    given_empty_table_name_when_query_runs_then_validation_is_exact,
+    "local/empty_table_name.json"
+);
+
+// Validation rule from Cucumber "Query without KeyConditionExpression".
+query_case!(
+    given_missing_key_condition_expression_when_query_runs_then_validation_is_exact,
+    "local/missing_key_condition_expression.json"
+);
+
+// Validation rule from Cucumber "Query with invalid KeyConditionExpression".
+query_case!(
+    given_invalid_key_condition_expression_when_query_runs_then_validation_is_exact,
+    "local/invalid_key_condition_expression.json"
+);
+
+// DDB-PAR-4 (AWS probe P15): a filter on `#a` -> `a.b` reads the top-level
+// `a.b`, never the nested member `a` -> `b`.
+query_case!(
+    given_dotted_alias_filter_when_query_runs_then_top_level_attribute_matches,
+    "local/ddb-par-4/dotted_alias_filter_top_query.json"
+);
+query_case!(
+    given_dotted_alias_filter_on_nested_value_when_query_runs_then_item_is_filtered_out,
+    "local/ddb-par-4/dotted_alias_filter_nested_query.json"
+);
+// AWS probe P1.
+query_case!(
+    given_trailing_and_key_condition_when_query_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_trailing_and_key_condition_when_query_runs_then_eof_syntax_error.json"
+);
+// AWS probe P4.
+query_case!(
+    given_empty_key_condition_when_query_runs_then_empty_expression_error,
+    "local/ddb-par-1/given_empty_key_condition_when_query_runs_then_empty_expression_error.json"
+);
+// AWS probe P5.
+query_case!(
+    given_trailing_whitespace_key_condition_when_query_runs_then_eof_near_keeps_whitespace,
+    "local/ddb-par-1/\
+     given_trailing_whitespace_key_condition_when_query_runs_then_eof_near_keeps_whitespace.json"
+);
+// AWS probe P11.
+query_case!(
+    given_query_filter_when_query_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/given_query_filter_when_query_runs_then_mixed_parameters_are_rejected.json"
+);
+// AWS probe P11.
+query_case!(
+    given_key_conditions_and_expression_when_query_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/\
+     given_key_conditions_and_expression_when_query_runs_then_mixed_parameters_are_rejected.json"
+);
+// local text: AWS applies KeyConditions; aux does not implement it.
+query_case!(
+    given_key_conditions_when_query_runs_then_legacy_parameter_is_rejected,
+    "local/ddb-par-2/given_key_conditions_when_query_runs_then_legacy_parameter_is_rejected.json"
+);
+// AWS probe P11.
+query_case!(
+    given_conditional_operator_when_query_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/\
+     given_conditional_operator_when_query_runs_then_mixed_parameters_are_rejected.json"
+);
+// AWS probe P17.
+query_case!(
+    given_nested_hash_equality_when_query_runs_then_nested_attribute_error,
+    "local/ddb-par-7/nested_hash_equality.json"
+);
+// AWS probe P17.
+query_case!(
+    given_nested_hash_range_condition_when_query_runs_then_nested_attribute_error,
+    "local/ddb-par-7/nested_hash_range_greater.json"
+);
+// AWS probe P17.
+query_case!(
+    given_nested_non_key_between_when_query_runs_then_nested_attribute_error,
+    "local/ddb-par-7/nested_non_key_between.json"
+);
+// AWS probe P17.
+query_case!(
+    given_second_non_key_condition_on_hash_only_table_when_query_runs_then_condition_count_error,
+    "local/ddb-par-7/second_non_key_condition.json"
+);
+// AWS probe P17.
+query_case!(
+    given_nested_gsi_range_condition_when_query_runs_then_nested_attribute_error,
+    "local/ddb-par-7/nested_gsi_range.json"
+);
+
+// AWS behavioural suite
+// AWS behavioural:
+// check_ddb_numeric_sort_key_query_orders_at_magnitude_extremes.py
+query_case!(
+    given_ddb_numeric_sort_key_query_orders_at_magnitude_extremes_forward_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_numeric_sort_key_query_orders_at_magnitude_extremes.forward.json"
+);
+
+// AWS behavioural:
+// check_ddb_numeric_sort_key_query_orders_at_magnitude_extremes.py
+query_case!(
+    given_ddb_numeric_sort_key_query_orders_at_magnitude_extremes_reverse_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_numeric_sort_key_query_orders_at_magnitude_extremes.reverse.json"
+);
+
+// AWS behavioural: check_ddb_query_size_function_rejected_in_key_condition.py
+query_case!(
+    given_ddb_query_size_function_rejected_in_key_condition_size_in_key_condition_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_query_size_function_rejected_in_key_condition.size_in_key_condition.json"
+);
+
+// AWS behavioural: check_ddb_query_size_function_rejected_in_key_condition.py
+query_case!(
+    given_ddb_query_size_function_rejected_in_key_condition_size_in_filter_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_query_size_function_rejected_in_key_condition.size_in_filter_control.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_not_equal_on_n_sort_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.not_equal_on_n_sort_key.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_or_on_n_sort_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.or_on_n_sort_key.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_begins_with_n_operand_on_n_sort_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.begins_with_n_operand_on_n_sort_key.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_greater_than_control_on_n_sort_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.greater_than_control_on_n_sort_key.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_begins_with_n_operand_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_begins_with_n_operand.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_begins_with_bool_operand_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_begins_with_bool_operand.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_less_than_n_operand_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_less_than_n_operand.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_less_than_bool_operand_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_less_than_bool_operand.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_between_n_lower_bound_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_between_n_lower_bound.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_between_bool_lower_bound_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_between_bool_lower_bound.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_begins_with_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_begins_with_control.json"
+);
+
+// AWS behavioural: check_key_condition_illegal_sort_key_operator_rejected.py
+query_case!(
+    given_key_condition_illegal_sort_key_operator_rejected_s_key_between_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_key_condition_illegal_sort_key_operator_rejected.s_key_between_control.json"
+);
+
+// AWS behavioural:
+// check_projection_update_and_query_filter_expressions_accepted_at_4096_bytes.
+// py
+query_case!(
+    given_projection_update_and_query_filter_expressions_accepted_at_4096_bytes_filter_4096_bytes_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_projection_update_and_query_filter_expressions_accepted_at_4096_bytes.filter_4096_bytes.json"
+);
+
+// AWS behavioural:
+// check_query_base_table_primary_key_in_filter_expression_rejected.py
+query_case!(
+    given_query_base_table_primary_key_in_filter_expression_rejected_non_key_filter_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_base_table_primary_key_in_filter_expression_rejected.non_key_filter_control.json"
+);
+
+// AWS behavioural:
+// check_query_base_table_primary_key_in_filter_expression_rejected.py
+query_case!(
+    given_query_base_table_primary_key_in_filter_expression_rejected_hash_key_in_filter_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_base_table_primary_key_in_filter_expression_rejected.hash_key_in_filter.json"
+);
+
+// AWS behavioural:
+// check_query_base_table_primary_key_in_filter_expression_rejected.py
+query_case!(
+    given_query_base_table_primary_key_in_filter_expression_rejected_range_key_in_filter_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_base_table_primary_key_in_filter_expression_rejected.range_key_in_filter.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_between_reversed_bounds_rejected.py
+query_case!(
+    given_query_filter_expression_between_reversed_bounds_rejected_ascending_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_between_reversed_bounds_rejected.ascending_control.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_between_reversed_bounds_rejected.py
+query_case!(
+    given_query_filter_expression_between_reversed_bounds_rejected_reversed_bounds_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_between_reversed_bounds_rejected.reversed_bounds.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_in_operator_with_101_operands_rejected.py
+query_case!(
+    given_query_filter_expression_in_operator_with_101_operands_rejected_in_101_operands_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_in_operator_with_101_operands_rejected.in_101_operands.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_in_operator_with_101_operands_rejected.py
+query_case!(
+    given_query_filter_expression_in_operator_with_101_operands_rejected_in_100_operands_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_in_operator_with_101_operands_rejected.in_100_operands.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_redundant_parentheses_rejected.py
+query_case!(
+    given_query_filter_expression_redundant_parentheses_rejected_double_comparison_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_redundant_parentheses_rejected.double_comparison.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_redundant_parentheses_rejected.py
+query_case!(
+    given_query_filter_expression_redundant_parentheses_rejected_double_function_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_redundant_parentheses_rejected.double_function.json"
+);
+
+// AWS behavioural:
+// check_query_filter_expression_redundant_parentheses_rejected.py
+query_case!(
+    given_query_filter_expression_redundant_parentheses_rejected_single_pair_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_filter_expression_redundant_parentheses_rejected.single_pair_control.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_document_path_forms_and_reserved_head_rejected.py
+query_case!(
+    given_query_key_condition_document_path_forms_and_reserved_head_rejected_sort_key_list_index_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_document_path_forms_and_reserved_head_rejected.sort_key_list_index.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_document_path_forms_and_reserved_head_rejected.py
+query_case!(
+    given_query_key_condition_document_path_forms_and_reserved_head_rejected_sort_key_begins_with_path_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_document_path_forms_and_reserved_head_rejected.sort_key_begins_with_path.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_document_path_forms_and_reserved_head_rejected.py
+query_case!(
+    given_query_key_condition_document_path_forms_and_reserved_head_rejected_value_first_path_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_document_path_forms_and_reserved_head_rejected.value_first_path.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_document_path_forms_and_reserved_head_rejected.py
+query_case!(
+    given_query_key_condition_document_path_forms_and_reserved_head_rejected_reserved_data_head_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_document_path_forms_and_reserved_head_rejected.reserved_data_head.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_document_path_forms_and_reserved_head_rejected.py
+query_case!(
+    given_query_key_condition_document_path_forms_and_reserved_head_rejected_pk_sk_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_document_path_forms_and_reserved_head_rejected.pk_sk_control.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_duplicate_sort_key_clause_and_nested_path_rejected.
+// py
+query_case!(
+    given_query_key_condition_duplicate_sort_key_clause_and_nested_path_rejected_range_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_duplicate_sort_key_clause_and_nested_path_rejected.range_control.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_duplicate_sort_key_clause_and_nested_path_rejected.
+// py
+query_case!(
+    given_query_key_condition_duplicate_sort_key_clause_and_nested_path_rejected_two_clauses_on_sort_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_duplicate_sort_key_clause_and_nested_path_rejected.two_clauses_on_sort_key.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_ge_negative_n_sort_key_numeric_order.py
+query_case!(
+    given_query_key_condition_ge_negative_n_sort_key_numeric_order_ge_threshold_forward_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_ge_negative_n_sort_key_numeric_order.ge_threshold_forward.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_ge_negative_n_sort_key_numeric_order.py
+query_case!(
+    given_query_key_condition_ge_negative_n_sort_key_numeric_order_ge_threshold_reverse_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_ge_negative_n_sort_key_numeric_order.ge_threshold_reverse.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.
+// py
+query_case!(
+    given_query_key_condition_non_key_missing_partition_begins_with_partition_rejected_non_key_attribute_for_sort_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.non_key_attribute_for_sort_key.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.
+// py
+query_case!(
+    given_query_key_condition_non_key_missing_partition_begins_with_partition_rejected_missing_partition_key_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.missing_partition_key.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.
+// py
+query_case!(
+    given_query_key_condition_non_key_missing_partition_begins_with_partition_rejected_partition_key_begins_with_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.partition_key_begins_with.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.
+// py
+query_case!(
+    given_query_key_condition_non_key_missing_partition_begins_with_partition_rejected_partition_only_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.partition_only_control.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.
+// py
+query_case!(
+    given_query_key_condition_non_key_missing_partition_begins_with_partition_rejected_sort_key_begins_with_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_non_key_missing_partition_begins_with_partition_rejected.sort_key_begins_with_control.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_syntax_error_and_attribute_type_function_rejected.
+// py
+query_case!(
+    given_query_key_condition_syntax_error_and_attribute_type_function_rejected_stray_equals_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_syntax_error_and_attribute_type_function_rejected.stray_equals.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_syntax_error_and_attribute_type_function_rejected.
+// py
+query_case!(
+    given_query_key_condition_syntax_error_and_attribute_type_function_rejected_attribute_type_function_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_syntax_error_and_attribute_type_function_rejected.attribute_type_function.json"
+);
+
+// AWS behavioural:
+// check_query_key_condition_syntax_error_and_attribute_type_function_rejected.
+// py
+query_case!(
+    given_query_key_condition_syntax_error_and_attribute_type_function_rejected_legal_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_key_condition_syntax_error_and_attribute_type_function_rejected.legal_control.json"
+);
+
+// AWS behavioural: check_query_limit_zero_rejected.py
+query_case!(
+    given_query_limit_zero_rejected_limit_zero_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_limit_zero_rejected.limit_zero.json"
+);
+
+// AWS behavioural:
+// check_query_nested_non_redundant_parenthesized_key_condition.py
+query_case!(
+    given_query_nested_non_redundant_parenthesized_key_condition_nested_sort_key_clause_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_nested_non_redundant_parenthesized_key_condition.nested_sort_key_clause.json"
+);
+
+// AWS behavioural:
+// check_query_nested_non_redundant_parenthesized_key_condition.py
+query_case!(
+    given_query_nested_non_redundant_parenthesized_key_condition_nested_partition_clause_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_nested_non_redundant_parenthesized_key_condition.nested_partition_clause.json"
+);
+
+// AWS behavioural:
+// check_query_never_returns_an_empty_page_with_a_last_evaluated_key.py
+query_case!(
+    given_query_never_returns_an_empty_page_with_a_last_evaluated_key_no_match_empty_page_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_never_returns_an_empty_page_with_a_last_evaluated_key.no_match_empty_page.json"
+);
+
+// AWS behavioural: check_query_unbalanced_nested_key_condition_rejected.py
+query_case!(
+    given_query_unbalanced_nested_key_condition_rejected_balanced_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_unbalanced_nested_key_condition_rejected.balanced_control.json"
+);
+
+// AWS behavioural: check_query_unbalanced_nested_key_condition_rejected.py
+query_case!(
+    given_query_unbalanced_nested_key_condition_rejected_unclosed_inner_paren_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_query_unbalanced_nested_key_condition_rejected.unclosed_inner_paren.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+query_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_query_ss_less_than_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.query_ss_less_than.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+query_case!(
+    given_select_non_specific_values_reject_projection_expression_query_all_attributes_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.query_all_attributes.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+query_case!(
+    given_select_non_specific_values_reject_projection_expression_query_count_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.query_count.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+query_case!(
+    given_select_non_specific_values_reject_projection_expression_query_all_projected_attributes_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.query_all_projected_attributes.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+query_case!(
+    given_select_non_specific_values_reject_projection_expression_query_specific_control_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.query_specific_control.json"
+);
+
+// AWS behavioural:
+// check_set_arithmetic_grouping_size_utf16_and_add_empty_string_to_set.py
+query_case!(
+    given_set_arithmetic_grouping_size_utf16_and_add_empty_string_to_set_size_counts_utf16_units_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_set_arithmetic_grouping_size_utf16_and_add_empty_string_to_set.size_counts_utf16_units.json"
+);
+
+// AWS behavioural: check_string_sort_key_orders_by_utf8_bytes.py
+query_case!(
+    given_string_sort_key_orders_by_utf8_bytes_forward_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_string_sort_key_orders_by_utf8_bytes.forward.json"
+);
+
+// AWS behavioural: check_string_sort_key_orders_by_utf8_bytes.py
+query_case!(
+    given_string_sort_key_orders_by_utf8_bytes_reverse_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_string_sort_key_orders_by_utf8_bytes.reverse.json"
+);
+
+// AWS behavioural: check_string_sort_key_orders_by_utf8_bytes.py
+query_case!(
+    given_string_sort_key_orders_by_utf8_bytes_bounded_to_replacement_when_query_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_string_sort_key_orders_by_utf8_bytes.bounded_to_replacement.json"
+);

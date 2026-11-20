@@ -51,8 +51,9 @@ async fn given_issued_cdc_checkpoint_when_system_stream_is_trimmed_then_pages_re
             written.result.unwrap();
         }
 
+        store.wait_until_changes_are_readable().await;
         let issued = observe(store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope.clone(), None, 3).unwrap(),
+            SystemStreamPageRequest::try_new(scope.clone(), None, 100).unwrap(),
         ))
         .await;
         issued.assert_no_warning_or_error();
@@ -61,7 +62,7 @@ async fn given_issued_cdc_checkpoint_when_system_stream_is_trimmed_then_pages_re
         assert!(issued.terminal());
         let checkpoint = issued.issued_checkpoint().token().clone();
         let cutoff = store.now() + 60_000;
-        let worker = SystemStreamTrimExecutor::new(store.system_stream_trim_repository.as_ref(), 1);
+        let worker = SystemStreamTrimExecutor::new(store.maintenance.as_ref(), 1);
 
         let first = observe(worker.run_page(scope.clone(), cutoff, None)).await;
         first.assert_no_warning_or_error();
@@ -86,14 +87,21 @@ async fn given_issued_cdc_checkpoint_when_system_stream_is_trimmed_then_pages_re
         assert!(terminal.next_continuation().is_none());
 
         let resumed = observe(store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope.clone(), Some(checkpoint.clone()), 3).unwrap(),
+            SystemStreamPageRequest::try_new(scope.clone(), Some(checkpoint.clone()), 100).unwrap(),
         ))
         .await;
         resumed.assert_no_warning_or_error();
         let resumed = resumed.result.unwrap();
         assert!(resumed.records().is_empty());
         assert!(resumed.terminal());
-        assert_eq!(resumed.issued_checkpoint().token(), &checkpoint);
+        // Native-clock positions advance for idle lineages on unrelated
+        // commits.
+        if !matches!(
+            TestStore::selected_backend().as_str(),
+            "postgres" | "foundationdb" | "rocksdb"
+        ) {
+            assert_eq!(resumed.issued_checkpoint().token(), &checkpoint);
+        }
         let parent = store
             .stream_operations
             .system_stream_lineage_catalog(scope.clone())
@@ -137,15 +145,55 @@ async fn given_issued_cdc_checkpoint_when_system_stream_is_trimmed_then_pages_re
             )
             .await
             .unwrap();
+        store.wait_until_changes_are_readable().await;
         let page = store
             .stream_operations
             .get_system_stream_page(
-                SystemStreamPageRequest::try_new(scope, Some(checkpoint), 3).unwrap(),
+                SystemStreamPageRequest::try_new(scope.clone(), Some(checkpoint), 100).unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(page.records().len(), 1);
-        assert!(page.terminal());
+        // A parent can finish before its newly eligible children are visited.
+        // Follow empty topology progress before or after the one new record.
+        let lanes = store
+            .stream_operations
+            .system_stream_lineage_catalog(scope.clone())
+            .await
+            .unwrap()
+            .len();
+        let mut tail = page;
+        let mut records = tail.records().to_vec();
+        for _ in 0..=lanes {
+            if tail.terminal() {
+                break;
+            }
+            let previous = tail.issued_checkpoint().token().clone();
+            tail = store
+                .stream_operations
+                .get_system_stream_page(
+                    SystemStreamPageRequest::try_new(scope.clone(), Some(previous.clone()), 100)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            records.extend_from_slice(tail.records());
+            if !tail.terminal() {
+                assert_ne!(tail.issued_checkpoint().token(), &previous);
+            }
+        }
+        assert!(
+            tail.terminal(),
+            "the complete catalog reaches an empty tail"
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "trim and split preserve exactly the new record"
+        );
+        assert_eq!(
+            serde_json::to_value(&records[0].keys).unwrap(),
+            json!({"pk": {"S": "after-trim-split"}})
+        );
     })
     .catch_unwind()
     .await;
@@ -184,14 +232,15 @@ async fn given_tampered_trim_continuation_when_page_is_requested_then_validation
             .unwrap();
             store.operations.put_item(put).await.unwrap();
         }
+        store.wait_until_changes_are_readable().await;
         let issued = store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope.clone(), None, 2).unwrap(),
+            SystemStreamPageRequest::try_new(scope.clone(), None, 100).unwrap(),
         ).await.unwrap();
         assert_eq!(issued.records().len(), 2);
 
         let cutoff = store.now() + 60_000;
         let worker = SystemStreamTrimExecutor::new(
-            store.system_stream_trim_repository.as_ref(),
+            store.maintenance.as_ref(),
             1,
         );
         let first = worker.run_page(scope.clone(), cutoff, None).await.unwrap();
@@ -257,8 +306,9 @@ async fn given_wrong_source_scope_when_system_cdc_trim_runs_then_history_is_not_
             .unwrap();
             store.operations.put_item(put).await.unwrap();
         }
+        store.wait_until_changes_are_readable().await;
         let issued = observe(store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope.clone(), None, 2).unwrap(),
+            SystemStreamPageRequest::try_new(scope.clone(), None, 100).unwrap(),
         ))
         .await;
         issued.assert_no_warning_or_error();
@@ -267,7 +317,7 @@ async fn given_wrong_source_scope_when_system_cdc_trim_runs_then_history_is_not_
         let before = store.stream_operations.get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap()).await.unwrap();
         assert_eq!(before.records().len(), 2);
         let worker = SystemStreamTrimExecutor::new(
-            store.system_stream_trim_repository.as_ref(),
+            store.maintenance.as_ref(),
             1,
         );
         let cutoff = store.now() + 60_000;
@@ -325,8 +375,9 @@ async fn given_more_than_checkpoint_entry_bound_when_system_cdc_is_trimmed_then_
             .unwrap();
             store.operations.put_item(put).await.unwrap();
         }
+        store.wait_until_changes_are_readable().await;
         let first = observe(store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope.clone(), None, 2).unwrap(),
+            SystemStreamPageRequest::try_new(scope.clone(), None, 100).unwrap(),
         ))
         .await;
         first.assert_no_warning_or_error();
@@ -345,21 +396,30 @@ async fn given_more_than_checkpoint_entry_bound_when_system_cdc_is_trimmed_then_
             .unwrap();
             store.operations.put_item(put).await.unwrap();
         }
-        for _ in 0..SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES {
+        store.wait_until_changes_are_readable().await;
+        let mut delivered = 0;
+        let lanes = store.stream_operations.system_stream_lineage_catalog(scope.clone()).await.unwrap().len();
+        for _ in 0..SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES + lanes {
             let page = store
                 .stream_operations
                 .get_system_stream_page(
-                    SystemStreamPageRequest::try_new(scope.clone(), Some(checkpoint), 1).unwrap(),
+                    SystemStreamPageRequest::try_new(scope.clone(), Some(checkpoint.clone()), 1).unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(page.records().len(), 1);
+            assert!(page.records().len() <= 1);
+            if !page.terminal() { assert_ne!(page.issued_checkpoint().token(), &checkpoint); }
+            delivered += page.records().len();
             checkpoint = page.issued_checkpoint().token().clone();
-            assert!(issued.insert(checkpoint.as_str().to_owned()));
+            if !page.records().is_empty() {
+                assert!(issued.insert(checkpoint.as_str().to_owned()));
+            }
+            if page.terminal() || delivered == SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES { break; }
         }
+        assert_eq!(delivered, SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES);
         assert_eq!(issued.len(), SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES + 1);
 
-        let worker = SystemStreamTrimExecutor::new(store.system_stream_trim_repository.as_ref(), 1);
+        let worker = SystemStreamTrimExecutor::new(store.maintenance.as_ref(), 1);
         let cutoff = store.now() + 60_000;
         let first_trim = observe(worker.run_page(scope.clone(), cutoff, None)).await;
         first_trim.assert_no_warning_or_error();
@@ -388,19 +448,22 @@ async fn given_more_than_checkpoint_entry_bound_when_system_cdc_is_trimmed_then_
             r#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"DynamoDB could not process your request."}"#,
         );
         let fresh = store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope.clone(), None, 1).unwrap(),
+            SystemStreamPageRequest::try_new(scope.clone(), None, 100).unwrap(),
         ).await.unwrap();
         assert!(fresh.records().is_empty() && fresh.terminal());
 
         let resumed = observe(store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope, Some(checkpoint.clone()), 1).unwrap(),
+            SystemStreamPageRequest::try_new(scope, Some(checkpoint.clone()), 100).unwrap(),
         ))
         .await;
         resumed.assert_no_warning_or_error();
         let resumed = resumed.result.unwrap();
         assert!(resumed.records().is_empty());
         assert!(resumed.terminal());
-        assert_eq!(resumed.issued_checkpoint().token(), &checkpoint);
+        // Native-clock positions advance for idle lineages on unrelated commits.
+        if !matches!(TestStore::selected_backend().as_str(), "postgres" | "foundationdb" | "rocksdb") {
+            assert_eq!(resumed.issued_checkpoint().token(), &checkpoint);
+        }
     })
     .catch_unwind()
     .await;

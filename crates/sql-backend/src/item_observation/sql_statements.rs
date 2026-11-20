@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use storage_provider::{ItemWriteObservationRead, canonical_revision_key};
+use storage_provider::ItemWriteObservationRead;
 use storage_types::{
     AttributeName, BoundTableInfo, KeyAttributeType, KeySchemaElement, StorageError, StorageResult,
 };
@@ -34,9 +34,8 @@ pub(super) fn live_observation_statement(
     let (keys, binds) = render_observation_keys(engine, &columns, rows)?;
     let relation = engine.item_table_name(table.history_id);
     let sql = format!(
-        "{keys} SELECT requested.__aux_ordinal, stored.item_value, stored.__aux_revision, \
-         stored.__aux_provenance, stored.__aux_ttl_epoch FROM requested JOIN \"{relation}\" AS \
-         stored ON {}",
+        "{keys} SELECT requested.__aux_ordinal, stored.item_value, stored.__aux_provenance, \
+         stored.__aux_ttl_epoch FROM requested JOIN \"{relation}\" AS stored ON {}",
         columns
             .iter()
             .enumerate()
@@ -45,38 +44,6 @@ pub(super) fn live_observation_statement(
             .join(" AND ")
     );
     Ok(SqlStatement::new(sql, binds))
-}
-
-pub(super) fn deleted_observation_batch_statement(
-    engine: impl SqlLayout,
-    reads: &[ItemWriteObservationRead<'_>],
-) -> StorageResult<SqlStatement> {
-    let columns = [
-        ("table_id".to_owned(), KeyAttributeType::B),
-        ("key_json".to_owned(), KeyAttributeType::S),
-    ];
-    let rows = reads
-        .iter()
-        .map(|read| {
-            let (table, key) = read.target();
-            Ok(vec![
-                SqlValue::try_from(crate::row_view::SqlValueRef::Blob(
-                    table.history_id.as_ref(),
-                ))?,
-                SqlValue::Text(canonical_revision_key(key)?),
-            ])
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
-    let (keys, binds) = render_observation_keys(engine, &columns, rows)?;
-    Ok(SqlStatement::new(
-        format!(
-            "{keys} SELECT requested.__aux_ordinal, stored.revision, stored.provenance FROM \
-             requested JOIN {} AS stored ON stored.table_id = requested.key0 AND stored.key_json \
-             = requested.key1",
-            engine.relation_name("item_tombstones")
-        ),
-        binds,
-    ))
 }
 
 // Ordinals preserve request order without decoding physical keys or comparing

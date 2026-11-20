@@ -8,7 +8,11 @@ use storage_provider::maintenance::{
 use storage_types::{BoundTableInfo, StorageResult};
 
 use super::read::read_expiration_index;
-use crate::{KvAttempt, catalog::KvCatalogAttempt, item_write::apply_ttl_index_writes};
+use crate::{
+    KvAttempt,
+    catalog::{KvCatalogAttempt, table_id_from_history},
+    item_write::apply_ttl_index_writes,
+};
 
 impl<A: KvAttempt> ExpirationPort for KvCatalogAttempt<'_, A> {
     async fn scan_expiration_index(
@@ -20,7 +24,7 @@ impl<A: KvAttempt> ExpirationPort for KvCatalogAttempt<'_, A> {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
-            let table_id = catalog.identity_for(&table.table_name)?.table_id;
+            let table_id = table_id_from_history(table.history_id)?;
             read_expiration_index(catalog.attempt, table_id, &read.into()).await
         }
         .await;
@@ -36,7 +40,7 @@ impl<A: KvAttempt> ExpirationPort for KvCatalogAttempt<'_, A> {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
-            let table_id = catalog.identity_for(&table.table_name)?.table_id;
+            let table_id = table_id_from_history(table.history_id)?;
             apply_ttl_index_writes(catalog.attempt, table_id, writes).await
         }
         .await;
@@ -76,7 +80,7 @@ impl<A: KvAttempt> storage_provider::TtlProjectionScanAttempt for KvCatalogAttem
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
-            let table_id = catalog.identity_for(&scan.table().table_name)?.table_id;
+            let table_id = table_id_from_history(scan.table().history_id)?;
             let (rows, more) =
                 read_expiration_index(catalog.attempt, table_id, scan.read()).await?;
             scan.finish_native(rows, more)

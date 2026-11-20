@@ -1,4 +1,3 @@
-use futures::TryFutureExt;
 use storage_types::{
     BatchGetItemRequest, BatchGetItemResponse, GetItemRequest, GetStreamRecordsRequest,
     GetStreamRecordsResponse, KeyAttributes, StorageError, StorageResult, TableName,
@@ -54,15 +53,9 @@ impl DatabaseManager {
         }
         let mut request = GetItemRequest::new(table_name, key);
         request.consistent_read = Some(consistent_read);
-        self.run_dynamo_admitted(
-            "default",
-            crate::admission::AdmissionClass::PointRead,
-            |dynamo| {
-                record_storage_operation("get_item", async move { dynamo.get_item(request).await })
-                    .map_ok(|response| response.item)
-            },
-        )
-        .await
+        self.get_item_request(request)
+            .await
+            .map(|response| response.item)
     }
 
     pub async fn get_item_decode<K, T>(

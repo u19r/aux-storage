@@ -9,9 +9,10 @@ use infrastructure_provider::{
         ConditionalWriteResult, DurableRecord, RecordAddress, RecordChange, RecordExpectation,
     },
 };
-use storage_provider::{DynamoOperations, DynamoPort, native_admission::NativeAttemptSource};
+use storage_common::native_admission::NativeAttemptSource;
+use storage_provider::{DynamoOperations, DynamoPort};
 use storage_types::{
-    AttemptMode, CreateTableRequest, GetItemRequest, NativeAttemptRejection, NativeWorkLimits,
+    AttemptMode, AttemptPlan, CreateTableRequest, DeadlineClass, GetItemRequest, NativeWorkLimits,
     PutItemRequest, ReadProtection, StorageError,
 };
 
@@ -123,8 +124,12 @@ where
         let captured_at = store.now();
         let put = put.clone();
         let record = record.clone();
-        let result = store
-            .with_dynamo_attempt(AttemptMode::ReadWriteItems, move |attempt| {
+        let result = storage_provider::DynamoPort::with_attempt(
+            store,
+            AttemptPlan::new(AttemptMode::ReadWriteItems, DeadlineClass::Write).start(
+                storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+            ),
+            move |attempt| {
                 Box::pin(async move {
                     fixture::put_item_in_catalog(attempt, &cache, put, captured_at).await?;
                     let changes = [RecordChange::Store {
@@ -151,10 +156,13 @@ where
                                     assert_eq!(rows[0].as_ref().unwrap().bytes, record.bytes)
                                 }
                                 Err(error) => {
-                                    assert_eq!(
-                                        error.native_attempt_rejection(),
-                                        Some(NativeAttemptRejection::Capacity)
-                                    );
+                                    assert!(matches!(
+                                        error.attempt_kind(),
+                                        Some(
+                                            storage_types::AttemptKind::Capacity
+                                                | storage_types::AttemptKind::TransactionBytes
+                                        )
+                                    ));
                                     return Ok(());
                                 }
                             }
@@ -165,15 +173,19 @@ where
                     }
                     Ok(())
                 })
-            })
-            .await;
+            },
+        )
+        .await;
         if exhaust {
-            assert_eq!(
+            assert!(matches!(
                 result
                     .expect_err("swallowed capacity failure committed")
-                    .native_attempt_rejection(),
-                Some(NativeAttemptRejection::Capacity)
-            );
+                    .attempt_kind(),
+                Some(
+                    storage_types::AttemptKind::Capacity
+                        | storage_types::AttemptKind::TransactionBytes
+                )
+            ));
         } else {
             result?;
         }

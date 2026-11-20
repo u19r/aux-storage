@@ -51,7 +51,7 @@ impl KvValueAllowance {
         let mut copied = Vec::new();
         copied
             .try_reserve_exact(value.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         copied.extend_from_slice(value);
         Ok(Some(copied))
     }
@@ -69,5 +69,5 @@ impl KvValueAllowance {
 }
 
 fn invalid_allowance() -> StorageError {
-    storage_types::InfrastructureResultKind::NativeCapacityRejected.into()
+    storage_types::AttemptFailure::CAPACITY.into()
 }

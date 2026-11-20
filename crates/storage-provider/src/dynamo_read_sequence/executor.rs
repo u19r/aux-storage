@@ -20,14 +20,14 @@ use super::{
     response::{enforce_response_limit, response},
 };
 use crate::{
-    CachePublication, DynamoRangeReadAttempt, GetItemAttempt, ReadSequenceStepReader,
-    TableMetadataCache, batch_get_item_in_attempt,
-    dynamo_range_read::query_for_read_sequence_in_attempt, get_item_in_attempt,
+    CachePublication, ItemReadAttempt, ReadSequenceStepReader, TableMetadataCache,
+    batch_get_item_in_attempt, dynamo_range_read::query_for_read_sequence_in_attempt,
+    get_item_in_attempt,
 };
 
 struct Execution<'a> {
     request: &'a ReadSequenceRequest,
-    plan: ReadSequencePlan,
+    plan: &'a ReadSequencePlan,
     resume: Option<ReadSequenceToken>,
     request_digest: String,
     active: BTreeSet<ReadSequenceNodeId>,
@@ -44,37 +44,48 @@ struct Execution<'a> {
 pub async fn read_sequence_in_attempt<A>(
     attempt: &mut A,
     cache: &TableMetadataCache,
-    request: ReadSequenceRequest,
-    capabilities: ReadSequenceValidationCapabilities,
+    bindings: &crate::RequestTableBindings,
+    request: &PreparedReadSequence,
 ) -> StorageResult<(ReadSequenceResponse, Vec<CachePublication>)>
 where
-    A: GetItemAttempt + DynamoRangeReadAttempt,
+    A: ItemReadAttempt,
 {
-    let mut reader = NativeReadSequenceReader { attempt, cache };
-    read_sequence_with_reader(&mut reader, request, capabilities).await
+    let mut reader = NativeReadSequenceReader {
+        attempt,
+        cache,
+        bindings,
+    };
+    execute_read_sequence(&mut reader, request).await
 }
 
 struct NativeReadSequenceReader<'a, A> {
     attempt: &'a mut A,
     cache: &'a TableMetadataCache,
+    bindings: &'a crate::RequestTableBindings,
 }
 
 #[async_trait]
 impl<A> ReadSequenceStepReader for NativeReadSequenceReader<'_, A>
-where A: GetItemAttempt + DynamoRangeReadAttempt + Send
+where A: ItemReadAttempt + Send
 {
     async fn get(
         &mut self,
         request: GetItemRequest,
     ) -> StorageResult<(GetItemResponse, Option<CachePublication>)> {
-        get_item_in_attempt(self.attempt, self.cache, &request).await
+        get_item_in_attempt(self.attempt, self.cache, self.bindings, &request).await
     }
 
     async fn batch_get_once(
         &mut self,
         request: BatchGetItemRequest,
     ) -> StorageResult<(BatchGetItemResponse, Vec<CachePublication>)> {
-        batch_get_item_in_attempt(self.attempt, self.cache, request).await
+        batch_get_item_in_attempt(
+            self.attempt,
+            self.cache,
+            &crate::BatchGetPlan::from(request),
+            self.bindings,
+        )
+        .await
     }
 
     async fn query(
@@ -86,7 +97,8 @@ where A: GetItemAttempt + DynamoRangeReadAttempt + Send
         Option<CachePublication>,
     )> {
         let (page, publication) =
-            query_for_read_sequence_in_attempt(self.attempt, self.cache, request).await?;
+            query_for_read_sequence_in_attempt(self.attempt, self.cache, self.bindings, request)
+                .await?;
         Ok((page.response, page.item_cursors, publication))
     }
 }
@@ -95,19 +107,53 @@ where A: GetItemAttempt + DynamoRangeReadAttempt + Send
 /// attempts and remote Dynamo operation calls.
 pub async fn read_sequence_with_reader<R: ReadSequenceStepReader>(
     reader: &mut R,
-    mut request: ReadSequenceRequest,
+    request: ReadSequenceRequest,
     capabilities: ReadSequenceValidationCapabilities,
 ) -> StorageResult<(ReadSequenceResponse, Vec<CachePublication>)> {
-    let plan = plan_read_sequence_with_capabilities(&request, capabilities)?;
-    let (resume, digest) = prepare_resume_token(&mut request, &plan.graph.structural_digest)?;
-    if let Some(token) = &resume {
-        validate_resume_token_shape(token, &plan)?;
+    let prepared = PreparedReadSequence::try_new(request, capabilities)?;
+    execute_read_sequence(reader, &prepared).await
+}
+
+pub(crate) struct PreparedReadSequence {
+    request: ReadSequenceRequest,
+    plan: ReadSequencePlan,
+    resume: Option<ReadSequenceToken>,
+    request_digest: String,
+}
+
+impl PreparedReadSequence {
+    pub(crate) fn try_new(
+        mut request: ReadSequenceRequest,
+        capabilities: ReadSequenceValidationCapabilities,
+    ) -> StorageResult<Self> {
+        let plan = plan_read_sequence_with_capabilities(&request, capabilities)?;
+        let (resume, digest) = prepare_resume_token(&mut request, &plan.graph.structural_digest)?;
+        if let Some(token) = &resume {
+            validate_resume_token_shape(token, &plan)?;
+        }
+        let request_digest = match digest {
+            Some(digest) => digest,
+            None => read_sequence_request_digest(&request)?,
+        };
+        Ok(Self {
+            request,
+            plan,
+            resume,
+            request_digest,
+        })
     }
-    let request_digest = match digest {
-        Some(digest) => digest,
-        None => read_sequence_request_digest(&request)?,
-    };
-    let mut execution = Execution::new(&request, plan, resume, request_digest);
+}
+
+async fn execute_read_sequence<R: ReadSequenceStepReader>(
+    reader: &mut R,
+    prepared: &PreparedReadSequence,
+) -> StorageResult<(ReadSequenceResponse, Vec<CachePublication>)> {
+    let mut execution = Execution::new(
+        &prepared.request,
+        &prepared.plan,
+        prepared.resume.clone(),
+        prepared.request_digest.clone(),
+    );
     let next = execution.run(reader).await?;
     let prior_completed = execution
         .resume
@@ -115,10 +161,9 @@ pub async fn read_sequence_with_reader<R: ReadSequenceStepReader>(
         .map_or(&[][..], |token| token.completed_nodes.as_slice());
     let result = response(
         execution.request,
-        &execution.plan,
+        execution.plan,
         &execution.outcomes,
         prior_completed,
-        execution.total_read_items,
         next,
     );
     enforce_response_limit(execution.request, &result)?;
@@ -128,7 +173,7 @@ pub async fn read_sequence_with_reader<R: ReadSequenceStepReader>(
 impl<'a> Execution<'a> {
     fn new(
         request: &'a ReadSequenceRequest,
-        plan: ReadSequencePlan,
+        plan: &'a ReadSequencePlan,
         resume: Option<ReadSequenceToken>,
         request_digest: String,
     ) -> Self {
@@ -138,7 +183,7 @@ impl<'a> Execution<'a> {
                     .map(ReadSequenceNodeId::from_index)
                     .collect()
             },
-            |token| active_nodes(&plan, token),
+            |token| active_nodes(plan, token),
         );
         let completed = resume.as_ref().map_or_else(BTreeSet::new, |token| {
             token.completed_nodes.iter().copied().collect()
@@ -167,7 +212,7 @@ impl<'a> Execution<'a> {
         &mut self,
         reader: &mut R,
     ) -> StorageResult<Option<String>> {
-        for node_id in dependent_first_order(&self.plan)? {
+        for node_id in dependent_first_order(self.plan)? {
             if !self.active.contains(&node_id) {
                 continue;
             }
@@ -297,7 +342,7 @@ impl<'a> Execution<'a> {
                 return Ok(token);
             }
         }
-        if let Some(node) = dependent_first_order(&self.plan)?
+        if let Some(node) = dependent_first_order(self.plan)?
             .into_iter()
             .find(|node| self.active.contains(node) && !self.completed.contains(&node.index()))
         {
@@ -390,10 +435,9 @@ impl<'a> Execution<'a> {
             .map_or(&[][..], |resume| resume.completed_nodes.as_slice());
         let result = response(
             self.request,
-            &self.plan,
+            self.plan,
             &self.outcomes,
             prior_completed,
-            self.total_read_items,
             token,
         );
         enforce_response_limit(self.request, &result)?;

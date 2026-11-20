@@ -5,12 +5,12 @@
 use std::num::NonZeroU32;
 
 use storage_types::{
-    AttemptMode, StorageError, StorageResult, StreamItemId, StreamName, TimestampMillis,
-    UserStreamName,
+    AttemptMode, AttemptPlan, DeadlineClass, StorageError, StorageResult, StreamItemId, StreamName,
+    TimestampMillis, UserStreamName,
 };
 use stream_provider::{
     ReadDirection, StreamAttempt, StreamDataType, StreamItem, StreamOperations, StreamPage,
-    StreamPartitioningMode, StreamPort, StreamReadRequest, StreamRowKind,
+    StreamPartitioningMode, StreamPort, StreamReadRequest,
 };
 
 use super::fixture;
@@ -88,7 +88,7 @@ async fn store_explicit_rows<P: StreamPort + 'static>(
         )
         .await?;
     assert!(
-        port.read_forward(StreamRowKind::User(name.clone()), None, 4)
+        port.read_forward(name.clone().into(), None, 4)
             .await?
             .items
             .is_empty()
@@ -98,23 +98,33 @@ async fn store_explicit_rows<P: StreamPort + 'static>(
         .map(|index| explicit_row(&name, index, 1))
         .collect::<HarnessResult<Vec<_>>>()?;
     let staged = rows.clone();
-    port.with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
-        Box::pin(async move {
-            for index in [4, 0, 3, 1, 2] {
-                let row = staged[index].clone();
-                attempt.store_user_item(row.clone()).await?;
-                let observed = point(attempt, &row)
-                    .await?
-                    .ok_or_else(|| StorageError::internal("staged explicit row missing"))?;
-                assert_row(&observed, &row);
-            }
-            Ok(())
-        })
-    })
+    stream_provider::StreamPort::with_attempt(
+        port,
+        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(port),
+        ),
+        move |attempt| {
+            Box::pin(async move {
+                for index in [4, 0, 3, 1, 2] {
+                    let row = staged[index].clone();
+                    attempt.store_user_item(row.clone()).await?;
+                    let observed = point(attempt, &row)
+                        .await?
+                        .ok_or_else(|| StorageError::internal("staged explicit row missing"))?;
+                    assert_row(&observed, &row);
+                }
+                Ok(())
+            })
+        },
+    )
     .await?;
     let aborted = explicit_row(&name, 7, 3)?;
-    let rollback: StorageResult<()> = port
-        .with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
+    let rollback: StorageResult<()> = stream_provider::StreamPort::with_attempt(
+        port,
+        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(port),
+        ),
+        move |attempt| {
             Box::pin(async move {
                 attempt.store_user_item(aborted.clone()).await?;
                 let observed = point(attempt, &aborted)
@@ -123,8 +133,9 @@ async fn store_explicit_rows<P: StreamPort + 'static>(
                 assert_row(&observed, &aborted);
                 Err(StorageError::internal("explicit stream fixture rollback"))
             })
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         !rollback
             .expect_err("fixture callback unexpectedly committed")
@@ -207,51 +218,56 @@ async fn verify_point_bounds<P: StreamPort + 'static>(
     expected: Vec<StreamItem>,
 ) -> HarnessResult<()> {
     let absent = explicit_row(&name, 7, 3)?;
-    port.with_stream_attempt(AttemptMode::ReadOnly, move |attempt| {
-        Box::pin(async move {
-            assert!(
-                point(attempt, &absent).await?.is_none(),
-                "rolled-back explicit row persisted"
-            );
-            for row in &expected {
-                let observed = point(attempt, row)
-                    .await?
-                    .ok_or_else(|| StorageError::internal("committed explicit row missing"))?;
-                assert_row(&observed, row);
-            }
-            assert!(
-                attempt
-                    .read_user_item_through(&name, expected[3].id, expected[2].id)
-                    .await?
-                    .is_none()
-            );
-            assert!(
-                attempt
-                    .read_user_item_through(&foreign, expected[2].id, expected[4].id)
-                    .await?
-                    .is_none()
-            );
-            let request = page_request(None, ReadDirection::Forward, 4);
-            let foreign_page = attempt
-                .read_user_page_through(&foreign, &request, expected[4].id)
-                .await?;
-            assert!(
-                foreign_page
-                    .finish(&request, &StreamRowKind::User(foreign.clone()))?
-                    .items
-                    .is_empty()
-            );
-            let page = attempt
-                .read_user_page_through(&name, &request, expected[4].id)
-                .await?;
-            assert!(
-                page.finish(&request, &StreamRowKind::User(foreign))
-                    .is_err(),
-                "foreign incarnation accepted actual rows"
-            );
-            Ok(())
-        })
-    })
+    stream_provider::StreamPort::with_attempt(
+        port,
+        AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(port),
+        ),
+        move |attempt| {
+            Box::pin(async move {
+                assert!(
+                    point(attempt, &absent).await?.is_none(),
+                    "rolled-back explicit row persisted"
+                );
+                for row in &expected {
+                    let observed = point(attempt, row)
+                        .await?
+                        .ok_or_else(|| StorageError::internal("committed explicit row missing"))?;
+                    assert_row(&observed, row);
+                }
+                assert!(
+                    attempt
+                        .read_user_item_through(&name, expected[3].id, expected[2].id)
+                        .await?
+                        .is_none()
+                );
+                assert!(
+                    attempt
+                        .read_user_item_through(&foreign, expected[2].id, expected[4].id)
+                        .await?
+                        .is_none()
+                );
+                let request = page_request(None, ReadDirection::Forward, 4);
+                let foreign_page = attempt
+                    .read_user_page_through(&foreign, &request, expected[4].id)
+                    .await?;
+                assert!(
+                    foreign_page
+                        .finish(&request, &foreign.clone())?
+                        .items
+                        .is_empty()
+                );
+                let page = attempt
+                    .read_user_page_through(&name, &request, expected[4].id)
+                    .await?;
+                assert!(
+                    page.finish(&request, &foreign).is_err(),
+                    "foreign incarnation accepted actual rows"
+                );
+                Ok(())
+            })
+        },
+    )
     .await?;
     Ok(())
 }
@@ -262,16 +278,21 @@ async fn page<P: StreamPort + 'static>(
     request: StreamReadRequest,
     through: StreamItemId,
 ) -> HarnessResult<StreamPage> {
-    Ok(port
-        .with_stream_attempt(AttemptMode::ReadOnly, move |attempt| {
+    Ok(stream_provider::StreamPort::with_attempt(
+        port,
+        AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(port),
+        ),
+        move |attempt| {
             Box::pin(async move {
                 attempt
                     .read_user_page_through(&name, &request, through)
                     .await?
-                    .finish(&request, &StreamRowKind::User(name))
+                    .finish(&request, &name)
             })
-        })
-        .await?)
+        },
+    )
+    .await?)
 }
 
 fn page_request(

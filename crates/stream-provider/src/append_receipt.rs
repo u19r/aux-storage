@@ -12,7 +12,7 @@ pub struct StreamAppendOperationId(uuid::Uuid);
 
 impl StreamAppendOperationId {
     pub fn fresh() -> Self {
-        Self(uuid::Uuid::new_v4())
+        Self(storage_types::ambient::uuid_v4())
     }
     pub fn bytes(self) -> [u8; 16] {
         *self.0.as_bytes()
@@ -112,10 +112,7 @@ impl StreamAppendAllocation {
             Self::AttemptAllocated(id) => Ok(id),
             Self::Versionstamped(user_bytes) => {
                 let stamp = stamp.ok_or_else(|| {
-                    StorageError::sync_submission_ambiguous(
-                        None,
-                        "stream commit had no versionstamp",
-                    )
+                    StorageError::commit_unknown("stream commit had no versionstamp")
                 })?;
                 let mut id = [0u8; 12];
                 id[..10].copy_from_slice(&stamp);
@@ -126,8 +123,43 @@ impl StreamAppendAllocation {
     }
 }
 
-/// The proof is serialized by the capture owner and never interpreted by a
-/// driver.
+/// What a capture owner proves about a captured append: identities only,
+/// never item data. Construction bounds it, so a receipt stays one unchunked
+/// native value.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
+pub struct StreamAppendProof(Vec<u8>);
+
+impl StreamAppendProof {
+    pub fn try_new(bytes: Vec<u8>) -> StorageResult<Self> {
+        if bytes.is_empty() || bytes.len() > crate::constants::STREAM_APPEND_PROOF_BYTES {
+            return Err(StorageError::internal(
+                "Table append proof is empty or exceeds its bound",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<u8>> for StreamAppendProof {
+    type Error = StorageError;
+    fn try_from(bytes: Vec<u8>) -> StorageResult<Self> {
+        Self::try_new(bytes)
+    }
+}
+
+impl From<StreamAppendProof> for Vec<u8> {
+    fn from(proof: StreamAppendProof) -> Self {
+        proof.0
+    }
+}
+
+/// The proof is serialized by the capture owner, bounded by
+/// `StreamAppendProof`, and never interpreted by a driver.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamAppendReceipt {
@@ -135,14 +167,14 @@ pub struct StreamAppendReceipt {
     pub history_id: TableHistoryId,
     pub operation: StreamAppendOperationId,
     pub request_digest: [u8; 32],
-    pub proof: Vec<u8>,
+    pub proof: StreamAppendProof,
     pub response: StreamAppendAllocation,
 }
 
 impl StreamAppendReceipt {
     pub fn new(
         request: &TableAppendRequest,
-        proof: Vec<u8>,
+        proof: StreamAppendProof,
         response: StreamAppendAllocation,
     ) -> Self {
         Self {
@@ -160,7 +192,6 @@ impl StreamAppendReceipt {
             || self.operation != key.operation
             || self.history_id != key.history_id
             || self.history_id.as_ref() == &[0; 16]
-            || self.proof.is_empty()
         {
             return Err(invalid_receipt());
         }

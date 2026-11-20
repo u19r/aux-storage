@@ -1,11 +1,11 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
-use storage_types::{AttributeValue, KeyAttributes};
+use storage_types::{AttemptPlan, AttributeValue, DeadlineClass, KeyAttributes};
 use tokio::sync::oneshot;
 
 use crate::{
-    AttemptMode, ColumnIndex, ReadProtection, SqlAttempt, SqlBackend, SqlDataAccess, SqlStatement,
-    SqlStore, SqlValue, item_lock::item_lock_statement,
+    AttemptMode, ColumnIndex, ReadProtection, SqlAttempt, SqlBackend, SqlStatement, SqlStore,
+    SqlValue, item_lock::item_lock_statement,
 };
 
 struct LockFixture {
@@ -28,28 +28,40 @@ impl LockFixture {
             .unwrap();
         let separator = if dsn.contains('?') { '&' } else { '?' };
         let dsn = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
-        let backend = super::PostgresBackend::initialize(&dsn, 4, false)
-            .await
-            .unwrap();
-        let store = SqlStore::initialize_schema(backend).await.unwrap();
+        let backend = super::PostgresBackend::initialize(
+            &dsn,
+            4,
+            false,
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .unwrap();
+        let store =
+            SqlStore::initialize_schema(backend, storage_types::InitialStreamLineages::ONE, true)
+                .await
+                .unwrap();
         let backend = Arc::clone(&store.backend);
         backend
-            .with_attempt(AttemptMode::ReadWrite, |attempt| {
-                Box::pin(async move {
-                    attempt
-                        .execute(SqlStatement::new(
-                            "CREATE TABLE item_lock_probe (value bigint NOT NULL)",
-                            vec![],
-                        ))
-                        .await?;
-                    attempt
-                        .execute(SqlStatement::new(
-                            "INSERT INTO item_lock_probe VALUES (0)",
-                            vec![],
-                        ))
-                        .await
-                })
-            })
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                    .start(backend.attempt_deadlines()),
+                |attempt| {
+                    Box::pin(async move {
+                        attempt
+                            .execute(SqlStatement::new(
+                                "CREATE TABLE item_lock_probe (value bigint NOT NULL)",
+                                vec![],
+                            ))
+                            .await?;
+                        attempt
+                            .execute(SqlStatement::new(
+                                "INSERT INTO item_lock_probe VALUES (0)",
+                                vec![],
+                            ))
+                            .await
+                    })
+                },
+            )
             .await
             .unwrap();
         Self {
@@ -85,9 +97,10 @@ async fn given_blocked_item_and_cold_cache_when_pipeline_runs_then_read_observes
     let backend = Arc::clone(&fixture.backend);
     let holder = tokio::spawn(async move {
         backend
-            .with_data_attempt(
-                AttemptMode::ReadWriteItems,
-                SqlDataAccess::Write,
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWriteItems, DeadlineClass::Write)
+                    .scoped(storage_types::AttemptScope::Data)
+                    .start(backend.attempt_deadlines()),
                 |attempt| {
                     Box::pin(async move {
                         attempt
@@ -115,9 +128,10 @@ async fn given_blocked_item_and_cold_cache_when_pipeline_runs_then_read_observes
     let backend = Arc::clone(&fixture.backend);
     let mut reader = tokio::spawn(async move {
         backend
-            .with_data_attempt(
-                AttemptMode::ReadWriteItems,
-                SqlDataAccess::Write,
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWriteItems, DeadlineClass::Write)
+                    .scoped(storage_types::AttemptScope::Data)
+                    .start(backend.attempt_deadlines()),
                 |attempt| {
                     Box::pin(async move {
                         attempt
@@ -164,17 +178,45 @@ async fn given_blocked_item_and_cold_cache_when_pipeline_runs_then_read_observes
 #[tokio::test]
 #[ignore = "requires TEST_POSTGRES_DSN"]
 async fn given_active_data_writer_when_split_starts_then_writers_coexist_and_split_drains_them() {
+    assert_split_drains_writer(AttemptMode::ReadWriteItems).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_POSTGRES_DSN"]
+async fn given_serializable_data_writer_when_split_starts_then_writers_coexist_and_split_drains_them()
+ {
+    assert_split_drains_writer(AttemptMode::ReadWrite).await;
+}
+
+async fn assert_split_drains_writer(mode: AttemptMode) {
     let fixture = LockFixture::load().await;
     let (locked, acquired) = oneshot::channel();
     let (release, released) = oneshot::channel();
     let backend = Arc::clone(&fixture.backend);
     let holder = tokio::spawn(async move {
         backend
-            .with_data_attempt(
-                AttemptMode::ReadWriteItems,
-                SqlDataAccess::Write,
+            .with_attempt(
+                AttemptPlan::new(
+                    mode,
+                    if mode == AttemptMode::ReadOnly {
+                        DeadlineClass::PointRead
+                    } else {
+                        DeadlineClass::Write
+                    },
+                )
+                .scoped(storage_types::AttemptScope::Data)
+                .start(backend.attempt_deadlines()),
                 |attempt| {
                     Box::pin(async move {
+                        // BEGIN is lazy: establish the native scope lock before
+                        // reporting readiness.
+                        attempt
+                            .query(
+                                SqlStatement::new("SELECT 1::bigint", vec![]),
+                                ReadProtection::Snapshot,
+                                NonZeroUsize::new(4096).unwrap(),
+                            )
+                            .await?;
                         locked.send(()).unwrap();
                         released.await.unwrap();
                         attempt
@@ -193,9 +235,10 @@ async fn given_active_data_writer_when_split_starts_then_writers_coexist_and_spl
     // A second ordinary writer must not wait for the first writer's fence.
     tokio::time::timeout(
         Duration::from_secs(2),
-        fixture.backend.with_data_attempt(
-            AttemptMode::ReadWriteItems,
-            SqlDataAccess::Write,
+        fixture.backend.with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWriteItems, DeadlineClass::Write)
+                .scoped(storage_types::AttemptScope::Data)
+                .start(fixture.backend.attempt_deadlines()),
             |attempt| {
                 Box::pin(async move {
                     attempt
@@ -215,9 +258,10 @@ async fn given_active_data_writer_when_split_starts_then_writers_coexist_and_spl
     let backend = Arc::clone(&fixture.backend);
     let mut split = tokio::spawn(async move {
         backend
-            .with_data_attempt(
-                AttemptMode::ReadWrite,
-                SqlDataAccess::Exclusive,
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                    .scoped(storage_types::AttemptScope::Topology)
+                    .start(backend.attempt_deadlines()),
                 |attempt| {
                     Box::pin(async move {
                         attempt

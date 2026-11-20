@@ -44,7 +44,7 @@ async fn store_for_with_request_timeout(
         tls: false,
         credentials: RemoteCredentialStrategy::DefaultChain,
         timeouts: Some(RemoteTimeoutOverrides {
-            connect_timeout_ms: Some(timeout_ms),
+            connect_timeout_ms: Some(timeout_ms / 2),
             request_timeout_ms: Some(timeout_ms),
         }),
     })

@@ -107,3 +107,89 @@ fn given_a_customer_alias_when_projection_is_prepared_then_existence_uses_a_dist
         Some("pk")
     );
 }
+
+#[test]
+fn given_related_writes_when_prepared_then_main_condition_and_request_token_are_preserved() {
+    let result = request().transact_items.remove(0).update.unwrap();
+    let index = storage_types::TransactPutRequest {
+        table_name: result.table_name.clone(),
+        item: storage_types::WireItem::try_from(&storage_types::AttributeMap::from_iter([(
+            "pk".to_string(),
+            AttributeValue::S("index".to_string()),
+        )]))
+        .unwrap(),
+        indexers: None,
+        condition_expression: None,
+        expression_attribute_names: None,
+        expression_attribute_values: None,
+        return_values_on_condition_check_failure: None,
+    };
+    let mut counter = result.clone();
+    counter.key =
+        KeyAttributes::from_iter([("pk".to_string(), AttributeValue::S("counter".to_string()))]);
+    let prepare = JobTerminalProjection::try_with_index_and_counter;
+    let prepared = prepare(
+        result.clone(),
+        index.clone(),
+        counter.clone(),
+        "group".to_string(),
+    )
+    .unwrap()
+    .into_request();
+    assert_eq!(prepared.transact_items.len(), 3);
+    assert_eq!(prepared.client_request_token.as_deref(), Some("group"));
+    assert_eq!(
+        prepared.transact_items[0]
+            .update
+            .as_ref()
+            .unwrap()
+            .condition_expression
+            .as_deref(),
+        Some("(#status = :running) AND attribute_exists(#job_projection_key)"),
+    );
+    let mut missing_condition = result.clone();
+    missing_condition.condition_expression = None;
+    assert!(
+        prepare(
+            missing_condition,
+            index.clone(),
+            counter.clone(),
+            "group".to_string()
+        )
+        .is_err()
+    );
+    let mut missing_key = result.clone();
+    missing_key.key = KeyAttributes::default();
+    assert!(
+        prepare(
+            missing_key,
+            index.clone(),
+            counter.clone(),
+            "group".to_string()
+        )
+        .is_err()
+    );
+    assert!(
+        prepare(
+            result.clone(),
+            index.clone(),
+            counter.clone(),
+            String::new()
+        )
+        .is_err()
+    );
+    let mut foreign_index = index.clone();
+    foreign_index.table_name = TableName::new("other");
+    assert!(
+        prepare(
+            result.clone(),
+            foreign_index,
+            counter.clone(),
+            "group".to_string()
+        )
+        .is_err()
+    );
+    let mut foreign_counter = counter;
+    foreign_counter.table_name = TableName::new("other");
+    assert!(prepare(result, index, foreign_counter, "group".to_string()).is_err());
+}

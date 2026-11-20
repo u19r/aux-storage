@@ -1,8 +1,9 @@
 //! Wire response assembly shared by SQL and KV ReadSequence attempts.
 
 use storage_types::{
-    READ_SEQUENCE_DEFAULT_MAX_RESPONSE_BYTES, ReadSequencePlan, ReadSequenceRequest,
-    ReadSequenceResponse, ReturnConsumedCapacity, StorageError, StorageResult,
+    ConsumedCapacity, READ_SEQUENCE_DEFAULT_MAX_RESPONSE_BYTES, ReadSequencePlan,
+    ReadSequenceRequest, ReadSequenceResponse, ReturnConsumedCapacity, StorageError, StorageResult,
+    TableName,
 };
 
 use super::node::NodeOutcome;
@@ -12,7 +13,6 @@ pub(super) fn response(
     plan: &ReadSequencePlan,
     outcomes: &[Option<NodeOutcome>],
     prior_completed: &[usize],
-    total_read_items: u32,
     next_sequence_token: Option<String>,
 ) -> ReadSequenceResponse {
     let nodes = plan
@@ -34,7 +34,7 @@ pub(super) fn response(
         nodes,
         partial: next_sequence_token.is_some(),
         next_sequence_token,
-        consumed_capacity: consumed_capacity(request.return_consumed_capacity, total_read_items),
+        consumed_capacity: consumed_capacity(request.return_consumed_capacity),
         read_consistency: request.read_consistency,
     }
 }
@@ -57,19 +57,10 @@ pub(super) fn enforce_response_limit(
     Ok(())
 }
 
-fn consumed_capacity(
-    capacity: Option<ReturnConsumedCapacity>,
-    read_count: u32,
-) -> Option<serde_json::Value> {
-    match capacity? {
-        ReturnConsumedCapacity::Total | ReturnConsumedCapacity::Indexes => {
-            let units = f64::from(read_count).max(0.5);
-            Some(serde_json::json!({
-                "TableName": "ReadSequence",
-                "CapacityUnits": units,
-                "ReadCapacityUnits": units,
-            }))
-        }
-        ReturnConsumedCapacity::None => None,
-    }
+fn consumed_capacity(capacity: Option<ReturnConsumedCapacity>) -> Option<ConsumedCapacity> {
+    ConsumedCapacity::zero(capacity, &TableName::new("ReadSequence"), None).map(|mut zero| {
+        zero.read_capacity_units = Some(0.0);
+        zero.table = None;
+        zero
+    })
 }

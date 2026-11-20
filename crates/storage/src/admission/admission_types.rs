@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use storage_types::{StorageEnum, StorageError, context::WrappedError as _};
+use storage_types::{AttemptKind, StorageEnum, StorageError, context::WrappedError as _};
 
 /// The bounded workload classes used by the controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,17 +59,9 @@ pub struct AdmissionConfig {
 }
 
 impl Default for AdmissionConfig {
+    /// The file defaults (`config::StorageAdmissionConfig`) own the values.
     fn default() -> Self {
-        Self {
-            enabled: true,
-            initial_sustainable_throughput_rps: 20_000,
-            initial_latency_estimate_ms: 5,
-            minimum_concurrency: 4,
-            maximum_concurrency: 1_024,
-            control_reserve_concurrency: 4,
-            queue_capacity: 256,
-            max_queue_wait_ms: 25,
-        }
+        Self::copied_from(&config::StorageAdmissionConfig::default())
     }
 }
 
@@ -78,7 +70,11 @@ impl AdmissionConfig {
     pub fn from_config(
         config: &config::StorageAdmissionConfig,
     ) -> Result<Self, AdmissionConfigError> {
-        Self::try_new(Self {
+        Self::try_new(Self::copied_from(config))
+    }
+
+    fn copied_from(config: &config::StorageAdmissionConfig) -> Self {
+        Self {
             enabled: config.enabled,
             initial_sustainable_throughput_rps: config.initial_sustainable_throughput_rps,
             initial_latency_estimate_ms: config.initial_latency_estimate_ms,
@@ -87,7 +83,7 @@ impl AdmissionConfig {
             control_reserve_concurrency: config.control_reserve_concurrency,
             queue_capacity: config.queue_capacity,
             max_queue_wait_ms: config.max_queue_wait_ms,
-        })
+        }
     }
 
     pub fn try_new(config: Self) -> Result<Self, AdmissionConfigError> {
@@ -216,27 +212,23 @@ impl AdmissionOutcome {
     }
 }
 
+/// Load on the store: known not committed and caused by load, never by another
+/// writer (a conflict) or by the request (an in-progress token). Every pressure
+/// error is `ErrorClass::Retryable`; the converse does not hold. Remote AWS
+/// throttling and unavailability codes arrive typed (storage-remote
+/// `classify_error_response`).
 pub(crate) fn is_admission_pressure(error: &StorageError) -> bool {
-    match error.to_enum() {
-        StorageEnum::ProvisionedThroughputExceeded { .. }
-        | StorageEnum::Throttled { .. }
-        | StorageEnum::LimitExceeded { .. }
-        | StorageEnum::RequestLimitExceeded
-        | StorageEnum::ServiceUnavailable { .. } => true,
-        StorageEnum::AwsService {
-            code: Some(code), ..
-        } => matches!(
-            code.as_str(),
-            "ServiceUnavailable"
-                | "ServiceUnavailableException"
-                | "RequestTimeout"
-                | "RequestTimeoutException"
-                | "ThrottlingException"
-                | "ProvisionedThroughputExceededException"
-                | "LimitExceededException"
-        ),
-        _ => false,
-    }
+    error
+        .attempt_kind()
+        .is_some_and(AttemptKind::is_unavailable)
+        || matches!(
+            error.to_enum(),
+            StorageEnum::ProvisionedThroughputExceeded { .. }
+                | StorageEnum::Throttled { .. }
+                | StorageEnum::LimitExceeded { .. }
+                | StorageEnum::RequestLimitExceeded
+                | StorageEnum::ServiceUnavailable { .. }
+        )
 }
 
 /// Why an operation could not enter the foreground lane.

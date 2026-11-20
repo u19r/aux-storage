@@ -1,4 +1,4 @@
-//! Reusable multi-row upsert lowering shared by primary and GSI writes.
+//! Reusable multi-row upsert and delete lowering for item relation writes.
 //!
 //! One logical attempt still owns one native transaction. Grouping equal-shape
 //! rows into one statement only removes redundant native round trips; every
@@ -15,7 +15,6 @@ pub(crate) struct UpsertShape {
     columns: Vec<String>,
     numeric_columns: Vec<bool>,
     conflict_columns: Vec<String>,
-    revision_guard: bool,
 }
 
 impl UpsertShape {
@@ -23,7 +22,6 @@ impl UpsertShape {
         columns: Vec<String>,
         numeric_columns: Vec<bool>,
         conflict_columns: Vec<String>,
-        revision_guard: bool,
     ) -> StorageResult<Self> {
         if columns.is_empty()
             || columns.len() != numeric_columns.len()
@@ -38,13 +36,11 @@ impl UpsertShape {
             columns,
             numeric_columns,
             conflict_columns,
-            revision_guard,
         })
     }
 
     fn same_as(&self, other: &Self) -> bool {
-        self.revision_guard == other.revision_guard
-            && self.columns == other.columns
+        self.columns == other.columns
             && self.numeric_columns == other.numeric_columns
             && self.conflict_columns == other.conflict_columns
     }
@@ -59,16 +55,43 @@ impl UpsertShape {
         relation: &str,
         rows: Vec<Vec<SqlValue>>,
     ) -> StorageResult<SqlStatement> {
+        let mut sql = SqlText::default();
+        let binds = self.render_into(&mut sql, engine, relation, rows)?;
+        Ok(SqlStatement::new(sql.finish()?, binds))
+    }
+
+    pub(crate) fn render_counted(
+        &self,
+        engine: impl SqlLayout,
+        relation: &str,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> StorageResult<crate::SqlCountedWrite> {
+        let count = crate::catalog::SqlDynamoCount::ExactlyRows(rows.len());
+        let mut sql = SqlText::start_counted_write()?;
+        let binds = self.render_into(&mut sql, engine, relation, rows)?;
+        sql.finish_counted_write(
+            binds,
+            count,
+            crate::catalog::SqlDynamoWriteKind::Primary.error_factory(),
+        )
+    }
+
+    fn render_into(
+        &self,
+        sql: &mut SqlText,
+        engine: impl SqlLayout,
+        relation: &str,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> StorageResult<Vec<SqlValue>> {
         let width = self.width();
         let capacity = rows
             .len()
             .checked_mul(width)
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         let mut binds = Vec::new();
         binds
             .try_reserve_exact(capacity)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let mut sql = SqlText::default();
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         sql.append(format_args!("INSERT INTO \"{relation}\" ("))?;
         sql.append_columns(self.columns.iter())?;
         sql.append(format_args!(") VALUES "))?;
@@ -94,12 +117,7 @@ impl UpsertShape {
         sql.append_columns(self.conflict_columns.iter())?;
         sql.append(format_args!(") DO UPDATE SET "))?;
         sql.append_assignments(self.columns.iter().skip(self.conflict_columns.len()))?;
-        if self.revision_guard {
-            sql.append(format_args!(
-                " WHERE excluded.__aux_item_version > \"{relation}\".__aux_item_version"
-            ))?;
-        }
-        Ok(SqlStatement::new(sql.finish()?, binds))
+        Ok(binds)
     }
 }
 
@@ -136,13 +154,13 @@ impl UpsertGroups {
             group
                 .rows
                 .try_reserve(1)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             group.rows.push(row.binds);
             return Ok(());
         }
         self.groups
             .try_reserve(1)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         self.groups.push(UpsertGroup {
             relation: row.relation,
             shape: row.shape,
@@ -151,14 +169,24 @@ impl UpsertGroups {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn into_statements(
         self,
         engine: impl SqlLayout,
     ) -> StorageResult<Vec<(SqlStatement, usize)>> {
         let mut statements = Vec::new();
-        statements
-            .try_reserve_exact(self.groups.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        self.for_each_batch(|shape, relation, rows| {
+            let count = rows.len();
+            statements.push((shape.render(engine, relation, rows)?, count));
+            Ok(())
+        })?;
+        Ok(statements)
+    }
+
+    pub(crate) fn for_each_batch(
+        self,
+        mut render: impl FnMut(&UpsertShape, &str, Vec<Vec<SqlValue>>) -> StorageResult<()>,
+    ) -> StorageResult<()> {
         for group in self.groups {
             let width = group.shape.width();
             let rows_per_statement = (MULTI_ROW_WRITE_BINDS / width.max(1)).max(1);
@@ -167,13 +195,10 @@ impl UpsertGroups {
                 let batch_len = rows.len().min(rows_per_statement);
                 let remaining = rows.split_off(batch_len);
                 let batch = std::mem::replace(&mut rows, remaining);
-                statements.push((
-                    group.shape.render(engine, &group.relation, batch)?,
-                    batch_len,
-                ));
+                render(&group.shape, &group.relation, batch)?;
             }
         }
-        Ok(statements)
+        Ok(())
     }
 }
 
@@ -210,16 +235,43 @@ impl DeleteShape {
         relation: &str,
         rows: Vec<Vec<SqlValue>>,
     ) -> StorageResult<SqlStatement> {
+        let mut sql = SqlText::default();
+        let binds = self.render_into(&mut sql, engine, relation, rows)?;
+        Ok(SqlStatement::new(sql.finish()?, binds))
+    }
+
+    pub(crate) fn render_counted(
+        &self,
+        engine: impl SqlLayout,
+        relation: &str,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> StorageResult<crate::SqlCountedWrite> {
+        let count = crate::catalog::SqlDynamoCount::AtMostRows(rows.len());
+        let mut sql = SqlText::start_counted_write()?;
+        let binds = self.render_into(&mut sql, engine, relation, rows)?;
+        sql.finish_counted_write(
+            binds,
+            count,
+            crate::catalog::SqlDynamoWriteKind::Primary.error_factory(),
+        )
+    }
+
+    fn render_into(
+        &self,
+        sql: &mut SqlText,
+        engine: impl SqlLayout,
+        relation: &str,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> StorageResult<Vec<SqlValue>> {
         let width = self.width();
         let capacity = rows
             .len()
             .checked_mul(width)
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         let mut binds = Vec::new();
         binds
             .try_reserve_exact(capacity)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let mut sql = SqlText::default();
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         sql.append(format_args!("DELETE FROM \"{relation}\" WHERE ("))?;
         sql.append_columns(&self.columns)?;
         sql.append(format_args!(") IN (VALUES "))?;
@@ -250,7 +302,7 @@ impl DeleteShape {
             sql.append(format_args!(")"))?;
         }
         sql.append(format_args!(")"))?;
-        Ok(SqlStatement::new(sql.finish()?, binds))
+        Ok(binds)
     }
 }
 
@@ -287,13 +339,13 @@ impl DeleteGroups {
             group
                 .rows
                 .try_reserve(1)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             group.rows.push(row.binds);
             return Ok(());
         }
         self.groups
             .try_reserve(1)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         self.groups.push(DeleteGroup {
             relation: row.relation,
             shape: row.shape,
@@ -302,14 +354,24 @@ impl DeleteGroups {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn into_statements(
         self,
         engine: impl SqlLayout,
     ) -> StorageResult<Vec<(SqlStatement, usize)>> {
         let mut statements = Vec::new();
-        statements
-            .try_reserve_exact(self.groups.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        self.for_each_batch(|shape, relation, rows| {
+            let count = rows.len();
+            statements.push((shape.render(engine, relation, rows)?, count));
+            Ok(())
+        })?;
+        Ok(statements)
+    }
+
+    pub(crate) fn for_each_batch(
+        self,
+        mut render: impl FnMut(&DeleteShape, &str, Vec<Vec<SqlValue>>) -> StorageResult<()>,
+    ) -> StorageResult<()> {
         for group in self.groups {
             let width = group.shape.width();
             let rows_per_statement = (MULTI_ROW_WRITE_BINDS / width.max(1)).max(1);
@@ -318,12 +380,9 @@ impl DeleteGroups {
                 let batch_len = rows.len().min(rows_per_statement);
                 let remaining = rows.split_off(batch_len);
                 let batch = std::mem::replace(&mut rows, remaining);
-                statements.push((
-                    group.shape.render(engine, &group.relation, batch)?,
-                    batch_len,
-                ));
+                render(&group.shape, &group.relation, batch)?;
             }
         }
-        Ok(statements)
+        Ok(())
     }
 }

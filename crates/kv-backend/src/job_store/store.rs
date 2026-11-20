@@ -11,7 +11,7 @@ use scheduled_bg_jobs::store::{
     CommitOutcome, RangePage, RangeRequest, StoreCapabilities, StoreKey, StoreTransaction,
 };
 use storage_provider::{RawOrderedJobStore, RawOrderedJobStoreError};
-use storage_types::StorageResult;
+use storage_types::{AttemptPlan, DeadlineClass, StorageResult};
 
 use super::{commit, limits, range};
 use crate::{
@@ -23,11 +23,11 @@ pub(crate) fn data_key(key: &[u8]) -> StorageResult<Vec<u8>> {
     let count = DATA_PREFIX
         .len()
         .checked_add(key.len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut physical = Vec::new();
     physical
         .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     physical.extend_from_slice(DATA_PREFIX);
     physical.extend_from_slice(key);
     Ok(physical)
@@ -39,7 +39,7 @@ pub(crate) fn data_keys<'a>(
     let mut physical = Vec::new();
     physical
         .try_reserve_exact(keys.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for key in keys {
         physical.push(data_key(key)?);
     }
@@ -50,7 +50,7 @@ pub(crate) struct KvRawOrderedJobStore<B> {
     pub(super) backend: Arc<B>,
     pub(super) capabilities: StoreCapabilities,
     pub(super) admission:
-        std::sync::OnceLock<Arc<dyn storage_provider::native_admission::NativeAdmission>>,
+        std::sync::OnceLock<Arc<dyn storage_common::native_admission::NativeAdmission>>,
 }
 
 impl<B: KvBackend + 'static> bg_job_store::ScheduledJobStoreSource for KvStore<B> {
@@ -81,7 +81,15 @@ impl<B: KvBackend + 'static> KvRawOrderedJobStore<B> {
         storage_provider::job_store::run_native_job_read(
             self.capabilities.max_transaction_duration(),
             self.admission.get().cloned(),
-            move || async move { backend.with_attempt(AttemptMode::ReadOnly, operation).await },
+            move || async move {
+                backend
+                    .with_attempt(
+                        AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::BackgroundPage)
+                            .start(backend.attempt_deadlines()),
+                        operation,
+                    )
+                    .await
+            },
         )
         .await
     }
@@ -91,7 +99,7 @@ impl<B: KvBackend + 'static> KvRawOrderedJobStore<B> {
 impl<B: KvBackend + 'static> RawOrderedJobStore for KvRawOrderedJobStore<B> {
     fn bind_native_admission(
         &self,
-        admission: Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        admission: Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> StorageResult<()> {
         self.admission.set(admission).map_err(|_| {
             storage_types::StorageError::internal("scheduled-job native admission is already bound")
@@ -143,9 +151,7 @@ impl<B: KvBackend + 'static> RawOrderedJobStore for KvRawOrderedJobStore<B> {
             .await?;
         let mut output = Vec::new();
         output.try_reserve_exact(values.len()).map_err(|_| {
-            RawOrderedJobStoreError::Backend(
-                storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-            )
+            RawOrderedJobStoreError::Backend(storage_types::AttemptFailure::CAPACITY.into())
         })?;
         output.extend(values.into_iter().map(|value| value.map(Bytes::from)));
         Ok(output)

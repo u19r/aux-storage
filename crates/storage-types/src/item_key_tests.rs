@@ -99,6 +99,7 @@ fn round_trip_pagination_token() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
@@ -172,6 +173,7 @@ fn key_consistency_across_methods() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
@@ -290,7 +292,6 @@ fn gsi_round_trip_hash_only() {
             },
         ],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
-            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi_pk".to_string(),
@@ -304,6 +305,7 @@ fn gsi_round_trip_hash_only() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
@@ -393,7 +395,6 @@ fn gsi_round_trip_with_gsi_range() {
             },
         ],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
-            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![
                 KeySchemaElement {
@@ -413,6 +414,7 @@ fn gsi_round_trip_with_gsi_range() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
@@ -509,7 +511,6 @@ fn gsi_round_trip_all_keys() {
             },
         ],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
-            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![
                 KeySchemaElement {
@@ -529,6 +530,7 @@ fn gsi_round_trip_all_keys() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
@@ -612,7 +614,6 @@ fn gsi_invalid_token_parts() {
             attribute_type: KeyAttributeType::S,
         }],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
-            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi_pk".to_string(),
@@ -626,6 +627,7 @@ fn gsi_invalid_token_parts() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
@@ -670,4 +672,35 @@ fn given_truncated_token_framing_when_decoded_then_no_partial_key_is_returned() 
     for token in [vec![0], vec![0, 4, b'a'], vec![0, 1, b'a', 0]] {
         assert!(split_next_token_to_keys(&token).is_err());
     }
+}
+
+#[test]
+fn keys_for_schema_error_texts_unchanged() {
+    let hash_schema = [KeySchemaElement {
+        attribute_name: "pk".to_string(),
+        key_type: KeyType::Hash,
+    }];
+    let error = crate::TableKey::from_key_schema(
+        TableName::new("t"),
+        &hash_schema,
+        &crate::KeyAttributes::new(),
+    )
+    .expect_err("missing key attribute");
+    assert!(
+        format!("{error:?}").contains("Missing key attribute: pk"),
+        "{error:?}"
+    );
+
+    let range_schema = [KeySchemaElement {
+        attribute_name: "sk".to_string(),
+        key_type: KeyType::Range,
+    }];
+    let mut item = crate::KeyAttributes::new();
+    item.insert("sk", AttributeValue::S("s".to_string()));
+    let error = crate::TableKey::from_key_schema(TableName::new("t"), &range_schema, &item)
+        .expect_err("missing hash key schema");
+    assert!(
+        format!("{error:?}").contains("Missing hash key schema"),
+        "{error:?}"
+    );
 }

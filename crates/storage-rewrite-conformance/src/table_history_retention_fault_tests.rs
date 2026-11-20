@@ -13,8 +13,8 @@ use storage_types::{StorageError, TimestampMillis};
 
 use super::{
     dynamodb_stream_history_tests::{create_stream_table, put_value},
-    image_retention_tests::table_stream,
-    table_history_retention_tests::{change_duration, cleanup_page, history_count, item_history},
+    image_retention_tests::canonical_history_reads,
+    table_history_retention_tests::{change_duration, cleanup_page, history_count},
     test_support::TestStore,
 };
 
@@ -64,10 +64,10 @@ async fn verify_cleanup_abort(store: TestStore, probe: &CleanupAbortProbe) -> an
         for value in ["v1", "v2", "v3"] {
             put_value(&store, &table, "item", value).await;
         }
-        let history = item_history(&store, &table).await?;
-        let pointers = table_stream(&store, &table).await?;
+        store.wait_until_changes_are_readable().await;
+        let history = canonical_history_reads(&store, &table).await?;
         store.advance_time(Duration::from_secs(25 * 3600));
-        let repository = &store.stream_retention_repository;
+        let repository = &store.maintenance;
         let horizon = TimestampMillis::from_timestamp(i64::MAX);
         let markers = repository
             .list_due_stream_trim_markers(horizon, 100)
@@ -84,7 +84,6 @@ async fn verify_cleanup_abort(store: TestStore, probe: &CleanupAbortProbe) -> an
         );
         anyhow::ensure!(probe.staged.load(Ordering::SeqCst) && !probe.armed.load(Ordering::SeqCst));
         anyhow::ensure!(history_count(&store, &history).await? == 3);
-        anyhow::ensure!(history_count(&store, &pointers).await? == 3);
         anyhow::ensure!(repository.load_stream_trim_states(&scopes).await? == states);
         anyhow::ensure!(
             repository
@@ -92,11 +91,10 @@ async fn verify_cleanup_abort(store: TestStore, probe: &CleanupAbortProbe) -> an
                 .await?
                 == markers
         );
-        anyhow::ensure!(cleanup_page(&store, 100).await?.rows_deleted == 1);
+        anyhow::ensure!(cleanup_page(&store, 100).await?.rows_deleted == 3);
         store.advance_time(Duration::from_millis(1));
-        anyhow::ensure!(cleanup_page(&store, 100).await?.rows_deleted == 4);
-        anyhow::ensure!(history_count(&store, &history).await? == 1);
-        anyhow::ensure!(history_count(&store, &pointers).await? == 0);
+        anyhow::ensure!(cleanup_page(&store, 100).await?.rows_deleted == 0);
+        anyhow::ensure!(history_count(&store, &history).await? == 0);
         Ok(())
     }
     .await;

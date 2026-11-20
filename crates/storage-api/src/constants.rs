@@ -14,23 +14,9 @@ pub const STORAGE_API_DYNAMODB_STAGE_LATENCY_MS_METRIC: metrics_facade::Histogra
     metrics_facade::HistogramMetric::StorageApiDynamodbStageLatencyMsMetric;
 
 pub(crate) const DYNAMODB_JSON_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-#[cfg(any(
-    test,
-    feature = "queue",
-    feature = "pubsub",
-    feature = "internal-test-routes"
-))]
 pub(crate) const AUXILIARY_JSON_BODY_LIMIT_BYTES: usize = 5 * 1024 * 1024;
-#[cfg(feature = "queue")]
-pub(crate) const QUEUE_JSON_TARGET_PREFIX: &str = "AmazonSQS.";
 
 pub const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(feature = "pubsub")]
-pub const PUBSUB_DELIVERY_IDLE_INTERVAL: Duration = Duration::from_secs(1);
-#[cfg(feature = "pubsub")]
-pub const PUBSUB_DELIVERY_ERROR_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(feature = "pubsub")]
-pub const PUBSUB_DELIVERY_BATCH_LIMIT: usize = 100;
 pub const PROMETHEUS_LATENCY_MS_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
     1000.0, 2500.0, 5000.0, 10000.0,
@@ -38,7 +24,6 @@ pub const PROMETHEUS_LATENCY_MS_BUCKETS: &[f64] = &[
 
 pub(crate) const DYNAMODB_STATUS_UNKNOWN_OPERATION: &str = "unknown";
 pub(crate) const DYNAMODB_OPERATIONS: &[&str] = &[
-    "get_canonical_history",
     "batch_get_item",
     "batch_write_item",
     "create_table",

@@ -102,9 +102,9 @@ fn decode_candidate(key: &[u8], bytes: &[u8]) -> StorageResult<GsiBuild<Vec<u8>>
             "KV GSI build identity does not match its key",
         ));
     }
-    if !build.state.permits_projection() {
+    if !build.state.is_runnable() {
         return Err(StorageError::internal(
-            "KV GSI runnable index contains a blocked build",
+            "KV GSI runnable index contains an inactive build",
         ));
     }
     Ok(build)

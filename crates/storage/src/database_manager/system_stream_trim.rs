@@ -16,11 +16,16 @@ impl DatabaseManager {
         page_limit: usize,
         continuation: Option<SystemStreamTrimContinuation>,
     ) -> StorageResult<SystemStreamTrimPageResult> {
-        let repository = self.system_stream_trim_repository.clone().ok_or_else(|| {
-            StorageError::unsupported(
-                "logical SystemStream trim is not supported by this storage provider",
-            )
-        })?;
+        let repository = self
+            .default_connection
+            .native
+            .as_ref()
+            .map(|native| std::sync::Arc::clone(&native.maintenance))
+            .ok_or_else(|| {
+                StorageError::unsupported(
+                    "logical SystemStream trim is not supported by this storage provider",
+                )
+            })?;
         self.admission_controller_for_connection("default")?
             .settle_foreground(AdmissionClass::Write, || async move {
                 SystemStreamTrimExecutor::new(repository.as_ref(), page_limit)

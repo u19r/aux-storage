@@ -1,170 +1,298 @@
-//! Real-provider baseline/history contract. Construction stays with each native
-//! backend.
+//! Real-provider proof that baseline mutations never publish stream events.
 
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use storage_types::{
-    AttemptMode, AttributeValue, BoundTableInfo, ItemHistoryEntry, ItemHistoryKind,
-    ItemHistoryPublication, ItemHistoryReference, ItemProvenance, ItemStreamVersion, KeyAttributes,
-    StorageResult, TableName,
+    AttemptMode, AttributeValue, BoundTableInfo, DeadlineClass, ItemProvenance, KeyAttributes,
+    StorageResult, TableName, maintenance::TargetIncarnation,
 };
-use stream_provider::{ItemHistoryReadAttempt, ItemHistoryReadBatch};
+use stream_provider::{PositionedStreamEntry, StreamAttempt, StreamChange};
 
 use crate::{
-    BoundDeleteItem, CatalogAttempt, DynamoOperations, DynamoPort, DynamoStreamWriteAttempt,
-    GetItemAttempt as _, ItemWriteObservationAttempt, PutItemShape,
-    TableHistoryRetentionAttempt as _,
-    maintenance::{StreamRetentionFinish, StreamRetentionFinishReason, StreamRetentionPort},
+    AcceptedDeleteItem, CatalogAttempt, DynamoOperations, DynamoPort, DynamoStreamWriteAttempt,
+    ItemReadAttempt as _, ItemWriteAttempt, PutItemShape, TtlPolicyAttempt as _,
+    maintenance::{ExpirationPort, ExpirationScanRead},
 };
 
 pub async fn qualify_baseline_history<P: DynamoPort + DynamoOperations>(store: P)
-where for<'a> P::Attempt<'a>: StreamRetentionPort {
+where for<'a> P::Attempt<'a>: ExpirationPort {
     let name = TableName::new("baseline-history");
     store.create_table(serde_json::from_value(serde_json::json!({
-        "TableName": name, "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "TableName": name, "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"}],
+        "GlobalSecondaryIndexes": [{"IndexName": "ByGroup",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}}],
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
         "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"}
     })).unwrap()).await.unwrap();
-    assert_live_revisions(&store, &name, None).await;
-    let first = write_baseline(&store, &name, Some("a")).await.unwrap();
-    assert_live_revisions(&store, &name, Some(first.version().get())).await;
-    let first_entry = read_history(&store, first.clone()).await.unwrap().unwrap();
-    assert_eq!(
-        first_entry.metadata().publication(),
-        &ItemHistoryPublication::PredecessorAnchor
-    );
-    let second = write_baseline(&store, &name, Some("b")).await.unwrap();
-    assert_live_revisions(&store, &name, Some(second.version().get())).await;
-    assert!(read_history(&store, first).await.unwrap().is_none());
-    assert!(
-        read_history(&store, second.clone())
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(second.version().get() > 1);
-    let quiet_delete = write_baseline(&store, &name, None).await.unwrap();
-    assert_live_revisions(&store, &name, None).await;
-    assert!(read_history(&store, second).await.unwrap().is_none());
-    assert!(
-        read_history(&store, quiet_delete).await.unwrap().is_none(),
-        "quiet delete invented an event"
-    );
-    let anchor = write_baseline(&store, &name, Some("c")).await.unwrap();
     store
-        .put_item(
+        .update_time_to_live(
             serde_json::from_value(serde_json::json!({
-                "TableName": name, "Item": {"pk": {"S": "key"}, "body": {"S": "ordinary"}}
+                "TableName": name,
+                "TimeToLiveSpecification": {"Enabled": true, "AttributeName": "expires"}
             }))
             .unwrap(),
         )
         .await
         .unwrap();
-    let event = ItemHistoryReference::try_new(
-        anchor.address().clone(),
-        ItemStreamVersion::new(anchor.version().get() + 1),
-    )
-    .unwrap();
-    let published = read_history(&store, event.clone()).await.unwrap().unwrap();
-    assert_eq!(
-        published.metadata().previous_version(),
-        Some(anchor.version())
-    );
-    assert_eq!(published.metadata().kind(), ItemHistoryKind::Image);
-    assert!(
-        read_history(&store, anchor.clone())
-            .await
-            .unwrap()
-            .is_some()
-    );
-    let quiet_delete = write_baseline(&store, &name, None).await.unwrap();
-    assert!(read_history(&store, quiet_delete).await.unwrap().is_none());
-    assert!(read_history(&store, event.clone()).await.unwrap().is_some());
-    assert!(read_history(&store, anchor).await.unwrap().is_some());
-    let current = write_baseline(&store, &name, Some("d")).await.unwrap();
-    assert!(
-        read_history(&store, event.clone()).await.unwrap().is_some(),
-        "unretired event lost"
-    );
-    qualify_retired_release(&store, name, event, current)
+    let mut groups = Vec::new();
+    let mut ttl_item_key = None;
+    assert_primary_presence(&store, &name, false).await;
+    for value in [Some("a"), Some("b"), None, Some("c")] {
+        write_baseline(&store, &name, value).await.unwrap();
+        assert_primary_presence(&store, &name, value.is_some()).await;
+        assert_derived_state(&store, &name, value, &mut groups, &mut ttl_item_key).await;
+        assert!(
+            read_history(&store).await.is_empty(),
+            "baseline published an event"
+        );
+    }
+    store
+        .put_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": name, "Item": fixture_item("ordinary")
+            }))
+            .unwrap(),
+        )
         .await
         .unwrap();
+    assert_derived_state(
+        &store,
+        &name,
+        Some("ordinary"),
+        &mut groups,
+        &mut ttl_item_key,
+    )
+    .await;
+    let published = read_history(&store).await;
+    assert_eq!(published.len(), 1);
+    let entry = &published[0].entry;
+    assert_eq!(entry.change(), StreamChange::Modify);
+    assert_eq!(
+        entry
+            .old_image()
+            .unwrap()
+            .item
+            .to_attribute_map()
+            .unwrap()
+            .get("body"),
+        Some(&AttributeValue::S("c".repeat(100_000)))
+    );
+    assert_eq!(
+        entry
+            .new_image()
+            .unwrap()
+            .item
+            .to_attribute_map()
+            .unwrap()
+            .get("body"),
+        Some(&AttributeValue::S("ordinary".into()))
+    );
+    let published_bytes = published[0].encode_value().unwrap();
+    for value in [None, Some("d"), Some("e")] {
+        write_baseline(&store, &name, value).await.unwrap();
+        assert_primary_presence(&store, &name, value.is_some()).await;
+        assert_derived_state(&store, &name, value, &mut groups, &mut ttl_item_key).await;
+        let retained = read_history(&store).await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].history_id, published[0].history_id);
+        assert_eq!(retained[0].position, published[0].position);
+        assert_eq!(
+            retained[0].encode_value().unwrap(),
+            published_bytes,
+            "baseline changed an already published event"
+        );
+    }
 }
 
-async fn assert_live_revisions<P: DynamoPort>(store: &P, name: &TableName, expected: Option<u64>) {
+fn fixture_epoch(value: &str) -> i64 {
+    4_102_444_800
+        + match value {
+            "a" => 1,
+            "b" => 2,
+            "c" => 3,
+            "ordinary" => 4,
+            "d" => 5,
+            "e" => 6,
+            _ => panic!("unknown baseline fixture image"),
+        }
+}
+
+fn fixture_item(value: &str) -> serde_json::Value {
+    let body = if value == "ordinary" {
+        value.to_owned()
+    } else {
+        value.repeat(100_000)
+    };
+    serde_json::json!({
+        "pk": {"S": "key"}, "body": {"S": body}, "gsi_pk": {"S": value},
+        "expires": {"N": fixture_epoch(value).to_string()}
+    })
+}
+
+async fn assert_derived_state<P: DynamoPort + DynamoOperations>(
+    store: &P,
+    name: &TableName,
+    current: Option<&str>,
+    groups: &mut Vec<String>,
+    ttl_item_key: &mut Option<String>,
+) where
+    for<'a> P::Attempt<'a>: ExpirationPort,
+{
+    if let Some(current) = current {
+        groups.push(current.to_owned());
+    }
+    for group in groups.iter() {
+        let result = store
+            .query(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": name, "IndexName": "ByGroup",
+                    "KeyConditionExpression": "gsi_pk = :group",
+                    "ExpressionAttributeValues": {":group": {"S": group}}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(result.last_evaluated_key.is_none());
+        let items = result.items.unwrap_or_default();
+        if current == Some(group.as_str()) {
+            assert_eq!(result.count, 1);
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                serde_json::to_value(items[0].to_attribute_map().unwrap()).unwrap(),
+                fixture_item(group)
+            );
+        } else {
+            assert_eq!(result.count, 0);
+            assert!(items.is_empty(), "stale GSI group {group}");
+        }
+    }
+    let expected_epoch = current.map(fixture_epoch);
     let name = name.clone();
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+    let current_key = crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
+            Box::pin(async move {
+                let table = load_table(attempt, &name).await?;
+                let config = attempt.read_ttl_config(&table).await?.unwrap();
+                assert_eq!(config.attribute_name, "expires");
+                let read = ExpirationScanRead {
+                    table_name: name,
+                    table_incarnation: TargetIncarnation::from(*table.history_id.as_ref()),
+                    ttl_attribute: config.attribute_name,
+                    policy_generation: config.policy_generation,
+                    cutoff_seconds: fixture_epoch("e"),
+                    cursor: None,
+                    limit: NonZeroUsize::new(16).unwrap(),
+                };
+                let (rows, more) = attempt.scan_expiration_index(&table, &read).await?;
+                assert!(!more);
+                let key = KeyAttributes::from([("pk".into(), AttributeValue::S("key".into()))]);
+                let (observed, _) = attempt.observe_for_write(&table, &key).await?;
+                if let Some(expected_epoch) = expected_epoch {
+                    assert_eq!(rows.len(), 1, "stale or missing TTL index address");
+                    assert_eq!(rows[0].indexed_expiration_seconds, expected_epoch);
+                    let crate::ItemWriteObservation::Live { ttl_epoch, .. } = observed else {
+                        panic!("expected live primary image");
+                    };
+                    assert_eq!(ttl_epoch, Some(expected_epoch));
+                    Ok(Some(rows[0].ttl_item_key.clone()))
+                } else {
+                    assert!(rows.is_empty());
+                    assert!(matches!(observed, crate::ItemWriteObservation::Absent));
+                    Ok(None)
+                }
+            })
+        },
+    )
+    .await
+    .unwrap();
+    if let Some(current_key) = current_key {
+        if let Some(original) = ttl_item_key.as_ref() {
+            assert_eq!(&current_key, original);
+        } else {
+            *ttl_item_key = Some(current_key);
+        }
+    }
+}
+
+async fn assert_primary_presence<P: DynamoPort>(store: &P, name: &TableName, expected: bool) {
+    let name = name.clone();
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
                 let table = load_table(attempt, &name).await?;
                 let key = KeyAttributes::from([("pk".into(), AttributeValue::S("key".into()))]);
                 let absent =
                     KeyAttributes::from([("pk".into(), AttributeValue::S("absent".into()))]);
-                let revisions = attempt
-                    .read_primary_live_revisions(&[
-                        (&table, &key),
-                        (&table, &absent),
-                        (&table, &key),
-                    ])
+                let items = attempt
+                    .read_primary_pairs(&[(&table, &key), (&table, &absent), (&table, &key)])
                     .await?;
                 assert_eq!(
-                    revisions
+                    items
                         .into_iter()
-                        .map(|revision| revision.map(|revision| revision.get()))
+                        .map(|item| item.is_some())
                         .collect::<Vec<_>>(),
-                    [expected, None, expected]
+                    [expected, false, expected]
                 );
-                assert!(attempt.read_primary_live_revisions(&[]).await?.is_empty());
+                assert!(attempt.read_primary_pairs(&[]).await?.is_empty());
                 Ok(())
             })
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
 }
 
 async fn write_baseline<P: DynamoPort>(
     store: &P,
     name: &TableName,
     value: Option<&str>,
-) -> StorageResult<ItemHistoryReference> {
+) -> StorageResult<()> {
     let name = name.clone();
-    let value = value.map(|value| value.repeat(100_000));
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+    let value = value.map(fixture_item);
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
                 let table = load_table(attempt, &name).await?;
                 let key = KeyAttributes::from([("pk".into(), AttributeValue::S("key".into()))]);
                 let (observed, lifecycle) = attempt.observe_for_write(&table, &key).await?;
-                let revision = match &observed {
-                    crate::ItemWriteObservation::Absent => 1,
-                    crate::ItemWriteObservation::Live { revision, .. }
-                    | crate::ItemWriteObservation::Deleted { revision, .. } => revision.get() + 1,
-                };
-                let reference = ItemHistoryReference::try_new(
-                    stream_provider::dynamo_item_history_address(&table, &key)?,
-                    ItemStreamVersion::new(revision),
-                )?;
                 if let Some(value) = value {
                     let request = serde_json::from_value(serde_json::json!({
-                        "TableName": name, "Item": {"pk": {"S": "key"}, "body": {"S": value}}
+                        "TableName": name, "Item": value
                     }))
                     .unwrap();
-                    let bound = PutItemShape::try_from_request(request)?.bind_table(table, None)?;
+                    let shape = Arc::new(PutItemShape::try_from_request(request)?);
+                    let bound = shape.bind_table(table)?;
                     let (accepted, _) = bound.accept_old(observed, lifecycle)?.into_result()?;
                     crate::prepare_baseline_upsert(attempt, accepted, ItemProvenance::default())
                         .await?;
                 } else {
-                    let accepted = BoundDeleteItem::for_maintenance(table, key)?
-                        .accept_old(observed, lifecycle)?
-                        .into_result()?;
-                    crate::prepare_baseline_delete(attempt, &accepted, ItemProvenance::default())
-                        .await?;
+                    storage_types::validate_transact_key(&table.info, &key)?;
+                    let old = crate::dynamo_put_item::ObservedWrite::try_new(observed, &key)?;
+                    let accepted =
+                        AcceptedDeleteItem::try_from_observed(table, key, old, lifecycle)?;
+                    crate::prepare_baseline_delete(attempt, &accepted).await?;
                 }
                 attempt.flush_dynamo_write().await?;
-                Ok(reference)
+                Ok(())
             })
-        })
-        .await
+        },
+    )
+    .await
 }
 
 async fn load_table(
@@ -175,110 +303,45 @@ async fn load_table(
     attempt.read_table_at_stamp(name, stamp).await
 }
 
-async fn read_history<P: DynamoPort>(
-    store: &P,
-    reference: ItemHistoryReference,
-) -> StorageResult<Option<ItemHistoryEntry>> {
-    store
-        .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
+async fn read_history<P: DynamoPort>(store: &P) -> Vec<PositionedStreamEntry> {
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
-                let entries = attempt
-                    .load_item_history_entries(ItemHistoryReadBatch {
-                        references: &[reference],
-                        maximum_bytes: std::num::NonZeroUsize::new(4_000_000).unwrap(),
-                    })
-                    .await?;
-                Ok(entries.into_iter().next().flatten())
+                let source = attempt.read_system_page_start().await?;
+                let initial = source.initial_checkpoint().unwrap();
+                let high = source.capture_high().unwrap();
+                let plan = source.plan_page(&initial, &high, 200).unwrap();
+                let pages = attempt.read_system_history_pages(plan.as_ref()).await?;
+                let observations = pages
+                    .iter()
+                    .zip(plan.as_ref())
+                    .map(
+                        |(page, read)| stream_provider::SystemStreamHistoryObservation {
+                            read,
+                            retired_through: page.retired_through.clone(),
+                            records: page
+                                .records
+                                .iter()
+                                .map(|(entry, _)| stream_provider::SystemStreamHistoryRecord {
+                                    position: entry.position.clone(),
+                                })
+                                .collect(),
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                plan.finish(&observations).unwrap();
+                Ok(pages
+                    .into_iter()
+                    .flat_map(|page| page.records)
+                    .map(|(entry, _)| entry)
+                    .collect())
             })
-        })
-        .await
-}
-
-async fn qualify_retired_release<P: DynamoPort + DynamoOperations>(
-    store: &P,
-    name: TableName,
-    unretired: ItemHistoryReference,
-    current: ItemHistoryReference,
-) -> StorageResult<()>
-where
-    for<'a> P::Attempt<'a>: StreamRetentionPort,
-{
-    store
-        .put_item(
-            serde_json::from_value(serde_json::json!({
-                "TableName": name, "Item": {"pk": {"S": "key"}, "body": {"S": "retired"}}
-            }))
-            .unwrap(),
-        )
-        .await?;
-    let event = ItemHistoryReference::try_new(
-        unretired.address().clone(),
-        ItemStreamVersion::new(current.version().get() + 1),
-    )?;
-    let metadata = read_history(store, event.clone())
-        .await?
-        .unwrap()
-        .metadata()
-        .clone();
-    let retire_name = name.clone();
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                let table = load_table(attempt, &retire_name).await?;
-                let state = attempt
-                    .load_table_history_retention(&table, storage_types::ReadProtection::Conflict)
-                    .await?
-                    .unwrap();
-                let mut next = state.clone();
-                let ItemHistoryPublication::Event {
-                    source_scope,
-                    table_position,
-                    ..
-                } = metadata.publication()
-                else {
-                    panic!("event")
-                };
-                assert_eq!(&next.frontier.source_scope, source_scope);
-                let lane = next
-                    .frontier
-                    .lineages
-                    .iter_mut()
-                    .find(|lane| {
-                        &lane.shard_id == table_position.shard_id()
-                            && &lane.lineage_id == table_position.lineage_id()
-                    })
-                    .unwrap();
-                lane.retired_through = Some(table_position.offset().clone());
-                let marker = crate::StreamTrimDueMarker::new(
-                    state.next_due_at.unwrap(),
-                    state.scope.clone(),
-                    state.policy_version,
-                );
-                attempt
-                    .finish_stream_trim_markers(vec![StreamRetentionFinish {
-                        marker: marker.clone(),
-                        reason: StreamRetentionFinishReason::Page { deleted_rows: 0 },
-                        update: Some(crate::StreamTrimStateUpdate {
-                            expected_state: state,
-                            write: crate::StreamTrimStateWrite {
-                                state: next,
-                                next_marker: Some(marker),
-                                replaced_marker: None,
-                            },
-                        }),
-                    }])
-                    .await
-            })
-        })
-        .await?;
-    write_baseline(store, &name, Some("e")).await?;
-    assert!(
-        read_history(store, event).await?.is_none(),
-        "retired former-current leaked"
-    );
-    assert!(
-        read_history(store, unretired).await?.is_some(),
-        "release deleted another revision"
-    );
-    Ok(())
+        },
+    )
+    .await
+    .unwrap()
 }

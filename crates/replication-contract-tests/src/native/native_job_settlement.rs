@@ -9,10 +9,10 @@ use scheduled_bg_jobs::{
 };
 use storage_provider::{
     DynamoPort,
-    maintenance::{ExpirationHandler, ExpirationPort, ExpirationProgress, MaintenancePort},
+    maintenance::{ExpirationHandler, ExpirationProgress, MaintenanceOperations, MaintenancePort},
 };
 use storage_types::{
-    AttemptMode,
+    AttemptMode, AttemptPlan, DeadlineClass,
     maintenance::{MaintenanceKind, TaskProgress},
 };
 use tokio::sync::oneshot;
@@ -121,8 +121,8 @@ async fn verify_destination_exclusion<S, P>(
 ) -> HarnessResult<()>
 where
     S: ScheduledJobStoreSource,
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
+    for<'native> P::Attempt<'native>: MaintenancePort,
 {
     let (original, successor, first) = prepare_claim(
         scheduler,
@@ -186,8 +186,8 @@ async fn verify_stale_progress<P>(
     acknowledged: &TaskProgress<ExpirationProgress>,
 ) -> HarnessResult<()>
 where
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
+    for<'native> P::Attempt<'native>: MaintenancePort,
 {
     let handler = ExpirationHandler::try_new(destination.clone(), Duration::from_secs(60))?;
     let stale = first.context().ok_or("stale context missing")?;
@@ -211,16 +211,21 @@ where
     P: DynamoPort + 'static,
     for<'native> P::Attempt<'native>: MaintenancePort,
 {
-    let progress = destination
-        .with_dynamo_attempt(AttemptMode::ReadWrite, |attempt| {
+    let progress = storage_provider::DynamoPort::with_attempt(
+        destination,
+        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(destination),
+        ),
+        |attempt| {
             Box::pin(async move {
                 let (_, progress, _) = attempt
                     .load_task_admission::<ExpirationProgress>(MaintenanceKind::TtlSweep)
                     .await?;
                 Ok(progress)
             })
-        })
-        .await?;
+        },
+    )
+    .await?;
     progress.ok_or_else(|| "native expiration progress missing".into())
 }
 
@@ -231,8 +236,8 @@ async fn lose_destination_ack<S, P>(
 ) -> HarnessResult<(ClaimedJob, TaskProgress<ExpirationProgress>)>
 where
     S: ScheduledJobStoreSource,
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
+    for<'native> P::Attempt<'native>: MaintenancePort,
 {
     let (original, successor, first) = prepare_claim(
         scheduler,
@@ -280,8 +285,8 @@ async fn verify_reopened_progress<P>(
     durable: &TaskProgress<ExpirationProgress>,
 ) -> HarnessResult<()>
 where
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
+    for<'native> P::Attempt<'native>: MaintenancePort,
 {
     let destination = Arc::new(destination);
     assert!(
@@ -308,8 +313,8 @@ async fn verify_overlapping_exclusion<S, P>(
 ) -> HarnessResult<()>
 where
     S: ScheduledJobStoreSource,
-    P: DynamoPort + 'static,
-    for<'native> P::Attempt<'native>: ExpirationPort,
+    P: DynamoPort + MaintenanceOperations + 'static,
+    for<'native> P::Attempt<'native>: MaintenancePort,
 {
     let (destination, successor_destination) = destinations;
     let (original, successor, first) = prepare_claim(

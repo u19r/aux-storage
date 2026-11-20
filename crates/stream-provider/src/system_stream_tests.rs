@@ -1,117 +1,17 @@
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use serde_json::json;
 use storage_types::{
-    DurationSeconds, StreamItemId, StreamName, StreamRecord, SystemStreamCheckpointToken,
-    SystemStreamContractError, SystemStreamPosition, SystemStreamScope, TimestampMillis,
-    UserStreamName,
+    StreamRecord, SystemStreamCheckpointToken, SystemStreamContractError, SystemStreamPosition,
+    SystemStreamScope, TimestampMillis,
 };
 
 use crate::{
-    CursorName, CursorPage, CursorPosition, Stream, StreamCursor, StreamPage,
-    StreamPartitioningMode, StreamProvider, StreamResult, SystemStreamIssuedCheckpoint,
-    SystemStreamLineage, SystemStreamLineageCatalog, SystemStreamPage, SystemStreamPageRequest,
-    SystemStreamSplitChild, SystemStreamSplitDisposition, SystemStreamSplitOperationId,
-    SystemStreamSplitReceipt, SystemStreamSplitRequest, SystemStreamSplitResult,
-    SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest,
+    SystemStreamIssuedCheckpoint, SystemStreamLineage, SystemStreamLineageCatalog,
+    SystemStreamPage, SystemStreamSplitChild, SystemStreamSplitDisposition,
+    SystemStreamSplitOperationId, SystemStreamSplitReceipt, SystemStreamSplitRequest,
+    SystemStreamSplitResult, SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest,
 };
-
-struct NoSystemStreamProvider;
-
-#[async_trait]
-impl StreamProvider for NoSystemStreamProvider {
-    async fn initialize_stream(&self) -> StreamResult<()> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn create_stream(
-        &self,
-        _stream_name: UserStreamName,
-        _ttl_seconds: Option<DurationSeconds>,
-        _partitioning_mode: StreamPartitioningMode,
-    ) -> StreamResult<StreamName> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn delete_stream(&self, _stream_name: UserStreamName) -> StreamResult<()> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn get_stream(&self, _stream_name: UserStreamName) -> StreamResult<Option<Stream>> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn append_item(
-        &self,
-        _stream_name: StreamName,
-        _item_data: &[u8],
-        _partition_key: Option<&str>,
-    ) -> StreamResult<StreamItemId> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn read_forward(
-        &self,
-        _stream_name: StreamName,
-        _exclusive_start_key: Option<StreamItemId>,
-        _limit: u32,
-    ) -> StreamResult<StreamPage> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn read_backward(
-        &self,
-        _stream_name: StreamName,
-        _exclusive_start_key: Option<StreamItemId>,
-        _limit: u32,
-    ) -> StreamResult<StreamPage> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn create_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-        _position: CursorPosition,
-    ) -> StreamResult<()> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn delete_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-    ) -> StreamResult<()> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn read_from_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-        _limit: u32,
-    ) -> StreamResult<CursorPage> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn advance_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-        _to_item_id: StreamItemId,
-    ) -> StreamResult<()> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-
-    async fn get_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-    ) -> StreamResult<Option<StreamCursor>> {
-        unimplemented!("not needed for SystemStream default tests")
-    }
-}
 
 fn scope() -> SystemStreamScope {
     SystemStreamScope::try_new("system", 7).expect("scope")
@@ -158,33 +58,6 @@ fn trim_request(page_limit: usize) -> SystemStreamTrimPageRequest {
         None,
     )
     .expect("trim request")
-}
-
-#[test]
-fn stream_provider_system_stream_defaults_fail_closed_and_are_object_safe() {
-    fn accepts_dyn_provider(_: &dyn StreamProvider) {}
-
-    futures::executor::block_on(async {
-        let provider = NoSystemStreamProvider;
-        accepts_dyn_provider(&provider);
-
-        assert!(
-            provider
-                .get_system_stream_page(
-                    SystemStreamPageRequest::try_new(scope(), None, 1).expect("page request")
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            provider
-                .system_stream_lineage_catalog(scope())
-                .await
-                .is_err()
-        );
-        assert!(provider.system_stream_scope().await.is_err());
-        assert!(provider.split_system_stream(request()).await.is_err());
-    });
 }
 
 #[test]
@@ -626,4 +499,114 @@ fn system_delete_record() -> StreamRecord {
         item: None,
         system_position: Some(SystemStreamPosition::try_new("shard-a", "lineage-a", "1").unwrap()),
     }
+}
+
+#[test]
+fn given_split_branch_when_split_again_then_other_routes_remain_stable() {
+    let before = SystemStreamLineageCatalog::try_new(
+        scope(),
+        vec![
+            lineage("root", "root", None, true),
+            lineage("left", "left", Some("root"), false),
+            lineage("right", "right", Some("root"), false),
+            lineage("other", "other", None, false),
+        ],
+    )
+    .unwrap();
+    let mut entries = vec![
+        lineage("root", "root", None, true),
+        lineage("left", "left", Some("root"), true),
+        lineage("right", "right", Some("root"), false),
+        lineage("other", "other", None, false),
+        lineage("left-a", "left-a", Some("left"), false),
+        lineage("left-b", "left-b", Some("left"), false),
+    ];
+    let after = SystemStreamLineageCatalog::try_new(scope(), entries.clone()).unwrap();
+    entries.reverse();
+    let reordered = SystemStreamLineageCatalog::try_new(scope(), entries).unwrap();
+    let mut counts = [0; 3];
+    let mut children_seen = [false; 2];
+    for key in 0_u64..1024 {
+        let key = key.to_be_bytes();
+        let previous = before.writer_lineage(&key).unwrap().lineage_id().as_str();
+        let next = after.writer_lineage(&key).unwrap().lineage_id().as_str();
+        assert_eq!(
+            next,
+            reordered
+                .writer_lineage(&key)
+                .unwrap()
+                .lineage_id()
+                .as_str()
+        );
+        match previous {
+            "left" => {
+                counts[0] += 1;
+                assert!(["left-a", "left-b"].contains(&next));
+                children_seen[usize::from(next == "left-b")] = true;
+            }
+            "right" => {
+                counts[1] += 1;
+                assert_eq!(next, previous);
+            }
+            "other" => {
+                counts[2] += 1;
+                assert_eq!(next, previous);
+            }
+            _ => panic!("unexpected route"),
+        }
+    }
+    assert!(counts.into_iter().all(|count| count > 0));
+    assert!(children_seen.into_iter().all(|seen| seen));
+}
+
+#[test]
+fn given_initial_root_count_when_catalog_is_built_then_identity_and_checkpoint_capacity_are_preserved()
+ {
+    for count in [1, 4, storage_types::SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES] {
+        let count = storage_types::InitialStreamLineages::try_from(count).unwrap();
+        let catalog = SystemStreamLineageCatalog::initial_roots(scope(), count).unwrap();
+        assert_eq!(catalog.len(), count.get());
+        assert_eq!(
+            catalog[0].shard_id().as_str(),
+            crate::DYNAMO_SYSTEM_SHARD_ID
+        );
+        assert_eq!(
+            catalog[0].lineage_id().as_str(),
+            crate::DYNAMO_SYSTEM_LINEAGE_ID
+        );
+        assert!(
+            catalog
+                .iter()
+                .all(|root| root.parent_lineage_id().is_none() && !root.sealed())
+        );
+        assert_eq!(
+            catalog,
+            SystemStreamLineageCatalog::initial_roots(scope(), count).unwrap()
+        );
+    }
+}
+
+#[test]
+fn given_prepared_split_when_persisted_then_pending_plan_has_no_numeric_end() {
+    let request = request();
+    let receipt = SystemStreamSplitReceipt::try_new(&request, 7).expect("receipt");
+    let result = receipt.split.clone();
+    let known = crate::SystemStreamSplitPlan::KnownEnd(receipt);
+    let pending = crate::SystemStreamSplitPlan::EndAtCommit(result.clone());
+    assert_eq!(known.split(), pending.split());
+    let bytes = storage_types::storage_serde::to_bytes(&pending).expect("pending codec");
+    let decoded: crate::SystemStreamSplitPlan =
+        storage_types::storage_serde::from_bytes(&bytes).expect("pending decode");
+    assert!(matches!(
+        &decoded,
+        crate::SystemStreamSplitPlan::EndAtCommit(_)
+    ));
+    assert_eq!(decoded.into_result(), result);
+    let bytes = storage_types::storage_serde::to_bytes(&known).expect("known codec");
+    let decoded: crate::SystemStreamSplitPlan =
+        storage_types::storage_serde::from_bytes(&bytes).expect("known decode");
+    let crate::SystemStreamSplitPlan::KnownEnd(receipt) = decoded else {
+        panic!("numeric plan changed kind");
+    };
+    assert_eq!(receipt.sealed_after_offset, 7);
 }

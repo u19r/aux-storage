@@ -1,10 +1,12 @@
 use http::StatusCode;
 use serde::Deserialize;
 use storage_types::{
-    AttributeMap, StorageEnum, StorageError, parse_dynamodb_table_not_found_message,
+    AttributeMap, CancellationCode, CancellationReason, StorageEnum, StorageError,
+    parse_dynamodb_table_not_found_message,
 };
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct RemoteErrorResponse {
     #[serde(default, rename = "__type", alias = "type", alias = "errorType")]
     pub error_type: Option<String>,
@@ -23,7 +25,8 @@ pub struct RemoteErrorResponse {
     pub cancellation_reasons: Option<Vec<RemoteCancellationReason>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct RemoteCancellationReason {
     #[serde(default, rename = "Code", alias = "code")]
     pub code: Option<String>,
@@ -78,21 +81,30 @@ pub fn classify_error_response(
             ),
         },
         Some("TransactionConflictException") => (
-            StorageError::from(StorageEnum::TransactionConflict { message }),
+            StorageError::from(storage_types::AttemptFailure::Conflict(
+                storage_types::ConflictCause::Remote,
+            )),
             true,
         ),
-        Some("TransactionCanceledException") => {
-            let reasons = error
-                .cancellation_reasons
-                .unwrap_or_default()
-                .into_iter()
-                .map(encode_cancellation_reason)
-                .collect::<Vec<_>>();
-            (
+        Some("TransactionCanceledException") => match error
+            .cancellation_reasons
+            .unwrap_or_default()
+            .into_iter()
+            .map(decode_cancellation_reason)
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(reasons) => (
                 StorageError::from(StorageEnum::TransactionCanceled { reasons }),
                 false,
-            )
-        }
+            ),
+            None => (
+                StorageError::from(StorageEnum::AwsService {
+                    code: Some("TransactionCanceledException".to_string()),
+                    message,
+                }),
+                false,
+            ),
+        },
         Some("TransactionInProgressException") => (
             StorageError::from(StorageEnum::TransactionInProgress { message }),
             true,
@@ -155,7 +167,7 @@ pub fn classify_error_response(
             StorageError::from(StorageEnum::AccessDenied { message }),
             false,
         ),
-        Some("MissingAuthenticationTokenException") => (
+        Some("MissingAuthenticationToken" | "MissingAuthenticationTokenException") => (
             StorageError::from(StorageEnum::MissingAuthenticationToken),
             false,
         ),
@@ -170,7 +182,7 @@ pub fn classify_error_response(
             }),
             false,
         ),
-        Some("InternalServerError") => (StorageError::internal(&message), true),
+        Some("InternalServerError") => (StorageError::internal("remote InternalServerError"), true),
         Some("ServiceUnavailable" | "ServiceUnavailableException") => {
             (StorageError::service_unavailable(1), true)
         }
@@ -201,13 +213,14 @@ fn normalize_error_code(raw: &str) -> String {
     raw.split('#').next_back().unwrap_or(raw).to_string()
 }
 
-fn encode_cancellation_reason(reason: RemoteCancellationReason) -> String {
-    let code = reason.code.unwrap_or_else(|| "None".to_string());
-    let Some(item) = reason.item else {
-        return reason
-            .message
-            .map_or(code.clone(), |message| format!("{code}\t{message}"));
+/// `None` when the code is not one of the seven AWS codes.
+fn decode_cancellation_reason(reason: RemoteCancellationReason) -> Option<CancellationReason> {
+    let code = match reason.code.as_deref() {
+        None => CancellationCode::None,
+        Some(code) => CancellationCode::parse(code)?,
     };
-    let item = item.to_string();
-    format!("{code}\t{}\t{item}", reason.message.unwrap_or_default())
+    let item = reason
+        .item
+        .and_then(|item| serde_json::from_value::<AttributeMap>(item).ok());
+    Some(CancellationReason::from_parts(code, reason.message, item))
 }

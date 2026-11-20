@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bg_jobs_tokio::{
     JobRuntime,
     test_support::{TestClock, runtime_builder},
@@ -18,16 +17,13 @@ use scheduled_bg_jobs::{
 use storage_backfill::GsiPageLimit;
 use storage_common::StorageJob;
 use storage_provider::maintenance::{
-    ExpirationHandler, ExpirationRepository, ExpirationRequest, GsiBuildHandler, GsiBuildRepository,
+    ExpirationHandler, ExpirationRequest, GsiBuildHandler, MaintenanceOperations,
 };
-use storage_types::{
-    StorageError, StorageResult, TimestampMillis, context::WrappedError as _,
-    maintenance::StepResult,
-};
+use storage_types::{StorageError, StorageResult, TimestampMillis, maintenance::StepResult};
 
 use super::{
     PendingFault,
-    fault::{ExpirationFaults, FaultingExpirationRepository},
+    fault::{ExpirationFaults, InstrumentedMaintenance},
 };
 use crate::{
     ScheduledJobStore, ScheduledJobStoreError, constants::MAINTENANCE_DRIVER_MAX_STORE_OPERATIONS,
@@ -38,11 +34,12 @@ const CLOCK_START: Timestamp = Timestamp::from_millis(1_800_000_000_000);
 const EXPIRATION_INTERVAL: Duration = Duration::from_secs(1);
 const DRIVE_ADVANCE: Duration = Duration::from_secs(10);
 const DRIVE_START_MAX_ATTEMPTS: usize = 64;
+#[cfg(any(feature = "foundationdb", feature = "rocksdb"))]
 const QUEUE_CLEANUP_MAX_STEPS: usize = 512;
 
 pub(super) struct MaintenanceHarness {
     store: ScheduledJobStore,
-    repository: Arc<dyn ExpirationRepository>,
+    repository: Arc<dyn MaintenanceOperations>,
     expiration_namespace: Namespace,
     clock: TestClock,
     faults: Arc<ExpirationFaults>,
@@ -50,6 +47,10 @@ pub(super) struct MaintenanceHarness {
     active_owner: Arc<JobRuntime<ScheduledJobStore>>,
     gsi_owner: Arc<JobRuntime<ScheduledJobStore>>,
     gsi_error: Arc<Mutex<Option<String>>>,
+    #[cfg_attr(
+        not(any(feature = "foundationdb", feature = "rocksdb")),
+        expect(dead_code, reason = "queue reclamation contracts run on KV providers")
+    )]
     queue_owner: Option<Arc<JobRuntime<ScheduledJobStore>>>,
     next_owner: u8,
 }
@@ -90,40 +91,35 @@ impl MaintenanceHarness {
         let clock = TestClock::new(CLOCK_START, MonotonicDeadline::ZERO);
         let faults = Arc::new(ExpirationFaults::default());
         let MaintenanceRepositories {
-            stream_initialization_repository,
-            expiration_repository,
-            gsi_build_repository,
+            operations,
             partition_reconciliation_repository: _,
             queue_message_cleanup_repository,
-            retention_repository: _,
+            pubsub_stale_subscriptions: _,
             job_catalog: _,
         } = repositories;
         let gsi_error = Arc::new(Mutex::new(None));
-        let gsi_build_repository = Arc::new(DiagnosticGsiBuildRepository {
-            repository: gsi_build_repository,
-            last_error: Arc::clone(&gsi_error),
-        });
-        let repository = Arc::new(FaultingExpirationRepository::new(
-            expiration_repository,
+        let repository: Arc<dyn MaintenanceOperations> = Arc::new(InstrumentedMaintenance::new(
+            operations,
             Arc::clone(&faults),
+            Arc::clone(&gsi_error),
         ));
         let paused_owner = Self::expiration_runtime(
             store.clone(),
-            Arc::clone(&repository) as Arc<dyn ExpirationRepository>,
+            Arc::clone(&repository),
             expiration_namespace.clone(),
             clock.clone(),
             1,
         )?;
         let active_owner = Self::expiration_runtime(
             store.clone(),
-            Arc::clone(&repository) as Arc<dyn ExpirationRepository>,
+            Arc::clone(&repository),
             expiration_namespace.clone(),
             clock.clone(),
             2,
         )?;
         let gsi_owner = Self::gsi_runtime(
             store.clone(),
-            (gsi_build_repository, stream_initialization_repository),
+            Arc::clone(&repository),
             Self::namespace(StorageJob::GsiBackfill)?,
             clock.clone(),
             3,
@@ -217,6 +213,7 @@ impl MaintenanceHarness {
         }
     }
 
+    #[cfg(any(feature = "foundationdb", feature = "rocksdb"))]
     pub(super) async fn drive_queue_cleanup_once(&self) -> StorageResult<()> {
         let queue_owner = self.queue_owner.as_ref().ok_or_else(|| {
             StorageError::unsupported("queue message cleanup is not selected for this backend")
@@ -224,6 +221,7 @@ impl MaintenanceHarness {
         self.drive_one(queue_owner, "queue message cleanup").await
     }
 
+    #[cfg(any(feature = "foundationdb", feature = "rocksdb"))]
     pub(super) async fn drive_queue_cleanup_until_idle(&self) -> StorageResult<()> {
         let queue_owner = self.queue_owner.as_ref().ok_or_else(|| {
             StorageError::unsupported("queue message cleanup is not selected for this backend")
@@ -357,10 +355,7 @@ impl MaintenanceHarness {
 
     fn gsi_runtime(
         store: ScheduledJobStore,
-        repositories: (
-            Arc<dyn GsiBuildRepository>,
-            Arc<dyn storage_provider::TableStreamInitializationRepository>,
-        ),
+        repository: Arc<dyn MaintenanceOperations>,
         namespace: Namespace,
         clock: TestClock,
         owner: u8,
@@ -368,12 +363,7 @@ impl MaintenanceHarness {
         let job = StorageJob::GsiBackfill;
         let page_limit = GsiPageLimit::try_from(1usize)
             .map_err(|error| StorageError::validation(error.to_string()))?;
-        let handler = GsiBuildHandler::try_new(
-            repositories.0,
-            repositories.1,
-            EXPIRATION_INTERVAL,
-            page_limit,
-        )?;
+        let handler = GsiBuildHandler::try_new(repository, EXPIRATION_INTERVAL, page_limit)?;
         Self::job_runtime(
             store,
             Self::catalog(job, handler)?,
@@ -409,7 +399,7 @@ impl MaintenanceHarness {
 
     fn expiration_runtime(
         store: ScheduledJobStore,
-        repository: Arc<dyn ExpirationRepository>,
+        repository: Arc<dyn MaintenanceOperations>,
         namespace: Namespace,
         clock: TestClock,
         owner: u8,
@@ -479,26 +469,5 @@ impl MaintenanceHarness {
             )
             .map_err(|error| StorageError::validation(error.to_string()))?;
         Ok(catalog)
-    }
-}
-
-struct DiagnosticGsiBuildRepository {
-    repository: Arc<dyn GsiBuildRepository>,
-    last_error: Arc<Mutex<Option<String>>>,
-}
-
-#[async_trait]
-impl GsiBuildRepository for DiagnosticGsiBuildRepository {
-    async fn advance_gsi_build(
-        &self,
-        request: storage_provider::maintenance::GsiBuildRequest,
-    ) -> StorageResult<storage_types::maintenance::StepResult<()>> {
-        let result = self.repository.advance_gsi_build(request).await;
-        if let Err(error) = &result {
-            let (kind, context) = error.recursive_context(Vec::new());
-            *self.last_error.lock().expect("GSI diagnostic lock") =
-                Some(format!("{kind:?}; context={context:?}"));
-        }
-        result
     }
 }

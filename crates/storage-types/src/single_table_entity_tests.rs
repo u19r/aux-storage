@@ -3,9 +3,9 @@ use serde::Serialize;
 use storage_derive::{SingleTableKeys, WireItemEncode};
 
 use crate::{
-    AttributeValue, ReadSequenceInputCardinality, ReadSequenceOnMissing, SingleTableEntity,
-    TimestampMillis, WireItem,
-    single_table_entity::{to_item_map, to_wire_entity, to_wire_item_fast},
+    AttributeMap, AttributeValue, ReadSequenceInputCardinality, ReadSequenceOnMissing,
+    SingleTableEntity, TimestampMillis, WireItem,
+    single_table_entity::{entity_type_from_item, to_item_map, to_wire_entity, to_wire_item_fast},
 };
 
 #[derive(Debug, Serialize, SingleTableKeys, WireItemEncode)]
@@ -111,55 +111,6 @@ fn given_all_gsis_and_absent_indexer_when_encoded_then_pairs_precede_ttl_and_rem
         );
         assert!(!attributes.contains_key("second"));
     }
-}
-
-#[test]
-fn given_ordered_entity_when_stored_and_restored_then_lookup_order_survives() {
-    let (item, indexers) = to_wire_entity(&ordered_entity())
-        .unwrap()
-        .into_write_parts();
-    let declaration = crate::IndexerDeclaration::try_new(
-        indexers.unwrap(),
-        crate::MaxIndexers::try_from(2).unwrap(),
-    )
-    .unwrap();
-    let stored = crate::IndexedWireItem::extract_wire_items(&item, &item, &declaration).unwrap();
-    let persisted: crate::VecMap<String, serde_json::Value> =
-        serde_json::from_slice(stored.residual_json()).unwrap();
-    assert_eq!(
-        persisted
-            .keys()
-            .map(String::as_str)
-            .take(11)
-            .collect::<Vec<_>>(),
-        [
-            "pk", "sk", "gsi1pk", "gsi1sk", "gsi3pk", "gsi3sk", "gsi5pk", "gsi5sk", "e_at",
-            "first", "second"
-        ]
-    );
-    let bytes = stored.encode_envelope().unwrap();
-    let restored = crate::IndexedWireItem::decode_envelope(&bytes)
-        .unwrap()
-        .into_wire_item_with_declaration()
-        .unwrap()
-        .0;
-    assert_eq!(
-        restored.to_attribute_map().unwrap(),
-        item.to_attribute_map().unwrap()
-    );
-    assert_eq!(
-        restored
-            .to_attribute_map()
-            .unwrap()
-            .keys()
-            .take(11)
-            .collect::<Vec<_>>(),
-        persisted
-            .keys()
-            .map(String::as_str)
-            .take(11)
-            .collect::<Vec<_>>()
-    );
 }
 
 #[derive(Debug, Serialize, SingleTableKeys, WireItemEncode)]
@@ -364,8 +315,7 @@ fn given_a_stored_entity_when_its_type_or_keys_disagree_then_identity_validation
 }
 
 #[test]
-fn given_a_legacy_entity_type_when_the_stored_identity_is_validated_then_the_named_format_remains_readable()
- {
+fn given_only_an_entity_type_named_attribute_when_identity_is_validated_then_it_is_rejected() {
     let entity = ordered_entity();
     let mut attributes = to_wire_item_fast(&entity)
         .unwrap()
@@ -374,31 +324,44 @@ fn given_a_legacy_entity_type_when_the_stored_identity_is_validated_then_the_nam
     let value = attributes.remove("et").unwrap();
     attributes.insert("entity_type", value);
     let source = WireItem::dynamo_json(serde_json::to_vec(&attributes).unwrap());
-    entity.validate_stored_identity(&source).unwrap();
+    entity.validate_stored_identity(&source).unwrap_err();
 }
 
 #[test]
-fn given_a_split_row_with_substituted_physical_keys_when_identity_is_validated_then_residual_metadata_cannot_hide_the_substitution()
+fn given_a_stored_et_when_read_by_the_entity_type_name_then_the_alias_returns_it() {
+    let item = to_wire_item_fast(&ordered_entity()).unwrap();
+    assert_eq!(
+        item.attribute_value("entity_type").unwrap(),
+        Some(AttributeValue::S("ORDERED".into()))
+    );
+    assert_eq!(
+        item.string_attribute("entity_type").unwrap().as_deref(),
+        Some("ORDERED")
+    );
+}
+
+#[test]
+fn given_a_stored_entity_type_only_when_read_as_et_then_absent() {
+    let map = AttributeMap::from_iter([
+        ("pk".to_string(), AttributeValue::S("p".into())),
+        ("sk".to_string(), AttributeValue::S("s".into())),
+        ("entity_type".to_string(), AttributeValue::S("X".into())),
+    ]);
+    let item = WireItem::try_from(&map).unwrap();
+    assert_eq!(item.attribute_value("et").unwrap(), None);
+    assert_eq!(entity_type_from_item(&map), None);
+}
+
+#[test]
+fn given_a_row_with_substituted_physical_keys_when_identity_is_validated_then_metadata_cannot_hide_the_substitution()
  {
     let entity = ordered_entity();
-    let source = WireItem::local_split(
-        crate::WireItemKeyAttributes::new(
-            "pk".into(),
-            AttributeValue::S("substituted-physical-key".into()),
-            Some("sk".into()),
-            Some(AttributeValue::S(entity.sk())),
-        ),
-        None,
-        Some(
-            serde_json::to_vec(
-                &to_wire_item_fast(&entity)
-                    .unwrap()
-                    .to_attribute_map()
-                    .unwrap(),
-            )
-            .unwrap(),
-        ),
-    );
+    let mut attributes = to_wire_item_fast(&entity)
+        .unwrap()
+        .to_attribute_map()
+        .unwrap();
+    attributes.insert("pk", AttributeValue::S("substituted-physical-key".into()));
+    let source = WireItem::dynamo_json(serde_json::to_vec(&attributes).unwrap());
     assert!(entity.validate_stored_identity(&source).is_err());
 }
 

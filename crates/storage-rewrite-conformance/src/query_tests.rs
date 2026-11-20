@@ -112,7 +112,8 @@ async fn given_filtered_query_when_pages_are_followed_then_every_match_appears_a
                     "status": {"S": "active"}
                 }],
                 "Count": 1,
-                "ScannedCount": 1
+                "ScannedCount": 1,
+                "LastEvaluatedKey": {"pk": {"S": "user#1"}, "sk": {"S": "item#003"}}
             })
         );
     })

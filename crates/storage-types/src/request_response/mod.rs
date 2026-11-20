@@ -1,4 +1,5 @@
 mod batch;
+mod consumed_capacity;
 mod internal;
 mod item;
 mod pagination;
@@ -11,6 +12,7 @@ mod transaction;
 mod transaction_tests;
 
 pub use batch::*;
+pub use consumed_capacity::*;
 pub use internal::*;
 pub use item::*;
 pub use pagination::*;
@@ -22,3 +24,5 @@ pub use transaction::*;
 
 #[cfg(test)]
 mod consumed_capacity_tests;
+#[cfg(test)]
+mod table_tests;

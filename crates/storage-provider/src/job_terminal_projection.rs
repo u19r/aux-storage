@@ -1,7 +1,10 @@
-use storage_types::{StorageError, StorageResult, TransactWriteItemsRequest};
+use storage_types::{
+    StorageError, StorageResult, TransactPutRequest, TransactUpdateRequest, TransactWriteItem,
+    TransactWriteItemsRequest,
+};
 
-/// A terminal lifecycle witness may publish one conditional destination update.
-/// It cannot create or delete rows, or authorize a batch of execution effects.
+/// Saves a result after a job is cancelled or permanently fails.
+/// The caller chooses the database writes. Storage checks the job token.
 #[derive(Clone)]
 pub struct JobTerminalProjection {
     request: TransactWriteItemsRequest,
@@ -41,6 +44,43 @@ impl TryFrom<TransactWriteItemsRequest> for JobTerminalProjection {
 }
 
 impl JobTerminalProjection {
+    /// Saves a result, an index entry and a counter update in one transaction.
+    /// Existing transaction checks validate keys, expressions, duplicate
+    /// targets and size limits.
+    pub fn try_with_index_and_counter(
+        result_update: TransactUpdateRequest,
+        index_put: TransactPutRequest,
+        counter_update: TransactUpdateRequest,
+        request_token: String,
+    ) -> StorageResult<Self> {
+        if result_update.table_name != index_put.table_name
+            || result_update.table_name != counter_update.table_name
+        {
+            return Err(StorageError::validation(
+                "job result, index, and counter writes must use the same table",
+            ));
+        }
+        let mut job_writes = Self::try_from(TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                update: Some(result_update),
+                ..Default::default()
+            }],
+            client_request_token: Some(request_token),
+            ..Default::default()
+        })?;
+        job_writes.request.transact_items.extend([
+            TransactWriteItem {
+                put: Some(index_put),
+                ..Default::default()
+            },
+            TransactWriteItem {
+                update: Some(counter_update),
+                ..Default::default()
+            },
+        ]);
+        Ok(job_writes)
+    }
+
     pub(crate) fn into_request(self) -> TransactWriteItemsRequest {
         self.request
     }

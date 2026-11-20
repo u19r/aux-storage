@@ -9,22 +9,20 @@ use http_request::{
     reqwest::{Request, header::HeaderMap},
 };
 use pubsub_provider::{
-    DeliveryRecordId, DeliveryStatus, InMemoryPubsubProvider, ListSubscriptionsRequest,
-    PublishRequest, PubsubProvider, SubscribeRequest, Subscription, SubscriptionProtocol, TopicArn,
-    TopicName,
+    DeliveryRecordId, ListSubscriptionsRequest, PublishRequest, PubsubProvider, SubscribeRequest,
+    Subscription, SubscriptionProtocol, TopicArn, TopicName,
 };
-use queue::{
-    CreateQueueRequest, QueueBackend, QueueConfig, QueueManager as TestQueueManager,
-    ReceiveMessageRequest, create_queue_provider,
-};
+use queue::{CreateQueueRequest, QueueManager as TestQueueManager, ReceiveMessageRequest};
 use serde_json::Value;
+use sql_backend::{SqlStore, sqlite::SqliteBackend};
 use stream_provider::{
     StreamError, SubscriptionMessage, SubscriptionMessageSender, SubscriptionSendFuture,
     SubscriptionSendOutcome,
 };
 
 use crate::{
-    manager::{PubsubDeliveryConfig, PubsubManager},
+    delivery_config::{DeliveryTiming, PubsubDeliveryConfig},
+    manager::PubsubManager,
     notification::{
         NotificationRenderContext, PubsubNotificationSignRequest, PubsubNotificationSigner,
         notification_body, notification_headers, notification_string_to_sign,
@@ -145,114 +143,26 @@ impl Transport for RecordingHttpTransport {
     }
 }
 
-async fn create_test_queue_manager() -> (TestQueueManager, tempfile::TempDir) {
-    let directory = tempfile::tempdir().expect("pubsub queue fixture directory");
-    let config = pubsub_fixture_queue_config(directory.path());
-    let provider = create_queue_provider(config).await.unwrap();
-    (TestQueueManager::new(Arc::from(provider)), directory)
-}
+/// One SQLite store holds the topics, the deliveries, and the queues, as in
+/// a deployment: an SNS delivery to SQS is one transaction on it.
+type TestProvider = SqlStore<SqliteBackend>;
 
-fn pubsub_fixture_queue_config(directory: &std::path::Path) -> QueueConfig {
-    let backend_type = pubsub_fixture_queue_backend();
-    let mut config = QueueConfig {
-        backend_type,
-        connection_string: None,
-        file_path: None,
-        postgres: None,
-        foundationdb: None,
-        remote: None,
-    };
-    match config.backend_type {
-        QueueBackend::SQLite | QueueBackend::Turso => {
-            config.connection_string = Some(":memory:".into())
-        }
-        QueueBackend::Postgres => {
-            let dsn = std::env::var("TEST_POSTGRES_DSN")
-                .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
-                .expect("owned Postgres DSN is required");
-            config.postgres = Some(queue::PostgresSettings {
-                dsn,
-                max_pool_size: 4,
-                background_max_pool_size: 4,
-                tls: false,
-            });
-        }
-        QueueBackend::RocksDB => {
-            config.connection_string = Some(
-                directory
-                    .join("queue.rocksdb")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-        QueueBackend::FoundationDb => {
-            config.foundationdb = Some(queue::FoundationDbSettings {
-                cluster_file: Some(
-                    std::env::var("FDB_CLUSTER_FILE").expect("owned FDB_CLUSTER_FILE is required"),
-                ),
-                subspace_prefix: Some(format!(
-                    "tests/pubsub-queue/{}/",
-                    directory
-                        .file_name()
-                        .expect("unique directory name")
-                        .to_string_lossy()
-                )),
-                ..Default::default()
-            });
-        }
-        QueueBackend::Remote => unreachable!("native queue fixture"),
-    }
-    config
-}
-
-fn pubsub_fixture_queue_backend() -> QueueBackend {
-    if cfg!(feature = "sqlite") {
-        QueueBackend::SQLite
-    } else if cfg!(feature = "turso") {
-        QueueBackend::Turso
-    } else if cfg!(feature = "postgres") {
-        QueueBackend::Postgres
-    } else if cfg!(feature = "rocksdb") {
-        QueueBackend::RocksDB
-    } else if cfg!(feature = "foundationdb") {
-        QueueBackend::FoundationDb
-    } else {
-        panic!("pubsub manager tests require a native backend")
-    }
-}
-
-#[cfg(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-))]
-#[tokio::test]
-async fn postgres_queue_provider_initialization_is_concurrent_safe() {
-    async fn initialize(config: QueueConfig) -> Result<(), String> {
-        create_queue_provider(config)
+async fn sqlite_provider() -> Arc<TestProvider> {
+    let driver = SqliteBackend::initialize(":memory:", storage_types::AttemptDeadlines::default())
+        .await
+        .expect("sqlite");
+    Arc::new(
+        SqlStore::initialize_schema(driver, storage_types::InitialStreamLineages::ONE, true)
             .await
-            .map(|_| ())
-            .map_err(|error| format!("create queue provider: {error:?}"))
-    }
-
-    let directory = tempfile::tempdir().expect("pubsub queue initialization fixture");
-    let (first, second, third, fourth) = tokio::join!(
-        initialize(pubsub_fixture_queue_config(directory.path())),
-        initialize(pubsub_fixture_queue_config(directory.path())),
-        initialize(pubsub_fixture_queue_config(directory.path())),
-        initialize(pubsub_fixture_queue_config(directory.path())),
-    );
-    for result in [first, second, third, fourth] {
-        result.expect("concurrent PostgreSQL queue initialization should be idempotent");
-    }
+            .expect("sqlite schema"),
+    )
 }
 
-async fn first_subscription(
-    provider: &InMemoryPubsubProvider,
-    topic_arn: TopicArn,
-) -> Subscription {
+fn queue_arn(name: &str) -> String {
+    format!("arn:aws:sqs:us-east-1:000000000000:{name}")
+}
+
+async fn first_subscription(provider: &TestProvider, topic_arn: TopicArn) -> Subscription {
     provider
         .list_subscriptions(ListSubscriptionsRequest {
             topic_arn: Some(topic_arn),
@@ -268,7 +178,7 @@ async fn first_subscription(
 
 async fn confirm_first_subscription(
     manager: &PubsubManager,
-    provider: &InMemoryPubsubProvider,
+    provider: &TestProvider,
     topic_arn: TopicArn,
 ) -> Subscription {
     let subscription = first_subscription(provider, topic_arn.clone()).await;
@@ -286,7 +196,7 @@ async fn confirm_first_subscription(
 
 #[tokio::test]
 async fn create_topic_is_idempotent_through_manager() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let manager = PubsubManager::new(provider);
 
     let first = manager.create_topic("orders").await.unwrap();
@@ -297,7 +207,7 @@ async fn create_topic_is_idempotent_through_manager() {
 
 #[tokio::test]
 async fn publish_routes_http_subscription_to_custom_sender_with_extra_json() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let sender = Arc::new(RecordingSender::default());
     let manager = PubsubManager::builder()
         .provider(provider.clone())
@@ -348,19 +258,19 @@ async fn publish_routes_http_subscription_to_custom_sender_with_extra_json() {
 
 #[tokio::test]
 async fn subscribe_stores_subscription_for_topic_listing() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
-    let (queue_manager, _directory) = create_test_queue_manager().await;
-    let queue_manager = Arc::new(queue_manager);
+    let provider = sqlite_provider().await;
+    let queue_manager = Arc::new(TestQueueManager::new(provider.clone()));
     queue_manager
         .create_queue(CreateQueueRequest {
             queue_name: "orders".to_string(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
     let manager = PubsubManager::builder()
         .provider(provider.clone())
-        .queue_manager(queue_manager)
+        .queue_wake(queue_manager.wake_handle())
         .build()
         .unwrap();
     let topic = manager.create_topic("orders").await.unwrap();
@@ -369,7 +279,7 @@ async fn subscribe_stores_subscription_for_topic_listing() {
         .subscribe(SubscribeRequest {
             topic_arn: topic.topic_arn.clone(),
             protocol: SubscriptionProtocol::Queue,
-            endpoint: "orders".to_string(),
+            endpoint: queue_arn("orders"),
             attributes: HashMap::new(),
             extra_json: serde_json::Value::Null,
         })
@@ -391,14 +301,17 @@ async fn subscribe_stores_subscription_for_topic_listing() {
 
 #[tokio::test]
 async fn execute_query_action_uses_manager_control_plane() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let manager = PubsubManager::new(provider);
 
     let success = manager
-        .execute_query_action(PubsubAction::CreateTopic {
-            name: TopicName::new("orders").unwrap(),
-            attributes: HashMap::new(),
-        })
+        .execute_query_action(PubsubAction::CreateTopic(
+            pubsub_provider::CreateTopicRequest {
+                name: TopicName::new("orders").unwrap(),
+                attributes: HashMap::new(),
+                tags: std::collections::BTreeMap::new(),
+            },
+        ))
         .await
         .unwrap();
 
@@ -413,7 +326,7 @@ async fn execute_query_action_uses_manager_control_plane() {
 
 #[tokio::test]
 async fn publish_records_custom_sender_failure_without_rejecting_publish() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let manager = PubsubManager::builder()
         .provider(provider.clone())
         .subscription_message_sender(Arc::new(FailingSender))
@@ -447,7 +360,7 @@ async fn publish_records_custom_sender_failure_without_rejecting_publish() {
 
 #[tokio::test]
 async fn process_due_deliveries_sends_pending_builtin_http_delivery() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let transport =
         RecordingHttpTransport::new(vec![StatusCode::NO_CONTENT, StatusCode::NO_CONTENT]);
     let http_client = HttpClient::builder()
@@ -487,30 +400,31 @@ async fn process_due_deliveries_sends_pending_builtin_http_delivery() {
         })
         .await
         .unwrap();
-    assert_eq!(provider.materialize_publish_intents(10).await.unwrap(), 1);
+    assert_eq!(
+        provider
+            .materialize_publish_intents(10)
+            .await
+            .unwrap()
+            .records,
+        1
+    );
     let record_id = DeliveryRecordId(format!(
         "{}:{}",
         subscription.subscription_arn, publish.message_id
     ));
-    let pending = provider
-        .get_delivery_record(&record_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending.status, DeliveryStatus::Pending);
+    let (pending, payload) = provider.get_delivery(&record_id).await.unwrap().unwrap();
+    assert!(pending.lease.is_none());
     assert_eq!(pending.attempts, 0);
-    assert_eq!(pending.message_body.as_deref(), Some("created"));
+    assert_eq!(payload.message_body.as_deref(), Some("created"));
 
     let processed = manager.process_due_deliveries(10).await.unwrap();
 
     assert_eq!(processed, 1);
-    let delivered = provider
-        .get_delivery_record(&record_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(delivered.status, DeliveryStatus::Delivered);
-    assert_eq!(delivered.attempts, 1);
+    assert_eq!(
+        provider.get_delivery(&record_id).await.unwrap(),
+        None,
+        "a delivered record is deleted (W3 design 1.5)"
+    );
     let payloads = transport.payloads();
     assert_eq!(payloads.len(), 2);
     let body = String::from_utf8(payloads[1].clone()).unwrap();
@@ -531,19 +445,19 @@ async fn process_due_deliveries_sends_pending_builtin_http_delivery() {
 
 #[tokio::test]
 async fn publish_sends_queue_notification_body_matching_aws_fixture() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
-    let (queue_manager, _directory) = create_test_queue_manager().await;
-    let queue_manager = Arc::new(queue_manager);
+    let provider = sqlite_provider().await;
+    let queue_manager = Arc::new(TestQueueManager::new(provider.clone()));
     queue_manager
         .create_queue(CreateQueueRequest {
             queue_name: "orders-queue".to_string(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
     let manager = PubsubManager::builder()
         .provider(provider)
-        .queue_manager(queue_manager.clone())
+        .queue_wake(queue_manager.wake_handle())
         .build()
         .unwrap();
     let topic = manager.create_topic("orders").await.unwrap();
@@ -551,7 +465,7 @@ async fn publish_sends_queue_notification_body_matching_aws_fixture() {
         .subscribe(SubscribeRequest {
             topic_arn: topic.topic_arn.clone(),
             protocol: SubscriptionProtocol::Queue,
-            endpoint: "orders-queue".to_string(),
+            endpoint: queue_arn("orders-queue"),
             attributes: HashMap::new(),
             extra_json: serde_json::Value::Null,
         })
@@ -598,19 +512,19 @@ async fn publish_sends_queue_notification_body_matching_aws_fixture() {
 
 #[tokio::test]
 async fn publish_sends_raw_queue_body_and_attributes_matching_aws_fixture() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
-    let (queue_manager, _directory) = create_test_queue_manager().await;
-    let queue_manager = Arc::new(queue_manager);
+    let provider = sqlite_provider().await;
+    let queue_manager = Arc::new(TestQueueManager::new(provider.clone()));
     queue_manager
         .create_queue(CreateQueueRequest {
             queue_name: "orders-raw-queue".to_string(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
     let manager = PubsubManager::builder()
         .provider(provider)
-        .queue_manager(queue_manager.clone())
+        .queue_wake(queue_manager.wake_handle())
         .build()
         .unwrap();
     let topic = manager.create_topic("orders").await.unwrap();
@@ -618,7 +532,7 @@ async fn publish_sends_raw_queue_body_and_attributes_matching_aws_fixture() {
         .subscribe(SubscribeRequest {
             topic_arn: topic.topic_arn.clone(),
             protocol: SubscriptionProtocol::Queue,
-            endpoint: "orders-raw-queue".to_string(),
+            endpoint: queue_arn("orders-raw-queue"),
             attributes: HashMap::from([("RawMessageDelivery".to_string(), "true".to_string())]),
             extra_json: serde_json::Value::Null,
         })
@@ -665,7 +579,7 @@ async fn publish_sends_raw_queue_body_and_attributes_matching_aws_fixture() {
 
 #[tokio::test]
 async fn notification_body_and_headers_match_normalized_aws_http_fixture() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let manager = PubsubManager::new(provider.clone());
     let topic = manager.create_topic("orders").await.unwrap();
     manager
@@ -707,7 +621,7 @@ async fn notification_body_and_headers_match_normalized_aws_http_fixture() {
 
 #[tokio::test]
 async fn subscribe_sends_confirmation_body_and_headers_matching_aws_fixture() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let transport = RecordingHttpTransport::new(vec![StatusCode::NO_CONTENT]);
     let http_client = HttpClient::builder()
         .with_transport(transport.clone())
@@ -794,11 +708,60 @@ async fn subscribe_sends_confirmation_body_and_headers_matching_aws_fixture() {
     );
 }
 
+/// The stale sweep deletes a pending subscription while its confirmation
+/// record is still queued: the record is settled without a request.
 #[tokio::test]
-async fn process_due_deliveries_retries_then_fails_builtin_http_delivery() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+async fn given_pending_subscription_deleted_when_its_confirmation_is_due_then_it_is_dropped_without_a_request()
+ {
+    let provider = sqlite_provider().await;
+    let transport = RecordingHttpTransport::new(vec![StatusCode::NO_CONTENT]);
+    let http_client = HttpClient::builder()
+        .with_transport(transport.clone())
+        .build()
+        .unwrap();
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .http_client(http_client)
+        .delivery_config(PubsubDeliveryConfig {
+            subscribe_url_base: Some("https://sns.us-east-1.amazonaws.com/".to_string()),
+            ..PubsubDeliveryConfig::default()
+        })
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("orders").await.unwrap();
+    manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Https,
+            endpoint: "https://example.com/hook".to_string(),
+            attributes: HashMap::new(),
+            extra_json: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+    let subscription = first_subscription(&provider, topic.topic_arn.clone()).await;
+
+    provider
+        .delete_subscription(&subscription.subscription_arn)
+        .await
+        .unwrap();
+
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
+    assert_eq!(transport.payloads().len(), 0, "no request was sent");
+    assert_eq!(
+        manager.process_due_deliveries(10).await.unwrap(),
+        0,
+        "the record is gone, not retried"
+    );
+}
+
+/// R5: a transient HTTP failure schedules a retry; no attempt counter ends
+/// the delivery before its one-hour deadline.
+#[tokio::test]
+async fn process_due_deliveries_schedules_retry_for_transient_http_failure() {
+    let provider = sqlite_provider().await;
     let transport = RecordingHttpTransport::new(vec![
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::NO_CONTENT,
         StatusCode::INTERNAL_SERVER_ERROR,
     ]);
     let http_client = HttpClient::builder()
@@ -810,11 +773,10 @@ async fn process_due_deliveries_retries_then_fails_builtin_http_delivery() {
         .http_client(http_client)
         .delivery_config(PubsubDeliveryConfig {
             worker_id: "test-worker".to_string(),
-            lease_duration: Duration::from_secs(30),
-            max_attempts: 2,
-            retry_base_delay: Duration::ZERO,
-            request_timeout: Duration::from_secs(1),
-            delivery_concurrency: 1,
+            timing: DeliveryTiming::from(&config::PubsubRunnerConfig {
+                request_timeout_seconds: 1,
+                ..config::PubsubRunnerConfig::default()
+            }),
             subscribe_url_base: None,
             unsubscribe_url_base: None,
             signing_cert_url: None,
@@ -832,9 +794,9 @@ async fn process_due_deliveries_retries_then_fails_builtin_http_delivery() {
         })
         .await
         .unwrap();
+    assert_eq!(manager.process_due_deliveries(1).await.unwrap(), 1);
     let subscription =
         confirm_first_subscription(&manager, &provider, topic.topic_arn.clone()).await;
-    assert_eq!(manager.process_due_deliveries(1).await.unwrap(), 1);
     let publish = manager
         .publish(PublishRequest {
             topic_arn: topic.topic_arn,
@@ -850,27 +812,24 @@ async fn process_due_deliveries_retries_then_fails_builtin_http_delivery() {
     ));
 
     assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
-    let retry = provider
-        .get_delivery_record(&record_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(retry.status, DeliveryStatus::RetryScheduled);
+    let (retry, _) = provider.get_delivery(&record_id).await.unwrap().unwrap();
+    assert!(retry.lease.is_none());
     assert_eq!(retry.attempts, 1);
-
-    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
-    let failed = provider
-        .get_delivery_record(&record_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(failed.status, DeliveryStatus::Failed);
-    assert_eq!(failed.attempts, 2);
+    assert_eq!(
+        retry.last_failure,
+        Some(pubsub_provider::DeliveryFailureCode::HttpStatus(500))
+    );
+    assert!(retry.due_at > provider.now());
+    assert_eq!(
+        manager.process_due_deliveries(10).await.unwrap(),
+        0,
+        "the retry is not due before its back-off"
+    );
 }
 
 #[tokio::test]
 async fn notification_body_uses_configured_unsubscribe_url_and_signer() {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let provider = sqlite_provider().await;
     let manager = PubsubManager::new(provider.clone());
     let topic = manager.create_topic("orders").await.unwrap();
     manager
@@ -1024,12 +983,11 @@ fn header_value(headers: &HeaderMap, name: &str) -> String {
 #[tokio::test]
 async fn given_typed_attributes_when_delivered_then_raw_queue_retains_types_and_large_envelope_succeeds()
  {
-    let provider = Arc::new(InMemoryPubsubProvider::default());
-    let (queues, _directory) = create_test_queue_manager().await;
-    let queues = Arc::new(queues);
+    let provider = sqlite_provider().await;
+    let queues = Arc::new(TestQueueManager::new(provider.clone()));
     let manager = PubsubManager::builder()
         .provider(provider.clone())
-        .queue_manager(queues.clone())
+        .queue_wake(queues.wake_handle())
         .build()
         .unwrap();
     let topic = manager.create_topic("typed-delivery").await.unwrap();
@@ -1039,6 +997,7 @@ async fn given_typed_attributes_when_delivered_then_raw_queue_retains_types_and_
             .create_queue(CreateQueueRequest {
                 queue_name: format!("typed-delivery-{raw}"),
                 attributes: None,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1047,7 +1006,7 @@ async fn given_typed_attributes_when_delivered_then_raw_queue_retains_types_and_
             .subscribe(SubscribeRequest {
                 topic_arn: topic.topic_arn.clone(),
                 protocol: SubscriptionProtocol::Queue,
-                endpoint: url.clone(),
+                endpoint: queue_arn(&format!("typed-delivery-{raw}")),
                 attributes: HashMap::from([("RawMessageDelivery".to_owned(), raw.to_string())]),
                 extra_json: Value::Null,
             })
@@ -1134,21 +1093,442 @@ async fn given_typed_attributes_when_delivered_then_raw_queue_retains_types_and_
         .subscriptions;
     for subscription in subscriptions {
         let record = provider
-            .get_delivery_record(&DeliveryRecordId(format!(
+            .get_delivery(&DeliveryRecordId(format!(
                 "{}:{}",
                 subscription.subscription_arn, published.message_id
             )))
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(
-            record.status,
-            if subscription.raw_message_delivery {
-                DeliveryStatus::Failed
-            } else {
-                DeliveryStatus::Delivered
-            }
+            record, None,
+            "the envelope is delivered; the raw delivery with 11 attributes is a permanent \
+             failure that is dropped (no dead-letter queue)"
         );
-        assert_eq!(record.attempts, 1);
     }
+    let (envelope_url, raw_url) = (&urls[0], &urls[1]);
+    for (url, expected) in [(envelope_url, 1), (raw_url, 0)] {
+        let received = queues
+            .receive_message(ReceiveMessageRequest {
+                queue_url: url.clone(),
+                max_number_of_messages: Some(10),
+                visibility_timeout: Some(30),
+                wait_time_seconds: Some(0),
+                attribute_names: None,
+                message_attribute_names: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(received.messages.len(), expected, "{url}");
+    }
+}
+
+/// W3 step 6: the delivery commit wakes a long poll on the destination queue
+/// in this process, as a send does.
+#[tokio::test]
+async fn given_long_poll_on_queue_when_sns_delivers_then_the_receive_wakes_at_once() {
+    let provider = sqlite_provider().await;
+    let queue_manager = Arc::new(TestQueueManager::new(provider.clone()));
+    let queue_url = queue_manager
+        .create_queue(CreateQueueRequest {
+            queue_name: "woken".to_string(),
+            attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .queue_url;
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_wake(queue_manager.wake_handle())
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("woken").await.unwrap();
+    manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: queue_arn("woken"),
+            attributes: HashMap::new(),
+            extra_json: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (received, ()) = tokio::join!(
+        queue_manager.receive_message(ReceiveMessageRequest {
+            queue_url,
+            max_number_of_messages: Some(1),
+            visibility_timeout: Some(30),
+            wait_time_seconds: Some(10),
+            attribute_names: None,
+            message_attribute_names: None,
+        }),
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            manager
+                .publish(PublishRequest {
+                    topic_arn: topic.topic_arn.clone(),
+                    message: "wake".to_string(),
+                    subject: None,
+                    message_attributes: HashMap::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
+        }
+    );
+    assert_eq!(received.unwrap().messages.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the delivery woke the long poll before its probe interval"
+    );
+}
+
+/// With a 60 s probe interval only the wake handle can deliver the message
+/// to the waiting receive.
+#[tokio::test]
+async fn given_long_probe_interval_when_sns_delivers_then_the_wake_handle_wakes_the_receive() {
+    let provider = sqlite_provider().await;
+    let queue_manager = Arc::new(
+        TestQueueManager::new(provider.clone())
+            .with_receive_probe_interval(Duration::from_secs(60)),
+    );
+    let queue_url = queue_manager
+        .create_queue(CreateQueueRequest {
+            queue_name: "woken".to_string(),
+            attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .queue_url;
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_wake(queue_manager.wake_handle())
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("woken").await.unwrap();
+    manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: queue_arn("woken"),
+            attributes: HashMap::new(),
+            extra_json: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (received, ()) = tokio::join!(
+        queue_manager.receive_message(ReceiveMessageRequest {
+            queue_url,
+            max_number_of_messages: Some(1),
+            visibility_timeout: Some(30),
+            wait_time_seconds: Some(10),
+            attribute_names: None,
+            message_attribute_names: None,
+        }),
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            manager
+                .publish(PublishRequest {
+                    topic_arn: topic.topic_arn.clone(),
+                    message: "wake".to_string(),
+                    subject: None,
+                    message_attributes: HashMap::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
+        }
+    );
+    assert_eq!(received.unwrap().messages.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "only the wake handle can beat a 60 s probe interval"
+    );
+}
+
+fn query(action: &str) -> crate::protocol::PubsubAction {
+    crate::protocol::decode_query_request(action.as_bytes()).unwrap()
+}
+
+fn next_token(xml: &str) -> Option<String> {
+    let (_, rest) = xml.split_once("<NextToken>")?;
+    let (token, _) = rest.split_once("</NextToken>")?;
+    Some(token.to_owned())
+}
+
+/// W3 test 32: 250 topics and 250 subscriptions are listed in three pages
+/// each, every item once; a bad token and a missing topic are errors.
+#[tokio::test]
+async fn given_250_topics_when_listed_then_next_token_pages_return_each_once() {
+    let provider = sqlite_provider().await;
+    let queues = Arc::new(TestQueueManager::new(provider.clone()));
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_wake(queues.wake_handle())
+        .build()
+        .unwrap();
+    let mut topics = Vec::new();
+    for index in 0..250 {
+        let topic = manager
+            .create_topic(format!("paged-{index:03}"))
+            .await
+            .unwrap();
+        manager
+            .subscribe(SubscribeRequest {
+                topic_arn: topic.topic_arn.clone(),
+                protocol: SubscriptionProtocol::Queue,
+                endpoint: queue_arn("paged"),
+                attributes: HashMap::new(),
+                extra_json: Value::Null,
+            })
+            .await
+            .unwrap();
+        topics.push(topic.topic_arn);
+    }
+    for (action, member) in [
+        ("ListTopics", "<TopicArn>"),
+        ("ListSubscriptions", "<SubscriptionArn>"),
+    ] {
+        let mut seen = std::collections::HashSet::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let request = match &token {
+                Some(token) => format!("Action={action}&NextToken={token}"),
+                None => format!("Action={action}"),
+            };
+            let success = manager.execute_query_action(query(&request)).await.unwrap();
+            let xml = crate::protocol::render_query_success(&success, "id");
+            pages += 1;
+            for item in xml.split(member).skip(1) {
+                let arn = item.split('<').next().unwrap().to_owned();
+                assert!(seen.insert(arn), "{action}: an item appeared twice");
+            }
+            token = next_token(&xml);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(pages, 3, "{action}");
+        assert_eq!(seen.len(), 250, "{action}");
+    }
+
+    let error = manager
+        .execute_query_action(query("Action=ListTopics&NextToken=%25%25"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.aws_query_error_type(), "InvalidParameter");
+    assert_eq!(error.aws_query_message(), "Invalid parameter: NextToken");
+    let error = manager
+        .execute_query_action(query(
+            "Action=ListSubscriptionsByTopic&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%\
+             3Amissing",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.aws_query_error_type(), "NotFound");
+    assert_eq!(error.aws_query_message(), "Topic does not exist");
+}
+
+struct BrokenSigner;
+
+impl PubsubNotificationSigner for BrokenSigner {
+    fn sign(
+        &self,
+        _request: PubsubNotificationSignRequest<'_>,
+    ) -> pubsub_provider::PubsubResult<String> {
+        Err(pubsub_provider::PubsubError::storage(
+            "signing key is unavailable",
+        ))
+    }
+}
+
+/// Review D5: an error before the attempt (here the signer) is settled as a
+/// transient internal failure under the fence, so the record reaches its
+/// deadline instead of being claimed again every lease.
+#[tokio::test]
+async fn given_signer_error_when_delivered_then_record_is_settled_as_transient() {
+    let provider = sqlite_provider().await;
+    let queues = Arc::new(TestQueueManager::new(provider.clone()));
+    queues
+        .create_queue(CreateQueueRequest {
+            queue_name: "signed".to_string(),
+            attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_wake(queues.wake_handle())
+        .notification_signer(Arc::new(BrokenSigner))
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("signed").await.unwrap();
+    manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: queue_arn("signed"),
+            attributes: HashMap::new(),
+            extra_json: Value::Null,
+        })
+        .await
+        .unwrap();
+    let subscription = first_subscription(&provider, topic.topic_arn.clone()).await;
+    let publish = manager
+        .publish(PublishRequest {
+            topic_arn: topic.topic_arn,
+            message: "unsigned".to_string(),
+            subject: None,
+            message_attributes: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
+    let (record, _) = provider
+        .get_delivery(&DeliveryRecordId(format!(
+            "{}:{}",
+            subscription.subscription_arn, publish.message_id
+        )))
+        .await
+        .unwrap()
+        .expect("the record waits for its retry");
+    assert!(record.lease.is_none());
+    assert_eq!(record.attempts, 1);
+    assert_eq!(
+        record.last_failure,
+        Some(pubsub_provider::DeliveryFailureCode::Internal)
+    );
+}
+
+/// Review D9: an `sqs` endpoint in another region is not this store's queue,
+/// also when a local queue has the same name; the delivery is a permanent
+/// `DestinationMissing` and the local queue stays empty.
+#[tokio::test]
+async fn given_queue_arn_in_another_region_when_delivered_then_destination_is_missing() {
+    let provider = sqlite_provider().await;
+    let queues = Arc::new(TestQueueManager::new(provider.clone()));
+    let url = queues
+        .create_queue(CreateQueueRequest {
+            queue_name: "elsewhere".to_string(),
+            attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .queue_url;
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_wake(queues.wake_handle())
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("regions").await.unwrap();
+    manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: "arn:aws:sqs:eu-west-1:000000000000:elsewhere".to_owned(),
+            attributes: HashMap::new(),
+            extra_json: Value::Null,
+        })
+        .await
+        .expect("Subscribe accepts another region, as AWS does");
+    manager
+        .publish(PublishRequest {
+            topic_arn: topic.topic_arn,
+            message: "far".to_string(),
+            subject: None,
+            message_attributes: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
+    let received = queues
+        .receive_message(ReceiveMessageRequest {
+            queue_url: url,
+            max_number_of_messages: Some(10),
+            visibility_timeout: Some(30),
+            wait_time_seconds: Some(0),
+            attribute_names: None,
+            message_attribute_names: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        received.messages.is_empty(),
+        "no delivery to the local queue"
+    );
+    assert_eq!(
+        manager.process_due_deliveries(10).await.unwrap(),
+        0,
+        "dropped"
+    );
+}
+
+/// Review D9: a subscription dead-letter target in another region is
+/// missing at the move, although a local queue has its name.
+#[tokio::test]
+async fn given_dead_letter_target_in_another_region_when_moved_then_it_is_missing() {
+    let provider = sqlite_provider().await;
+    let queues = Arc::new(TestQueueManager::new(provider.clone()));
+    let dlq = queues
+        .create_queue(CreateQueueRequest {
+            queue_name: "far-dlq".to_string(),
+            attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .queue_url;
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_wake(queues.wake_handle())
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("far-dlq").await.unwrap();
+    manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: queue_arn("absent"),
+            attributes: HashMap::from([(
+                "RedrivePolicy".to_owned(),
+                r#"{"deadLetterTargetArn":"arn:aws:sqs:eu-west-1:000000000000:far-dlq"}"#
+                    .to_owned(),
+            )]),
+            extra_json: Value::Null,
+        })
+        .await
+        .unwrap();
+    manager
+        .publish(PublishRequest {
+            topic_arn: topic.topic_arn,
+            message: "lost".to_string(),
+            subject: None,
+            message_attributes: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
+    let received = queues
+        .receive_message(ReceiveMessageRequest {
+            queue_url: dlq,
+            max_number_of_messages: Some(10),
+            visibility_timeout: Some(30),
+            wait_time_seconds: Some(0),
+            attribute_names: None,
+            message_attribute_names: None,
+        })
+        .await
+        .unwrap();
+    assert!(received.messages.is_empty(), "no move to the other region");
+    assert_eq!(
+        manager.process_due_deliveries(10).await.unwrap(),
+        0,
+        "dropped"
+    );
 }

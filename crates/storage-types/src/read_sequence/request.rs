@@ -55,7 +55,8 @@ impl Default for ReadSequenceValidationCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct ReadSequenceRequest {
     #[serde(default)]

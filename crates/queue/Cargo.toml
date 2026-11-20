@@ -10,72 +10,42 @@ version = "0.1.0"
 [lib]
 doctest = false
 
-[[bin]]
-name = "queue"
-path = "src/main/mod.rs"
-required-features = ["server"]
-
 [features]
-default = ["sqlite", "server"]
-server = [
-    "dep:axum",
-    "dep:clap",
-    "dep:metrics-exporter-prometheus",
-    "dep:tracing-subscriber",
-    "dep:uuid",
-]
-sqlite = ["dep:sql-backend", "sql-backend/sqlite", "storage-types/sqlite"]
-turso = ["dep:sql-backend", "sql-backend/turso", "storage-types/turso"]
-postgres = ["dep:sql-backend", "sql-backend/postgres", "storage-types/postgres"]
-rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "storage-types/rocksdb"]
-foundationdb = ["dep:kv-backend", "kv-backend/foundationdb"]
-remote = ["dep:queue-remote"]
+default = ["sqlite"]
+sqlite = ["sql-backend/sqlite", "storage-types/sqlite"]
+turso = ["sql-backend/turso", "storage-types/turso"]
+postgres = ["sql-backend/postgres", "storage-types/postgres"]
+rocksdb = ["kv-backend/rocksdb", "storage-types/rocksdb"]
+foundationdb = ["kv-backend/foundationdb"]
 opt-loop-profiling = ["dep:opt-loop-probe"]
 
 [dependencies]
 async-trait = { workspace = true }
-axum = { workspace = true, optional = true }
 bg-jobs-tokio = { workspace = true }
-clap = { workspace = true, optional = true }
-config = { path = "../config" }
-http-error = { path = "../http-error" }
-kv-backend = { path = "../kv-backend", optional = true, default-features = false }
 md5 = { workspace = true }
-metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-facade = { workspace = true }
 opt-loop-probe = { workspace = true, optional = true }
 queue-provider = { path = "../queue-provider" }
-queue-remote = { path = "../queue-remote", optional = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-types = { path = "../storage-types" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, optional = true }
-url = { workspace = true }
-uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
-aws-config = { workspace = true }
-aws-sdk-sqs = { workspace = true }
-reqwest = { workspace = true }
+anyhow = { workspace = true }
+kv-backend = { path = "../kv-backend", default-features = false }
+queue-provider = { path = "../queue-provider", features = ["test-support"] }
+quint-connect = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sql-backend = { path = "../sql-backend", default-features = false, features = ["test-support"] }
 storage-observability-test-support = { path = "../storage-observability-test-support" }
+storage-provider = { path = "../storage-provider" }
+storage-types = { path = "../storage-types", features = ["test-support"] }
 tempfile = { workspace = true }
-tokio = { workspace = true }
-tokio-postgres = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
 
-[[test]]
-name = "aws_parity_tests"
-path = "tests/aws_parity_tests/mod.rs"
-required-features = ["server"]
-
-[[test]]
-name = "http_binary_tests"
-path = "tests/http_binary_tests.rs"
-required-features = ["server"]

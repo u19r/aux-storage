@@ -23,7 +23,7 @@ use scheduled_bg_jobs::{
 #[cfg(feature = "remote")]
 use storage_provider::{RemoteCredentialStrategy, RemoteStorageSettings};
 #[cfg(feature = "sqlite")]
-use storage_provider::{SqliteSettings, StorageConnectionConfig, StorageConnectionRegistry};
+use storage_provider::{SqliteSettings, StorageConnectionRegistry};
 #[cfg(any(feature = "remote", feature = "sqlite"))]
 use storage_provider::{StorageBackend, StorageConfig};
 #[cfg(feature = "sqlite")]
@@ -43,6 +43,7 @@ use crate::{DatabaseManagerRuntimeOptions, ScheduledJobStore};
 #[cfg(feature = "sqlite")]
 fn sqlite_config(path: &str) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(path.to_string()),
         file_path: None,
@@ -56,9 +57,10 @@ fn sqlite_config(path: &str) -> StorageConfig {
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_connection(path: &str) -> StorageConnectionConfig {
+fn sqlite_connection(path: &str) -> StorageConfig {
     let config = sqlite_config(path);
-    StorageConnectionConfig {
+    StorageConfig {
+        initial_stream_lineages: config.initial_stream_lineages,
         backend_type: config.backend_type,
         connection_string: config.connection_string,
         file_path: config.file_path,
@@ -200,10 +202,7 @@ async fn given_two_live_file_backed_sqlite_managers_when_second_disables_jobs_th
         std::process::id()
     ));
     let mut config = sqlite_config(database_path.to_str().expect("UTF-8 SQLite path"));
-    config.sqlite = Some(SqliteSettings {
-        immediate_gsi_consistency: true,
-        force_file_backed_database: true,
-    });
+    config.sqlite = Some(SqliteSettings {});
 
     let (first, _, first_store) =
         database_manager_with_components(config.clone(), DatabaseManagerRuntimeOptions::default())
@@ -268,10 +267,7 @@ async fn given_synchronized_sqlite_manager_construction_when_http_and_observer_a
         std::process::id()
     ));
     let mut config = sqlite_config(database_path.to_str().expect("UTF-8 SQLite path"));
-    config.sqlite = Some(SqliteSettings {
-        immediate_gsi_consistency: true,
-        force_file_backed_database: true,
-    });
+    config.sqlite = Some(SqliteSettings {});
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
     let http_barrier = std::sync::Arc::clone(&barrier);
@@ -393,6 +389,7 @@ async fn given_remote_backend_when_store_is_requested_then_manager_reports_unsup
     // backend-disabled branch under test is reached.
     let result = DatabaseManager::new_with_config_and_runtime_options(
         StorageConfig {
+            initial_stream_lineages: None,
             backend_type: StorageBackend::Remote,
             connection_string: None,
             file_path: None,
@@ -478,6 +475,7 @@ async fn given_remote_manager_with_endpoint_credentials_when_constructing_then_r
  {
     let result = DatabaseManager::new_with_config_and_runtime_options(
         StorageConfig {
+            initial_stream_lineages: None,
             backend_type: StorageBackend::Remote,
             connection_string: None,
             file_path: None,

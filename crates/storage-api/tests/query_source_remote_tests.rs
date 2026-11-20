@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 
 fn remote_config(endpoint_url: String) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::Remote,
         connection_string: None,
         file_path: None,

@@ -1,6 +1,6 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::cmp::Ordering;
 
-use crate::{AttributeValue, TableKey};
+use crate::{AttributeMap, AttributeValue, TableKey};
 
 impl PartialEq for TableKey {
     fn eq(&self, other: &Self) -> bool {
@@ -21,21 +21,6 @@ impl TableKey {
                 (None, Some(_)) => Ordering::Less,
                 (None, None) => Ordering::Equal,
             })
-    }
-
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut encoded = Vec::new();
-        append_string(&mut encoded, self.table_name.as_ref());
-        append_attribute_value(&mut encoded, &self.hash_key);
-        match self.range_key.as_ref() {
-            Some(value) => {
-                encoded.push(1);
-                append_attribute_value(&mut encoded, value);
-            }
-            None => encoded.push(0),
-        }
-        encoded
     }
 }
 
@@ -106,10 +91,7 @@ fn attribute_tag(value: &AttributeValue) -> u8 {
     }
 }
 
-fn compare_maps(
-    left: &HashMap<String, AttributeValue>,
-    right: &HashMap<String, AttributeValue>,
-) -> Ordering {
+fn compare_maps(left: &AttributeMap, right: &AttributeMap) -> Ordering {
     let count_order = compare_encoded_length(left.len(), right.len());
     if count_order != Ordering::Equal {
         return count_order;
@@ -141,64 +123,11 @@ fn compare_maps(
 }
 
 fn next_map_entry<'a>(
-    values: &'a HashMap<String, AttributeValue>,
+    values: &'a AttributeMap,
     previous: Option<&str>,
 ) -> Option<(&'a str, &'a AttributeValue)> {
     values
         .iter()
-        .filter(|(key, _)| previous.is_none_or(|previous| key.as_str() > previous))
+        .filter(|(key, _)| previous.is_none_or(|previous| *key > previous))
         .min_by_key(|(key, _)| *key)
-        .map(|(key, value)| (key.as_str(), value))
-}
-
-fn append_attribute_value(encoded: &mut Vec<u8>, value: &AttributeValue) {
-    match value {
-        AttributeValue::S(value) => append_tagged_string(encoded, b'S', value),
-        AttributeValue::N(value) => append_tagged_string(encoded, b'N', value),
-        AttributeValue::B(value) => append_tagged_string(encoded, b'B', value),
-        AttributeValue::SS(values) => append_tagged_strings(encoded, b's', values),
-        AttributeValue::NS(values) => append_tagged_strings(encoded, b'n', values),
-        AttributeValue::BS(values) => append_tagged_strings(encoded, b'b', values),
-        AttributeValue::BOOL(value) => encoded.extend([b'1', u8::from(*value)]),
-        AttributeValue::NULL(value) => encoded.extend([b'0', u8::from(*value)]),
-        AttributeValue::L(values) => {
-            encoded.push(b'l');
-            append_length(encoded, values.len());
-            for value in values {
-                append_attribute_value(encoded, value);
-            }
-        }
-        AttributeValue::M(values) => {
-            encoded.push(b'm');
-            let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_by(|left, right| left.0.cmp(right.0));
-            append_length(encoded, entries.len());
-            for (key, value) in entries {
-                append_string(encoded, key);
-                append_attribute_value(encoded, value);
-            }
-        }
-    }
-}
-
-fn append_tagged_string(encoded: &mut Vec<u8>, tag: u8, value: &str) {
-    encoded.push(tag);
-    append_string(encoded, value);
-}
-
-fn append_tagged_strings(encoded: &mut Vec<u8>, tag: u8, values: &[String]) {
-    encoded.push(tag);
-    append_length(encoded, values.len());
-    for value in values {
-        append_string(encoded, value);
-    }
-}
-
-fn append_string(encoded: &mut Vec<u8>, value: &str) {
-    append_length(encoded, value.len());
-    encoded.extend(value.as_bytes());
-}
-
-fn append_length(encoded: &mut Vec<u8>, length: usize) {
-    encoded.extend(u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes());
 }

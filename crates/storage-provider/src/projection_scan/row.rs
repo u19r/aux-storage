@@ -1,11 +1,9 @@
-use storage_types::{ItemKey, ItemRevision, WireItem};
+use storage_types::{ItemKey, WireItem};
 
-/// A live native projection and its physical key/revision evidence.
-/// Historical projection tombstones are not queryable live projections.
+/// A live native projection and its physical key.
 pub struct GsiProjectionRow {
     pub key: ItemKey,
     pub image: WireItem,
-    pub revision: ItemRevision,
 }
 
 pub struct TtlProjectionPage {

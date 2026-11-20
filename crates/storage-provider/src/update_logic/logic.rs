@@ -4,10 +4,9 @@ use std::{
     sync::{Arc, OnceLock, RwLock},
 };
 
-use storage_condition::{Condition, parse_condition_expression_typed};
 use storage_types::{
     AttributeMap, AttributeValue, StorageError, StorageResult,
-    subset_expression_attribute_values_for_expression,
+    condition::{AttributePath, Condition, parse_condition_expression_typed},
 };
 
 #[allow(unused_imports)]
@@ -16,7 +15,8 @@ use crate::{
     constants::UPDATE_SECTION_KEYWORDS,
     update_logic::{
         path::{
-            get_attribute_value, remove_attribute_value, resolve_document_path, set_attribute_value,
+            get_attribute_value, remove_attribute_value, require_update_parent,
+            resolve_document_path, set_attribute_value,
         },
         value::{
             BoundUpdateOperand, SetFunctionPlan, UpdateValuePlan, add_add_expression_with_rhs,
@@ -29,42 +29,43 @@ use crate::{
 };
 
 /// Represents an update operation parsed from an update expression
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum UpdateOperation {
     Set {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: AttributeValue,
     },
     SetExpression {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: UpdateOperand,
     },
     SetIfNotExists {
-        field: Arc<str>,
-        path: Arc<str>,
+        field: Arc<AttributePath>,
+        path: Arc<AttributePath>,
         operand: AttributeValue,
     },
     SetListAppend {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         operand1: AttributeValue,
         operand2: AttributeValue,
     },
     Add {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: AttributeValue,
     },
     Remove {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
     },
     Delete {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: AttributeValue,
     },
 }
 
 impl UpdateOperation {
     #[must_use]
-    pub fn field_name(&self) -> &str {
+    pub fn field_path(&self) -> &AttributePath {
         match self {
             UpdateOperation::Add { field, .. }
             | UpdateOperation::Delete { field, .. }
@@ -77,48 +78,49 @@ impl UpdateOperation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum BoundUpdateOperation<'a> {
     Set {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: Cow<'a, AttributeValue>,
     },
     SetExpression {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: BoundUpdateOperand<'a>,
     },
     SetArithmetic {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         lhs: BoundUpdateOperand<'a>,
         rhs: BoundUpdateOperand<'a>,
         operator: ArithmeticOperator,
     },
     SetIfNotExists {
-        field: Arc<str>,
-        path: Arc<str>,
+        field: Arc<AttributePath>,
+        path: Arc<AttributePath>,
         operand: Cow<'a, AttributeValue>,
     },
     SetListAppend {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         operand1: Cow<'a, AttributeValue>,
         operand2: Cow<'a, AttributeValue>,
     },
     Add {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: Cow<'a, AttributeValue>,
     },
     Remove {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
     },
     Delete {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: Cow<'a, AttributeValue>,
     },
 }
 
 impl BoundUpdateOperation<'_> {
     #[must_use]
-    pub fn field_name(&self) -> &str {
+    pub fn field_path(&self) -> &AttributePath {
         match self {
             BoundUpdateOperation::Add { field, .. }
             | BoundUpdateOperation::Delete { field, .. }
@@ -132,7 +134,7 @@ impl BoundUpdateOperation<'_> {
     }
 
     #[must_use]
-    pub fn field_name_arc(&self) -> Arc<str> {
+    pub fn field_path_arc(&self) -> Arc<AttributePath> {
         match self {
             BoundUpdateOperation::Add { field, .. }
             | BoundUpdateOperation::Delete { field, .. }
@@ -212,27 +214,29 @@ pub fn parse_update_expression(
     bind_update_expression_plan(&plan, expression_attribute_values)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 struct CachedUpdateExpressionPlan {
     attribute_names: Vec<(String, String)>,
     plan: Arc<Vec<UpdateOperationPlan>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 enum UpdateOperationPlan {
     Set {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: UpdateValuePlan,
     },
     Add {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: UpdateValuePlan,
     },
     Remove {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
     },
     Delete {
-        field: Arc<str>,
+        field: Arc<AttributePath>,
         value: UpdateValuePlan,
     },
 }
@@ -320,7 +324,7 @@ fn parse_update_expression_plan(
         else if let Some(add_part) = part.strip_prefix("ADD ") {
             let assignment = add_part.trim();
             if let Some((field, value_expr)) = assignment.split_once(' ') {
-                let field = Arc::from(resolve_attribute_name(
+                let field = Arc::new(resolve_attribute_name(
                     field.trim(),
                     expression_attribute_names,
                 )?);
@@ -342,7 +346,7 @@ fn parse_update_expression_plan(
         }
         // Parse REMOVE operations
         else if let Some(remove_part) = part.strip_prefix("REMOVE ") {
-            let field = Arc::from(resolve_attribute_name(
+            let field = Arc::new(resolve_attribute_name(
                 remove_part.trim(),
                 expression_attribute_names,
             )?);
@@ -352,7 +356,7 @@ fn parse_update_expression_plan(
         else if let Some(delete_part) = part.strip_prefix("DELETE ") {
             let assignment = delete_part.trim();
             if let Some((field, value_expr)) = assignment.split_once(' ') {
-                let field = Arc::from(resolve_attribute_name(
+                let field = Arc::new(resolve_attribute_name(
                     field.trim(),
                     expression_attribute_names,
                 )?);
@@ -405,7 +409,7 @@ fn parse_update_expression_plan(
                 // Try ADD operation continuation if it contains " " but not "="
                 else if part.contains(' ') && !part.contains('=') {
                     if let Some((field, value_expr)) = part.split_once(' ') {
-                        let field = Arc::from(resolve_attribute_name(
+                        let field = Arc::new(resolve_attribute_name(
                             field.trim(),
                             expression_attribute_names,
                         )?);
@@ -431,7 +435,7 @@ fn parse_update_expression_plan(
                 }
                 // Otherwise, assume it's a REMOVE operation continuation
                 else {
-                    let field = Arc::from(resolve_attribute_name(
+                    let field = Arc::new(resolve_attribute_name(
                         part.trim(),
                         expression_attribute_names,
                     )?);
@@ -637,7 +641,7 @@ fn push_set_operation_plan(
     value_expr: &str,
     expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<()> {
-    let field = Arc::from(resolve_attribute_name(field, expression_attribute_names)?);
+    let field = Arc::new(resolve_attribute_name(field, expression_attribute_names)?);
     match resolve_attribute_value_plan(value_expr, expression_attribute_names)? {
         Ok(value) => {
             operations.push(UpdateOperationPlan::Set { field, value });
@@ -768,7 +772,7 @@ fn sorted_attribute_names(
 fn resolve_attribute_name(
     name: &str,
     expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
-) -> StorageResult<String> {
+) -> StorageResult<AttributePath> {
     resolve_document_path(name, expression_attribute_names)
 }
 
@@ -777,43 +781,44 @@ pub fn apply_update_operations(
     mut item: AttributeMap,
     operations: &[UpdateOperation],
 ) -> StorageResult<AttributeMap> {
+    // Every SET right-hand side reads the item as it was before the update.
+    let mut staged: Vec<(&Arc<AttributePath>, AttributeValue)> =
+        Vec::with_capacity(operations.len());
     for operation in operations {
         match operation {
-            UpdateOperation::Set { field, value } => {
-                set_attribute_value(&mut item, field, value.clone())?;
-            }
+            UpdateOperation::Set { field, value } => staged.push((field, value.clone())),
             UpdateOperation::SetExpression { field, value } => {
-                let value = evaluate_update_operand(&item, value)?;
-                set_attribute_value(&mut item, field, value)?;
+                staged.push((field, evaluate_update_operand(&item, value)?));
             }
             UpdateOperation::SetIfNotExists {
                 field,
                 path,
                 operand,
             } => {
-                if let Some(existing_value) = get_attribute_value(&item, path).cloned() {
-                    set_attribute_value(&mut item, field, existing_value)?;
-                } else {
-                    set_attribute_value(&mut item, field, operand.clone())?;
-                }
+                let value = get_attribute_value(&item, path)
+                    .cloned()
+                    .unwrap_or_else(|| operand.clone());
+                staged.push((field, value));
             }
             UpdateOperation::SetListAppend {
                 field,
                 operand1,
                 operand2,
-            } => {
-                let result = list_append_values(operand1, operand2)?;
-                set_attribute_value(&mut item, field, result)?;
-            }
+            } => staged.push((field, list_append_values(operand1, operand2)?)),
             _ => {}
         }
     }
-
-    for operation in operations {
-        if let UpdateOperation::Remove { field } = operation {
-            remove_attribute_value(&mut item, field)?;
-        }
+    for (field, value) in staged {
+        set_attribute_value(&mut item, field, value)?;
     }
+
+    remove_in_resolution_order(
+        &mut item,
+        operations.iter().filter_map(|operation| match operation {
+            UpdateOperation::Remove { field } => Some(&**field),
+            _ => None,
+        }),
+    )?;
 
     for operation in operations {
         if let UpdateOperation::Add { field, value } = operation {
@@ -823,13 +828,7 @@ pub fn apply_update_operations(
 
     for operation in operations {
         if let UpdateOperation::Delete { field, value } = operation {
-            let Some(mut existing_value) = item.remove(field.as_ref()) else {
-                continue;
-            };
-            let remove_attribute = apply_delete_set_operation(&mut existing_value, value, field)?;
-            if !remove_attribute {
-                item.insert(field.to_string(), existing_value);
-            }
+            apply_delete_operation(&mut item, field, value)?;
         }
     }
 
@@ -842,14 +841,16 @@ pub fn apply_bound_update_operations(
     operations: &[BoundUpdateOperation<'_>],
 ) -> StorageResult<AttributeMap> {
     let mut item = item;
+    // Every SET right-hand side reads the item as it was before the update.
+    let mut staged: Vec<(&Arc<AttributePath>, AttributeValue)> =
+        Vec::with_capacity(operations.len());
     for operation in operations {
         match operation {
             BoundUpdateOperation::Set { field, value } => {
-                set_attribute_value(&mut item, field, value.clone().into_owned())?;
+                staged.push((field, value.clone().into_owned()));
             }
             BoundUpdateOperation::SetExpression { field, value } => {
-                let value = evaluate_bound_update_operand(&item, value)?;
-                set_attribute_value(&mut item, field, value)?;
+                staged.push((field, evaluate_bound_update_operand(&item, value)?));
             }
             BoundUpdateOperation::SetArithmetic {
                 field,
@@ -858,36 +859,42 @@ pub fn apply_bound_update_operations(
                 operator,
             } => {
                 let value = evaluate_bound_set_arithmetic(&item, lhs, *operator, rhs)?;
-                set_attribute_value(&mut item, field, value)?;
+                staged.push((field, value));
             }
             BoundUpdateOperation::SetIfNotExists {
                 field,
                 path,
                 operand,
             } => {
-                if let Some(existing_value) = get_attribute_value(&item, path).cloned() {
-                    set_attribute_value(&mut item, field, existing_value)?;
-                } else {
-                    set_attribute_value(&mut item, field, operand.clone().into_owned())?;
-                }
+                let value = get_attribute_value(&item, path)
+                    .cloned()
+                    .unwrap_or_else(|| operand.clone().into_owned());
+                staged.push((field, value));
             }
             BoundUpdateOperation::SetListAppend {
                 field,
                 operand1,
                 operand2,
             } => {
-                let result = list_append_values(operand1.as_ref(), operand2.as_ref())?;
-                set_attribute_value(&mut item, field, result)?;
+                staged.push((
+                    field,
+                    list_append_values(operand1.as_ref(), operand2.as_ref())?,
+                ));
             }
             _ => {}
         }
     }
-
-    for operation in operations {
-        if let BoundUpdateOperation::Remove { field } = operation {
-            remove_attribute_value(&mut item, field)?;
-        }
+    for (field, value) in staged {
+        set_attribute_value(&mut item, field, value)?;
     }
+
+    remove_in_resolution_order(
+        &mut item,
+        operations.iter().filter_map(|operation| match operation {
+            BoundUpdateOperation::Remove { field } => Some(&**field),
+            _ => None,
+        }),
+    )?;
 
     for operation in operations {
         if let BoundUpdateOperation::Add { field, value } = operation {
@@ -897,23 +904,78 @@ pub fn apply_bound_update_operations(
 
     for operation in operations {
         if let BoundUpdateOperation::Delete { field, value } = operation {
-            let Some(mut existing_value) = item.remove(field.as_ref()) else {
-                continue;
-            };
-            let remove_attribute =
-                apply_delete_set_operation(&mut existing_value, value.as_ref(), field)?;
-            if !remove_attribute {
-                item.insert(field.to_string(), existing_value);
-            }
+            apply_delete_operation(&mut item, field, value.as_ref())?;
         }
     }
 
     Ok(item)
 }
 
+/// REMOVE paths resolve against the original item: list indices are removed
+/// from the highest down and a child path before its parent.
+fn remove_in_resolution_order<'a>(
+    item: &mut AttributeMap,
+    paths: impl Iterator<Item = &'a AttributePath>,
+) -> StorageResult<()> {
+    let mut paths = paths.collect::<Vec<_>>();
+    if paths.len() > 1 {
+        paths.sort_by(|left, right| compare_removal_paths(left, right));
+    }
+    for path in paths {
+        remove_attribute_value(item, path)?;
+    }
+    Ok(())
+}
+
+fn compare_removal_paths(left: &AttributePath, right: &AttributePath) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    use storage_types::condition::PathElement;
+
+    for (left, right) in left.elements().iter().zip(right.elements()) {
+        let ordering = match (left, right) {
+            (PathElement::Name(left), PathElement::Name(right)) => left.cmp(right),
+            (PathElement::Index(left), PathElement::Index(right)) => right.cmp(left),
+            (PathElement::Name(_), PathElement::Index(_)) => Ordering::Less,
+            (PathElement::Index(_), PathElement::Name(_)) => Ordering::Greater,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    right.elements().len().cmp(&left.elements().len())
+}
+
+/// A top-level DELETE target is taken out of the item and put back only when
+/// members remain; a nested target is read, edited and written at its path.
+fn apply_delete_operation(
+    item: &mut AttributeMap,
+    field: &AttributePath,
+    value: &AttributeValue,
+) -> StorageResult<()> {
+    let Some(name) = field.top_level() else {
+        let Some(existing_value) = get_attribute_value(item, field) else {
+            return require_update_parent(item, field);
+        };
+        let mut existing_value = existing_value.clone();
+        return if apply_delete_set_operation(&mut existing_value, value)? {
+            remove_attribute_value(item, field)
+        } else {
+            set_attribute_value(item, field, existing_value)
+        };
+    };
+    let Some(mut existing_value) = item.remove(name) else {
+        return Ok(());
+    };
+    if !apply_delete_set_operation(&mut existing_value, value)? {
+        item.insert(name.to_string(), existing_value);
+    }
+    Ok(())
+}
+
 fn apply_add_operation(
     item: &mut AttributeMap,
-    field: &str,
+    field: &AttributePath,
     value: &AttributeValue,
 ) -> StorageResult<()> {
     // Validate the operand before touching state so malformed numbers fail
@@ -925,10 +987,6 @@ fn apply_add_operation(
     }
 
     let Some(existing_value) = get_attribute_value(item, field) else {
-        if update_field_is_top_level(field) {
-            item.insert(field.to_string(), value.clone());
-            return Ok(());
-        }
         return set_attribute_value(item, field, value.clone());
     };
     let mut updated_value = existing_value.clone();
@@ -961,14 +1019,7 @@ fn apply_add_operation(
     Ok(())
 }
 
-fn update_field_is_top_level(field: &str) -> bool {
-    !field
-        .as_bytes()
-        .iter()
-        .any(|byte| matches!(byte, b'.' | b'['))
-}
-
-fn validate_add_operand(field: &str, value: &AttributeValue) -> StorageResult<()> {
+fn validate_add_operand(field: &AttributePath, value: &AttributeValue) -> StorageResult<()> {
     match value {
         AttributeValue::N(num) => {
             validate_add_number(field, num)?;
@@ -1000,7 +1051,6 @@ fn append_unique_values(existing: &mut Vec<String>, values_to_add: &[String]) {
 fn apply_delete_set_operation(
     existing_value: &mut AttributeValue,
     delete_value: &AttributeValue,
-    _field: &str,
 ) -> StorageResult<bool> {
     match (existing_value, delete_value) {
         (AttributeValue::SS(existing_set), AttributeValue::SS(delete_set))
@@ -1075,105 +1125,18 @@ pub fn before_update_item_optional<'a>(
         Vec::new()
     };
 
-    let condition = if let Some(expr) = condition_expression {
-        Some(
-            cached_condition_expression(
-                expr,
+    let condition = condition_expression
+        .map(|expression| {
+            parse_condition_expression_typed(
+                expression,
                 expression_attribute_names,
                 expression_attribute_values,
             )
-            .map_err(StorageError::validation)?,
-        )
-    } else {
-        None
-    };
+            .map_err(StorageError::validation)
+        })
+        .transpose()?;
 
     Ok((operations, condition))
-}
-
-#[derive(Debug, Clone)]
-struct CachedConditionExpression {
-    attribute_names: Vec<(String, String)>,
-    attribute_values: Vec<(String, AttributeValue)>,
-    condition: Arc<Condition>,
-}
-
-fn cached_condition_expression(
-    condition_expression: &str,
-    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
-    expression_attribute_values: Option<&storage_types::AttributeMap>,
-) -> Result<Condition, String> {
-    static CONDITION_EXPRESSION_CACHE: OnceLock<
-        RwLock<HashMap<String, Vec<CachedConditionExpression>>>,
-    > = OnceLock::new();
-
-    let cache = CONDITION_EXPRESSION_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Ok(guard) = cache.read()
-        && let Some(conditions) = guard.get(condition_expression)
-        && let Some(cached) = conditions.iter().find(|cached| {
-            attribute_names_match(expression_attribute_names, &cached.attribute_names)
-                && condition_attribute_values_match(
-                    expression_attribute_values,
-                    &cached.attribute_values,
-                )
-        })
-    {
-        return Ok((*cached.condition).clone());
-    }
-
-    let condition = Arc::new(parse_condition_expression_typed(
-        condition_expression,
-        expression_attribute_names,
-        expression_attribute_values,
-    )?);
-    if let Ok(mut guard) = cache.write() {
-        let conditions = guard.entry(condition_expression.to_string()).or_default();
-        if let Some(cached) = conditions.iter().find(|cached| {
-            attribute_names_match(expression_attribute_names, &cached.attribute_names)
-                && condition_attribute_values_match(
-                    expression_attribute_values,
-                    &cached.attribute_values,
-                )
-        }) {
-            return Ok((*cached.condition).clone());
-        }
-        conditions.push(CachedConditionExpression {
-            attribute_names: sorted_attribute_names(expression_attribute_names),
-            attribute_values: sorted_condition_attribute_values(
-                condition_expression,
-                expression_attribute_values,
-            ),
-            condition: Arc::clone(&condition),
-        });
-    }
-    Ok((*condition).clone())
-}
-
-fn sorted_condition_attribute_values(
-    condition_expression: &str,
-    expression_attribute_values: Option<&storage_types::AttributeMap>,
-) -> Vec<(String, AttributeValue)> {
-    let values = subset_expression_attribute_values_for_expression(
-        condition_expression,
-        expression_attribute_values,
-    );
-    let mut values = values
-        .as_ref()
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .map(|(key, value)| (key.to_string(), value.clone()))
-        .collect::<Vec<_>>();
-    values.sort_by(|left, right| left.0.cmp(&right.0));
-    values
-}
-
-fn condition_attribute_values_match(
-    expression_attribute_values: Option<&storage_types::AttributeMap>,
-    cached_values: &[(String, AttributeValue)],
-) -> bool {
-    cached_values.iter().all(|(key, value)| {
-        expression_attribute_values.and_then(|values| values.get(key)) == Some(value)
-    })
 }
 
 fn numeric_set_members_equal(left: &str, right: &str) -> bool {

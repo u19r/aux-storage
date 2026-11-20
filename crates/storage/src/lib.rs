@@ -26,17 +26,9 @@ pub use bg_job_store::{ScheduledJobStore, ScheduledJobStoreError};
 #[cfg(feature = "foundationdb")]
 pub use kv_backend::foundationdb::shutdown_foundationdb_network;
 
-pub mod common {
-    pub use storage_common::*;
-}
+pub mod common;
 
-pub mod condition {
-    pub use storage_condition::*;
-}
-
-pub mod derive {
-    pub use storage_derive::*;
-}
+pub mod derive;
 
 /// Supported provider configuration and stable provider contracts for embedded
 /// consumers.
@@ -45,42 +37,29 @@ pub mod derive {
 /// either part of [`DatabaseManager`]'s public signatures or is used by an
 /// existing storage consumer. The re-exports retain the provider crate's type
 /// identity while keeping backend implementations behind this facade.
-pub mod provider {
-    pub use storage_provider::{
-        AtomicItemReadModifyWriteRequest, AtomicItemTransform, AtomicItemWriteDecision,
-        FoundationDbSettings, JobTerminalProjection, PostgresSettings, RangeReadItem,
-        RangeReadPage, ReadSequenceBatchGetResponse, ReadSequenceExecuted, ReadSequenceExecution,
-        ReadSequenceExecutionBudget, ReadSequenceFlatResult, ReadSequenceFlatRow,
-        ReadSequenceReadContext, ReadSequenceReadLimits, ReadSequenceUnsupportedReason,
-        RemoteCredentialStrategy, RemoteStaticCredentials, RemoteStorageSettings,
-        RemoteTimeoutOverrides, RocksdbSettings, SqliteSettings, StorageBackend, StorageConfig,
-        StorageConnectionConfig, StorageConnectionRegistry, StorageProvider,
-        StorageProviderReadContext, TursoSettings,
-    };
-}
+pub mod provider;
 
-pub mod types {
-    pub use storage_types::*;
-}
+pub mod types;
 
 pub mod admission;
 mod maintenance_runtime;
 pub mod point_read;
 mod provider_bundle;
-#[cfg(feature = "remote")]
-pub use storage_remote::RemoteStorageProvider;
-
-mod newtypes;
+mod regional;
 #[cfg(feature = "remote")]
 pub use provider_bundle::{RemoteScheduledJobStoreConfig, connect_remote_scheduled_job_store};
+#[cfg(feature = "remote")]
+pub use storage_remote::RemoteStorageProvider;
 mod constants;
 #[cfg(all(feature = "test-support", feature = "foundationdb"))]
 mod foundationdb_test_scope;
 #[cfg(all(feature = "test-support", feature = "foundationdb"))]
 pub use foundationdb_test_scope::FoundationDbTestScope;
+mod connection;
 mod database_manager;
 #[cfg(all(test, feature = "test-support", feature = "foundationdb"))]
 mod foundationdb_test_scope_tests;
+pub mod messaging;
 pub mod startup;
 mod updated_at_apply;
 #[cfg(test)]
@@ -107,14 +86,10 @@ mod database_manager_tests;
 mod storage_tests;
 
 #[cfg(test)]
+mod manager_cutover_tests;
+#[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
 mod storage_test_support_tests;
 
-pub use database_manager::CanonicalHistoryResponse;
-pub use provider_bundle::StorageProviderBundle;
-#[cfg(feature = "regional")]
-pub use regional_replication::runtime::RegionalRuntime;
-
-#[cfg(all(feature = "regional", feature = "test-support"))]
-pub mod regional_test_support;
+pub use provider_bundle::InitializedStore;

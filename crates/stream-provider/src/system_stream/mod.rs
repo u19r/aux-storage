@@ -24,21 +24,19 @@ mod trim_tests;
 
 pub use catalog::{SystemStreamLineage, SystemStreamLineageCatalog};
 pub use history::{
-    SystemHistoryReadAttempt, SystemStreamHistory, SystemStreamHistoryBounds,
-    SystemStreamHistoryObservation, SystemStreamHistoryOrdering, SystemStreamHistoryPage,
-    SystemStreamHistoryRead, SystemStreamHistoryRecord, SystemStreamWriteAllocation,
+    SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamHistoryObservation,
+    SystemStreamHistoryOrdering, SystemStreamHistoryPage, SystemStreamHistoryRead,
+    SystemStreamHistoryRecord, SystemStreamWriteAllocation, lineage_frontier_high,
 };
-pub use logical_mutation::{
-    DynamoMutationRoute, LogicalSystemStreamMutation, LogicalSystemStreamMutationInput,
-    canonical_route_key,
-};
+pub use logical_mutation::{DynamoMutationRoute, canonical_route_key};
 pub use page::{SystemStreamIssuedCheckpoint, SystemStreamPage, SystemStreamPageRequest};
 pub use split::{
     SystemStreamSplitChild, SystemStreamSplitDisposition, SystemStreamSplitOperationId,
-    SystemStreamSplitReceipt, SystemStreamSplitRequest, SystemStreamSplitResult,
+    SystemStreamSplitPlan, SystemStreamSplitReceipt, SystemStreamSplitRequest,
+    SystemStreamSplitResult,
 };
 pub use trim::{
-    SystemStreamTrimAttempt, SystemStreamTrimContinuation, SystemStreamTrimOperationId,
-    SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest, SystemStreamTrimPageResult,
-    SystemStreamTrimRecord, execute_trim_page,
+    SystemStreamTrimContinuation, SystemStreamTrimOperationId, SystemStreamTrimPageReceipt,
+    SystemStreamTrimPageRequest, SystemStreamTrimPageResult, SystemStreamTrimRecord,
+    execute_trim_page, retired_frontiers,
 };

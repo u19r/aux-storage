@@ -8,7 +8,7 @@ use storage_api::{
 };
 use storage_provider::{
     RemoteCredentialStrategy, RemoteStorageSettings, RemoteTimeoutOverrides, SqliteSettings,
-    StorageBackend, StorageConfig, StorageConnectionConfig, StorageConnectionRegistry,
+    StorageBackend, StorageConfig, StorageConnectionRegistry,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -73,6 +73,7 @@ fn admission_test_runtime_options() -> DatabaseManagerRuntimeOptions {
 #[allow(dead_code)]
 pub fn remote_config(origin_endpoint: &str) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::Remote,
         connection_string: None,
         file_path: None,
@@ -86,7 +87,8 @@ pub fn remote_config(origin_endpoint: &str) -> StorageConfig {
 }
 
 pub fn remote_connection_registry(origin_endpoint: &str) -> StorageConnectionRegistry {
-    let connection = |origin_endpoint| StorageConnectionConfig {
+    let connection = |origin_endpoint| StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::Remote,
         connection_string: None,
         file_path: None,
@@ -121,6 +123,7 @@ fn remote_settings(origin_endpoint: &str) -> RemoteStorageSettings {
 
 fn sqlite_config(database_path: &Path) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(database_path.to_string_lossy().into_owned()),
         file_path: None,
@@ -167,13 +170,15 @@ async fn start_api_with_database(
     let mut app_state = AppState::new(database.clone());
     if enable_queue {
         let queue_provider = database
-            .initialization_queue_provider()
+            .messaging_store(storage::messaging::MessagingLane::Caller)
+            .map(|store| store.queue)
             .ok_or("SQLite origin does not expose a queue provider")?;
         app_state = app_state.with_messaging(
-            Some(Arc::new(queue::QueueManager::new(queue_provider))),
-            format!("http://{address}"),
-            "000000000000".to_string(),
-            #[cfg(feature = "pubsub")]
+            Some(Arc::new(
+                queue::QueueManager::new(queue_provider).with_endpoint(queue::QueueEndpoint {
+                    public_base_url: format!("http://{address}"),
+                }),
+            )),
             None,
         );
     }

@@ -2,9 +2,8 @@ use fdb_chaos_model::{
     PublishAttempt, PublishAuditPhase, PublishDeliveryAudit, PublishIntentAudit, PublishOutcome,
     check_publish_attempts, check_publish_progress,
 };
-use pubsub_provider::{PubsubAttempt, PubsubPort};
 
-use crate::{common::*, imports::*, pubsub_delivery::*};
+use crate::{imports::*, pubsub_delivery::*};
 
 impl PubsubDeliveryWorkload {
     pub(crate) async fn publish_for_delivery_audit(
@@ -17,18 +16,26 @@ impl PubsubDeliveryWorkload {
         for sequence in 0..2 {
             let message_id = PubsubMessageId::new();
             let message_body = self.message_body(sequence);
-            let result = provider
-                .accept_publish(
-                    PublishRequest {
-                        topic_arn: topic_arn.clone(),
-                        message: message_body.clone(),
-                        subject: None,
-                        message_attributes: HashMap::new(),
-                    },
-                    message_id.clone(),
-                    true,
-                )
-                .await;
+            // A retryable outcome (a conflict or an expired attempt deadline)
+            // proves nothing committed: publish again under the same ID.
+            let mut result = Ok(());
+            for _ in 0..6 {
+                result = provider
+                    .accept_publish(
+                        PublishRequest {
+                            topic_arn: topic_arn.clone(),
+                            message: message_body.clone(),
+                            subject: None,
+                            message_attributes: HashMap::new(),
+                        },
+                        message_id.clone(),
+                        true,
+                    )
+                    .await;
+                if !matches!(&result, Err(error) if is_known_not_committed_retryable(error)) {
+                    break;
+                }
+            }
             let outcome = match &result {
                 Ok(()) => PublishOutcome::Acknowledged,
                 Err(error) if is_unknown_commit(error) => PublishOutcome::Unknown,
@@ -66,9 +73,9 @@ impl PubsubDeliveryWorkload {
         &mut self,
         db: SimDatabase,
         phase: PublishAuditPhase,
-    ) -> Result<Vec<DeliveryRecord>, String> {
+    ) -> Result<Vec<DeliveryPayload>, String> {
         let (candidates, records) =
-            super::pubsub_snapshot::read_pubsub_snapshot(self.driver(db)).await?;
+            super::pubsub_snapshot::read_pubsub_snapshot(self.driver(db)?).await?;
         let intents = candidates
             .into_iter()
             .map(|candidate| PublishIntentAudit {
@@ -86,12 +93,14 @@ impl PubsubDeliveryWorkload {
             .map(|record| PublishDeliveryAudit {
                 record_id: record.id.0.clone(),
                 message_id: record.message_id.to_string(),
-                subscription_arn: record.subscription_arn.to_string(),
+                subscription_arn: record
+                    .subscription
+                    .as_ref()
+                    .map(|subscription| subscription.subscription_arn.to_string())
+                    .unwrap_or_default(),
                 message_body: record.message_body.clone(),
-                terminal: matches!(
-                    record.status,
-                    DeliveryStatus::Delivered | DeliveryStatus::Failed
-                ),
+                // A stored record is pending; terminal records are deleted.
+                terminal: false,
             })
             .collect::<Vec<_>>();
         self.publish_audit_count += 1;
@@ -117,8 +126,13 @@ impl PubsubDeliveryWorkload {
                     .map_err(|error| error.to_string())?,
                 now,
             };
-            match provider.materialize_publish_chunks(request).await {
-                Ok(_) => return Ok(()),
+            // A failed chunk is reported, not returned (review D8).
+            let outcome = provider
+                .materialize_publish_chunks(request)
+                .await
+                .and_then(|report| report.first_error.map_or(Ok(()), Err));
+            match outcome {
+                Ok(()) => return Ok(()),
                 Err(error) if is_unknown_commit(&error) => {
                     self.unknown_materialization_count += 1;
                     let records = self
@@ -159,51 +173,45 @@ impl PubsubDeliveryWorkload {
         unreachable!("bounded materialization passes return on the second attempt")
     }
 
-    pub(crate) async fn claim_delivery_for_audit(
+    /// Claim up to `take` due records of one destination. An unknown claim
+    /// commit is recovered by claiming again after the lease: the fence
+    /// makes a lost or applied claim harmless (W3S R4, R5).
+    pub(crate) async fn claim_for_audit(
         &mut self,
-        provider: &Arc<kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>>,
-        phase: &str,
-        request: ClaimDeliveryRecordsRequest,
-    ) -> Result<(ClaimDeliveryRecordsResponse, TimestampMillis), String> {
-        let started_at = request.now;
-        let simulated_start = self.context.now();
-        let before = read_claim_records(provider, self.delivery_record_ids.clone()).await?;
-        match provider.claim_delivery_records(request.clone()).await {
-            Ok(response) => Ok((response, started_at)),
-            Err(error) if is_unknown_commit(&error) => {
-                self.unknown_claim_count += 1;
-                let after = read_claim_records(provider, self.delivery_record_ids.clone()).await?;
-                verify_unknown_claim(&request, &before, &after)?;
-                self.claim_audit_count += 1;
-                self.write_publish_audit(&format!("claim-audit-{:02}-{phase}.json", self.claim_audit_count),
-                    &serde_json::json!({"request": request, "before": before, "after": after, "outcome": "ambiguous"}))?;
-                let lease_ms = request
-                    .lease_expires_at
-                    .timestamp_millis()
-                    .saturating_sub(started_at.timestamp_millis())
-                    .max(1);
-                self.context
-                    .delay(std::time::Duration::from_millis(lease_ms as u64 + 1))
-                    .await
-                    .map_err(|error| format!("claim recovery delay failed: {error}"))?;
-                let now = recovery_timestamp(started_at, simulated_start, self.context.now())?;
-                if now <= request.lease_expires_at {
-                    return Err("claim recovery clock did not expire original lease".into());
-                }
-                let retry = ClaimDeliveryRecordsRequest {
-                    owner: request.owner,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
+        owner: &str,
+        destination: &DestinationKey,
+        now: TimestampMillis,
+    ) -> Result<(Vec<ClaimedDelivery>, TimestampMillis), String> {
+        let mut now = now;
+        for _ in 0..6 {
+            let request = DeliveryClaimRequest {
+                terms: ClaimTerms {
+                    owner: owner.to_owned(),
                     now,
-                    lease_expires_at: now + lease_ms,
-                    limit: request.limit,
-                };
-                let response = provider
-                    .claim_delivery_records(retry)
-                    .await
-                    .map_err(|error| format!("claim recovery failed: {error}"))?;
-                Ok((response, now))
+                    lease_until: now + CLAIM_LEASE_MS,
+                },
+                asks: vec![DestinationAsk {
+                    destination: destination.clone(),
+                    take: std::num::NonZeroU32::new(10).expect("nonzero take"),
+                    mode: AskMode::Due,
+                }],
+            };
+            match provider.claim_deliveries(request).await {
+                Ok(mut claims) => {
+                    let claimed = claims.pop().map(|claim| claim.claimed).unwrap_or_default();
+                    return Ok((claimed, now));
+                }
+                Err(error) if is_unknown_commit(&error) => {
+                    self.unknown_claim_count += 1;
+                    now = now + CLAIM_LEASE_MS + 1;
+                }
+                // A conflict proves that nothing committed: claim again.
+                Err(error) if is_retryable(&error) => {}
+                Err(error) => return Err(error.to_string()),
             }
-            Err(error) => Err(error.to_string()),
         }
+        Err("delivery claim failed six times".into())
     }
 
     fn write_publish_audit(&self, name: &str, value: &serde_json::Value) -> Result<(), String> {
@@ -215,19 +223,13 @@ impl PubsubDeliveryWorkload {
         fs::write(root.join(name), bytes).map_err(|error| format!("write publish audit: {error}"))
     }
 
-    pub(crate) fn expected_delivery_status(
-        &self,
-        subscription: &SubscriptionArn,
-    ) -> DeliveryStatus {
+    /// The first subscription (in ARN order) is delivered; the other fails.
+    pub(crate) fn expects_delivery(&self, subscription: &SubscriptionArn) -> bool {
         let first = self
             .subscription_arns
             .iter()
             .min_by_key(|arn| arn.to_string());
-        if first == Some(subscription) {
-            DeliveryStatus::Delivered
-        } else {
-            DeliveryStatus::Failed
-        }
+        first == Some(subscription)
     }
 }
 
@@ -247,60 +249,23 @@ pub(crate) fn recovery_timestamp(
     ))
 }
 
-fn is_unknown_commit(error: &pubsub_provider::PubsubError) -> bool {
+/// A settle or local delivery that lost every conflict retry, expired its
+/// attempt deadline (known not committed), or whose commit outcome is
+/// unknown, is tried again under the same fence.
+pub(crate) fn is_retryable(error: &pubsub_provider::PubsubError) -> bool {
+    is_unknown_commit(error) || is_known_not_committed_retryable(error)
+}
+
+/// Known not committed, and the public contract says clients retry.
+pub(crate) fn is_known_not_committed_retryable(error: &pubsub_provider::PubsubError) -> bool {
     matches!(error, pubsub_provider::PubsubError::Storage(source)
-        if matches!(source.as_ref(), StorageEnum::SyncSubmissionAmbiguous { .. }))
+        if source.class().is_retryable())
 }
 
-async fn read_claim_records(
-    provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
-    ids: Vec<DeliveryRecordId>,
-) -> Result<Vec<DeliveryRecord>, String> {
-    let count = ids.len();
-    let rows = storage_common::retry::retry_native_conflicts(
-        provider,
-        storage_provider::DYNAMO_WRITE_RETRY,
-        || {
-            let ids = ids.clone();
-            provider.with_pubsub_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-                Box::pin(async move { attempt.read_deliveries(ids).await })
-            })
-        },
-    )
-    .await
-    .map_err(|error| storage_error_detail(&error))?;
-    if rows.len() != count || rows.iter().any(Option::is_none) {
-        return Err("claim audit lost a durable delivery".into());
-    }
-    Ok(rows.into_iter().flatten().collect())
+pub(crate) fn is_unknown_commit(error: &pubsub_provider::PubsubError) -> bool {
+    matches!(error, pubsub_provider::PubsubError::Storage(source)
+        if source.is_commit_unknown())
 }
 
-fn verify_unknown_claim(
-    request: &ClaimDeliveryRecordsRequest,
-    before: &[DeliveryRecord],
-    after: &[DeliveryRecord],
-) -> Result<(), String> {
-    if before.len() > usize::from(request.limit) {
-        return Err("claim fixture exceeds one atomic batch".into());
-    }
-    let expected = before
-        .iter()
-        .map(|record| {
-            let mut next = record.clone();
-            if record.is_claimable(request.now) {
-                next.claim_generation = next
-                    .claim_generation
-                    .checked_add(1)
-                    .ok_or_else(|| "claim generation overflow".to_string())?;
-                next.lease_owner = Some(request.owner.clone());
-                next.lease_expires_at = Some(request.lease_expires_at);
-                next.updated_at = request.now;
-            }
-            Ok(next)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if after != before && after != expected {
-        return Err("unknown claim has partial or invalid durable effects".into());
-    }
-    Ok(())
-}
+/// The lease of the workload's claims.
+pub(crate) const CLAIM_LEASE_MS: i64 = 30_000;

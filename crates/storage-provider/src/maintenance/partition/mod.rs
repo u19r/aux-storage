@@ -4,6 +4,4 @@ mod repository;
 
 pub use handler::PartitionReconciliationHandler;
 pub use port::{PartitionPort, PartitionReconciliationSource, PartitionSamplePage};
-pub use repository::{
-    AdmittedPartitionRepository, PartitionReconciliationRepository, PartitionReconciliationRequest,
-};
+pub use repository::{PartitionReconciliationRepository, PartitionReconciliationRequest};

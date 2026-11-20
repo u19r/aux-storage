@@ -49,17 +49,14 @@ async fn assert_batch_write_case(
     request: BatchWriteItemRequest,
     rejection_reason: Option<&str>,
 ) {
-    let table_kind = case["tables"][0].as_str().unwrap();
-    let (name, writes) = case["request"]["RequestItems"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .next()
-        .unwrap();
-    let table = TableName::new(name);
-    store
-        .create_conformance_table(table_kind, table.clone())
-        .await;
+    let request_items = case["request"]["RequestItems"].as_object().unwrap();
+    let table_kinds = case["tables"].as_array().unwrap();
+    assert_eq!(request_items.len(), table_kinds.len());
+    for ((name, _), kind) in request_items.iter().zip(table_kinds) {
+        store
+            .create_conformance_table(kind.as_str().unwrap(), TableName::new(name))
+            .await;
+    }
 
     let observed = observe(store.operations.batch_write_item(request)).await;
     if let Some(reason) = rejection_reason {
@@ -91,40 +88,54 @@ async fn assert_batch_write_case(
     };
     assert_expected_response(case, status, &body);
 
-    if status != 200 {
-        let scan = ScanRequest::try_from(json!({"TableName": table.as_ref()})).unwrap();
-        let scanned = store.operations.scan(scan).await.unwrap();
-        assert!(
-            scanned.items.as_deref().unwrap_or_default().is_empty(),
-            "rejected batch must write no items"
-        );
-        return;
-    }
-    for write in writes.as_array().unwrap() {
-        let (key, expected_item) = if let Some(put) = write.get("PutRequest") {
-            let item = &put["Item"];
-            (json!({"pk": item["pk"], "sk": item["sk"]}), Some(item))
-        } else {
-            (write["DeleteRequest"]["Key"].clone(), None)
-        };
-        let read = store
-            .operations
-            .get_item(GetItemRequest::new(
-                table.clone(),
-                serde_json::from_value::<KeyAttributes>(key).unwrap(),
-            ))
-            .await
-            .unwrap();
-        let actual_item = serde_json::to_value(read).unwrap()["Item"].clone();
-        if let Some(expected_item) = expected_item {
-            let mut expected_item: AttributeMap =
-                serde_json::from_value(expected_item.clone()).unwrap();
-            expected_item.normalize_numbers_for_write();
-            assert_eq!(actual_item, serde_json::to_value(expected_item).unwrap());
-        } else {
-            assert_eq!(actual_item, Value::Null, "deleted key must remain absent");
+    for (name, writes) in request_items {
+        let table = TableName::new(name);
+        if status != 200 {
+            let scan = ScanRequest::try_from(json!({"TableName": table.as_ref()})).unwrap();
+            let scanned = store.operations.scan(scan).await.unwrap();
+            assert!(
+                scanned.items.as_deref().unwrap_or_default().is_empty(),
+                "rejected batch must write no items"
+            );
+            continue;
+        }
+        for write in writes.as_array().unwrap() {
+            let (key, expected_item) = if let Some(put) = write.get("PutRequest") {
+                let item = &put["Item"];
+                (item_key(item), Some(item))
+            } else {
+                (write["DeleteRequest"]["Key"].clone(), None)
+            };
+            let read = store
+                .operations
+                .get_item(GetItemRequest::new(
+                    table.clone(),
+                    serde_json::from_value::<KeyAttributes>(key).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let actual_item = serde_json::to_value(read).unwrap()["Item"].clone();
+            if let Some(expected_item) = expected_item {
+                let mut expected_item: AttributeMap =
+                    serde_json::from_value(expected_item.clone()).unwrap();
+                expected_item.normalize_numbers_for_write();
+                assert_eq!(actual_item, serde_json::to_value(expected_item).unwrap());
+            } else {
+                assert_eq!(actual_item, Value::Null, "deleted key must remain absent");
+            }
         }
     }
+}
+
+/// The primary key attributes (`pk`, and `sk` when present) of a seeded item.
+fn item_key(item: &Value) -> Value {
+    let mut key = serde_json::Map::new();
+    for name in ["pk", "sk"] {
+        if let Some(value) = item.get(name) {
+            key.insert(name.to_owned(), value.clone());
+        }
+    }
+    Value::Object(key)
 }
 
 macro_rules! batch_write_case {
@@ -246,3 +257,16 @@ batch_write_case!(given_field_request_items_400_docs_limit_put_string_partition_
 batch_write_case!(given_field_request_items_400_docs_limit_put_string_partition_key_empty_rejected_when_batch_write_item_runs_then_conformance_response_matches, "field-request_items/400/docs_limit_put_string_partition_key_empty_rejected.json", None);
 batch_write_case!(given_field_request_items_400_docs_limit_put_string_sort_key_1025_bytes_rejected_when_batch_write_item_runs_then_conformance_response_matches, "field-request_items/400/docs_limit_put_string_sort_key_1025_bytes_rejected.json", None);
 batch_write_case!(given_field_request_items_400_docs_limit_put_string_sort_key_empty_rejected_when_batch_write_item_runs_then_conformance_response_matches, "field-request_items/400/docs_limit_put_string_sort_key_empty_rejected.json", None);
+
+// AWS behavioural suite
+batch_write_case!(given_check_batch_request_shape_defects_rejected_delete_extra_key_attribute_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_request_shape_defects_rejected--delete-extra-key-attribute.json", None);
+batch_write_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_put_wrong_typed_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--put-wrong-typed.json", None);
+batch_write_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_delete_wrong_typed_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--delete-wrong-typed.json", None);
+batch_write_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_put_list_typed_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--put-list-typed.json", None);
+batch_write_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_delete_list_typed_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--delete-list-typed.json", None);
+batch_write_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_put_missing_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--put-missing.json", None);
+batch_write_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_delete_missing_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--delete-missing.json", None);
+batch_write_case!(given_check_batch_write_item_put_request_accepts_32_levels_rejects_33_map_32_levels_accepted_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_put_request_accepts_32_levels_rejects_33--map-32-levels-accepted.json", None);
+batch_write_case!(given_check_batch_write_item_put_request_accepts_32_levels_rejects_33_list_32_levels_accepted_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_put_request_accepts_32_levels_rejects_33--list-32-levels-accepted.json", None);
+batch_write_case!(given_check_batch_write_item_put_request_accepts_32_levels_rejects_33_list_33_levels_with_sibling_refused_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_put_request_accepts_32_levels_rejects_33--list-33-levels-with-sibling-refused.json", None);
+batch_write_case!(given_check_batch_write_item_rejects_whole_call_for_one_oversized_nested_put_when_batch_write_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_rejects_whole_call_for_one_oversized_nested_put.json", None);

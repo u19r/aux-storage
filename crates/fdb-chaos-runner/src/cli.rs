@@ -18,6 +18,8 @@ pub(crate) struct CliArgs {
     pub(crate) artifact_root: PathBuf,
     pub(crate) library_path: String,
     pub(crate) library_name: String,
+    /// SHA-256 that the workload library must have; a rerun records it.
+    pub(crate) expect_library_sha256: Option<String>,
 }
 
 impl CliArgs {
@@ -36,6 +38,7 @@ impl CliArgs {
             artifact_root: PathBuf::from(DEFAULT_ARTIFACT_ROOT),
             library_path: DEFAULT_LIBRARY_PATH.to_string(),
             library_name: DEFAULT_LIBRARY_NAME.to_string(),
+            expect_library_sha256: None,
         };
 
         while let Some(arg) = args.next() {
@@ -56,6 +59,10 @@ impl CliArgs {
                 }
                 "--library-path" => parsed.library_path = next_arg(&mut args, "--library-path")?,
                 "--library-name" => parsed.library_name = next_arg(&mut args, "--library-name")?,
+                "--expect-library-sha256" => {
+                    parsed.expect_library_sha256 =
+                        Some(next_arg(&mut args, "--expect-library-sha256")?);
+                }
                 "--help" | "-h" => return Err(help_text()),
                 other => return Err(format!("unknown argument '{other}'\n{}", help_text())),
             }
@@ -65,18 +72,25 @@ impl CliArgs {
     }
 
     pub(crate) fn rerun_command(&self) -> String {
-        format!(
+        let mut command = format!(
             "cargo run -p fdb-chaos-runner -- run --workload {} --profile {} --seed {} --buggify \
-             {} --test-file {} --artifact-root {} --library-path {} --library-name {}",
+             {} --fdbserver {} --test-file {} --artifact-root {} --library-path {} --library-name \
+             {}",
             shell_word(&self.workload),
             shell_word(&self.profile),
             self.seed,
             shell_word(&self.buggify),
+            shell_word(&self.fdbserver),
             shell_word(&self.test_file.display().to_string()),
             shell_word(&self.artifact_root.display().to_string()),
             shell_word(&self.library_path),
             shell_word(&self.library_name),
-        )
+        );
+        if let Some(sha256) = &self.expect_library_sha256 {
+            command.push_str(" --expect-library-sha256 ");
+            command.push_str(&shell_word(sha256));
+        }
+        command
     }
 }
 pub(crate) fn next_arg<I>(args: &mut I, flag: &str) -> Result<String, String>
@@ -104,6 +118,6 @@ pub(crate) fn shell_word(value: &str) -> String {
 pub(crate) fn help_text() -> String {
     "usage: fdb-chaos-runner run [--workload noop] [--profile smoke] [--seed 1] [--buggify on] \
      [--fdbserver fdbserver] [--test-file path] [--artifact-root path] [--library-path path] \
-     [--library-name name]"
+     [--library-name name] [--expect-library-sha256 hex]"
         .to_string()
 }

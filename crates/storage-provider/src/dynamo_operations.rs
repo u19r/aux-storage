@@ -12,12 +12,13 @@ use storage_types::{
     CreateTableRequest, CreateTableResponse, DeleteItemRequest, DeleteItemResponse,
     DeleteTableRequest, DeleteTableResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, GetItemRequest, GetItemResponse,
-    GetStreamRecordsRequest, GetStreamRecordsResponse, ListStreamsRequest, ListStreamsResponse,
-    ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse, QueryRequest,
-    QueryResponse, ReadSequenceRequest, ReadSequenceResponse, ScanRequest, ScanResponse,
-    StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest, TransactGetItemsResponse,
-    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
-    UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    GetStreamRecordsRequest, GetStreamRecordsResponse, IndexName, ListStreamsRequest,
+    ListStreamsResponse, ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse,
+    QueryRequest, QueryResponse, ReadSequenceRequest, ReadSequenceResponse, ScanRequest,
+    ScanResponse, StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest,
+    TransactGetItemsResponse, TransactWriteItemsRequest, TransactWriteItemsResponse,
+    UpdateItemRequest, UpdateItemResponse, UpdateTableRequest, UpdateTableResponse,
+    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
 };
 
 /// One public operation is one native attempt per try, including all required
@@ -28,16 +29,6 @@ use storage_types::{
 /// may combine independent steps without changing the public result.
 #[async_trait]
 pub trait DynamoOperations: Send + Sync {
-    /// The replacement stores do not publish legacy change-index markers.
-    async fn list_change_index_markers(
-        &self,
-        _request: crate::ListChangeIndexMarkersRequest,
-    ) -> StorageResult<Vec<crate::ChangeIndexMarker>> {
-        Err(storage_types::StorageError::unsupported(
-            "change-index markers are unavailable",
-        ))
-    }
-
     async fn get_table_info(&self, table_name: TableName) -> StorageResult<Arc<StoredTableInfo>>;
     async fn create_table(&self, request: CreateTableRequest)
     -> StorageResult<CreateTableResponse>;
@@ -159,4 +150,23 @@ pub trait DynamoOperations: Send + Sync {
     ) -> StorageResult<storage_types::TableStreamCheckpoint>;
     async fn list_streams(&self, request: ListStreamsRequest)
     -> StorageResult<ListStreamsResponse>;
+
+    /// Readiness records of the named indexes of one table.
+    async fn read_gsi_readiness_records(
+        &self,
+        table_name: &TableName,
+        index_names: &[IndexName],
+    ) -> StorageResult<Vec<crate::GsiReadinessRecord>>;
+
+    async fn read_gsi_index_readiness(
+        &self,
+        table_name: &TableName,
+        index_names: &[IndexName],
+    ) -> StorageResult<Vec<(IndexName, crate::GsiIndexReadiness)>> {
+        crate::GsiReadinessSnapshot::from(
+            self.read_gsi_readiness_records(table_name, index_names)
+                .await?,
+        )
+        .select(index_names)
+    }
 }

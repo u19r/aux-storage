@@ -11,10 +11,13 @@ pub(crate) async fn delete_table_appends<A: SqlAttempt>(
     history: TableHistoryId,
 ) -> StorageResult<TableReclaimStep> {
     let counts = attempt
-        .execute_batch(super::sql_statements::delete_table_appends(engine, history))
-        .await?;
-    if counts.len() != 4 || counts[..3].iter().any(|count| *count > 64) || counts[3] > 1 {
-        return Err(StorageError::internal("SQL append reclaim count differs"));
+        .execute_batch_exact(super::sql_statements::delete_table_appends(engine, history))
+        .await?
+        .into_array::<4>()?;
+    if counts[..3].iter().any(|count| *count > 64) || counts[3] > 1 {
+        return Err(StorageError::internal(
+            "SQL append reclaim count is out of range",
+        ));
     }
     Ok(if counts[..3].contains(&64) {
         TableReclaimStep::Advanced

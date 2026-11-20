@@ -4,12 +4,10 @@ use std::sync::{
 };
 
 use storage_provider::{DynamoOperations, StreamDurationTrimConfig, StreamDurationTrimWorker};
-use storage_types::{
-    Clock, ItemHistoryAddress, StreamName, TableHistoryTarget, TableName, TimestampMillis,
-};
+use storage_types::{Clock, TableHistoryTarget, TableName, TimestampMillis};
 use stream_provider::{
-    StreamOperations, StreamRowKind, SystemStreamLineage, SystemStreamSplitChild,
-    SystemStreamSplitOperationId, SystemStreamSplitRequest,
+    StreamOperations, SystemStreamLineage, SystemStreamSplitChild, SystemStreamSplitOperationId,
+    SystemStreamSplitRequest,
 };
 
 struct CapturedClock(AtomicI64);
@@ -27,9 +25,14 @@ async fn given_cross_lineage_capture_times_when_newer_revisions_expire_first_the
     let hour = 3_600_000;
     let clock = Arc::new(CapturedClock(AtomicI64::new(recent - 72 * hour)));
     let store = crate::SqlStore::initialize_schema(
-        crate::sqlite::SqliteBackend::initialize(":memory:")
-            .await
-            .unwrap(),
+        crate::sqlite::SqliteBackend::initialize(
+            ":memory:",
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .unwrap(),
+        storage_types::InitialStreamLineages::ONE,
+        true,
     )
     .await
     .unwrap()
@@ -42,32 +45,9 @@ async fn given_cross_lineage_capture_times_when_newer_revisions_expire_first_the
         "AuxStreamDurationHours": 24,
         "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"}
     })).unwrap()).await.unwrap();
-    let target = TableHistoryTarget::try_from(
-        created
-            .table_description
-            .latest_stream_arn
-            .as_deref()
-            .unwrap(),
-    )
-    .unwrap();
+    let target = TableHistoryTarget::try_from(&created.table_description).unwrap();
     let key: storage_types::KeyAttributes =
         serde_json::from_value(serde_json::json!({"pk": {"S": "one"}})).unwrap();
-    let history = StreamRowKind::Item(
-        ItemHistoryAddress {
-            history_id: target.history_id,
-            stream_name: StreamName::table_item_stream(
-                &name,
-                &storage_types::ItemKey::table_key(
-                    name.clone(),
-                    storage_types::AttributeValue::S("one".into()),
-                    None,
-                ),
-            )
-            .unwrap(),
-        }
-        .physical_stream_name()
-        .unwrap(),
-    );
     clock.0.store(recent, Ordering::SeqCst);
     put_revision(&store, &name, "recent-parent").await;
     let scope = store.system_stream_scope().await.unwrap();
@@ -114,15 +94,7 @@ async fn given_cross_lineage_capture_times_when_newer_revisions_expire_first_the
         .unwrap();
     clock.0.store(recent + hour, Ordering::SeqCst);
     cleanup_page(&store).await;
-    assert_eq!(
-        store
-            .read_forward(history.clone(), None, 10)
-            .await
-            .unwrap()
-            .items
-            .len(),
-        3
-    );
+    assert_eq!(canonical_count(&store, target.history_id).await, 1);
     let visible = store
         .get_stream_records(storage_types::GetStreamRecordsRequest::table(
             name.clone(),
@@ -141,28 +113,16 @@ async fn given_cross_lineage_capture_times_when_newer_revisions_expire_first_the
         .await
         .unwrap();
     assert_eq!(
-        store
-            .read_forward(history.clone(), None, 10)
-            .await
-            .unwrap()
-            .items
-            .len(),
-        3,
-        "system trim changed item history"
+        canonical_count(&store, target.history_id).await,
+        1,
+        "system trim changed retained canonical entry"
     );
     clock.0.store(recent + 25 * hour, Ordering::SeqCst);
     for _ in 0..8 {
         cleanup_page(&store).await;
         clock.0.fetch_add(1, Ordering::SeqCst);
     }
-    assert!(
-        store
-            .read_forward(history, None, 10)
-            .await
-            .unwrap()
-            .items
-            .is_empty()
-    );
+    assert!(canonical_count(&store, target.history_id).await == 0);
     assert!(
         store
             .get_stream_records(storage_types::GetStreamRecordsRequest::table(
@@ -206,4 +166,42 @@ async fn cleanup_page(store: &crate::SqlStore<crate::sqlite::SqliteBackend>) {
         .run_due_page(store.now(), store.now())
         .await
         .unwrap();
+}
+
+async fn canonical_count(
+    store: &crate::SqlStore<crate::sqlite::SqliteBackend>,
+    history: storage_types::TableHistoryId,
+) -> usize {
+    use crate::{SqlAttempt as _, SqlBackend as _};
+    store
+        .backend
+        .with_attempt(
+            storage_types::AttemptPlan::new(
+                storage_types::AttemptMode::ReadOnly,
+                storage_types::DeadlineClass::PointRead,
+            )
+            .start(store.backend.attempt_deadlines()),
+            move |attempt| {
+                Box::pin(async move {
+                    let page = attempt
+                        .query(
+                            crate::SqlStatement::new(
+                                "SELECT entry_blob FROM sys_stream_entries WHERE table_id = ?1 \
+                                 LIMIT 11",
+                                vec![crate::SqlValue::Blob(history.as_ref().to_vec())],
+                            ),
+                            storage_types::ReadProtection::Snapshot,
+                            crate::constants::STREAM_READ_BYTES,
+                        )
+                        .await?;
+                    assert!(
+                        !page.more && page.rows.len() <= 10,
+                        "canonical inventory is incomplete"
+                    );
+                    Ok(page.rows.len())
+                })
+            },
+        )
+        .await
+        .unwrap()
 }

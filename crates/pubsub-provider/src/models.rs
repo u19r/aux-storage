@@ -6,8 +6,10 @@ use uuid::Uuid;
 
 use crate::{PublishAcceptanceInput, Subscription, TopicArn};
 
-const MAX_PUBLISH_CHUNK_CLAIM_LIMIT: u32 = 4_096;
-const MAX_DELIVERY_CLAIM_LIMIT: u32 = 4_096;
+/// The one claim batch size of publish chunks and deliveries (review D12):
+/// a larger request is an error, not a silent cap.
+pub const CLAIM_BATCH_LIMIT: u32 = 32;
+const MAX_PUBLISH_CHUNK_CLAIM_LIMIT: u32 = CLAIM_BATCH_LIMIT;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AcceptedPublication {
@@ -55,53 +57,6 @@ impl AcceptedPublication {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "u32", into = "u32")]
-pub struct DeliveryClaimLimit(NonZeroU32);
-
-impl TryFrom<usize> for DeliveryClaimLimit {
-    type Error = crate::PubsubError;
-
-    fn try_from(limit: usize) -> crate::PubsubResult<Self> {
-        let limit = u32::try_from(limit)
-            .map_err(|_| crate::PubsubError::storage("delivery claim limit exceeds its maximum"))?;
-        Self::try_from(limit)
-    }
-}
-
-impl TryFrom<u32> for DeliveryClaimLimit {
-    type Error = crate::PubsubError;
-
-    fn try_from(limit: u32) -> crate::PubsubResult<Self> {
-        let limit = NonZeroU32::new(limit)
-            .ok_or_else(|| crate::PubsubError::storage("delivery claim limit must be positive"))?;
-        if limit.get() > MAX_DELIVERY_CLAIM_LIMIT {
-            return Err(crate::PubsubError::storage(
-                "delivery claim limit exceeds its maximum",
-            ));
-        }
-        Ok(Self(limit))
-    }
-}
-
-impl From<DeliveryClaimLimit> for u32 {
-    fn from(limit: DeliveryClaimLimit) -> Self {
-        limit.0.get()
-    }
-}
-
-impl From<DeliveryClaimLimit> for usize {
-    fn from(limit: DeliveryClaimLimit) -> Self {
-        limit.0.get() as Self
-    }
-}
-
-impl From<DeliveryClaimLimit> for i64 {
-    fn from(limit: DeliveryClaimLimit) -> Self {
-        Self::from(limit.0.get())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionSnapshotGeneration(Uuid);
 
 impl SubscriptionSnapshotGeneration {
@@ -112,7 +67,7 @@ impl SubscriptionSnapshotGeneration {
     /// ordering across nodes.
     #[must_use]
     pub fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self(storage_types::ambient::uuid_now_v7())
     }
 }
 
@@ -141,7 +96,8 @@ pub struct SubscriptionSnapshot {
     pub chunks: Vec<Vec<Subscription>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PublishIntent {
     pub acceptance: PublishAcceptanceInput,
     pub snapshot: SubscriptionSnapshotRoot,
@@ -149,20 +105,34 @@ pub struct PublishIntent {
     pub lease_expires_at: Option<TimestampMillis>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl PublishIntent {
+    /// The due time of the intent: its lease end, else its acceptance time
+    /// (review D2), so the probe reports a real age.
+    #[must_use]
+    pub fn due_at(&self) -> TimestampMillis {
+        self.lease_expires_at.unwrap_or(self.acceptance.accepted_at)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ClaimedPublishChunk {
     pub intent: PublishIntent,
     pub subscriptions: Vec<Subscription>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PublishChunkCommit {
     pub claimed_intent: PublishIntent,
-    pub records: Vec<crate::DeliveryRecord>,
+    pub records: Vec<crate::NewDelivery>,
+    /// Subscriptions of the chunk whose filter policy excluded the message.
+    pub filtered_out: u32,
     pub next_intent: Option<PublishIntent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PublishAcceptancePlan {
     pub snapshot: SubscriptionSnapshot,
     pub acceptance: PublishAcceptanceInput,
@@ -202,6 +172,13 @@ impl TryFrom<u32> for PublishChunkClaimLimit {
             ));
         }
         Ok(Self(limit))
+    }
+}
+
+impl PublishChunkClaimLimit {
+    #[must_use]
+    pub const fn get(self) -> NonZeroU32 {
+        self.0
     }
 }
 

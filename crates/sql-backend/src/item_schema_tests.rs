@@ -24,9 +24,17 @@ fn given_reversed_key_schema_when_rendering_then_primary_key_order_is_preserved(
             attribute_type: KeyAttributeType::S,
         })
         .to_vec();
-    let root = render_item_table(SqlEngine::Postgres, &table.info, table.history_id);
+    let root = render_item_table(
+        SqlEngine::Postgres,
+        &table.info,
+        &table.binding,
+        table.history_id,
+    );
     assert!(root.contains("PRIMARY KEY (\"pk\", \"sk\")"));
     for engine in [SqlEngine::Postgres, SqlEngine::Sqlite, SqlEngine::Turso] {
-        assert!(!render_item_table(engine, &table.info, table.history_id).contains("PARTITION BY"));
+        assert!(
+            !render_item_table(engine, &table.info, &table.binding, table.history_id)
+                .contains("PARTITION BY")
+        );
     }
 }

@@ -10,7 +10,11 @@ doctest = false
 
 [features]
 runtime-integration = []
-test-support = ["uuid"]
+test-support = [
+    "regional-replication/test-support",
+    "storage-types/test-support",
+    "stream-provider/test-support",
+]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -20,25 +24,25 @@ hex = { workspace = true }
 infrastructure-provider = { workspace = true }
 lru-ttl-cache = { workspace = true }
 metrics-facade = { workspace = true }
-queue-provider = { path = "../queue-provider" }
+regional-replication = { path = "../regional-replication" }
 scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 storage-backfill = { path = "../storage-backfill" }
 storage-common = { path = "../storage-common" }
-storage-condition = { path = "../storage-condition" }
 storage-types = { path = "../storage-types" }
 stream-provider = { path = "../stream-provider" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
-cpu-time = { workspace = true }
 quint-connect = { workspace = true }
+regional-replication = { path = "../regional-replication", features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
+stream-provider = { path = "../stream-provider", features = ["test-support"] }
 
 [lints]
 workspace = true

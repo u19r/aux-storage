@@ -12,6 +12,7 @@ struct MbtConfig {
     enabled: bool,
     minimum: usize,
     maximum: usize,
+    start: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -85,6 +86,7 @@ impl Default for AdmissionControllerMbtDriver {
                 enabled: true,
                 minimum: 2,
                 maximum: 8,
+                start: 8,
             },
             mbt_last_state: MbtControllerState {
                 desired_limit: 8,
@@ -142,6 +144,7 @@ impl Driver for AdmissionControllerMbtDriver {
                         enabled: mbtEnabled,
                         minimum: 2,
                         maximum: 8,
+                        start: 8,
                     },
                     MbtControllerState {
                         desired_limit: desiredLimit,
@@ -226,6 +229,7 @@ impl Driver for AdmissionControllerMbtDriver {
                             enabled: mbt_enabled,
                             minimum: 2,
                             maximum: 8,
+                            start: 8,
                         },
                         MbtControllerState {
                             desired_limit,

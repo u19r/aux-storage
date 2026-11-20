@@ -8,8 +8,7 @@ use storage_types::{
     SystemStreamPosition, SystemStreamScope,
 };
 use stream_provider::{
-    DYNAMO_SYSTEM_LINEAGE_ID, DYNAMO_SYSTEM_SHARD_ID, SystemStreamHistory,
-    SystemStreamHistoryBounds, SystemStreamLineage, SystemStreamLineageCatalog,
+    SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamLineage, SystemStreamLineageCatalog,
 };
 
 use crate::{
@@ -25,6 +24,16 @@ pub async fn initialize_system_stream<A: SqlAttempt>(
     for sql in authority_schema(engine) {
         attempt.execute(SqlStatement::new(sql, vec![])).await?;
     }
+    Ok(())
+}
+
+/// Insert the system authority after `initialize_system_stream` when the
+/// database has none.
+pub(crate) async fn seed_system_stream<A: SqlAttempt>(
+    attempt: &mut A,
+    engine: impl SqlLayout,
+    initial_stream_lineages: storage_types::InitialStreamLineages,
+) -> StorageResult<()> {
     let scope = attempt
         .query(
             SqlStatement::new(
@@ -45,7 +54,7 @@ pub async fn initialize_system_stream<A: SqlAttempt>(
     }
     if scope.rows.is_empty() {
         reject_partial_authority(attempt, engine).await?;
-        insert_initial_authority(attempt, engine).await?;
+        insert_initial_authority(attempt, engine, initial_stream_lineages).await?;
     }
     capture_high(attempt, engine).await?;
     Ok(())
@@ -58,7 +67,7 @@ fn authority_schema(engine: impl SqlLayout) -> [String; 4] {
         format!(
             "CREATE TABLE IF NOT EXISTS {relation_sys_system_stream_scope} (scope_key TEXT \
              PRIMARY KEY, version {int} NOT NULL, scope_id TEXT NOT NULL, generation {int} NOT \
-             NULL){}",
+             NULL, transaction_offset {int} NOT NULL DEFAULT 0 CHECK (transaction_offset >= 0)){}",
             engine.engine().table_suffix(),
             relation_sys_system_stream_scope = engine.relation_name("sys_system_stream_scope"),
         ),
@@ -66,14 +75,15 @@ fn authority_schema(engine: impl SqlLayout) -> [String; 4] {
             "CREATE TABLE IF NOT EXISTS {relation_sys_system_stream_lineage} (scope_key TEXT NOT \
              NULL, shard_id TEXT NOT NULL, lineage_id TEXT NOT NULL, parent_lineage_id TEXT, \
              sealed {sealed}, sealed_after_offset {int}, initial_sequence {int} NOT NULL DEFAULT \
-             1 CHECK (initial_sequence > 0), PRIMARY KEY (scope_key, shard_id, lineage_id)){}",
+             1 CHECK (initial_sequence > 0), retired_offset {int} NOT NULL DEFAULT 0, PRIMARY KEY \
+             (scope_key, shard_id, lineage_id)){}",
             engine.engine().table_suffix(),
             relation_sys_system_stream_lineage = engine.relation_name("sys_system_stream_lineage"),
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {relation_sys_system_stream_sequences} (scope_key TEXT \
              NOT NULL, shard_id TEXT PRIMARY KEY, next_offset {int} NOT NULL CHECK (next_offset > \
-             0), retired_offset {int} NOT NULL DEFAULT 0){}",
+             0)){}",
             engine.engine().table_suffix(),
             relation_sys_system_stream_sequences =
                 engine.relation_name("sys_system_stream_sequences"),
@@ -121,6 +131,7 @@ async fn reject_partial_authority<A: SqlAttempt>(
 async fn insert_initial_authority<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
+    initial_stream_lineages: storage_types::InitialStreamLineages,
 ) -> StorageResult<()> {
     let scope_id = uuid::Uuid::new_v4().to_string();
     let scope_sql = format!(
@@ -138,49 +149,58 @@ async fn insert_initial_authority<A: SqlAttempt>(
             vec![
                 SqlValue::Text("system".to_owned()),
                 SqlValue::Integer(1),
-                SqlValue::Text(scope_id),
+                SqlValue::Text(scope_id.clone()),
                 SqlValue::Integer(1),
             ],
         ))
         .await?;
-    let lineage_sql = format!(
-        "INSERT INTO {relation_sys_system_stream_lineage} (scope_key, shard_id, lineage_id, \
-         sealed) VALUES ({}, {}, {}, {})",
-        engine.engine().placeholder(1),
-        engine.engine().placeholder(2),
-        engine.engine().placeholder(3),
-        engine.engine().placeholder(4),
-        relation_sys_system_stream_lineage = engine.relation_name("sys_system_stream_lineage"),
-    );
-    attempt
-        .execute(SqlStatement::new(
-            lineage_sql,
-            vec![
-                SqlValue::Text("system".to_owned()),
-                SqlValue::Text(DYNAMO_SYSTEM_SHARD_ID.to_owned()),
-                SqlValue::Text(DYNAMO_SYSTEM_LINEAGE_ID.to_owned()),
-                SqlValue::Boolean(false),
-            ],
-        ))
-        .await?;
-    let sequence_sql = format!(
-        "INSERT INTO {relation_sys_system_stream_sequences} (scope_key, shard_id, next_offset) \
-         VALUES ({}, {}, {})",
-        engine.engine().placeholder(1),
-        engine.engine().placeholder(2),
-        engine.engine().placeholder(3),
-        relation_sys_system_stream_sequences = engine.relation_name("sys_system_stream_sequences"),
-    );
-    attempt
-        .execute(SqlStatement::new(
-            sequence_sql,
-            vec![
-                SqlValue::Text("system".to_owned()),
-                SqlValue::Text(DYNAMO_SYSTEM_SHARD_ID.to_owned()),
-                SqlValue::Integer(1),
-            ],
-        ))
-        .await?;
+    let scope = SystemStreamScope::try_new(scope_id, 1).map_err(|_| unavailable())?;
+    let catalog = SystemStreamLineageCatalog::initial_roots(scope, initial_stream_lineages)
+        .map_err(|_| unavailable())?;
+    for lineage in catalog.iter() {
+        let lineage_sql = format!(
+            "INSERT INTO {relation_sys_system_stream_lineage} (scope_key, shard_id, lineage_id, \
+             sealed) VALUES ({}, {}, {}, {})",
+            engine.engine().placeholder(1),
+            engine.engine().placeholder(2),
+            engine.engine().placeholder(3),
+            engine.engine().placeholder(4),
+            relation_sys_system_stream_lineage = engine.relation_name("sys_system_stream_lineage"),
+        );
+        attempt
+            .execute(SqlStatement::new(
+                lineage_sql,
+                vec![
+                    SqlValue::Text("system".to_owned()),
+                    SqlValue::Text(lineage.shard_id().as_str().to_owned()),
+                    SqlValue::Text(lineage.lineage_id().as_str().to_owned()),
+                    SqlValue::Boolean(false),
+                ],
+            ))
+            .await?;
+        if engine.engine() == SqlEngine::Postgres {
+            continue;
+        }
+        let sequence_sql = format!(
+            "INSERT INTO {relation_sys_system_stream_sequences} (scope_key, shard_id, \
+             next_offset) VALUES ({}, {}, {})",
+            engine.engine().placeholder(1),
+            engine.engine().placeholder(2),
+            engine.engine().placeholder(3),
+            relation_sys_system_stream_sequences =
+                engine.relation_name("sys_system_stream_sequences"),
+        );
+        attempt
+            .execute(SqlStatement::new(
+                sequence_sql,
+                vec![
+                    SqlValue::Text("system".to_owned()),
+                    SqlValue::Text(lineage.shard_id().as_str().to_owned()),
+                    SqlValue::Integer(1),
+                ],
+            ))
+            .await?;
+    }
     Ok(())
 }
 
@@ -196,26 +216,38 @@ pub async fn capture_high<A: SqlAttempt>(
         .map_err(|_| unavailable())
 }
 
-/// Confirm that the requested frontier remains reachable in protected history.
-pub(crate) async fn validate_frontier<A: SqlAttempt>(
-    attempt: &mut A,
-    engine: impl SqlLayout,
-    current: &SystemStreamCheckpoint,
-    through: &SystemStreamCheckpoint,
-) -> StorageResult<()> {
-    read_history(attempt, engine)
-        .await?
-        .plan_page(current, through, 1)
-        .map_err(|_| StorageEnum::HistoryUnavailable)?;
-    Ok(())
-}
-
 pub(crate) fn sequence_advance_statement(
     engine: impl SqlLayout,
     shard_id: &str,
     expected_offset: NonZeroU64,
     next_offset: NonZeroU64,
 ) -> StorageResult<SqlStatement> {
+    let (sql, binds) = sequence_advance_parts(engine, shard_id, expected_offset, next_offset)?;
+    Ok(SqlStatement::new(sql, binds))
+}
+
+pub(crate) fn counted_sequence_advance(
+    engine: impl SqlLayout,
+    shard_id: &str,
+    expected_offset: NonZeroU64,
+    next_offset: NonZeroU64,
+) -> StorageResult<crate::SqlCountedWrite> {
+    let (body, binds) = sequence_advance_parts(engine, shard_id, expected_offset, next_offset)?;
+    let mut sql = crate::statement::SqlText::start_counted_write()?;
+    sql.append(format_args!("{body}"))?;
+    sql.finish_counted_write(
+        binds,
+        crate::catalog::SqlDynamoCount::ExactlyOne,
+        crate::catalog::SqlDynamoWriteKind::SystemSequence.error_factory(),
+    )
+}
+
+fn sequence_advance_parts(
+    engine: impl SqlLayout,
+    shard_id: &str,
+    expected_offset: NonZeroU64,
+    next_offset: NonZeroU64,
+) -> StorageResult<(std::borrow::Cow<'static, str>, Vec<SqlValue>)> {
     let expected = i64::try_from(expected_offset.get()).map_err(|_| unavailable())?;
     let next = i64::try_from(next_offset.get()).map_err(|_| unavailable())?;
     let sql = crate::sql_template::sql_template!(engine,
@@ -223,7 +255,7 @@ pub(crate) fn sequence_advance_statement(
         " WHERE scope_key = 'system' AND shard_id = " {2},
         " AND next_offset = " {3},
     );
-    Ok(SqlStatement::new(
+    Ok((
         sql,
         vec![
             SqlValue::Integer(next),
@@ -247,58 +279,84 @@ pub(crate) async fn read_history<A: SqlAttempt>(
     decode_history_page(page, engine)
 }
 
-pub(crate) enum HistoryRead {
+pub(crate) enum HistoryRead<'a> {
     Writer,
     Reader,
+    Split(&'a storage_types::SystemStreamLineageId),
 }
 
-pub(crate) fn history_statement(engine: impl SqlLayout, read: HistoryRead) -> SqlStatement {
-    let (next_offset, native_columns, native_join) =
-        if engine.engine() == SqlEngine::Postgres && matches!(read, HistoryRead::Writer) {
+pub(crate) fn history_statement(engine: impl SqlLayout, read: HistoryRead<'_>) -> SqlStatement {
+    let is_postgres = engine.engine() == SqlEngine::Postgres;
+    let frontier =
+        "((pg_snapshot_xmin(pg_current_snapshot())::text::bigint + s.transaction_offset) * 65536)";
+    let mut params = vec![];
+    let (next_offset, native_join) = if is_postgres {
+        if let HistoryRead::Split(parent) = read {
+            params.push(SqlValue::Text(parent.as_str().to_owned()));
             (
-                "CASE WHEN l.sealed THEN q.next_offset ELSE GREATEST(q.next_offset, \
-                 (pg_current_xact_id()::text::bigint + 1) * 65536) END",
-                ", pg_snapshot_xmin(pg_current_snapshot())::text::bigint, \
-                 pg_current_xact_id()::text::bigint",
-                std::borrow::Cow::Borrowed(""),
-            )
-        } else if engine.engine() == SqlEngine::Postgres {
-            (
-                "CASE WHEN l.sealed THEN q.next_offset ELSE GREATEST(q.next_offset, \
-                 q.retired_offset + 1, COALESCE(tail.offset, l.initial_sequence - 1) + 1) END",
-                ", pg_snapshot_xmin(pg_current_snapshot())::text::bigint, \
-                 COALESCE(pg_current_xact_id_if_assigned()::text::bigint, 0)",
+                format!(
+                    "CASE WHEN l.sealed THEN l.sealed_after_offset WHEN l.lineage_id = $1 THEN \
+                     GREATEST({frontier}, l.retired_offset + 1, COALESCE(tail.offset, 0) + 1, \
+                     l.initial_sequence) ELSE GREATEST({frontier}, l.initial_sequence) END"
+                ),
                 crate::sql_template::sql_template!(
                     engine,
                     " LEFT JOIN LATERAL (SELECT split_part(r.offset_text, '-', 1)::bigint AS \
-                     offset FROM "["sys_dynamo_stream_records"],
-                    " AS r WHERE r.shard_id = l.shard_id AND r.lineage_id = l.lineage_id ORDER BY \
-                     r.offset_order DESC, r.offset_text DESC LIMIT 1) AS tail ON TRUE"
-                ),
+                     offset FROM "["sys_stream_entries"],
+                    " AS r WHERE l.lineage_id = $1 AND r.shard_id = l.shard_id AND r.lineage_id = \
+                     l.lineage_id ORDER BY r.offset_order DESC, r.offset_text DESC LIMIT 1) AS \
+                     tail ON TRUE"
+                )
+                .into_owned(),
             )
         } else {
-            ("q.next_offset", "", std::borrow::Cow::Borrowed(""))
-        };
+            (
+                format!(
+                    "CASE WHEN l.sealed THEN l.sealed_after_offset ELSE GREATEST({frontier}, \
+                     l.initial_sequence) END"
+                ),
+                String::new(),
+            )
+        }
+    } else {
+        (
+            "q.next_offset".to_owned(),
+            format!(
+                " LEFT JOIN {} AS q ON q.scope_key = l.scope_key AND q.shard_id = l.shard_id",
+                engine.relation_name("sys_system_stream_sequences"),
+            ),
+        )
+    };
+    let extra = if is_postgres {
+        "FALSE".to_owned()
+    } else {
+        format!(
+            "EXISTS (SELECT 1 FROM {} AS extra WHERE extra.scope_key = 'system' AND NOT EXISTS \
+             (SELECT 1 FROM {} AS known WHERE known.scope_key = extra.scope_key AND \
+             known.shard_id = extra.shard_id))",
+            engine.relation_name("sys_system_stream_sequences"),
+            engine.relation_name("sys_system_stream_lineage"),
+        )
+    };
+    let native_columns = if is_postgres {
+        ", pg_snapshot_xmin(pg_current_snapshot())::text::bigint, \
+         (pg_snapshot_xmax(pg_current_snapshot())::text::bigint - \
+         pg_snapshot_xmin(pg_current_snapshot())::text::bigint), s.transaction_offset"
+    } else {
+        ""
+    };
     SqlStatement::new(
         format!(
-            "SELECT s.version, s.scope_id, s.generation, EXISTS (SELECT 1 FROM \
-             {relation_sys_system_stream_sequences} AS extra WHERE extra.scope_key = 'system' AND \
-             NOT EXISTS (SELECT 1 FROM {relation_sys_system_stream_lineage} AS known WHERE \
-             known.scope_key = extra.scope_key AND known.shard_id = extra.shard_id)), l.shard_id, \
-             l.lineage_id, l.parent_lineage_id, l.sealed, l.initial_sequence, \
-             l.sealed_after_offset, {next_offset}{native_columns} FROM \
-             {relation_sys_system_stream_scope} AS s LEFT JOIN \
-             {relation_sys_system_stream_lineage} AS l ON l.scope_key = s.scope_key LEFT JOIN \
-             {relation_sys_system_stream_sequences} AS q ON q.scope_key = l.scope_key AND \
-             q.shard_id = l.shard_id{native_join} WHERE s.scope_key = 'system' ORDER BY \
-             l.shard_id, l.lineage_id LIMIT {}",
+            "SELECT s.version, s.scope_id, s.generation, {extra}, l.shard_id, l.lineage_id, \
+             l.parent_lineage_id, l.sealed, l.initial_sequence, l.sealed_after_offset, \
+             {next_offset}{native_columns} FROM {} AS s LEFT JOIN {} AS l ON l.scope_key = \
+             s.scope_key{native_join} WHERE s.scope_key = 'system' ORDER BY l.shard_id, \
+             l.lineage_id LIMIT {}",
+            engine.relation_name("sys_system_stream_scope"),
+            engine.relation_name("sys_system_stream_lineage"),
             SYSTEM_STREAM_SNAPSHOT_ROWS.get(),
-            relation_sys_system_stream_sequences =
-                engine.relation_name("sys_system_stream_sequences"),
-            relation_sys_system_stream_lineage = engine.relation_name("sys_system_stream_lineage"),
-            relation_sys_system_stream_scope = engine.relation_name("sys_system_stream_scope"),
         ),
-        vec![],
+        params,
     )
 }
 
@@ -313,22 +371,33 @@ pub(crate) fn decode_history_page(
         return decode_history(page.rows);
     }
     let mut frontiers = Vec::with_capacity(page.rows.len());
+    let mut minimum_new_position = None;
+    let lag = integer(page.rows.first().ok_or_else(unavailable)?, 12)?;
+    let lag = u64::try_from(lag).map_err(|_| unavailable())?;
     for row in &page.rows {
-        let upper =
-            crate::stream_allocation::mapped_offset(crate::stream_allocation::integer(row, 11)?)?;
+        let upper = crate::stream_allocation::mapped_offset(
+            crate::stream_allocation::integer(row, 11)?
+                .checked_add(crate::stream_allocation::integer(row, 13)?)
+                .ok_or_else(unavailable)?,
+        )?;
         let (_, bound) = decode_lineage(row)?;
-        let high = bound
-            .sealed_after
-            .map_or(upper.saturating_sub(1), |end| end.get() - 1);
-        let high = high
-            .max(bound.initial_sequence.get() - 1)
-            .min(bound.next_sequence.get() - 1);
+        let minimum = NonZeroU64::new(upper).ok_or_else(unavailable)?;
+        minimum_new_position = Some(minimum);
+        let high = stream_provider::lineage_frontier_high(
+            bound.initial_sequence,
+            bound.next_sequence,
+            bound.sealed_after.map(NonZeroU64::get),
+            upper,
+        )?;
         frontiers.push(
             SystemStreamPosition::try_new(text(row, 4)?, text(row, 5)?, format!("{high:020}"))
                 .map_err(|_| unavailable())?,
         );
     }
-    Ok(decode_history(page.rows)?.with_sparse_numeric_ordering(frontiers))
+    let history = decode_history(page.rows)?
+        .with_sparse_numeric_ordering(frontiers, minimum_new_position.ok_or_else(unavailable)?);
+    metrics::gauge!("storage.postgres.stream.frontier.lag.xids").set(lag as f64);
+    Ok(history)
 }
 
 fn decode_history(rows: Vec<SqlRow>) -> StorageResult<SystemStreamHistory> {
@@ -420,4 +489,20 @@ fn sequence(value: i64) -> StorageResult<NonZeroU64> {
 
 fn unavailable() -> storage_types::StorageError {
     StorageEnum::HistoryUnavailable.into()
+}
+
+/// The routing query supplies this setting before item conditions run. The
+/// compatible relation lock keeps an opener from changing it until commit.
+pub(crate) fn transaction_offset(page: &crate::SqlQueryPage) -> StorageResult<i64> {
+    let row = page.rows.first().ok_or_else(unavailable)?;
+    let offset = integer(row, 13)?;
+    if offset < 0
+        || page
+            .rows
+            .iter()
+            .any(|row| !matches!(integer(row, 13), Ok(value) if value == offset))
+    {
+        return Err(unavailable());
+    }
+    Ok(offset)
 }

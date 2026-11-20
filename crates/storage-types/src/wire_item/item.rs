@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -10,47 +10,32 @@ use crate::{
     LogicalItemSize, StorageError, StorageResult, StoredTableInfo, TableName, TimestampMillis,
     TimestampSeconds,
     constants::{
-        CREATED_AT_ALIAS_ATTR, CREATED_AT_ATTR, ENTITY_TYPE_ATTR, EXPIRES_AT_ALIAS_ATTR,
-        EXPIRES_AT_ATTR, LEGACY_ENTITY_TYPE_ATTR, UPDATED_AT_ALIAS_ATTR, UPDATED_AT_ATTR,
+        CREATED_AT_ALIAS_ATTR, CREATED_AT_ATTR, ENTITY_TYPE_ATTR, ENTITY_TYPE_NAME_ALIAS,
+        EXPIRES_AT_ALIAS_ATTR, EXPIRES_AT_ATTR, UPDATED_AT_ALIAS_ATTR, UPDATED_AT_ATTR,
     },
     verify_key_attributes,
-    wire_item::{
-        key_attributes::{
-            WireItemKeyAttributes, attribute_from_key_attributes, blob_is_empty_json_object,
-            number_from_key_attributes, scalar_from_key_attributes, string_from_key_attributes,
-        },
-        projection::{
-            encode_dynamo_attribute_values, parse_complete_dynamo_attribute_value_field,
-            parse_dynamo_attribute_fields, parse_dynamo_attribute_value_field,
-            parse_dynamo_attribute_values, parse_dynamo_bool_field, parse_dynamo_number_field_i64,
-            parse_dynamo_scalar_fields,
-            parse_dynamo_scalar_fields_with_aliases as parse_dynamo_scalar_fields_with_aliases_impl,
-            parse_dynamo_string_field,
-        },
+    wire_item::projection::{
+        encode_dynamo_attribute_values, parse_complete_dynamo_attribute_value_field,
+        parse_dynamo_attribute_fields, parse_dynamo_attribute_value_field,
+        parse_dynamo_attribute_values, parse_dynamo_bool_field, parse_dynamo_number_field_i64,
+        parse_dynamo_scalar_fields,
+        parse_dynamo_scalar_fields_with_aliases as parse_dynamo_scalar_fields_with_aliases_impl,
+        parse_dynamo_string_field,
     },
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct BatchGetWireItemResponse {
     pub responses: Option<crate::VecMap<TableName, Vec<WireItem>>>,
     pub unprocessed_keys: Option<crate::VecMap<TableName, KeysAndAttributes>>,
-    pub consumed_capacity: Option<serde_json::Value>,
+    pub consumed_capacity: Option<Vec<crate::ConsumedCapacity>>,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "LocalSplit is latency-sensitive on read path, avoid extra heap indirection"
-)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum WireItem {
-    DynamoJson {
-        data: Vec<u8>,
-    },
-    LocalSplit {
-        primary_key: WireItemKeyAttributes,
-        secondary_key: Option<WireItemKeyAttributes>,
-        non_key_attributes_blob: Option<Vec<u8>>,
-    },
+    DynamoJson { data: Vec<u8> },
 }
 
 pub trait TryFromWireItem: Sized {
@@ -116,7 +101,7 @@ impl WireAttributeDecode for bool {
             "1" => Ok(true),
             "0" => Ok(false),
             _ => Err(StorageError::internal(&format!(
-                "invalid {field} field: {raw}"
+                "invalid {field} field: expected boolean"
             ))),
         }
     }
@@ -175,7 +160,7 @@ impl WireAttributeDecode for TimestampSeconds {
     }
 }
 
-impl WireAttributeDecode for DateTime<Utc> {
+impl WireAttributeDecode for Timestamp {
     fn decode(raw: Option<&str>, field: &str) -> StorageResult<Self> {
         let raw = required_raw_scalar(raw, field)?;
         parse_datetime_auto(raw, field)
@@ -186,26 +171,26 @@ fn required_raw_scalar<'a>(raw: Option<&'a str>, field: &str) -> StorageResult<&
     raw.ok_or_else(|| StorageError::internal(&format!("missing required field {field}")))
 }
 
-fn parse_datetime_auto(raw: &str, field: &str) -> StorageResult<DateTime<Utc>> {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
-        return Ok(parsed.with_timezone(&Utc));
+fn parse_datetime_auto(raw: &str, field: &str) -> StorageResult<Timestamp> {
+    if let Ok(parsed) = raw.parse::<Timestamp>() {
+        return Ok(parsed);
     }
     if let Ok(timestamp) = raw.parse::<i64>() {
         // Heuristic: 13+ digit epoch values are milliseconds, otherwise
         // seconds.
         let parsed = if raw.len() >= 13 {
-            Utc.timestamp_millis_opt(timestamp).single()
+            Timestamp::from_millisecond(timestamp)
         } else {
-            Utc.timestamp_opt(timestamp, 0).single()
+            Timestamp::from_second(timestamp)
         };
-        return parsed.ok_or_else(|| {
+        return parsed.map_err(|_| {
             StorageError::internal(&format!(
                 "invalid {field} field timestamp value: {timestamp}"
             ))
         });
     }
     Err(StorageError::internal(&format!(
-        "invalid {field} field datetime format: {raw}"
+        "invalid {field} field datetime format"
     )))
 }
 
@@ -227,18 +212,6 @@ impl TryFrom<&WireItem> for AttributeMap {
     fn try_from(item: &WireItem) -> StorageResult<Self> {
         match item {
             WireItem::DynamoJson { data } => AttributeMap::from_dynamo_json(data),
-            WireItem::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                let mut attributes = decode_non_key_attributes(non_key_attributes_blob.as_deref())?;
-                insert_key_attributes(&mut attributes, primary_key);
-                if let Some(secondary_key) = secondary_key {
-                    insert_key_attributes(&mut attributes, secondary_key);
-                }
-                Ok(attributes)
-            }
         }
     }
 }
@@ -249,18 +222,6 @@ impl TryFrom<WireItem> for AttributeMap {
     fn try_from(item: WireItem) -> StorageResult<Self> {
         match item {
             WireItem::DynamoJson { data } => AttributeMap::from_dynamo_json(&data),
-            WireItem::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                let mut attributes = decode_non_key_attributes(non_key_attributes_blob.as_deref())?;
-                insert_owned_key_attributes(&mut attributes, primary_key);
-                if let Some(secondary_key) = secondary_key {
-                    insert_owned_key_attributes(&mut attributes, secondary_key);
-                }
-                Ok(attributes)
-            }
         }
     }
 }
@@ -297,33 +258,6 @@ impl TryFrom<AttributeMap> for WireItem {
     }
 }
 
-fn insert_key_attributes(attributes: &mut AttributeMap, keys: &WireItemKeyAttributes) {
-    attributes.insert(keys.hash_key_name.to_string(), keys.hash_key.clone());
-    if let (Some(name), Some(value)) = (&keys.sort_key_name, &keys.sort_key) {
-        attributes.insert(name.to_string(), value.clone());
-    }
-}
-
-fn insert_owned_key_attributes(attributes: &mut AttributeMap, keys: WireItemKeyAttributes) {
-    attributes.insert(keys.hash_key_name.into_owned(), keys.hash_key);
-    if let (Some(name), Some(value)) = (keys.sort_key_name, keys.sort_key) {
-        attributes.insert(name.into_owned(), value);
-    }
-}
-
-fn decode_non_key_attributes(blob: Option<&[u8]>) -> StorageResult<AttributeMap> {
-    match blob {
-        Some(blob) if !blob.is_empty() && !blob_is_empty_json_object(blob) => {
-            serde_json::from_slice(blob).map_err(|err| {
-                StorageError::internal(&format!(
-                    "decode wire item non-key attributes failed: {err}"
-                ))
-            })
-        }
-        _ => Ok(AttributeMap::new()),
-    }
-}
-
 impl TryIntoWireItem for HashMap<String, AttributeValue> {
     fn try_into_wire_item(&self) -> StorageResult<WireItem> {
         WireItem::try_from(self)
@@ -342,65 +276,16 @@ impl WireItem {
         Self::DynamoJson { data }
     }
 
-    #[must_use]
-    pub fn local_split(
-        primary_key: WireItemKeyAttributes,
-        secondary_key: Option<WireItemKeyAttributes>,
-        non_key_attributes_blob: Option<Vec<u8>>,
-    ) -> Self {
-        Self::LocalSplit {
-            primary_key,
-            secondary_key,
-            non_key_attributes_blob,
-        }
-    }
-
     /// Verify the addressed key without completing or rewriting the image.
     /// False means a component is missing; conflicting or invalid values fail.
     /// Canonical images must agree across split keys and residual attributes.
     pub fn has_verified_keys(&self, key: &crate::KeyAttributes) -> StorageResult<bool> {
-        if let Self::LocalSplit {
-            primary_key,
-            secondary_key,
-            ..
-        } = self
-        {
-            let entries = std::iter::once(primary_key)
-                .chain(secondary_key)
-                .flat_map(|keys| {
-                    std::iter::once((keys.hash_key_name.as_ref(), &keys.hash_key))
-                        .chain(keys.sort_key_name.as_deref().zip(keys.sort_key.as_ref()))
-                });
-            for (name, value) in entries {
-                verify_key_attributes(key, |requested| {
-                    Ok((name == requested).then(|| value.clone()))
-                })?;
-            }
-        }
         verify_key_attributes(key, |name| self.canonical_key_attribute_value(name))
     }
 
     fn canonical_key_attribute_value(&self, field: &str) -> StorageResult<Option<AttributeValue>> {
         match self {
             Self::DynamoJson { data } => parse_complete_dynamo_attribute_value_field(data, field),
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                let value = non_key_attributes_blob
-                    .as_deref()
-                    .filter(|bytes| !bytes.is_empty())
-                    .map(|bytes| parse_complete_dynamo_attribute_value_field(bytes, field))
-                    .transpose()?
-                    .flatten();
-                Ok(value.or_else(|| {
-                    std::iter::once(primary_key)
-                        .chain(secondary_key)
-                        .find_map(|keys| attribute_from_key_attributes(keys, field))
-                        .cloned()
-                }))
-            }
         }
     }
 
@@ -411,28 +296,26 @@ impl WireItem {
     /// require `has_verified_keys` to verify agreement between represented
     /// keys.
     pub fn with_verified_keys(self, key: &crate::KeyAttributes) -> StorageResult<Self> {
-        if verify_key_attributes(key, |name| self.key_attribute_value(name))? {
+        if self.has_complete_write_keys(key)? {
             return Ok(self);
         }
 
+        self.complete_write_keys(key)
+    }
+
+    pub(super) fn has_complete_write_keys(
+        &self,
+        key: &crate::KeyAttributes,
+    ) -> StorageResult<bool> {
+        verify_key_attributes(key, |name| self.key_attribute_value(name))
+    }
+
+    pub(super) fn complete_write_keys(self, key: &crate::KeyAttributes) -> StorageResult<Self> {
         let attributes = AttributeMap::try_from(&self)?.with_verified_keys(key)?;
         Self::try_from(&attributes)
     }
 
     fn key_attribute_value(&self, field: &str) -> StorageResult<Option<AttributeValue>> {
-        if let Self::LocalSplit {
-            primary_key,
-            secondary_key,
-            ..
-        } = self
-            && let Some(value) = attribute_from_key_attributes(primary_key, field).or_else(|| {
-                secondary_key
-                    .as_ref()
-                    .and_then(|keys| attribute_from_key_attributes(keys, field))
-            })
-        {
-            return Ok(Some(value.clone()));
-        }
         self.attribute_value(field)
     }
 
@@ -440,47 +323,12 @@ impl WireItem {
     pub fn payload_len(&self) -> usize {
         match self {
             Self::DynamoJson { data } => data.len(),
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                primary_key.payload_len()
-                    + secondary_key
-                        .as_ref()
-                        .map_or(0, WireItemKeyAttributes::payload_len)
-                    + non_key_attributes_blob.as_ref().map_or(0, Vec::len)
-            }
         }
     }
 
     pub fn logical_size(&self) -> StorageResult<LogicalItemSize> {
         match self {
             Self::DynamoJson { data } => LogicalItemSize::from_dynamo_json(data, "WireItem", &[]),
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                let key_entries = canonical_key_entries(primary_key, secondary_key.as_ref());
-                let key_names = key_entries
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>();
-                let key_size = LogicalItemSize::try_from_entries(key_entries.iter().copied())?;
-                let non_key_size = non_key_attributes_blob
-                    .as_deref()
-                    .filter(|blob| !blob.is_empty() && !blob_is_empty_json_object(blob))
-                    .map_or(Ok(0), |blob| {
-                        LogicalItemSize::size_from_dynamo_json(blob, "WireItem", &key_names)
-                    })?;
-                let size = u64::from(key_size)
-                    .checked_add(non_key_size)
-                    .ok_or_else(|| {
-                        StorageError::internal(&"logical item size arithmetic overflowed")
-                    })?;
-                LogicalItemSize::try_from(size)
-            }
         }
     }
 
@@ -518,48 +366,6 @@ impl WireItem {
                 }
                 Ok(normalize_entity_type_scalar(field, value))
             }
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                if let Some(blob) = non_key_attributes_blob
-                    && !blob.is_empty()
-                    && !blob_is_empty_json_object(blob.as_slice())
-                {
-                    let mut projected = parse_dynamo_string_field(blob.as_slice(), field)?;
-                    if projected.is_none()
-                        && let Some(alias) = alias_field(field)
-                    {
-                        projected = parse_dynamo_string_field(blob.as_slice(), alias)?;
-                    }
-                    if projected.is_some() {
-                        return Ok(normalize_entity_type_scalar(field, projected));
-                    }
-                }
-                if let Some(value) = string_from_key_attributes(primary_key, field).or_else(|| {
-                    alias_field(field)
-                        .and_then(|alias| string_from_key_attributes(primary_key, alias))
-                }) {
-                    return Ok(normalize_entity_type_scalar(
-                        field,
-                        Some(Cow::Borrowed(value)),
-                    ));
-                }
-                if let Some(secondary_key) = secondary_key
-                    && let Some(value) =
-                        string_from_key_attributes(secondary_key, field).or_else(|| {
-                            alias_field(field)
-                                .and_then(|alias| string_from_key_attributes(secondary_key, alias))
-                        })
-                {
-                    return Ok(normalize_entity_type_scalar(
-                        field,
-                        Some(Cow::Borrowed(value)),
-                    ));
-                }
-                Ok(None)
-            }
         }
     }
 
@@ -585,71 +391,17 @@ impl WireItem {
                 }
                 Ok(value)
             }
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                if let Some(blob) = non_key_attributes_blob
-                    && !blob.is_empty()
-                    && !blob_is_empty_json_object(blob.as_slice())
-                {
-                    let mut value = parse_dynamo_number_field_i64(blob.as_slice(), field)?;
-                    if value.is_none()
-                        && let Some(alias) = alias_field(field)
-                    {
-                        value = parse_dynamo_number_field_i64(blob.as_slice(), alias)?;
-                    }
-                    if let Some(value) = value {
-                        return Ok(Some(value));
-                    }
-                }
-                let mut value = number_from_key_attributes(primary_key, field)?;
-                if value.is_none()
-                    && let Some(alias) = alias_field(field)
-                {
-                    value = number_from_key_attributes(primary_key, alias)?;
-                }
-                if let Some(value) = value {
-                    return Ok(Some(value));
-                }
-                if let Some(secondary_key) = secondary_key {
-                    let mut value = number_from_key_attributes(secondary_key, field)?;
-                    if value.is_none()
-                        && let Some(alias) = alias_field(field)
-                    {
-                        value = number_from_key_attributes(secondary_key, alias)?;
-                    }
-                    if let Some(value) = value {
-                        return Ok(Some(value));
-                    }
-                }
-
-                Ok(None)
-            }
         }
     }
 
     pub fn bool_attribute(&self, field: &str) -> StorageResult<Option<bool>> {
         match self {
             Self::DynamoJson { data } => parse_dynamo_bool_field(data.as_slice(), field),
-            Self::LocalSplit {
-                non_key_attributes_blob,
-                ..
-            } => {
-                if let Some(blob) = non_key_attributes_blob
-                    && !blob.is_empty()
-                    && !blob_is_empty_json_object(blob.as_slice())
-                {
-                    return parse_dynamo_bool_field(blob.as_slice(), field);
-                }
-                Ok(None)
-            }
         }
     }
 
-    /// Reads one field, falling back to its canonical or legacy timestamp or
-    /// entity-type alias when the requested name is absent. Use
+    /// Reads one field, falling back to its timestamp alias, or for
+    /// `entity_type` to the stored `et`, when the requested name is absent. Use
     /// `select_attribute_values` to inspect exact persisted field names.
     pub fn attribute_value(&self, field: &str) -> StorageResult<Option<AttributeValue>> {
         match self {
@@ -662,89 +414,19 @@ impl WireItem {
                 }
                 Ok(normalize_entity_type_attribute_value(field, value))
             }
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                if let Some(blob) = non_key_attributes_blob
-                    && !blob.is_empty()
-                    && !blob_is_empty_json_object(blob.as_slice())
-                {
-                    let mut value = parse_dynamo_attribute_value_field(blob.as_slice(), field)?;
-                    if value.is_none()
-                        && let Some(alias) = alias_field(field)
-                    {
-                        value = parse_dynamo_attribute_value_field(blob.as_slice(), alias)?;
-                    }
-                    if value.is_some() {
-                        return Ok(normalize_entity_type_attribute_value(field, value));
-                    }
-                }
-                if let Some(value) =
-                    attribute_from_key_attributes(primary_key, field).or_else(|| {
-                        alias_field(field)
-                            .and_then(|alias| attribute_from_key_attributes(primary_key, alias))
-                    })
-                {
-                    return Ok(normalize_entity_type_attribute_value(
-                        field,
-                        Some(value.clone()),
-                    ));
-                }
-                if let Some(secondary_key) = secondary_key
-                    && let Some(value) = attribute_from_key_attributes(secondary_key, field)
-                        .or_else(|| {
-                            alias_field(field).and_then(|alias| {
-                                attribute_from_key_attributes(secondary_key, alias)
-                            })
-                        })
-                {
-                    return Ok(normalize_entity_type_attribute_value(
-                        field,
-                        Some(value.clone()),
-                    ));
-                }
-                Ok(None)
-            }
         }
     }
 
     /// Decodes exact persisted field names in one pass, preserving the
-    /// requested order. Unlike `attribute_value`, this does not resolve
-    /// canonical or legacy aliases; an absent requested name retains its
-    /// own `None` slot.
+    /// requested order. Unlike `attribute_value`, this does not resolve the
+    /// entity-type name alias; an absent requested name retains its own
+    /// `None` slot.
     pub fn select_attribute_values(
         &self,
         fields: &[&str],
     ) -> StorageResult<Vec<Option<AttributeValue>>> {
         match self {
             Self::DynamoJson { data } => parse_dynamo_attribute_values(data, fields),
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                let mut values = match non_key_attributes_blob {
-                    Some(blob) if !blob.is_empty() && !blob_is_empty_json_object(blob) => {
-                        parse_dynamo_attribute_values(blob, fields)?
-                    }
-                    _ => vec![None; fields.len()],
-                };
-                for (field, value) in fields.iter().zip(&mut values) {
-                    if value.is_some() {
-                        continue;
-                    }
-                    *value = attribute_from_key_attributes(primary_key, field)
-                        .or_else(|| {
-                            secondary_key
-                                .as_ref()
-                                .and_then(|keys| attribute_from_key_attributes(keys, field))
-                        })
-                        .cloned();
-                }
-                Ok(values)
-            }
         }
     }
 
@@ -759,29 +441,6 @@ impl WireItem {
     pub fn project_attributes(&self, fields: &[&str]) -> StorageResult<AttributeMap> {
         match self {
             Self::DynamoJson { data } => parse_dynamo_attribute_fields(data, fields),
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => {
-                let mut attributes = match non_key_attributes_blob {
-                    Some(blob) if !blob.is_empty() && !blob_is_empty_json_object(blob) => {
-                        parse_dynamo_attribute_fields(blob, fields)?
-                    }
-                    _ => AttributeMap::new(),
-                };
-                for field in fields {
-                    let value = attribute_from_key_attributes(primary_key, field).or_else(|| {
-                        secondary_key
-                            .as_ref()
-                            .and_then(|keys| attribute_from_key_attributes(keys, field))
-                    });
-                    if let Some(value) = value {
-                        attributes.insert(*field, value.clone());
-                    }
-                }
-                Ok(attributes)
-            }
         }
     }
 
@@ -907,45 +566,6 @@ impl WireItem {
                 }
                 Ok(values)
             }
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-                ..
-            } => {
-                let mut values = if let Some(blob) = non_key_attributes_blob
-                    && !blob.is_empty()
-                    && !blob_is_empty_json_object(blob.as_slice())
-                {
-                    parse_dynamo_scalar_fields(blob.as_slice(), fields)?
-                } else {
-                    vec![None; fields.len()]
-                };
-                for (index, field) in fields.iter().enumerate() {
-                    if values[index].is_some() {
-                        values[index] = normalize_entity_type_scalar(field, values[index].take());
-                        continue;
-                    }
-                    let value = scalar_from_key_attributes(primary_key, field)
-                        .or_else(|| {
-                            secondary_key
-                                .as_ref()
-                                .and_then(|secondary| scalar_from_key_attributes(secondary, field))
-                        })
-                        .or_else(|| {
-                            alias_field(field).and_then(|alias| {
-                                scalar_from_key_attributes(primary_key, alias).or_else(|| {
-                                    secondary_key.as_ref().and_then(|secondary| {
-                                        scalar_from_key_attributes(secondary, alias)
-                                    })
-                                })
-                            })
-                        });
-                    values[index] = value.map(Cow::Borrowed);
-                    values[index] = normalize_entity_type_scalar(field, values[index].take());
-                }
-                Ok(values)
-            }
         }
     }
 }
@@ -965,58 +585,13 @@ fn parse_dynamo_scalar_fields_with_aliases<'a>(
     parse_dynamo_scalar_fields_with_aliases_impl(bytes, fields, aliases.as_slice())
 }
 
-pub(super) fn canonical_key_entries<'a>(
-    primary_key: &'a WireItemKeyAttributes,
-    secondary_key: Option<&'a WireItemKeyAttributes>,
-) -> SmallVec<[(&'a str, &'a AttributeValue); 4]> {
-    let mut entries = SmallVec::new();
-    for keys in std::iter::once(primary_key).chain(secondary_key) {
-        insert_canonical_key_entry(&mut entries, keys.hash_key_name.as_ref(), &keys.hash_key);
-        if let (Some(name), Some(value)) = (&keys.sort_key_name, &keys.sort_key) {
-            insert_canonical_key_entry(&mut entries, name.as_ref(), value);
-        }
-    }
-    entries
-}
-
-pub(super) fn canonical_key_entries_mut<'a>(
-    primary_key: &'a mut WireItemKeyAttributes,
-    secondary_key: Option<&'a mut WireItemKeyAttributes>,
-) -> SmallVec<[(&'a str, &'a mut AttributeValue); 4]> {
-    let mut entries = SmallVec::new();
-    for keys in std::iter::once(primary_key).chain(secondary_key) {
-        insert_canonical_key_entry(
-            &mut entries,
-            keys.hash_key_name.as_ref(),
-            &mut keys.hash_key,
-        );
-        if let (Some(name), Some(value)) = (&keys.sort_key_name, &mut keys.sort_key) {
-            insert_canonical_key_entry(&mut entries, name.as_ref(), value);
-        }
-    }
-    entries
-}
-
-fn insert_canonical_key_entry<'a, T>(
-    entries: &mut SmallVec<[(&'a str, T); 4]>,
-    name: &'a str,
-    value: T,
-) {
-    if let Some(index) = entries.iter().position(|(existing, _)| *existing == name) {
-        entries[index].1 = value;
-    } else {
-        entries.push((name, value));
-    }
-}
-
 fn length_prefixed_capacity(parts: &[Option<&[u8]>]) -> usize {
     parts.iter().flatten().map(|part| part.len() + 2).sum()
 }
 
 fn alias_field(field: &str) -> Option<&'static str> {
     match field {
-        LEGACY_ENTITY_TYPE_ATTR => Some(ENTITY_TYPE_ATTR),
-        ENTITY_TYPE_ATTR => Some(LEGACY_ENTITY_TYPE_ATTR),
+        ENTITY_TYPE_NAME_ALIAS => Some(ENTITY_TYPE_ATTR),
         CREATED_AT_ATTR => Some(CREATED_AT_ALIAS_ATTR),
         CREATED_AT_ALIAS_ATTR => Some(CREATED_AT_ATTR),
         UPDATED_AT_ATTR => Some(UPDATED_AT_ALIAS_ATTR),

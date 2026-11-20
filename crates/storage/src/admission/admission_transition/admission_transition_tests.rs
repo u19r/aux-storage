@@ -350,20 +350,18 @@ fn given_near_max_limit_when_probe_starts_then_limit_saturates_without_overflow(
         ..AdmissionConfig::default()
     };
     let now = Instant::now();
-    for admission_state in [AdmissionState::Stable, AdmissionState::Recovering] {
-        let mut state = state_at(now, admission_state, usize::MAX - 1);
-        state.saturated_healthy_windows = 2;
+    let mut state = state_at(now, AdmissionState::Stable, usize::MAX - 1);
+    state.saturated_healthy_windows = 2;
 
-        transition_window(
-            &config,
-            &mut state,
-            signals(now, true, false, false, true, 1.0, 100.0),
-        );
+    transition_window(
+        &config,
+        &mut state,
+        signals(now, true, false, false, true, 1.0, 100.0),
+    );
 
-        assert_eq!(state.state, AdmissionState::Probe);
-        assert_eq!(state.desired_limit, usize::MAX);
-        assert_eq!(state.probe_previous_limit, Some(usize::MAX - 1));
-    }
+    assert_eq!(state.state, AdmissionState::Probe);
+    assert_eq!(state.desired_limit, usize::MAX);
+    assert_eq!(state.probe_previous_limit, Some(usize::MAX - 1));
 }
 
 #[test]
@@ -411,7 +409,9 @@ fn three_controllers_track_capacity_drop_and_recovery_without_locking_low() {
             state,
             signals(timestamp, true, false, false, true, 1.0, 100.0),
         );
-        for _ in 0..3 {
+        // One recovering window restores the starting limit of 100; three
+        // saturated healthy Stable windows then start a probe.
+        for _ in 0..4 {
             timestamp += Duration::from_secs(10);
             transition_window(
                 &config,
@@ -497,4 +497,40 @@ pub(crate) fn transition_for_model(
             now,
         },
     );
+}
+
+/// Benchmark regression: once the limit is at its floor, offered load above
+/// that limit makes waiters time out. Those timeouts describe demand above
+/// the local limit, not provider overload, so they must not keep the
+/// controller in emergency while service latency is healthy.
+#[test]
+fn emergency_recovers_while_queue_timeouts_continue_at_a_healthy_reduced_limit() {
+    let config = AdmissionConfig {
+        minimum_concurrency: 4,
+        ..AdmissionConfig::default()
+    };
+    let start = Instant::now();
+    let mut state = state_at(start, AdmissionState::Emergency, 4);
+    let mut now = start;
+    let mut left_emergency_at = None;
+    for window in 1..=20 {
+        let limit = state.desired_limit;
+        state.window.peak_in_flight = limit;
+        state.window.queue_waits = limit;
+        state.window.queue_timeout = true;
+        for _ in 0..40 {
+            state
+                .window
+                .add_sample(AdmissionClass::PointRead, Duration::from_millis(3));
+        }
+        state.window.successes = limit * 100;
+        now += WINDOW;
+        evaluate_window(&config, &mut state, now);
+        if left_emergency_at.is_none() && state.state != AdmissionState::Emergency {
+            left_emergency_at = Some(window);
+        }
+    }
+    assert!(left_emergency_at.is_some_and(|window| window <= 3));
+    assert_ne!(state.state, AdmissionState::Emergency);
+    assert!(state.desired_limit >= 6, "limit {}", state.desired_limit);
 }

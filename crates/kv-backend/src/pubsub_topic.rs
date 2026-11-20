@@ -15,22 +15,15 @@ pub(crate) async fn read_topics<A: KvAttempt>(
     native: &mut A,
     protection: ReadProtection,
     arns: Vec<TopicArn>,
-) -> StorageResult<Vec<Option<TopicRecord>>> {
+) -> StorageResult<storage_types::Exact<Option<TopicRecord>>> {
     let values = native
-        .get_batch(arns.iter().map(topic_key).collect(), protection)
+        .get_batch_exact(arns.iter().map(topic_key).collect(), protection)
         .await?;
-    if values.len() != arns.len() {
-        return Err(StorageError::internal("KV topic batch count differs"));
-    }
-    values
-        .into_iter()
-        .zip(arns)
-        .map(|(value, arn)| {
-            value
-                .map(|bytes| decode_record(&bytes, arn.as_str().as_bytes()))
-                .transpose()
-        })
-        .collect()
+    values.try_zip_map(arns, |arn, value| {
+        value
+            .map(|bytes| decode_record(&bytes, arn.as_str().as_bytes()))
+            .transpose()
+    })
 }
 
 pub(crate) async fn write_topic<A: KvAttempt>(

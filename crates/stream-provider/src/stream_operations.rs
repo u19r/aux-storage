@@ -1,13 +1,11 @@
 //! Public stream operations share catalog and page decisions across backends.
 
 use async_trait::async_trait;
-use storage_types::{
-    AttemptMode, DurationSeconds, StreamItemId, StreamName, SystemStreamScope, UserStreamName,
-};
+use storage_types::{DurationSeconds, StreamItemId, StreamName, SystemStreamScope, UserStreamName};
 
 use crate::{
-    CursorName, CursorPage, CursorPosition, ReadDirection, Stream, StreamAttempt, StreamCursor,
-    StreamError, StreamPage, StreamPartitioningMode, StreamPort, StreamResult, StreamRowKind,
+    CursorName, CursorPage, CursorPosition, ReadDirection, Stream, StreamAddress, StreamAttempt,
+    StreamCursor, StreamError, StreamPage, StreamPartitioningMode, StreamPort, StreamResult,
     SystemStreamHistory, SystemStreamLineage, SystemStreamPage, SystemStreamPageRequest,
     SystemStreamSplitRequest, SystemStreamSplitResult,
 };
@@ -34,47 +32,47 @@ pub trait StreamOperations: Send + Sync {
 
     async fn create_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
         position: CursorPosition,
     ) -> StreamResult<()>;
 
     async fn get_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
     ) -> StreamResult<Option<StreamCursor>>;
 
     async fn delete_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
     ) -> StreamResult<()>;
 
     async fn advance_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
         to_item_id: StreamItemId,
     ) -> StreamResult<()>;
 
     async fn read_from_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
         limit: u32,
     ) -> StreamResult<CursorPage>;
 
     async fn read_forward(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         exclusive_start: Option<StreamItemId>,
         limit: u32,
     ) -> StreamResult<StreamPage>;
 
     async fn read_backward(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         exclusive_start: Option<StreamItemId>,
         limit: u32,
     ) -> StreamResult<StreamPage>;
@@ -101,16 +99,10 @@ pub trait StreamOperations: Send + Sync {
 
 /// A backend read context provides one coherent logical authority snapshot.
 async fn load_system_stream_history<P: StreamPort>(port: &P) -> StreamResult<SystemStreamHistory> {
-    port.with_stream_attempt(AttemptMode::ReadOnly, move |attempt| {
-        Box::pin(async move {
-            attempt
-                .read_stream(crate::StreamReadKind::System(
-                    crate::SystemStreamReadKind::Catalog,
-                ))
-                .await?
-                .into_system_catalog()
-        })
-    })
+    port.with_attempt(
+        crate::constants::STREAM_RANGE_READ.start(port.attempt_deadlines()),
+        move |attempt| Box::pin(async move { attempt.read_system_page_start_snapshot().await }),
+    )
     .await
     .map_err(StreamError::from_storage_error)
 }
@@ -145,7 +137,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn create_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
         position: CursorPosition,
     ) -> StreamResult<()> {
@@ -154,7 +146,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn get_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
     ) -> StreamResult<Option<StreamCursor>> {
         crate::stream_cursor::get_cursor(self, stream, cursor_name).await
@@ -162,7 +154,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn delete_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
     ) -> StreamResult<()> {
         crate::stream_cursor::delete_cursor(self, stream, cursor_name).await
@@ -170,7 +162,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn advance_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
         to_item_id: StreamItemId,
     ) -> StreamResult<()> {
@@ -179,7 +171,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn read_from_cursor(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         cursor_name: CursorName,
         limit: u32,
     ) -> StreamResult<CursorPage> {
@@ -188,7 +180,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn read_forward(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         exclusive_start: Option<StreamItemId>,
         limit: u32,
     ) -> StreamResult<StreamPage> {
@@ -197,7 +189,7 @@ impl<P: StreamPort> StreamOperations for P {
 
     async fn read_backward(
         &self,
-        stream: StreamRowKind,
+        stream: StreamAddress,
         exclusive_start: Option<StreamItemId>,
         limit: u32,
     ) -> StreamResult<StreamPage> {
@@ -239,28 +231,35 @@ impl<P: StreamPort> StreamOperations for P {
         &self,
         request: SystemStreamSplitRequest,
     ) -> StreamResult<SystemStreamSplitResult> {
-        storage_common::retry::retry_native_conflicts(
+        storage_common::retry::retry_tries(
             self,
-            crate::constants::STREAM_WRITE_RETRY,
-            || {
+            self.attempt_deadlines(),
+            crate::constants::STREAM_CATALOG_WRITE,
+            |attempt_request, _| {
                 let request = request.clone();
-                self.with_topology_attempt(move |attempt| {
-                    Box::pin(async move {
-                        let (history, prior) = attempt
-                            .read_system_split_state(request.operation_id())
-                            .await?;
-                        if let Some(prior) = prior {
-                            return history.replay_split(&request, &prior).map_err(|error| {
+                self.with_attempt(
+                    attempt_request.scoped(storage_types::AttemptScope::Topology),
+                    move |attempt| {
+                        Box::pin(async move {
+                            let (history, prior) = attempt
+                                .read_system_split_state(
+                                    request.parent().lineage_id(),
+                                    request.operation_id(),
+                                )
+                                .await?;
+                            if let Some(prior) = prior {
+                                return history.replay_split(&request, &prior).map_err(|error| {
+                                    storage_types::StorageError::validation(error.to_string())
+                                });
+                            }
+                            let receipt = history.plan_split(&request).map_err(|error| {
                                 storage_types::StorageError::validation(error.to_string())
-                            });
-                        }
-                        let receipt = history.plan_split(&request).map_err(|error| {
-                            storage_types::StorageError::validation(error.to_string())
-                        })?;
-                        attempt.write_system_split(&receipt).await?;
-                        Ok(receipt.split)
-                    })
-                })
+                            })?;
+                            attempt.write_system_split(&receipt).await?;
+                            Ok(receipt.into_result())
+                        })
+                    },
+                )
             },
         )
         .await

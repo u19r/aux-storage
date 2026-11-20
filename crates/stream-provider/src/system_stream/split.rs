@@ -360,6 +360,29 @@ pub struct SystemStreamSplitReceipt {
     pub sealed_after_offset: u64,
 }
 
+/// A split whose final end is known now or supplied by its native commit.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum SystemStreamSplitPlan {
+    KnownEnd(SystemStreamSplitReceipt),
+    EndAtCommit(SystemStreamSplitResult),
+}
+
+impl SystemStreamSplitPlan {
+    pub fn split(&self) -> &SystemStreamSplitResult {
+        match self {
+            Self::KnownEnd(receipt) => &receipt.split,
+            Self::EndAtCommit(split) => split,
+        }
+    }
+
+    pub fn into_result(self) -> SystemStreamSplitResult {
+        match self {
+            Self::KnownEnd(receipt) => receipt.split,
+            Self::EndAtCommit(split) => split,
+        }
+    }
+}
+
 impl SystemStreamSplitReceipt {
     pub fn try_new(
         request: &SystemStreamSplitRequest,

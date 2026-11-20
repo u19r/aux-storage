@@ -1,7 +1,7 @@
 //! A user-stream append decides its mode inside one native write attempt.
 
 use infrastructure_provider::physical_attempt::PhysicalRecordOperation;
-use storage_common::{partition::PartitionInfo, retry::retry_native_conflicts};
+use storage_common::partition::PartitionInfo;
 use storage_types::{
     SemanticDecision, StorageError, StorageResult, StreamItemId, StreamName, TimestampMillis,
     UserStreamName,
@@ -10,7 +10,7 @@ use storage_types::{
 use crate::{
     Stream, StreamAppendAllocation, StreamAttempt, StreamDataType, StreamError,
     StreamPartitioningMode, StreamPort, StreamResult, StreamRowValue, StreamValidationKind,
-    constants::STREAM_WRITE_RETRY,
+    constants::STREAM_WRITE,
 };
 
 /// Validated append payload with its request-time sample and timestamp.
@@ -89,25 +89,30 @@ pub(crate) async fn append_item<P: StreamPort>(
         item_data.to_vec(),
         partition_key.map(str::to_owned),
         port.now(),
-        rand::random(),
+        storage_types::ambient::uuid_v4().as_u128(),
     )?;
     let allocation = port.item_id_allocation();
-    let (staged, stamp) = retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
-        let input = input.clone();
-        let name = name.clone();
-        port.with_committed_stream_attempt(move |attempt| {
-            Box::pin(async move {
-                let stream = crate::stream_catalog::load_user_stream_in_attempt(attempt, &name)
-                    .await?
-                    .into_result()?;
-                accept_user_append_in_attempt(attempt, stream, input)
-                    .await?
-                    .into_result()?
-                    .append(allocation)
-                    .await
+    let (staged, stamp) = storage_common::retry::retry_tries(
+        port,
+        port.attempt_deadlines(),
+        STREAM_WRITE,
+        |attempt_request, _| {
+            let input = input.clone();
+            let name = name.clone();
+            port.with_committed_stream_attempt(attempt_request, move |attempt| {
+                Box::pin(async move {
+                    let stream = crate::stream_catalog::load_user_stream_in_attempt(attempt, &name)
+                        .await?
+                        .into_result()?;
+                    accept_user_append_in_attempt(attempt, stream, input)
+                        .await?
+                        .into_result()?
+                        .append(allocation)
+                        .await
+                })
             })
-        })
-    })
+        },
+    )
     .await
     .map_err(StreamError::from_storage_error)?;
     staged

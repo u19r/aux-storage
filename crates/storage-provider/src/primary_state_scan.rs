@@ -3,7 +3,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use storage_common::{DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT};
+use storage_common::MAX_SCAN_LIMIT;
 use storage_types::{BoundTableInfo, ScanTableRequest, StorageResult};
 
 use crate::{
@@ -47,7 +47,7 @@ impl PrimaryStateScan {
         &self,
         bound: &'a BoundRangeReadPlan<'a>,
     ) -> StorageResult<BoundRangeReadPage<'a>> {
-        bound.page(DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT)
+        bound.page(MAX_SCAN_LIMIT)
     }
 }
 

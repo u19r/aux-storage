@@ -5,18 +5,19 @@ use scheduled_bg_jobs::{
 };
 use storage_types::{StorageError, StorageResult, TimestampMillis, maintenance::StepResult};
 
-use super::{ExpirationRepository, ExpirationRequest};
+use super::ExpirationRequest;
+use crate::maintenance::MaintenanceOperations;
 
 const EXPIRATION_PAGE_LIMIT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(255);
 
 pub struct ExpirationHandler {
-    repository: Arc<dyn ExpirationRepository>,
+    repository: Arc<dyn MaintenanceOperations>,
     interval: Duration,
 }
 
 impl ExpirationHandler {
     pub fn try_new(
-        repository: Arc<dyn ExpirationRepository>,
+        repository: Arc<dyn MaintenanceOperations>,
         interval: Duration,
     ) -> StorageResult<Self> {
         if interval.is_zero() {

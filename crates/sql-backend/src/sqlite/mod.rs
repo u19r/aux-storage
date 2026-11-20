@@ -12,7 +12,11 @@ mod value;
 #[cfg(test)]
 mod durability_tests;
 #[cfg(test)]
+mod error_tests;
+#[cfg(test)]
 mod transaction_tests;
 
 pub use attempt::SqliteAttempt;
 pub use driver::SqliteBackend;
+#[cfg(test)]
+mod driver_tests;

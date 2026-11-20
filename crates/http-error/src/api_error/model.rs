@@ -1,17 +1,16 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 use storage_types::{
-    AttributeMap, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
+    AttemptFailure, AttributeMap, CancellationReason, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
     DYNAMODB_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
     DYNAMODB_MISSING_AUTH_TOKEN_MESSAGE, DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE,
     DYNAMODB_RESOURCE_IN_USE_MESSAGE, DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE,
-    DYNAMODB_THROTTLING_MESSAGE, DYNAMODB_TRANSACTION_CANCELED_MESSAGE, StorageEnum, StorageError,
-    context::WrappedError as _,
+    DYNAMODB_THROTTLING_MESSAGE, DYNAMODB_TRANSACTION_CANCELED_MESSAGE,
+    DYNAMODB_TRANSACTION_CONFLICT_MESSAGE, StorageEnum, StorageError, context::WrappedError as _,
 };
 use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ErrorResponse {
     /// AWS-compatible JSON error field name. DynamoDB and SQS JSON protocol
     /// errors use `__type`. Machine-readable API error type.
@@ -53,7 +52,8 @@ pub struct ErrorResponse {
     pub retry_after_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct DynamoDbCancellationReason {
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
     pub item: Option<AttributeMap>,
@@ -63,99 +63,9 @@ pub struct DynamoDbCancellationReason {
     pub message: Option<String>,
 }
 
-pub trait IntoApiError {
-    fn status_code(&self) -> u16;
-    fn error_code(&self) -> Cow<'static, str>;
-    fn error_message(&self) -> Cow<'static, str>;
-
-    fn error_response(&self) -> ErrorResponse {
-        ErrorResponse {
-            error_type: self.error_code().into_owned(),
-            message: self.error_message().into_owned(),
-            transaction_message: None,
-            cancellation_reasons: None,
-            item: None,
-            request_id: None,
-            documentation_url: None,
-            retry_after_seconds: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ValidationIssue {
-    /// Machine-readable validation error code.
-    #[schema(example = "invalid_request")]
-    pub code: Cow<'static, str>,
-    /// Field name that failed validation.
-    #[schema(example = "slug")]
-    pub field: Cow<'static, str>,
-    /// JSON path for the invalid field.
-    #[schema(example = "body.slug")]
-    pub path: Cow<'static, str>,
-    /// Human-readable validation message.
-    #[schema(example = "slug must contain only lowercase letters, numbers, and hyphens")]
-    pub message: Cow<'static, str>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct ErrorEnvelope {
-    /// Machine-readable error code.
-    #[schema(example = "invalid_request")]
-    pub code: Cow<'static, str>,
-    /// Human-readable error message.
-    #[schema(example = "Invalid request body")]
-    pub message: Cow<'static, str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Optional field associated with this error.
-    #[schema(nullable = true, example = "slug")]
-    pub field: Option<Cow<'static, str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Optional JSON path associated with this error.
-    #[schema(nullable = true, example = "body.slug")]
-    pub path: Option<Cow<'static, str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Request correlation identifier echoed in the response body.
-    #[schema(nullable = true, example = "018f1f61-2a6f-7ac3-b9b6-7f65bb2d91fd")]
-    pub request_id: Option<Cow<'static, str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Optional documentation link for operator or developer remediation.
-    #[schema(nullable = true, example = "/docs/explanations/error-code-catalog")]
-    pub documentation_url: Option<Cow<'static, str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Optional retry budget for rate-limited responses.
-    #[schema(nullable = true, example = 2)]
-    pub retry_after_seconds: Option<u64>,
-}
-
-impl ErrorEnvelope {
-    #[must_use]
-    pub fn new(code: impl Into<Cow<'static, str>>, message: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-            field: None,
-            path: None,
-            request_id: None,
-            documentation_url: None,
-            retry_after_seconds: None,
-        }
-    }
-
-    #[must_use]
-    pub fn with_field_path(
-        mut self,
-        field: Option<impl Into<Cow<'static, str>>>,
-        path: Option<impl Into<Cow<'static, str>>>,
-    ) -> Self {
-        self.field = field.map(Into::into);
-        self.path = path.map(Into::into);
-        self
-    }
-}
-
 /// HTTP API error type that doesn't depend on Axum
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields)]
 pub struct HttpApiError {
     pub error_type: String,
@@ -183,28 +93,6 @@ impl HttpApiError {
             error_type: "InternalServerError".to_string(),
             message: message.into(),
             status_code: 500,
-            cancellation_reasons: None,
-            item: None,
-            response_headers: Vec::new(),
-        }
-    }
-
-    pub fn resource_in_use_error(message: impl Into<String>) -> Self {
-        Self {
-            error_type: "ResourceInUseException".to_string(),
-            message: message.into(),
-            status_code: 400,
-            cancellation_reasons: None,
-            item: None,
-            response_headers: Vec::new(),
-        }
-    }
-
-    pub fn resource_not_found_error(message: impl Into<String>) -> Self {
-        Self {
-            error_type: "ResourceNotFoundException".to_string(),
-            message: message.into(),
-            status_code: 400,
             cancellation_reasons: None,
             item: None,
             response_headers: Vec::new(),
@@ -280,6 +168,17 @@ impl HttpApiError {
         )
     }
 
+    /// The DynamoDB 500 for every internal-class storage failure, an unknown
+    /// commit outcome and a capacity refusal: constant text, no cause.
+    #[must_use]
+    pub fn dynamodb_internal_error() -> Self {
+        Self::dynamodb_protocol_error(
+            "InternalServerError",
+            DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+            500,
+        )
+    }
+
     pub fn aws_query_error(
         error_type: impl Into<String>,
         message: impl Into<String>,
@@ -310,25 +209,14 @@ impl HttpApiError {
         self.item = Some(Box::new(item));
         self
     }
-}
 
-impl IntoApiError for HttpApiError {
-    fn status_code(&self) -> u16 {
-        self.status_code
-    }
-
-    fn error_code(&self) -> Cow<'static, str> {
-        Cow::Owned(self.error_type.clone())
-    }
-
-    fn error_message(&self) -> Cow<'static, str> {
-        Cow::Owned(self.message.clone())
-    }
-
-    fn error_response(&self) -> ErrorResponse {
+    /// The JSON error body of this error with its cancellation reasons, item
+    /// and `Retry-After` seconds; the transaction message stays empty.
+    #[must_use]
+    pub fn error_response(&self) -> ErrorResponse {
         ErrorResponse {
-            error_type: self.error_code().into_owned(),
-            message: self.error_message().into_owned(),
+            error_type: self.error_type.clone(),
+            message: self.message.clone(),
             transaction_message: None,
             cancellation_reasons: self.cancellation_reasons.clone(),
             item: self.item.as_ref().map(|item| (**item).clone()),
@@ -343,19 +231,28 @@ impl IntoApiError for HttpApiError {
     }
 }
 
+/// The DynamoDB answer. Class contract (ARCH-2-f, `StorageError::class()`):
+/// `CommitUnknown`, `Capacity` and `Internal` answer `dynamodb_internal_error`
+/// (fixed exceptions: `Unsupported` keeps its fixed capability text,
+/// `AwsService` relays the remote AWS answer); `Retryable` never answers 500;
+/// `Client` answers 4xx with its AWS type. A DynamoDB request can exceed a
+/// native transaction limit by itself, so `Capacity` is not answered 503.
 impl From<StorageError> for HttpApiError {
     fn from(error: StorageError) -> Self {
         let variant: &StorageEnum = error.to_enum();
         match variant {
-            StorageEnum::Database(err) => {
-                Self::internal_server_error(format!("Database error: {err}"))
-            }
-            StorageEnum::AwsSerialization(err) => {
-                Self::internal_server_error(format!("AWS serialization error: {err}"))
-            }
-            StorageEnum::Serialization(err) => {
-                Self::internal_server_error(format!("Serialization error: {err}"))
-            }
+            StorageEnum::Database(_)
+            | StorageEnum::AwsSerialization(_)
+            | StorageEnum::Serialization(_)
+            | StorageEnum::InfrastructureResult(_)
+            | StorageEnum::InternalServerError { .. }
+            | StorageEnum::HistoryUnavailable
+            | StorageEnum::GuardConflict { .. }
+            | StorageEnum::IdempotencyReplay { .. }
+            | StorageEnum::Attempt(
+                AttemptFailure::CommitUnknown(_) | AttemptFailure::Capacity { .. },
+            ) => Self::dynamodb_internal_error(),
+            StorageEnum::Unsupported { message } => Self::internal_server_error(message.clone()),
 
             StorageEnum::TableAlreadyExists { name } => Self::dynamodb_protocol_error(
                 "ResourceInUseException",
@@ -380,37 +277,27 @@ impl From<StorageError> for HttpApiError {
             ),
             StorageEnum::TrimmedDataAccess => Self::dynamodb_protocol_error(
                 "TrimmedDataAccessException",
-                variant.to_string(),
+                "The data you are trying to access has been trimmed.",
                 400,
             ),
             StorageEnum::DeletionProtectionEnabled { message, .. } => {
                 Self::dynamodb_protocol_error("ValidationException", message.clone(), 400)
             }
 
-            StorageEnum::InternalServerError { .. } => Self::dynamodb_protocol_error(
-                "InternalServerError",
-                DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
-                500,
-            ),
             StorageEnum::ServiceUnavailable {
                 retry_after_seconds,
                 ..
             } => Self::service_unavailable(*retry_after_seconds),
-            // Commit uncertainty stays internal. A DynamoDB 500 does not
-            // assert whether a write took effect.
-            StorageEnum::SyncNotLeader { .. }
-            | StorageEnum::SyncSubmissionAmbiguous { .. }
-            | StorageEnum::InfrastructureResult(_)
-            | StorageEnum::HistoryUnavailable => Self::dynamodb_protocol_error(
-                "InternalServerError",
-                DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
-                500,
+            // Known not committed: a client may repeat. A fresh-validation
+            // failure has had its one shared retry.
+            StorageEnum::Attempt(
+                AttemptFailure::Unavailable(_) | AttemptFailure::FreshValidation(_),
+            ) => Self::service_unavailable(1),
+            StorageEnum::Attempt(AttemptFailure::Conflict(_)) => Self::dynamodb_protocol_error(
+                "TransactionConflictException",
+                DYNAMODB_TRANSACTION_CONFLICT_MESSAGE,
+                400,
             ),
-            StorageEnum::GuardConflict { message } => Self::internal_server_error(message.clone()),
-            StorageEnum::Unsupported { message } => Self::internal_server_error(message.clone()),
-            StorageEnum::TransactionConflict { message } => {
-                Self::dynamodb_protocol_error("TransactionConflictException", message.clone(), 400)
-            }
             StorageEnum::TransactionInProgress { message } => Self::dynamodb_protocol_error(
                 "TransactionInProgressException",
                 message.clone(),
@@ -421,9 +308,6 @@ impl From<StorageError> for HttpApiError {
                 DYNAMODB_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
                 400,
             ),
-            StorageEnum::IdempotencyReplay { .. } => {
-                Self::internal_server_error("native idempotency replay escaped its owning provider")
-            }
             StorageEnum::ConditionalCheckFailed => Self::dynamodb_protocol_error(
                 "ConditionalCheckFailedException",
                 DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
@@ -435,14 +319,34 @@ impl From<StorageError> for HttpApiError {
                 400,
             )
             .with_item(item.clone()),
-            StorageEnum::IndexNotFound { .. } => Self::dynamodb_protocol_error(
+            StorageEnum::IndexNotFound {
+                index_name,
+                table_name,
+            } => Self::dynamodb_protocol_error(
                 "ResourceNotFoundException",
-                DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE,
+                format!(
+                    "{DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE}: Index {index_name} for table \
+                     {table_name}"
+                ),
                 400,
             ),
-            StorageEnum::ResourceNotFound { .. } => Self::dynamodb_protocol_error(
+            StorageEnum::ResourceNotFound {
+                resource_type,
+                resource_id,
+            } => Self::dynamodb_protocol_error(
                 "ResourceNotFoundException",
-                DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE,
+                match (*resource_type, resource_id.as_str()) {
+                    ("shard", _) => {
+                        format!("{DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE}: Shard does not exist")
+                    }
+                    ("stream", "") => {
+                        format!("{DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE}: Stream does not exist")
+                    }
+                    ("stream", arn) => {
+                        format!("{DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE}: Stream: {arn} not found")
+                    }
+                    _ => DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE.to_owned(),
+                },
                 400,
             ),
             StorageEnum::ResourceExists { .. } => Self::dynamodb_protocol_error(
@@ -454,7 +358,10 @@ impl From<StorageError> for HttpApiError {
                 Self::dynamodb_protocol_error("ValidationException", message.to_string(), 400)
             }
             StorageEnum::TransactionCanceled { reasons } => {
-                let cancellation_reasons = dynamodb_cancellation_reasons(reasons);
+                let cancellation_reasons = reasons
+                    .iter()
+                    .map(DynamoDbCancellationReason::from)
+                    .collect::<Vec<_>>();
                 let reason_codes = cancellation_reasons
                     .iter()
                     .map(|reason| reason.code.as_str())
@@ -531,10 +438,14 @@ fn dynamodb_validation_message(message: &str) -> String {
                 value: "
             .to_string();
     }
+    if message.starts_with("The parameter cannot be converted to a numeric value: ") {
+        return format!("1 validation error detected: {message}");
+    }
     if message.starts_with("1 validation error detected:")
         || message.starts_with("One or more parameter values were invalid:")
         || message == "The provided key element does not match the schema"
         || message == "Item size has exceeded the maximum allowed size"
+        || message == "Item size to update has exceeded the maximum allowed size"
     {
         return message.to_string();
     }
@@ -592,30 +503,12 @@ impl From<HttpApiError> for (axum::http::StatusCode, axum::response::Json<ErrorR
     }
 }
 
-fn dynamodb_cancellation_reasons(reasons: &[String]) -> Vec<DynamoDbCancellationReason> {
-    reasons
-        .iter()
-        .map(|reason| {
-            let mut parts = reason.splitn(3, '\t');
-            let code = parts.next().unwrap_or_default();
-            let message = parts.next().map(ToString::to_string);
-            let item = parts
-                .next()
-                .and_then(|item| serde_json::from_str::<AttributeMap>(item).ok());
-            DynamoDbCancellationReason {
-                item,
-                code: code.to_string(),
-                message: message.or_else(|| default_cancellation_reason_message(code)),
-            }
-        })
-        .collect()
-}
-
-fn default_cancellation_reason_message(code: &str) -> Option<String> {
-    match code {
-        "ConditionalCheckFailed" => Some(DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE.to_string()),
-        "ValidationError" => Some(String::new()),
-        "None" => None,
-        _ => None,
+impl From<&CancellationReason> for DynamoDbCancellationReason {
+    fn from(reason: &CancellationReason) -> Self {
+        Self {
+            item: reason.item.clone(),
+            code: reason.code.as_str().to_string(),
+            message: reason.message.clone(),
+        }
     }
 }

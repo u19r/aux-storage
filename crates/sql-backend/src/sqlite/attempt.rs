@@ -1,6 +1,4 @@
-use std::num::NonZeroUsize;
-#[cfg(feature = "fault-injection")]
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use storage_types::StorageResult;
 
@@ -12,7 +10,10 @@ pub struct SqliteAttempt {
     settlement: storage_types::NativeAttemptSettlement,
     session: Session,
     mode: AttemptMode,
-    #[cfg(feature = "fault-injection")]
+    // Any execute call or query that is not read-only registers this attempt
+    // as a pending durable writer before its commit, even if it fails.
+    durable_write: DurableWriteSlot,
+    /// `None` in production.
     fault_probe: Option<Arc<dyn crate::SqlFaultProbe>>,
 }
 
@@ -20,21 +21,86 @@ impl SqliteAttempt {
     pub(super) fn new(
         session: Session,
         execution: (AttemptMode, Option<storage_types::NativeWorkLimits>),
-        #[cfg(feature = "fault-injection")] fault_probe: Option<Arc<dyn crate::SqlFaultProbe>>,
+        durable_write: DurableWriteSlot,
+        fault_probe: Option<Arc<dyn crate::SqlFaultProbe>>,
     ) -> Self {
         let (mode, limits) = execution;
         Self {
             settlement: storage_types::NativeAttemptSettlement::new(limits),
             session,
             mode,
-            #[cfg(feature = "fault-injection")]
+            durable_write,
             fault_probe,
+        }
+    }
+
+    fn record_write(&self, wrote: bool) {
+        if wrote {
+            self.durable_write.register();
         }
     }
 }
 
+/// The attempt's registration as a pending durable writer. The driver takes
+/// it after the native commit or failure and settles durability with it.
+#[derive(Clone)]
+pub(super) struct DurableWriteSlot {
+    batch: Option<std::sync::Arc<storage_common::durability::DurabilityBatch>>,
+    write:
+        std::sync::Arc<std::sync::Mutex<Option<storage_common::durability::PendingDurableWrite>>>,
+}
+
+impl DurableWriteSlot {
+    pub(super) fn new(
+        batch: Option<std::sync::Arc<storage_common::durability::DurabilityBatch>>,
+    ) -> Self {
+        Self {
+            batch,
+            write: std::sync::Arc::default(),
+        }
+    }
+
+    fn register(&self) {
+        let Some(batch) = &self.batch else {
+            return;
+        };
+        let mut write = self
+            .write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if write.is_none() {
+            *write = Some(batch.begin_write());
+        }
+    }
+
+    pub(super) fn is_registered(&self) -> bool {
+        self.write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// On the writer thread, right after the native commit returned success.
+    pub(super) fn record_commit(&self) {
+        if let Some(write) = self
+            .write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            write.record_commit();
+        }
+    }
+
+    pub(super) fn take(&self) -> Option<storage_common::durability::PendingDurableWrite> {
+        self.write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
 impl SqlAttempt for SqliteAttempt {
-    #[cfg(feature = "fault-injection")]
     fn fault_probe(&self) -> Option<&dyn crate::SqlFaultProbe> {
         self.fault_probe.as_deref()
     }
@@ -63,18 +129,28 @@ impl SqlAttempt for SqliteAttempt {
             for (_, protection) in &statements {
                 protection.validate(self.mode)?;
             }
-            #[cfg(feature = "fault-injection")]
+            let writes = self.mode != AttemptMode::ReadOnly;
             let fault_probe = self.fault_probe.clone();
-            self.session
+            let wave = match self.fault_probe.as_deref() {
+                Some(probe) => {
+                    let sql = statements
+                        .iter()
+                        .map(|(statement, _)| statement.sql())
+                        .collect::<Vec<_>>();
+                    crate::fault_injection::SqlWave::start_plain(Some(probe), &sql).await?
+                }
+                None => None,
+            };
+            let (pages, wrote) = self
+                .session
                 .call(move |connection| {
-                    let native = NativeStatements::new(
-                        connection,
-                        #[cfg(feature = "fault-injection")]
-                        fault_probe.as_deref(),
-                    );
-                    native.query_batch(statements, max_bytes)
+                    let native = NativeStatements::new(connection, writes, fault_probe.as_deref());
+                    Ok((native.query_batch(statements, max_bytes), native.wrote()))
                 })
-                .await
+                .await?;
+            crate::fault_injection::end_wave(wave);
+            self.record_write(wrote);
+            pages
         }
         .await;
         let result = result.and_then(|pages| {
@@ -94,25 +170,31 @@ impl SqlAttempt for SqliteAttempt {
                 statement.charge_work(&self.settlement)?;
             }
             self.mode.require_write()?;
-            #[cfg(feature = "fault-injection")]
+            self.record_write(!statements.is_empty());
             let fault_probe = self.fault_probe.clone();
-            self.session
+            let wave = match self.fault_probe.as_deref() {
+                Some(probe) => {
+                    let sql = statements.iter().map(SqlStatement::sql).collect::<Vec<_>>();
+                    crate::fault_injection::SqlWave::start_plain(Some(probe), &sql).await?
+                }
+                None => None,
+            };
+            let counts = self
+                .session
                 .call(move |connection| {
-                    let native = NativeStatements::new(
-                        connection,
-                        #[cfg(feature = "fault-injection")]
-                        fault_probe.as_deref(),
-                    );
+                    let native = NativeStatements::new(connection, true, fault_probe.as_deref());
                     native.execute_batch(statements)
                 })
-                .await
+                .await;
+            crate::fault_injection::end_wave(wave);
+            counts
         }
         .await;
         let result = result.and_then(|counts| {
             let bytes = counts
                 .len()
                 .checked_mul(std::mem::size_of::<u64>())
-                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .ok_or(storage_types::AttemptFailure::CAPACITY)?;
             self.settlement.charge_data(bytes)?;
             Ok(counts)
         });
@@ -129,18 +211,23 @@ impl SqlAttempt for SqliteAttempt {
         let result = async {
             statement.charge_work(&self.settlement)?;
             protection.validate(self.mode)?;
-            #[cfg(feature = "fault-injection")]
+            let writes = self.mode != AttemptMode::ReadOnly;
             let fault_probe = self.fault_probe.clone();
-            self.session
+            let wave = crate::fault_injection::SqlWave::start_plain(
+                self.fault_probe.as_deref(),
+                &[statement.sql()],
+            )
+            .await?;
+            let (page, wrote) = self
+                .session
                 .call(move |connection| {
-                    NativeStatements::new(
-                        connection,
-                        #[cfg(feature = "fault-injection")]
-                        fault_probe.as_deref(),
-                    )
-                    .query(statement, max_bytes)
+                    let native = NativeStatements::new(connection, writes, fault_probe.as_deref());
+                    Ok((native.query(statement, max_bytes), native.wrote()))
                 })
-                .await
+                .await?;
+            crate::fault_injection::end_wave(wave);
+            self.record_write(wrote);
+            page
         }
         .await;
         let result = result.and_then(|page| {
@@ -155,18 +242,22 @@ impl SqlAttempt for SqliteAttempt {
         let result = async {
             statement.charge_work(&self.settlement)?;
             self.mode.require_write()?;
-            #[cfg(feature = "fault-injection")]
+            self.record_write(true);
             let fault_probe = self.fault_probe.clone();
-            self.session
+            let wave = crate::fault_injection::SqlWave::start_plain(
+                self.fault_probe.as_deref(),
+                &[statement.sql()],
+            )
+            .await?;
+            let count = self
+                .session
                 .call(move |connection| {
-                    NativeStatements::new(
-                        connection,
-                        #[cfg(feature = "fault-injection")]
-                        fault_probe.as_deref(),
-                    )
-                    .execute(statement)
+                    NativeStatements::new(connection, true, fault_probe.as_deref())
+                        .execute(statement)
                 })
-                .await
+                .await;
+            crate::fault_injection::end_wave(wave);
+            count
         }
         .await;
         let result = result.and_then(|count| {

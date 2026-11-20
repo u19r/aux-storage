@@ -4,26 +4,44 @@ use std::{future::Future, sync::Arc};
 
 use storage_backfill::GsiProjectionLifecycle;
 use storage_types::{
-    BoundTableInfo, DeleteItemRequest, DynamoRequestValidate as _, ItemProvenance, KeyAttributes,
-    PutItemRequest, StorageEnum, StorageError, StorageResult, TableName, TimestampMillis,
-    TransactConditionCheckRequest, TransactWriteItem, TransactWriteItemsRequest,
-    TransactWriteItemsResponse, UpdateItemRequest, context::WrappedError as _,
-    return_values_on_condition_check_failure_all_old, transact_key_fingerprint,
-    transaction_canceled_for_indexed_reasons, transaction_cancellation_reason_at,
-    transaction_write_binding_error_with_len, validate_transact_key,
+    BoundTableInfo, CancellationReason, DeleteItemRequest, DynamoRequestValidate as _,
+    KeyAttributes, PutItemRequest, StorageEnum, StorageError, StorageResult, TableName,
+    TimestampMillis, TransactConditionCheckRequest, TransactWriteItem, TransactWriteItemsRequest,
+    TransactWriteItemsResponse, UpdateItemRequest, condition::CompiledCondition,
+    context::WrappedError as _, return_values_on_condition_check_failure_all_old,
+    transact_key_fingerprint, transaction_canceled_for_indexed_reasons,
+    transaction_cancellation_reason_at, transaction_write_binding_error_with_len,
+    validate_transact_key,
 };
 
 use crate::{
     AcceptedDeleteItem, AcceptedUpsert, BoundDeleteItem, BoundPutItem, BoundUpdateItem,
-    DeleteItemAttempt, DeleteItemShape, ItemWriteObservation, ItemWriteObservationRead,
-    PutItemShape, SemanticDecision, TableMetadataCache, UncheckedCondition, UpdateItemShape,
-    UpsertAttempt, prepare_accepted_delete, prepare_accepted_upsert,
-    transact_idempotency::{TransactTokenRequest, encode_transact_receipt, find_transact_response},
+    DeleteItemShape, ItemWriteAttempt, ItemWriteObservation, ItemWriteObservationRead,
+    PutItemShape, SemanticDecision, UpdateItemShape, prepare_accepted_delete,
+    prepare_accepted_upsert,
+    transact_idempotency::{TransactTokenRequest, encode_transact_receipt},
 };
+
+/// Where one transact receipt lives. A plain request token uses the
+/// receipt table. A scheduled-job effect uses its execution's receipt
+/// group in the scheduled-job data keyspace, so the job store removes it
+/// with the execution.
+#[derive(Clone, Copy, Debug)]
+pub enum ReceiptSlot<'a> {
+    Request(&'a str),
+    JobEffect(&'a scheduled_bg_jobs::store::StoreKey),
+}
 
 /// The lowerer only protects and stores opaque bytes. Token identity, expiry,
 /// replay, and response decisions are shared across all five drivers.
-pub trait DynamoTransactWriteAttempt: UpsertAttempt + DeleteItemAttempt {
+pub trait DynamoTransactWriteAttempt: ItemWriteAttempt + crate::CatalogAttempt {
+    fn read_write_observations(
+        &mut self,
+        batch: crate::WriteObservationBatch<'_>,
+    ) -> impl Future<Output = StorageResult<crate::WriteObservationBatchResult>> + Send {
+        crate::read_write_observations_default(self, batch)
+    }
+
     /// Loads an ordered scheduled-job row with conflict protection in this
     /// same native attempt. Unsupported adapters must fail closed.
     fn read_scheduled_jobs(
@@ -39,50 +57,46 @@ pub trait DynamoTransactWriteAttempt: UpsertAttempt + DeleteItemAttempt {
 
     fn read_transact_receipt(
         &mut self,
-        token: &str,
+        slot: ReceiptSlot<'_>,
     ) -> impl Future<Output = StorageResult<Option<Vec<u8>>>> + Send;
 
-    fn write_transact_receipt(
+    fn stage_transact_receipt(
         &mut self,
-        token: &str,
+        slot: ReceiptSlot<'_>,
         receipt: Vec<u8>,
-    ) -> impl Future<Output = StorageResult<()>> + Send;
+    ) -> StorageResult<()>;
 }
 
-#[derive(Clone)]
 pub struct DynamoTransactWriteShape {
-    members: Vec<MemberShape>,
+    members: Arc<[MemberShape]>,
     token: Option<TransactTokenRequest>,
     effect_authority: Option<crate::job_write_authority::JobWriteAuthority>,
 }
 
-#[derive(Clone)]
 enum MemberShape {
-    Put(PutItemShape),
-    Update(UpdateItemShape),
-    Delete(DeleteItemShape),
-    Check(ConditionCheckShape),
+    Put(Arc<PutItemShape>),
+    Update(Arc<UpdateItemShape>),
+    Delete(Arc<DeleteItemShape>),
+    Check(Arc<ConditionCheckShape>),
 }
 
-#[derive(Clone)]
 struct ConditionCheckShape {
     table_name: TableName,
     key: KeyAttributes,
-    condition: UncheckedCondition,
+    condition: CompiledCondition,
     return_old_on_failure: bool,
 }
 
 struct BoundConditionCheck {
     table: Arc<BoundTableInfo>,
     key: KeyAttributes,
-    condition: UncheckedCondition,
-    return_old_on_failure: bool,
+    shape: Arc<ConditionCheckShape>,
 }
 
 enum BoundMember {
     Put(Box<BoundPutItem>),
     Update(BoundUpdateItem),
-    Delete(BoundDeleteItem),
+    Delete(Box<BoundDeleteItem>),
     Check(BoundConditionCheck),
 }
 
@@ -96,21 +110,7 @@ pub enum AcceptedTransactWriteMember {
 /// The successful condition's protected observation survives acceptance.
 /// Regional capture must not re-read the checked item or invent a mutation.
 pub struct AcceptedTransactConditionCheck {
-    pub table: Arc<BoundTableInfo>,
-    pub key: KeyAttributes,
     pub old_item: Option<storage_types::VerifiedWireItem>,
-    pub old_indexers: Vec<String>,
-    pub old_provenance: Option<ItemProvenance>,
-}
-
-impl AcceptedTransactWriteMember {
-    pub fn mutation(&self) -> Option<crate::AcceptedMutationRef<'_>> {
-        match self {
-            Self::Put(item) | Self::Update(item) => Some(crate::AcceptedMutationRef::Upsert(item)),
-            Self::Delete(item) => Some(crate::AcceptedMutationRef::Delete(item)),
-            Self::ConditionCheck(_) => None,
-        }
-    }
 }
 
 impl MemberShape {
@@ -123,11 +123,7 @@ impl MemberShape {
         }
     }
 
-    fn bind(
-        self,
-        table: Arc<BoundTableInfo>,
-        ttl: Option<&crate::TtlConfigRecord>,
-    ) -> StorageResult<BoundMember> {
+    fn bind(&self, table: Arc<BoundTableInfo>) -> StorageResult<BoundMember> {
         let key = match &self {
             Self::Put(_) => None,
             Self::Update(shape) => Some(shape.key()),
@@ -138,21 +134,20 @@ impl MemberShape {
             validate_transact_key(&table.info, key)?;
         }
         match self {
-            Self::Put(shape) => shape
-                .bind_table(Arc::clone(&table), ttl)
+            Self::Put(shape) => Arc::clone(shape)
+                .bind_table(Arc::clone(&table))
                 .map(Box::new)
                 .map(BoundMember::Put),
-            Self::Update(shape) => shape.bind_table(table).map(BoundMember::Update),
-            Self::Delete(shape) => shape.bind_table(table).map(BoundMember::Delete),
-            Self::Check(mut shape) => {
-                shape.key.normalize_numbers_for_write();
-                Ok(BoundMember::Check(BoundConditionCheck {
-                    table,
-                    key: shape.key,
-                    condition: shape.condition,
-                    return_old_on_failure: shape.return_old_on_failure,
-                }))
-            }
+            Self::Update(shape) => Arc::clone(shape).bind_table(table).map(BoundMember::Update),
+            Self::Delete(shape) => Arc::clone(shape)
+                .bind_table(table)
+                .map(Box::new)
+                .map(BoundMember::Delete),
+            Self::Check(shape) => Ok(BoundMember::Check(BoundConditionCheck {
+                table,
+                key: shape.key.clone(),
+                shape: Arc::clone(shape),
+            })),
         }
     }
 }
@@ -180,36 +175,10 @@ impl DynamoTransactWriteShape {
             .map(MemberShape::try_from)
             .collect::<StorageResult<Vec<_>>>()?;
         Ok(Self {
-            members,
+            members: members.into(),
             token,
             effect_authority: None,
         })
-    }
-
-    pub fn try_from_job_effect(
-        request: TransactWriteItemsRequest,
-        authority: scheduled_bg_jobs::JobEffectAuthority,
-    ) -> StorageResult<Self> {
-        Self::try_from_request(request)?.authorize_effect(
-            crate::job_write_authority::JobWriteAuthority::Effect(authority),
-        )
-    }
-
-    pub fn try_from_job_projection(
-        request: crate::JobTerminalProjection,
-        authority: scheduled_bg_jobs::JobTerminalAuthority,
-    ) -> StorageResult<Self> {
-        Self::try_from_request(request.into_request())?.authorize_effect(
-            crate::job_write_authority::JobWriteAuthority::Terminal(authority),
-        )
-    }
-
-    pub async fn read_replay<A: DynamoTransactWriteAttempt>(
-        &self,
-        attempt: &mut A,
-        captured_at: TimestampMillis,
-    ) -> StorageResult<SemanticDecision<Option<TransactWriteItemsResponse>>> {
-        find_transact_response(attempt, self.token.as_ref(), captured_at).await
     }
 
     /// Requires a runtime-issued witness and binds receipt replay to its
@@ -221,34 +190,48 @@ impl DynamoTransactWriteShape {
         let token = self.token.as_mut().ok_or_else(|| {
             StorageError::validation("scheduled-job effects require a replay token")
         })?;
-        token.authorize_effect(&authority);
+        token.authorize_effect(&authority)?;
         self.effect_authority = Some(authority);
         Ok(self)
     }
 
     pub fn bind(
-        self,
-        lookup: StorageResult<impl Fn(&TableName) -> StorageResult<crate::WriteTableBinding>>,
+        self: Arc<Self>,
+        lookup: StorageResult<impl Fn(&TableName) -> StorageResult<Arc<BoundTableInfo>>>,
         captured_at: TimestampMillis,
     ) -> BoundTransactWrite {
         let receipt = self
             .token
+            .as_ref()
             .map(|request| {
-                let bytes = encode_transact_receipt(&request, captured_at)?;
-                Ok(PreparedTransactReceipt { request, bytes })
+                let bytes = encode_transact_receipt(request, captured_at)?;
+                Ok(PreparedTransactReceipt {
+                    shape: Arc::clone(&self),
+                    bytes,
+                })
             })
             .transpose();
-        let members = lookup.and_then(|lookup| bind_members(self.members, lookup));
+        let members = match lookup {
+            Ok(lookup) => bind_members(&self.members, lookup),
+            Err(error) if matches!(error.as_ref(), StorageEnum::TableNotFound { .. }) => {
+                Ok(SemanticDecision::Rejected(error))
+            }
+            Err(error) => Err(error),
+        };
         BoundTransactWrite {
             members,
             receipt,
-            effect_authority: self.effect_authority,
+            effect_authority: self.effect_authority.clone(),
         }
+    }
+
+    pub(crate) fn token(&self) -> Option<&TransactTokenRequest> {
+        self.token.as_ref()
     }
 
     pub fn table_names(&self) -> Vec<TableName> {
         let mut names = Vec::new();
-        for member in &self.members {
+        for member in self.members.iter() {
             if !names.contains(member.table_name()) {
                 names.push(member.table_name().clone());
             }
@@ -258,17 +241,30 @@ impl DynamoTransactWriteShape {
 }
 
 fn bind_members(
-    members: Vec<MemberShape>,
-    lookup: impl Fn(&TableName) -> StorageResult<crate::WriteTableBinding>,
+    members: &[MemberShape],
+    lookup: impl Fn(&TableName) -> StorageResult<Arc<BoundTableInfo>>,
 ) -> StorageResult<SemanticDecision<Vec<BoundMember>>> {
     let total = members.len();
     let mut seen = Vec::with_capacity(total);
     let mut bound = Vec::with_capacity(total);
-    for (ordinal, member) in members.into_iter().enumerate() {
-        let crate::WriteTableBinding { table, ttl } = lookup(member.table_name())?;
-        let item = match member.bind(table, ttl.as_ref()) {
+    for (ordinal, member) in members.iter().enumerate() {
+        let table = match lookup(member.table_name()) {
+            Ok(table) => table,
+            Err(error) if matches!(error.as_ref(), StorageEnum::TableNotFound { .. }) => {
+                return Ok(SemanticDecision::Rejected(error));
+            }
+            Err(error) => return Err(error),
+        };
+        let item = match member.bind(table) {
             Ok(item) => item,
-            Err(error) if matches!(error.as_ref(), StorageEnum::Validation { .. }) => {
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    StorageEnum::Validation { .. }
+                        | StorageEnum::RawValidation { .. }
+                        | StorageEnum::KeyValidation(_)
+                ) =>
+            {
                 return Ok(SemanticDecision::Rejected(
                     transaction_write_binding_error_with_len(ordinal, total, error),
                 ));
@@ -308,17 +304,26 @@ impl BoundTransactWrite {
             .collect()
     }
 
-    pub async fn prepare<A: DynamoTransactWriteAttempt>(
+    pub(crate) async fn accept_observations<A: DynamoTransactWriteAttempt>(
         self,
         attempt: &mut A,
         clock: &dyn storage_types::Clock,
+        observations: storage_types::Exact<(ItemWriteObservation, GsiProjectionLifecycle)>,
     ) -> StorageResult<SemanticDecision<AcceptedTransactWrite>> {
-        Self::check_effect_authority(self.effect_authority.as_ref(), attempt, clock).await?;
+        let authority = self.effect_authority.as_ref();
         let members = match self.members? {
             SemanticDecision::Accepted(members) => members,
-            SemanticDecision::Rejected(error) => return Ok(SemanticDecision::Rejected(error)),
+            SemanticDecision::Rejected(error) => {
+                Self::check_effect_authority(authority, attempt, clock).await?;
+                return Ok(SemanticDecision::Rejected(error));
+            }
         };
-        let members = match accept_members(attempt, members).await? {
+        // The job rows are read with a row lock, which assigns the Postgres
+        // transaction ID. Read them after the item locks so that the stream
+        // positions of this attempt follow the item lock order.
+        let accepted = accept_members(members, observations)?;
+        Self::check_effect_authority(authority, attempt, clock).await?;
+        let members = match accepted {
             SemanticDecision::Accepted(members) => members,
             SemanticDecision::Rejected(error) => return Ok(SemanticDecision::Rejected(error)),
         };
@@ -354,42 +359,29 @@ impl BoundTransactWrite {
         Ok(())
     }
 
-    pub(crate) async fn execute<A: DynamoTransactWriteAttempt>(
-        self,
-        attempt: &mut A,
-        cache: &TableMetadataCache,
-        tables: &crate::dynamo_write_preparation::PreparedWriteTables,
-        bindings: &crate::RequestTableBindings,
-        times: (TimestampMillis, std::sync::Arc<dyn storage_types::Clock>),
-    ) -> StorageResult<TransactWriteItemsResponse> {
-        let (captured_at, clock) = times;
-        let Self {
-            receipt,
-            members,
-            effect_authority,
-        } = self;
-        let receipt = receipt?;
-        if let Some(response) = find_transact_response(
-            attempt,
-            receipt.as_ref().map(|receipt| &receipt.request),
-            captured_at,
-        )
-        .await?
-        .into_result()?
-        {
-            return Ok(response);
-        }
-        tables.confirm(attempt, cache, bindings).await?;
-        Self {
-            members,
-            receipt: Ok(receipt),
-            effect_authority,
-        }
-        .prepare(attempt, clock.as_ref())
-        .await?
-        .into_result()?
-        .apply(attempt, captured_at, |_, _| Ok(ItemProvenance::default()))
-        .await
+    pub(crate) fn observation_reads(&self) -> Vec<ItemWriteObservationRead<'_>> {
+        let Ok(SemanticDecision::Accepted(members)) = &self.members else {
+            return Vec::new();
+        };
+        members
+            .iter()
+            .map(|member| {
+                let (table, key) = member.target();
+                match member {
+                    BoundMember::Check(_) => ItemWriteObservationRead::ConditionCheck(table, key),
+                    _ => ItemWriteObservationRead::Write(table, key),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn needs_history(&self) -> bool {
+        matches!(&self.members, Ok(SemanticDecision::Accepted(members)) if members.iter().any(|member| match member {
+            BoundMember::Put(item) => item.table.info.requires_stream_entry(),
+            BoundMember::Update(item) => item.table.info.requires_stream_entry(),
+            BoundMember::Delete(item) => item.table.info.requires_stream_entry(),
+            BoundMember::Check(_) => false,
+        }))
     }
 }
 
@@ -399,49 +391,44 @@ pub struct AcceptedTransactWrite {
 }
 
 struct PreparedTransactReceipt {
-    request: TransactTokenRequest,
+    shape: Arc<DynamoTransactWriteShape>,
     bytes: Vec<u8>,
 }
 
 impl AcceptedTransactWrite {
-    pub fn members(&self) -> &[AcceptedTransactWriteMember] {
-        &self.members
-    }
-
     pub async fn apply<A: DynamoTransactWriteAttempt>(
         self,
         attempt: &mut A,
         captured_at: TimestampMillis,
-        mut provenance: impl FnMut(usize, &AcceptedTransactWriteMember) -> StorageResult<ItemProvenance>
-        + Send,
     ) -> StorageResult<TransactWriteItemsResponse> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            for (ordinal, member) in self.members.into_iter().enumerate() {
-                let provenance = provenance(ordinal, &member)?;
+            for member in self.members {
                 match member {
                     AcceptedTransactWriteMember::Put(item)
                     | AcceptedTransactWriteMember::Update(item) => {
-                        prepare_accepted_upsert(attempt, *item, captured_at, provenance).await?;
+                        prepare_accepted_upsert(attempt, *item, captured_at).await?;
                     }
-                    AcceptedTransactWriteMember::Delete(item) => {
-                        prepare_accepted_delete(attempt, &item, captured_at, provenance).await?;
+                    AcceptedTransactWriteMember::Delete(mut item) => {
+                        prepare_accepted_delete(attempt, &mut item, captured_at).await?;
                     }
                     AcceptedTransactWriteMember::ConditionCheck(_) => {}
                 }
             }
-            attempt.flush_dynamo_write().await?;
 
             let response = TransactWriteItemsResponse {
                 consumed_capacity: None,
                 item_collection_metrics: None,
             };
             if let Some(receipt) = self.receipt {
-                attempt
-                    .write_transact_receipt(receipt.request.token(), receipt.bytes)
-                    .await?;
+                let request = receipt
+                    .shape
+                    .token
+                    .as_ref()
+                    .ok_or_else(|| StorageError::internal("prepared receipt lacks a token"))?;
+                attempt.stage_transact_receipt(request.slot(), receipt.bytes)?;
             }
             Ok(response)
         }
@@ -450,34 +437,22 @@ impl AcceptedTransactWrite {
     }
 }
 
-async fn accept_members<A: DynamoTransactWriteAttempt>(
-    attempt: &mut A,
+fn accept_members(
     bound: Vec<BoundMember>,
+    observations: storage_types::Exact<(ItemWriteObservation, GsiProjectionLifecycle)>,
 ) -> StorageResult<SemanticDecision<Vec<AcceptedTransactWriteMember>>> {
     let total = bound.len();
     let mut accepted = Vec::with_capacity(total);
     let mut reasons = vec![None; total];
-    let reads = bound
-        .iter()
-        .map(|member| {
-            let (table, key) = member.target();
-            match member {
-                BoundMember::Check(_) => ItemWriteObservationRead::ConditionCheck(table, key),
-                _ => ItemWriteObservationRead::Write(table, key),
-            }
-        })
-        .collect::<Vec<_>>();
-    let observations = attempt.observe_for_writes(&reads).await?;
-    if observations.len() != total {
-        return Err(StorageError::internal(
-            "transaction write observation count differs",
-        ));
-    }
     for (ordinal, (item, observation)) in bound.into_iter().zip(observations).enumerate() {
         match accept_member(item, observation)? {
             SemanticDecision::Accepted(member) => accepted.push(member),
             SemanticDecision::Rejected(error) => {
-                reasons[ordinal] = Some(cancellation_reason(&error)?.ok_or_else(|| {
+                let error = match error.into_transact_empty_key_validation() {
+                    Ok(validation) => return Err(validation),
+                    Err(error) => error,
+                };
+                reasons[ordinal] = Some(cancellation_reason(&error).ok_or_else(|| {
                     StorageError::internal("transaction rejection has no cancellation reason")
                 })?);
             }
@@ -548,27 +523,19 @@ fn check_condition(
 ) -> StorageResult<SemanticDecision<AcceptedTransactConditionCheck>> {
     let old = crate::dynamo_put_item::ObservedWrite::try_new(observed, &bound.key)?;
     Ok(crate::dynamo_put_item::check_write_condition(
-        Some(&bound.condition),
+        Some(&bound.shape.condition),
         old.item.as_deref(),
-        bound.return_old_on_failure,
+        bound.shape.return_old_on_failure,
     )?
-    .map(|()| AcceptedTransactConditionCheck {
-        table: bound.table,
-        key: bound.key,
-        old_item: old.item,
-        old_indexers: old.indexers,
-        old_provenance: old.provenance,
-    }))
+    .map(|()| AcceptedTransactConditionCheck { old_item: old.item }))
 }
 
-fn cancellation_reason(error: &StorageError) -> StorageResult<Option<String>> {
+fn cancellation_reason(error: &StorageError) -> Option<CancellationReason> {
     match error.to_enum() {
-        StorageEnum::ConditionalCheckFailedWithItem { item } => Ok(Some(format!(
-            "ConditionalCheckFailed\t{}\t{}",
-            storage_types::DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
-            serde_json::to_string(item)?,
-        ))),
-        _ => Ok(transaction_cancellation_reason_at(error, 0)),
+        StorageEnum::ConditionalCheckFailedWithItem { item } => Some(
+            CancellationReason::conditional_check_failed(Some(item.clone())),
+        ),
+        _ => transaction_cancellation_reason_at(error, 0),
     }
 }
 
@@ -585,7 +552,9 @@ impl TryFrom<TransactWriteItem> for MemberShape {
                 request.expression_attribute_values = put.expression_attribute_values;
                 request.return_values_on_condition_check_failure =
                     put.return_values_on_condition_check_failure;
-                PutItemShape::from_validated_request(request).map(Self::Put)
+                PutItemShape::from_validated_request(request)
+                    .map(Arc::new)
+                    .map(Self::Put)
             }
             (None, Some(update), None, None) => {
                 UpdateItemShape::from_validated_request(UpdateItemRequest {
@@ -605,6 +574,7 @@ impl TryFrom<TransactWriteItem> for MemberShape {
                     return_values_on_condition_check_failure: update
                         .return_values_on_condition_check_failure,
                 })
+                .map(Arc::new)
                 .map(Self::Update)
             }
             (None, None, Some(delete), None) => {
@@ -614,9 +584,13 @@ impl TryFrom<TransactWriteItem> for MemberShape {
                 request.expression_attribute_values = delete.expression_attribute_values;
                 request.return_values_on_condition_check_failure =
                     delete.return_values_on_condition_check_failure;
-                DeleteItemShape::from_validated_request(request).map(Self::Delete)
+                DeleteItemShape::from_validated_request(request)
+                    .map(Arc::new)
+                    .map(Self::Delete)
             }
-            (None, None, None, Some(check)) => condition_check_shape(check).map(Self::Check),
+            (None, None, None, Some(check)) => {
+                condition_check_shape(check).map(Arc::new).map(Self::Check)
+            }
             _ => Err(StorageError::validation(
                 "Each TransactWriteItem must contain exactly one operation",
             )),
@@ -625,14 +599,15 @@ impl TryFrom<TransactWriteItem> for MemberShape {
 }
 
 fn condition_check_shape(
-    check: TransactConditionCheckRequest,
+    mut check: TransactConditionCheckRequest,
 ) -> StorageResult<ConditionCheckShape> {
-    let condition = UncheckedCondition::parse(
+    let condition = CompiledCondition::compile_write(
         Some(check.condition_expression),
         check.expression_attribute_names,
         check.expression_attribute_values,
     )?
     .ok_or_else(|| StorageError::validation("ConditionCheck requires a condition"))?;
+    check.key.normalize_numbers_for_write();
     Ok(ConditionCheckShape {
         table_name: check.table_name,
         key: check.key,

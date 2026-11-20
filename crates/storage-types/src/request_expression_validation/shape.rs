@@ -1,9 +1,10 @@
 use super::{
-    ExpressionKind, ExpressionValidationContext, attribute_type_literal_operand_error,
+    ExpressionKind, ExpressionValidationContext, SmallVec, attribute_type_literal_operand_error,
     contains_same_operand_error, document_path_index_syntax_error, function_context_error,
-    function_syntax_or_arity_error, reserved_word_in_expression, split_nonempty_top_level_args,
+    function_syntax_or_arity_error, nonempty_top_level_args, reserved_word_in_expression,
     update_expression_grammar_error_for_sections, validation_message,
 };
+use crate::condition::{between_upper_is_less_than_lower, dynamodb_attribute_value_display};
 
 pub(super) fn validate_expression_shape(
     context: &ExpressionValidationContext<'_>,
@@ -49,9 +50,13 @@ pub(super) fn validate_expression_shape(
             prefixed,
         ));
     }
-    if kind == ExpressionKind::Condition && has_redundant_parentheses(expression) {
+    if matches!(
+        kind,
+        ExpressionKind::Condition | ExpressionKind::Filter | ExpressionKind::Update
+    ) && has_redundant_parentheses(expression)
+    {
         return Err(validation_message(
-            "Invalid ConditionExpression: The expression has redundant parentheses;".to_string(),
+            format!("Invalid {kind}: The expression has redundant parentheses;"),
             prefixed,
         ));
     }
@@ -126,7 +131,7 @@ fn in_operand_count_error(expression: &str, kind: ExpressionKind) -> Option<Stri
         return None;
     }
     for operands in in_operand_lists(expression) {
-        let count = split_nonempty_top_level_args(operands).len();
+        let count = nonempty_top_level_args(operands).count();
         if count > 100 {
             return Some(format!(
                 "Invalid {kind}: The IN operator is provided with too many operands; number of \
@@ -178,7 +183,10 @@ pub(super) fn validate_between_bounds(
     values: Option<&crate::AttributeMap>,
     prefixed: bool,
 ) -> Result<(), String> {
-    if kind != ExpressionKind::Condition {
+    if !matches!(
+        kind,
+        ExpressionKind::Condition | ExpressionKind::Filter | ExpressionKind::KeyCondition
+    ) {
         return Ok(());
     }
     let Some(values) = values else {
@@ -189,12 +197,39 @@ pub(super) fn validate_between_bounds(
         let (Some(lower), Some(upper)) = (values.get(lower_key), values.get(upper_key)) else {
             continue;
         };
+        for operand in [lower, upper] {
+            if !matches!(
+                operand,
+                crate::AttributeValue::S(_)
+                    | crate::AttributeValue::N(_)
+                    | crate::AttributeValue::B(_)
+            ) {
+                return Err(validation_message(
+                    format!(
+                        "Invalid {kind}: Incorrect operand type for operator or function; \
+                         operator or function: BETWEEN, operand type: {}",
+                        operand.variant_name()
+                    ),
+                    prefixed,
+                ));
+            }
+        }
+        if std::mem::discriminant(lower) != std::mem::discriminant(upper) {
+            return Err(validation_message(
+                format!(
+                    "Invalid {kind}: The BETWEEN operator requires same data type for lower and \
+                     upper bounds; lower bound operand: {}, upper bound operand: {}",
+                    dynamodb_attribute_value_display(lower),
+                    dynamodb_attribute_value_display(upper)
+                ),
+                prefixed,
+            ));
+        }
         if between_upper_is_less_than_lower(lower, upper) {
             return Err(validation_message(
                 format!(
-                    "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be \
-                     greater than or equal to lower bound; lower bound operand: {}, upper bound \
-                     operand: {}",
+                    "Invalid {kind}: The BETWEEN operator requires upper bound to be greater than \
+                     or equal to lower bound; lower bound operand: {}, upper bound operand: {}",
                     dynamodb_attribute_value_display(lower),
                     dynamodb_attribute_value_display(upper)
                 ),
@@ -277,43 +312,6 @@ fn read_expression_value_key(expression: &str, start: usize) -> Option<(&str, us
     Some((expression.get(key_start..index)?, index))
 }
 
-fn between_upper_is_less_than_lower(
-    lower: &crate::AttributeValue,
-    upper: &crate::AttributeValue,
-) -> bool {
-    match (lower, upper) {
-        (crate::AttributeValue::N(lower), crate::AttributeValue::N(upper)) => {
-            crate::compare_dynamodb_numbers(upper, lower).is_ok_and(std::cmp::Ordering::is_lt)
-        }
-        (crate::AttributeValue::S(lower), crate::AttributeValue::S(upper)) => upper < lower,
-        (crate::AttributeValue::B(lower), crate::AttributeValue::B(upper)) => {
-            match (
-                crate::dynamodb_binary::decode_base64_string(lower),
-                crate::dynamodb_binary::decode_base64_string(upper),
-            ) {
-                (Ok(lower), Ok(upper)) => upper < lower,
-                _ => upper < lower,
-            }
-        }
-        _ => false,
-    }
-}
-
-fn dynamodb_attribute_value_display(value: &crate::AttributeValue) -> String {
-    match value {
-        crate::AttributeValue::S(value) => format!("AttributeValue: {{S:{value}}}"),
-        crate::AttributeValue::N(value) => format!("AttributeValue: {{N:{value}}}"),
-        crate::AttributeValue::B(value) => format!("AttributeValue: {{B:{value}}}"),
-        crate::AttributeValue::BOOL(value) => format!("AttributeValue: {{BOOL:{value}}}"),
-        crate::AttributeValue::NULL(value) => format!("AttributeValue: {{NULL:{value}}}"),
-        crate::AttributeValue::SS(values) => format!("AttributeValue: {{SS:{values:?}}}"),
-        crate::AttributeValue::NS(values) => format!("AttributeValue: {{NS:{values:?}}}"),
-        crate::AttributeValue::BS(values) => format!("AttributeValue: {{BS:{values:?}}}"),
-        crate::AttributeValue::L(values) => format!("AttributeValue: {{L:{values:?}}}"),
-        crate::AttributeValue::M(values) => format!("AttributeValue: {{M:{values:?}}}"),
-    }
-}
-
 fn has_redundant_parentheses(expression: &str) -> bool {
     let Some((start, end)) = trimmed_bounds(expression) else {
         return false;
@@ -331,7 +329,7 @@ fn has_redundant_parentheses(expression: &str) -> bool {
 }
 
 fn contains_double_parenthesized_segment(expression: &str) -> bool {
-    let mut stack = Vec::new();
+    let mut stack = SmallVec::<[usize; 8]>::new();
     for (index, ch) in expression.char_indices() {
         match ch {
             '(' => stack.push(index),

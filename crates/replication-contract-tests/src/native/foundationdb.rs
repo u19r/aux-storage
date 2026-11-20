@@ -10,7 +10,7 @@ use kv_backend::{
     KvAttempt as _, KvBackend as _, KvFaultProbe, KvMutation, KvStore,
     foundationdb::FoundationDbBackend,
 };
-use storage_types::AttemptMode;
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass};
 
 use super::fixture;
 use crate::HarnessResult;
@@ -43,7 +43,8 @@ impl FoundationDb {
             Some(probe) => backend.with_fault_probe(probe),
             None => backend,
         };
-        let store = KvStore::initialize_format(backend).await?;
+        let store =
+            KvStore::initialize_format(backend, storage_types::InitialStreamLineages::ONE).await?;
         store.initialize_records(fixture::limits()?).await?;
         Ok(store)
     }
@@ -58,14 +59,18 @@ impl FoundationDb {
         drop(self.store);
         let backend = open_backend(&self.cluster_file, &self.prefix).await?;
         backend
-            .with_attempt(AttemptMode::ReadWrite, |native| {
-                Box::pin(async move {
-                    native.native_stage(vec![KvMutation::DeleteRange {
-                        begin: vec![],
-                        end: vec![255],
-                    }])
-                })
-            })
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                    .start(backend.attempt_deadlines()),
+                |native| {
+                    Box::pin(async move {
+                        native.native_stage(vec![KvMutation::DeleteRange {
+                            begin: vec![],
+                            end: vec![255],
+                        }])
+                    })
+                },
+            )
             .await?;
         Ok(())
     }
@@ -101,6 +106,7 @@ async fn open_backend(
     FoundationDbBackend::initialize(kv_backend::foundationdb::FoundationDbOptions {
         cluster_file: Some(path),
         subspace_prefix: Some(prefix),
+        attempt_deadlines: storage_types::AttemptDeadlines::default(),
         ..Default::default()
     })
     .await

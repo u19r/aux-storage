@@ -133,6 +133,9 @@ async fn given_numeric_gsi_keys_when_query_pages_then_native_order_is_preserved(
                     .await?;
                 let page = result.items.unwrap_or_default();
                 let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
+                if page.is_empty() && next.is_none() {
+                    break; // exact-Limit LastEvaluatedKey: the resumed page is empty
+                }
                 anyhow::ensure!(page.len() == 1, "numeric GSI page missing");
                 let attrs = page[0].to_attribute_map()?;
                 let Some(AttributeValue::N(number)) = attrs.get("gsi_sk") else {
@@ -211,6 +214,9 @@ async fn given_gsi_table_when_post_creation_writes_then_gsi_query_finds_them() -
                     .await?;
                 let page = result.items.unwrap_or_default();
                 let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
+                if page.is_empty() && next.is_none() && !seen.is_empty() {
+                    break; // exact-Limit LastEvaluatedKey: the resumed page is empty
+                }
                 anyhow::ensure!(!page.is_empty(), "GSI continuation returned no row");
                 for item in page {
                     let attrs = item.to_attribute_map()?;
@@ -364,9 +370,18 @@ async fn given_keys_only_gsi_when_query_projects_unavailable_value_then_rejected
             .await?;
         let second = second_page.items.unwrap_or_default();
         let end = second_page.last_evaluated_key.map(ExclusiveStartKey::Key);
+        // The page that evaluated exactly its Limit keeps a LastEvaluatedKey;
+        // the next is empty.
+        let end = end.ok_or_else(|| anyhow::anyhow!("exact-Limit page lost its continuation"))?;
+        anyhow::ensure!(second.len() == 1, "wrong second key-only page: {second:?}");
+        let last_page = fixture
+            .operations
+            .query(query(None, None, Some(end)))
+            .await?;
         anyhow::ensure!(
-            second.len() == 1 && end.is_none(),
-            "wrong final key-only page: {second:?}, {end:?}"
+            last_page.items.unwrap_or_default().is_empty()
+                && last_page.last_evaluated_key.is_none(),
+            "wrong final key-only page"
         );
         for item in first.into_iter().chain(second) {
             let attributes = item.to_attribute_map()?;
@@ -506,6 +521,9 @@ async fn given_binary_base_and_gsi_keys_when_paged_and_mutated_then_identity_is_
                         .await?;
                     let page = result.items.unwrap_or_default();
                     let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
+                    if page.is_empty() && next.is_none() && !seen.is_empty() {
+                        break; // exact-Limit LastEvaluatedKey: the resumed page is empty
+                    }
                     anyhow::ensure!(page.len() == 1, "binary page missing");
                     let attrs = page[0].to_attribute_map()?;
                     let field = if index_name.is_some() { "gsi_sk" } else { "sk" };

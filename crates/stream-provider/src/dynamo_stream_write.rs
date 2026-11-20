@@ -1,105 +1,118 @@
-//! One logical Dynamo write becomes the same stream rows on SQL and KV.
-//!
-//! The backends own row keys, statements, and native transaction staging.
-//! Image encoding, reference identity and payload admission
-//! are decided once here after the operation has allocated a stream position.
+//! One accepted mutation owns one self-contained stream entry. Native keys
+//! carry its incarnation and position; the value never contains a pending
+//! stamp.
 
+use serde::{Deserialize, Serialize};
 use storage_types::{
-    BoundTableInfo, ItemHistoryAddress, ItemKey, KeyAttributes, StorageError, StorageResult,
-    StreamName, SystemStreamPosition, SystemStreamScope,
+    StorageResult, SystemStreamPosition, SystemStreamScope, TableHistoryId, TableName,
+    storage_serde,
 };
 
-use crate::{LogicalSystemStreamMutation, StreamItem, StreamWriteKind};
+use crate::StreamEntry;
 
-pub struct DynamoStreamWriteInput<'a> {
-    pub table: &'a BoundTableInfo,
-    pub mutation: LogicalSystemStreamMutation,
-    pub source_scope: SystemStreamScope,
+/// Canonical positioned entry shared by native writers and public readers.
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
+pub struct PositionedStreamEntry {
+    pub history_id: TableHistoryId,
     pub position: SystemStreamPosition,
+    pub source_table_name: TableName,
+    pub source_scope: SystemStreamScope,
+    pub entry: StreamEntry,
 }
 
-impl DynamoStreamWriteInput<'_> {
-    fn require_bound_identity(&self) -> StorageResult<()> {
-        let table = self.table;
-        let mutation = &self.mutation;
-        if mutation.history_id != table.history_id
-            || mutation.source_table_name.as_str() != table.table_name.as_ref()
-        {
-            return Err(StorageError::internal(
-                "stream mutation does not match its bound table",
-            ));
+#[derive(Serialize, Deserialize)]
+struct StreamEntryValue {
+    source_table_name: TableName,
+    source_scope: SystemStreamScope,
+    entry: StreamEntry,
+}
+
+#[derive(Serialize)]
+struct StreamEntryValueRef<'a, E> {
+    source_table_name: &'a TableName,
+    source_scope: &'a SystemStreamScope,
+    entry: &'a E,
+}
+
+impl PositionedStreamEntry {
+    pub const VALUE_PREFIX_BYTES: usize = 12;
+
+    pub fn decode_created_at(bytes: &[u8]) -> StorageResult<storage_types::TimestampMillis> {
+        let prefix = bytes
+            .get(..Self::VALUE_PREFIX_BYTES)
+            .ok_or_else(invalid_prefix)?;
+        if &prefix[..4] != b"SEV1" {
+            return Err(invalid_prefix());
         }
-        Ok(())
+        let millis = i64::from_be_bytes(prefix[4..].try_into().map_err(|_| invalid_prefix())?);
+        Ok(storage_types::TimestampMillis::from_timestamp(millis))
     }
-}
 
-/// Materialized history plus two metadata indexes share one native commit.
-pub struct DynamoStreamWritePlan {
-    pub rows: [StreamWriteKind<StreamItem>; 2],
-    pub record: storage_types::SystemHistoryRecord,
-}
+    pub fn encode_value(&self) -> StorageResult<Vec<u8>> {
+        Self::encode_body(&self.source_table_name, &self.source_scope, &self.entry)
+    }
 
-impl TryFrom<DynamoStreamWriteInput<'_>> for DynamoStreamWritePlan {
-    type Error = StorageError;
+    /// Encode the accepted record before its native address is assigned.
+    pub fn encode_body(
+        source_table_name: &TableName,
+        source_scope: &SystemStreamScope,
+        entry: &StreamEntry,
+    ) -> StorageResult<Vec<u8>> {
+        Self::encode_entry(source_table_name, source_scope, entry, entry.created_at())
+    }
 
-    fn try_from(input: DynamoStreamWriteInput<'_>) -> StorageResult<Self> {
-        input.require_bound_identity()?;
-        let previous_bytes = input.mutation.predecessor_payload_bytes;
-        let metadata = input.history_metadata()?;
-        let mutation = input.mutation;
-        let change = match mutation.item {
-            None => storage_types::ItemHistoryChange::Deleted { key: mutation.key },
-            Some(item) => storage_types::ItemHistoryChange::Image {
-                item,
-                indexers: storage_types::IndexerDeclaration::try_new(
-                    mutation.indexers,
-                    input.table.max_indexers,
-                )?,
-            },
-        };
-        let item = StreamItem::try_from(storage_types::ItemHistoryEntry::try_new(
-            metadata.clone(),
-            change,
-        )?)?;
-        let pointer =
-            storage_types::ItemHistoryPointer::try_new(metadata, item.data.len(), previous_bytes)?;
-        let table = StreamItem::try_from(&pointer)?;
+    pub fn encode_input(
+        source_table_name: &TableName,
+        source_scope: &SystemStreamScope,
+        entry: &crate::StreamEntryInput<'_>,
+    ) -> StorageResult<Vec<u8>> {
+        Self::encode_entry(source_table_name, source_scope, entry, entry.created_at())
+    }
+
+    fn encode_entry<E: Serialize>(
+        source_table_name: &TableName,
+        source_scope: &SystemStreamScope,
+        entry: &E,
+        created_at: storage_types::TimestampMillis,
+    ) -> StorageResult<Vec<u8>> {
+        let mut bytes = storage_serde::to_bytes(&StreamEntryValueRef {
+            source_table_name,
+            source_scope,
+            entry,
+        })?;
+        let body_len = bytes.len();
+        bytes.reserve_exact(Self::VALUE_PREFIX_BYTES);
+        bytes.resize(body_len + Self::VALUE_PREFIX_BYTES, 0);
+        bytes.copy_within(..body_len, Self::VALUE_PREFIX_BYTES);
+        bytes[..4].copy_from_slice(b"SEV1");
+        bytes[4..Self::VALUE_PREFIX_BYTES]
+            .copy_from_slice(&created_at.timestamp_millis().to_be_bytes());
+        Ok(bytes)
+    }
+
+    /// Native readers supply the address from the selected key/index row.
+    pub fn decode_value(
+        history_id: TableHistoryId,
+        position: SystemStreamPosition,
+        bytes: &[u8],
+    ) -> StorageResult<Self> {
+        let created_at = Self::decode_created_at(bytes)?;
+        let value: StreamEntryValue =
+            storage_serde::from_bytes(&bytes[Self::VALUE_PREFIX_BYTES..])?;
+        if value.entry.created_at() != created_at {
+            return Err(invalid_prefix());
+        }
         Ok(Self {
-            rows: [StreamWriteKind::Item(item), StreamWriteKind::Table(table)],
-            record: pointer.try_into()?,
+            history_id,
+            position,
+            source_table_name: value.source_table_name,
+            source_scope: value.source_scope,
+            entry: value.entry,
         })
     }
 }
 
-impl DynamoStreamWriteInput<'_> {
-    fn history_metadata(&self) -> StorageResult<storage_types::ItemHistoryMetadata> {
-        storage_types::ItemHistoryMetadata::try_new(
-            dynamo_item_history_address(self.table, &self.mutation.key)?,
-            self.mutation.item_stream_version,
-            self.mutation.previous_version,
-            storage_types::ItemHistoryPublication::Event {
-                kind: if self.mutation.item.is_none() {
-                    storage_types::ItemHistoryKind::Deleted
-                } else {
-                    storage_types::ItemHistoryKind::Image
-                },
-                source_scope: self.source_scope.clone(),
-                table_position: self.position.clone(),
-                created_at: self.mutation.created_at,
-                user_identity: self.mutation.user_identity.clone(),
-            },
-        )
-    }
-}
-
-pub fn dynamo_item_history_address(
-    table: &BoundTableInfo,
-    key: &KeyAttributes,
-) -> StorageResult<ItemHistoryAddress> {
-    let item_key = ItemKey::from_key_schema(table.table_name.clone(), &table.key_schema, key)
-        .map_err(|error| StorageError::internal(&format!("stream item key error: {error}")))?;
-    Ok(ItemHistoryAddress {
-        history_id: table.history_id,
-        stream_name: StreamName::table_item_stream(&table.table_name, &item_key)?,
-    })
+fn invalid_prefix() -> storage_types::StorageError {
+    storage_types::StorageError::internal("Invalid canonical stream entry prefix")
 }

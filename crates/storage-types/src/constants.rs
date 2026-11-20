@@ -4,8 +4,8 @@ pub const DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE: &str = "The conditional req
 pub(crate) const DYNAMODB_CLIENT_REQUEST_TOKEN_MAX_CHARS: usize = 36;
 pub const DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE: &str = "DynamoDB could not process your request.";
 pub const DYNAMODB_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
-    "The request was rejected because the same client request token was used with different \
-     parameters.";
+    "Specified idempotent token was used with different request parameters within the idempotency \
+     window";
 pub const DYNAMODB_MISSING_AUTH_TOKEN_MESSAGE: &str =
     "Request must contain a valid (registered) AWS Access Key ID.";
 pub const DYNAMODB_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE: &str =
@@ -16,12 +16,22 @@ pub const DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE: &str = "Throughput exceeds th
 pub const DYNAMODB_RESOURCE_IN_USE_MESSAGE: &str =
     "The resource which you are attempting to change is in use.";
 pub const DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found";
+pub const ONE_ONLINE_INDEX_MESSAGE: &str = "Subscriber limit exceeded: Only 1 online index can be \
+                                            created or deleted simultaneously per table";
 pub const DYNAMODB_THROTTLING_MESSAGE: &str = "Rate of requests exceeds the allowed throughput.";
 pub const DYNAMODB_TRANSACTION_CANCELED_MESSAGE: &str =
     "Transaction cancelled, please refer cancellation reasons for specific reasons.";
+pub const DYNAMODB_TRANSACTION_CONFLICT_MESSAGE: &str =
+    "Operation was rejected because there is an ongoing transaction for the item.";
 /// FoundationDB read-version caching is opt-in. A lagged version must be
 /// validated against the target cluster before enabling it.
 pub const FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS: u16 = 0;
+/// FoundationDB client `reply_byte_limit` knob: the most bytes one range
+/// reply carries. The native default of 80,000 bytes splits a 1 MiB Query
+/// page into 18 native completions; 1 MiB returns it in 6.
+pub const FOUNDATIONDB_DEFAULT_REPLY_BYTE_LIMIT: u32 = 1_048_576;
+pub const FOUNDATIONDB_MIN_REPLY_BYTE_LIMIT: u32 = 80_000;
+pub const FOUNDATIONDB_MAX_REPLY_BYTE_LIMIT: u32 = 4 * 1_048_576;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MIN: u32 = 1;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MAX: u32 = 1000;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE: &str = "Limit must be between 1 and 1000";
@@ -40,7 +50,9 @@ pub const MAX_INDEXERS_CAPACITY: u8 = 32;
 pub const MAX_INDEXER_DECLARATION_BYTES: usize = 1_024;
 
 pub const ENTITY_TYPE_ATTR: &str = "et";
-pub const LEGACY_ENTITY_TYPE_ATTR: &str = "entity_type";
+/// A reader may name the entity type `entity_type`; it reads the stored `et`.
+/// Nothing stores `entity_type`.
+pub const ENTITY_TYPE_NAME_ALIAS: &str = "entity_type";
 pub const CREATED_AT_ATTR: &str = "created_at";
 pub const UPDATED_AT_ATTR: &str = "updated_at";
 pub const EXPIRES_AT_ATTR: &str = "expires_at";
@@ -95,17 +107,6 @@ pub const READ_SEQUENCE_HARD_MAX_SELECTOR_PATH_DEPTH: u32 = 16;
 pub const READ_SEQUENCE_TOKEN_VERSION: u8 = 3;
 pub const READ_SEQUENCE_TOKEN_MAX_BYTES: usize = 64 * 1024;
 
-pub const INDEXED_VALUE_FORMAT_VERSION: u8 = 1;
-pub const INDEXED_VALUE_RAW_CODEC: u8 = 0;
-pub const INDEXED_VALUE_LZ4_CODEC: u8 = 1;
-pub const INDEXED_VALUE_RAW_HEADER: u8 = 0x10;
-pub const INDEXED_VALUE_LZ4_HEADER: u8 = 0x11;
-pub const INDEXER_TUPLE_OFFSET: usize = 2;
-pub(crate) const ENVELOPE_SLOT_NIL: u8 = 0;
-pub(crate) const ENVELOPE_SLOT_STRING: u8 = 1;
-pub(crate) const ENVELOPE_FIXED_BYTES: usize =
-    1 + std::mem::size_of::<u32>() + std::mem::size_of::<u8>();
-
 pub(crate) const READ_SEQUENCE_INPUT_MARKER_PREFIX: &str = "\u{1f}aux-read-sequence-input:\u{1f}";
 pub(crate) const READ_SEQUENCE_STRING_TEMPLATE_PREFIX: &str =
     "\u{1f}aux-read-sequence-string-template:\u{1f}";
@@ -115,9 +116,6 @@ pub(crate) const READ_SEQUENCE_INPUT_LITERAL_ESCAPE_PREFIX: &str =
 pub const MAX_STREAM_RETENTION_HOURS: u16 = 24 * 365 * 7;
 
 pub(crate) const STREAM_ITEM_ID_LEN: usize = 12;
-pub(crate) const STREAM_ITEM_KEY_MAX_BYTES: usize = 1024;
-pub(crate) const STREAM_ITEM_HASH_PREFIX: &[u8] = b"hash/";
-pub(crate) const ITEM_STREAM_VERSION_LEN: usize = 8;
 
 pub const STORAGE_SERDE_ENCODED_PREFIX_LEN: usize = 8;
 pub(crate) const RAW_JSON_PREFIX: [u8; STORAGE_SERDE_ENCODED_PREFIX_LEN] =
@@ -267,15 +265,8 @@ pub(crate) const DYNAMODB_NUMBER_ZERO_PADDING: &str =
 /// Existing durable maintenance target incarnation envelope.
 pub const MAX_TARGET_INCARNATION_BYTES: usize = 256;
 
-pub(crate) const ITEM_HISTORY_RECORD_FORMAT: u8 = 1;
-pub(crate) const ITEM_HISTORY_RECORD_HEADER_BYTES: usize = 21;
-
 pub(crate) const MATERIALIZED_ITEM_FORMAT: u8 = 1;
 pub(crate) const MATERIALIZED_ITEM_HEADER_BYTES: usize = 21;
-
-/// Bounds generated history addresses, scope/position and the 1,024-byte
-/// declaration, including JSON escaping, before metadata allocation.
-pub(crate) const ITEM_HISTORY_METADATA_MAX_BYTES: usize = 32 * 1024;
 
 pub(crate) const SQS_NUMBER_MIN_EXPONENT: i32 = -128;
 pub(crate) const SQS_NUMBER_MAX_EXPONENT: i32 = 126;

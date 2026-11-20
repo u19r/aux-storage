@@ -1,10 +1,10 @@
 //! Protected task progress shared by SQL maintenance workflows.
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
+use storage_provider::maintenance::ProgressWrite;
 use storage_types::{
-    Revision, StorageEnum, StorageError, StorageResult,
+    MissExpectation, Revision, StorageError, StorageResult,
     maintenance::{MaintenanceKind, TaskProgress},
-    storage_serde,
 };
 
 use super::sql_statements;
@@ -33,9 +33,9 @@ pub(super) fn decode_progress<P: DeserializeOwned>(
             "SQL maintenance task row has invalid types",
         ));
     };
-    let progress: TaskProgress<P> = storage_serde::from_bytes(&bytes)?;
-    if progress.authority.scope.work != kind
-        || progress.authority.scope.target.as_ref() != target
+    let progress: TaskProgress<P> =
+        storage_provider::maintenance::decode_task_progress(&bytes, kind)?;
+    if progress.authority.scope.target.as_ref() != target
         || encode_revision(progress.revision)? != revision
     {
         return Err(StorageError::internal(
@@ -45,47 +45,37 @@ pub(super) fn decode_progress<P: DeserializeOwned>(
     Ok(Some(progress))
 }
 
-pub(crate) async fn write_progress<A: SqlAttempt, P: Serialize>(
+/// Conditional insert or update of one progress record.
+pub(crate) async fn store_progress<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
-    kind: MaintenanceKind,
-    expected: Option<Revision>,
-    next: TaskProgress<P>,
+    write: ProgressWrite,
 ) -> StorageResult<()> {
-    let statement = progress_statement(engine, kind, expected, &next)?;
-    if attempt.execute(statement).await? != 1 {
-        return Err(StorageEnum::TransactionConflict {
-            message: "maintenance task progress changed during this attempt".to_owned(),
-        }
-        .into());
+    if attempt.execute(progress_statement(engine, write)?).await? != 1 {
+        return Err(StorageError::write_miss(
+            "maintenance_progress",
+            MissExpectation::Revision,
+        ));
     }
     Ok(())
 }
 
-pub(crate) fn progress_statement<P: Serialize>(
+pub(crate) fn progress_statement(
     engine: impl SqlLayout,
-    kind: MaintenanceKind,
-    expected: Option<Revision>,
-    next: &TaskProgress<P>,
+    write: ProgressWrite,
 ) -> StorageResult<SqlStatement> {
-    if next.authority.scope.work != kind {
-        return Err(StorageError::internal(
-            "maintenance task progress has the wrong kind",
-        ));
-    }
-    let target = next.authority.scope.target.as_ref().to_vec();
-    let revision = encode_revision(next.revision)?;
-    let bytes = storage_serde::to_bytes(next)?;
-    let statement = match expected {
+    let target = write.target.as_ref().to_vec();
+    let revision = encode_revision(write.revision)?;
+    let statement = match write.expected {
         Some(expected) => sql_statements::update_progress(
             engine,
-            kind,
+            write.kind,
             target,
             encode_revision(expected)?,
             revision,
-            bytes,
+            write.bytes,
         ),
-        None => sql_statements::insert_progress(engine, kind, target, revision, bytes),
+        None => sql_statements::insert_progress(engine, write.kind, target, revision, write.bytes),
     };
     Ok(statement)
 }

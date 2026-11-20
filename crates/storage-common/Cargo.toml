@@ -8,24 +8,27 @@ license.workspace = true
 description = "Backend-agnostic shared helpers for storage providers (pagination, projection, key schema validation, retry logic)"
 
 [features]
+fault-injection = []
 rocksdb = ["storage-types/rocksdb"]
 
 [dependencies]
+futures = { workspace = true }
 metrics = { workspace = true }
 metrics-facade = { workspace = true }
-rand = { workspace = true }
 scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-smallvec = { workspace = true }
 storage-types = { path = "../storage-types" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
+storage-types = { path = "../storage-types", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

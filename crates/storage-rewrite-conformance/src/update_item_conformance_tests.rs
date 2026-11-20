@@ -747,3 +747,528 @@ update_item_case!(
     given_update_expression_missing_value_when_update_item_runs_then_conformance_response_matches,
     "field-update_expression/400/update_expression_missing_value.json"
 );
+
+// DDB-PAR-4 (AWS probe P15): SET and REMOVE through an alias whose value holds
+// `.` or `[` address that one top-level attribute.
+update_item_case!(
+    given_dotted_alias_set_when_update_runs_then_top_level_attribute_is_written,
+    "local/ddb-par-4/dotted_alias_set_update.json"
+);
+update_item_case!(
+    given_bracket_alias_remove_when_update_runs_then_top_level_attribute_is_removed,
+    "local/ddb-par-4/bracket_alias_remove_update.json"
+);
+update_item_case!(
+    given_dotted_alias_remove_when_update_runs_then_nested_member_is_kept,
+    "local/ddb-par-4/dotted_alias_remove_update.json"
+);
+update_item_case!(
+    given_nested_path_set_when_update_runs_then_map_member_is_written,
+    "local/ddb-par-4/nested_path_set_update.json"
+);
+update_item_case!(
+    given_dotted_alias_condition_on_top_level_value_when_update_runs_then_update_applies,
+    "local/ddb-par-4/dotted_alias_condition_top_update.json"
+);
+update_item_case!(
+    given_dotted_alias_condition_on_nested_value_when_update_runs_then_condition_fails,
+    "local/ddb-par-4/dotted_alias_condition_nested_update.json"
+);
+// AWS probe P1.
+update_item_case!(
+    given_trailing_comma_set_when_update_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_trailing_comma_set_when_update_runs_then_eof_syntax_error.json"
+);
+// AWS probe P1.
+update_item_case!(
+    given_dangling_remove_when_update_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_dangling_remove_when_update_runs_then_eof_syntax_error.json"
+);
+// AWS probe P1.
+update_item_case!(
+    given_unknown_clause_when_update_runs_then_clause_token_error,
+    "local/ddb-par-1/given_unknown_clause_when_update_runs_then_clause_token_error.json"
+);
+// AWS probe P2.
+update_item_case!(
+    given_string_literal_set_when_update_runs_then_literal_is_rejected,
+    "local/ddb-par-1/given_string_literal_set_when_update_runs_then_literal_is_rejected.json"
+);
+// AWS probe P7.
+update_item_case!(
+    given_set_without_equals_when_update_runs_then_value_is_the_token,
+    "local/ddb-par-1/given_set_without_equals_when_update_runs_then_value_is_the_token.json"
+);
+// AWS probe P10.
+update_item_case!(
+    given_if_not_exists_one_operand_when_update_runs_then_operand_count_error,
+    "local/ddb-par-1/given_if_not_exists_one_operand_when_update_runs_then_operand_count_error.\
+     json"
+);
+// AWS probe P10.
+update_item_case!(
+    given_list_append_one_operand_when_update_runs_then_operand_count_error,
+    "local/ddb-par-1/given_list_append_one_operand_when_update_runs_then_operand_count_error.json"
+);
+// AWS probe P4.
+update_item_case!(
+    given_empty_update_when_update_runs_then_empty_expression_error,
+    "local/ddb-par-1/given_empty_update_when_update_runs_then_empty_expression_error.json"
+);
+// AWS probe P4.
+update_item_case!(
+    given_blank_update_when_update_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_blank_update_when_update_runs_then_eof_syntax_error.json"
+);
+// AWS probe P9.
+update_item_case!(
+    given_values_without_expression_when_update_runs_then_only_with_expressions_error,
+    "local/ddb-par-1/\
+     given_values_without_expression_when_update_runs_then_only_with_expressions_error.json"
+);
+// AWS probe P1.
+update_item_case!(
+    given_parenthesized_operand_set_when_update_runs_then_missing_attribute_error,
+    "local/ddb-par-1/\
+     given_parenthesized_operand_set_when_update_runs_then_missing_attribute_error.json"
+);
+update_item_case!(
+    given_lowercase_clauses_when_update_runs_then_update_is_accepted,
+    "local/ddb-par-1/given_lowercase_clauses_when_update_runs_then_update_is_accepted.json"
+);
+// AWS probe P11.
+update_item_case!(
+    given_attribute_updates_and_update_expression_when_update_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/given_attribute_updates_and_update_expression_when_update_runs_then_mixed_parameters_are_rejected.json"
+);
+
+// AWS behavioural suite
+// AWS behavioural:
+// check_query_and_update_item_placeholders_without_an_expression_rejected.py
+update_item_case!(
+    given_update_names_without_expression_when_update_item_runs_then_only_with_expressions_error_match_aws,
+    "local/aws-behav/check_query_and_update_item_placeholders_without_an_expression_rejected.json"
+);
+// AWS behavioural:
+// check_deep_expression_attribute_value_in_condition_and_set_rejected_before_conditional_check.
+// py
+update_item_case!(
+    given_33_level_set_value_and_failing_condition_when_update_item_runs_then_nesting_error_match_aws,
+    "local/aws-behav/check_deep_expression_attribute_value_in_condition_and_set_rejected_before_conditional_check.json"
+);
+// AWS behavioural:
+// check_write_condition_parenthesized_forms_evaluate_like_unparenthesized.py
+update_item_case!(
+    given_false_parenthesized_update_condition_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_write_condition_parenthesized_forms_evaluate_like_unparenthesized.json#update_false_parenthesized_condition"
+);
+// AWS behavioural:
+// check_write_condition_parenthesized_forms_evaluate_like_unparenthesized.py
+update_item_case!(
+    given_true_parenthesized_update_condition_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_write_condition_parenthesized_forms_evaluate_like_unparenthesized.json#\
+     update_true_parenthesized_condition"
+);
+// AWS behavioural:
+// check_condition_expression_contains_same_path_and_between_reversed_rejected.
+// py
+update_item_case!(
+    given_reversed_numeric_between_bounds_when_update_item_runs_then_parse_error_and_item_unchanged_match_aws,
+    "local/aws-behav/check_condition_expression_contains_same_path_and_between_reversed_rejected.json"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_attribute_exists_map_member_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_attribute_exists_map_member"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_attribute_not_exists_absent_map_member_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_attribute_not_exists_absent_map_member"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_map_member_equals_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_map_member_equals"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_map_member_begins_with_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_map_member_begins_with"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_map_member_contains_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_map_member_contains"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_map_member_attribute_type_string_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_map_member_attribute_type_string"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_nested_map_attribute_type_map_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_nested_map_attribute_type_map"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_two_level_map_member_equals_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_two_level_map_member_equals"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_list_element_member_equals_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_list_element_member_equals"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_list_element_of_nested_list_equals_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_list_element_of_nested_list_equals"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_list_index_equals_string_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_list_index_equals_string"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_conjunction_of_nested_paths_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_conjunction_of_nested_paths"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_not_attribute_exists_absent_nested_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#hold_not_attribute_exists_absent_nested"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_type_tag_named_member_m_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_type_tag_named_member_M"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_type_tag_named_member_l_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_type_tag_named_member_L"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_type_tag_named_member_s_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_type_tag_named_member_S"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_digit_named_member_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_digit_named_member"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_hold_nested_list_index_equals_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#\
+     hold_nested_list_index_equals"
+);
+// AWS behavioural:
+// check_condition_nested_document_paths_that_hold_apply_the_write.py
+update_item_case!(
+    given_nested_near_miss_when_update_item_runs_then_conditional_failure_and_item_unchanged_match_aws,
+    "local/aws-behav/check_condition_nested_document_paths_that_hold_apply_the_write.json#near_miss_nested_path"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_type_mismatch_attribute_exists_absent_member_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#fail_attribute_exists_absent_member"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_type_mismatch_attribute_not_exists_present_member_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#fail_attribute_not_exists_present_member"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_type_mismatch_not_equal_member_inner_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#fail_not_equal_member_inner"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_type_mismatch_attribute_exists_list_member_name_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#fail_attribute_exists_list_member_name"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_type_mismatch_attribute_exists_index_on_map_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#fail_attribute_exists_index_on_map"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_type_mismatch_or_of_wrong_paths_when_update_item_runs_then_conditional_failure_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#fail_or_of_wrong_paths"
+);
+// AWS behavioural:
+// check_condition_nested_path_type_mismatch_fails_the_condition.py
+update_item_case!(
+    given_nested_list_element_member_condition_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_condition_nested_path_type_mismatch_fails_the_condition.json#\
+     holding_list_element_member"
+);
+// AWS behavioural:
+// check_deep_dynamodb_2_list_index_clauses_read_one_pre_image.py
+update_item_case!(
+    given_list_index_swap_when_update_item_runs_then_clauses_read_pre_image_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_list_index_clauses_read_one_pre_image.json#\
+     swap_list_elements"
+);
+// AWS behavioural:
+// check_deep_dynamodb_2_list_index_clauses_read_one_pre_image.py
+update_item_case!(
+    given_remove_then_set_list_index_when_update_item_runs_then_original_indices_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_list_index_clauses_read_one_pre_image.json#\
+     remove_and_set_list_index"
+);
+// AWS behavioural:
+// check_deep_dynamodb_2_list_index_clauses_read_one_pre_image.py
+update_item_case!(
+    given_list_append_and_element_read_when_update_item_runs_then_rhs_reads_pre_image_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_list_index_clauses_read_one_pre_image.json#\
+     list_append_reads_pre_image"
+);
+// AWS behavioural: check_deep_dynamodb_2_list_index_on_non_list_rejected.py
+update_item_case!(
+    given_set_index_on_string_when_update_item_runs_then_invalid_path_error_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_list_index_on_non_list_rejected.json#\
+     set_index_on_string"
+);
+// AWS behavioural: check_deep_dynamodb_2_list_index_on_non_list_rejected.py
+update_item_case!(
+    given_set_index_on_absent_attribute_when_update_item_runs_then_invalid_path_error_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_list_index_on_non_list_rejected.json#\
+     set_index_on_absent_attribute"
+);
+// AWS behavioural: check_deep_dynamodb_2_list_index_on_non_list_rejected.py
+update_item_case!(
+    given_set_index_on_list_when_update_item_runs_then_element_replaced_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_list_index_on_non_list_rejected.json#\
+     set_index_replaces_list_element"
+);
+// AWS behavioural:
+// check_deep_dynamodb_2_remove_list_indices_resolve_against_original.py
+update_item_case!(
+    given_remove_two_list_indices_when_update_item_runs_then_original_elements_removed_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_remove_list_indices_resolve_against_original.json#\
+     remove_two_indices_one_expression"
+);
+// AWS behavioural:
+// check_deep_dynamodb_2_remove_list_indices_resolve_against_original.py
+update_item_case!(
+    given_remove_list_indices_out_of_order_when_update_item_runs_then_original_elements_removed_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_remove_list_indices_resolve_against_original.json#remove_indices_clause_order"
+);
+// AWS behavioural: check_deep_dynamodb_2_update_clauses_read_one_pre_image.py
+update_item_case!(
+    given_remove_and_set_copy_when_update_item_runs_then_one_pre_image_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_update_clauses_read_one_pre_image.json#\
+     remove_then_set_copies_pre_image"
+);
+// AWS behavioural: check_deep_dynamodb_2_update_clauses_read_one_pre_image.py
+update_item_case!(
+    given_set_rotation_when_update_item_runs_then_one_pre_image_rotates_match_aws,
+    "local/aws-behav/check_deep_dynamodb_2_update_clauses_read_one_pre_image.json#\
+     set_rotation_reads_pre_image"
+);
+// AWS behavioural:
+// check_reserved_word_bare_rejected_across_update_filter_and_projection.py
+update_item_case!(
+    given_bare_reserved_word_in_update_when_update_item_runs_then_reserved_keyword_error_match_aws,
+    "local/aws-behav/check_reserved_word_bare_rejected_across_update_filter_and_projection.json#\
+     update_bare_reserved_word"
+);
+// AWS behavioural:
+// check_reserved_word_bare_rejected_across_update_filter_and_projection.py
+update_item_case!(
+    given_aliased_reserved_word_in_update_when_update_item_runs_then_update_applies_match_aws,
+    "local/aws-behav/check_reserved_word_bare_rejected_across_update_filter_and_projection.json#\
+     update_aliased_reserved_word"
+);
+// AWS behavioural:
+// check_update_item_set_empty_string_set_rejected_top_and_nested.py
+update_item_case!(
+    given_empty_string_set_at_top_level_when_update_item_runs_then_validation_error_match_aws,
+    "local/aws-behav/check_update_item_set_empty_string_set_rejected_top_and_nested.json#\
+     set_empty_string_set_top_level"
+);
+// AWS behavioural:
+// check_update_item_set_empty_string_set_rejected_top_and_nested.py
+update_item_case!(
+    given_empty_string_set_at_nested_path_when_update_item_runs_then_validation_error_match_aws,
+    "local/aws-behav/check_update_item_set_empty_string_set_rejected_top_and_nested.json#\
+     set_empty_string_set_nested_path"
+);
+// AWS behavioural: check_update_item_set_list_preserves_element_order.py
+update_item_case!(
+    given_whole_list_literal_when_update_item_runs_then_element_order_is_kept_match_aws,
+    "local/aws-behav/check_update_item_set_list_preserves_element_order.json"
+);
+// AWS behavioural:
+// check_update_item_set_ss_sole_empty_string_member_top_and_nested.py
+update_item_case!(
+    given_sole_empty_string_set_member_when_update_item_runs_then_top_and_nested_stored_match_aws,
+    "local/aws-behav/check_update_item_set_ss_sole_empty_string_member_top_and_nested.json"
+);
+// AWS behavioural:
+// check_update_item_updated_new_includes_unchanged_set_value_and_upsert.py
+update_item_case!(
+    given_updated_new_reassigned_value_when_update_item_runs_then_only_set_attributes_returned_match_aws,
+    "local/aws-behav/check_update_item_updated_new_includes_unchanged_set_value_and_upsert.json#updated_new_includes_reassigned_value"
+);
+// AWS behavioural:
+// check_update_item_updated_new_includes_unchanged_set_value_and_upsert.py
+update_item_case!(
+    given_upsert_of_new_key_when_update_item_runs_then_created_attributes_returned_match_aws,
+    "local/aws-behav/check_update_item_updated_new_includes_unchanged_set_value_and_upsert.json#\
+     updated_new_upsert_new_key"
+);
+// AWS behavioural: check_update_item_without_actions_upserts_key_only_item.py
+update_item_case!(
+    given_key_only_update_of_new_key_when_update_item_runs_then_no_attributes_match_aws,
+    "local/aws-behav/check_update_item_without_actions_upserts_key_only_item.json#\
+     no_actions_new_key"
+);
+// AWS behavioural: check_update_item_without_actions_upserts_key_only_item.py
+update_item_case!(
+    given_key_only_update_of_existing_key_when_update_item_runs_then_item_unchanged_match_aws,
+    "local/aws-behav/check_update_item_without_actions_upserts_key_only_item.json#\
+     no_actions_existing_key"
+);
+// AWS behavioural: check_update_list_append_on_ghost_attribute_rejected.py
+update_item_case!(
+    given_list_append_on_absent_attribute_when_update_item_runs_then_missing_attribute_error_match_aws,
+    "local/aws-behav/check_update_list_append_on_ghost_attribute_rejected.json#list_append_on_absent_attribute"
+);
+// AWS behavioural: check_update_list_append_on_ghost_attribute_rejected.py
+update_item_case!(
+    given_list_append_on_existing_list_when_update_item_runs_then_list_appends_match_aws,
+    "local/aws-behav/check_update_list_append_on_ghost_attribute_rejected.json#\
+     list_append_on_existing_list"
+);
+// AWS behavioural:
+// check_update_remove_add_delete_through_invalid_path_rejected.py
+update_item_case!(
+    given_remove_through_scalar_parent_when_update_item_runs_then_invalid_path_error_match_aws,
+    "local/aws-behav/check_update_remove_add_delete_through_invalid_path_rejected.json#\
+     remove_through_scalar_parent"
+);
+// AWS behavioural:
+// check_update_remove_add_delete_through_invalid_path_rejected.py
+update_item_case!(
+    given_add_through_scalar_parent_when_update_item_runs_then_invalid_path_error_match_aws,
+    "local/aws-behav/check_update_remove_add_delete_through_invalid_path_rejected.json#\
+     add_through_scalar_parent"
+);
+// AWS behavioural:
+// check_update_remove_add_delete_through_invalid_path_rejected.py
+update_item_case!(
+    given_delete_through_scalar_parent_when_update_item_runs_then_invalid_path_error_match_aws,
+    "local/aws-behav/check_update_remove_add_delete_through_invalid_path_rejected.json#\
+     delete_through_scalar_parent"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_s_to_n_alone_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_s_to_n_alone"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_s_to_n_add_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_s_to_n_add"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_m_to_m_alone_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_m_to_m_alone"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_m_to_m_add_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_m_to_m_add"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_m_nested_alone_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_m_nested_alone"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_m_nested_add_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_m_nested_add"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_l_to_m_alone_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_l_to_m_alone"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_l_to_m_add_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_l_to_m_add"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_l_to_l_alone_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_l_to_l_alone"
+);
+// AWS behavioural:
+// check_update_set_replaces_the_existing_value_without_merging.py
+update_item_case!(
+    given_set_replaces_l_to_l_add_when_update_item_runs_then_whole_value_replaced_match_aws,
+    "local/aws-behav/check_update_set_replaces_the_existing_value_without_merging.json#\
+     replace_l_to_l_add"
+);

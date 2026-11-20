@@ -153,3 +153,32 @@ async fn given_zero_limit_when_list_streams_is_parsed_then_aws_validation_shape_
     expected.as_object_mut().unwrap().remove("message");
     assert_eq!(actual, expected);
 }
+
+/// AWS behavioural: check_list_streams_limit_over_100_rejected.py
+///
+/// The boundary Limit=100 parses.
+#[tokio::test]
+async fn given_limit_above_one_hundred_when_list_streams_is_parsed_then_aws_message_is_returned() {
+    let case = FIXTURES.case(
+        include_str!("../fixtures/dynamodb_streams_validation_cases.jsonl"),
+        "local/aws-behav/check_list_streams_limit_over_100_rejected.json",
+    );
+    let observed = observe(async { ListStreamsRequest::try_from(case["request"].clone()) }).await;
+    observed.assert_no_warning_or_error();
+    observed.assert_database_calls_exact(&[]);
+    let message = observed
+        .result
+        .expect_err("ListStreams limit above 100 must fail");
+    let (status, axum::Json(body)): (_, axum::Json<http_error::ErrorResponse>) =
+        http_error::HttpApiError::dynamodb_protocol_error("ValidationException", message, 400)
+            .into();
+    assert_eq!(
+        status.as_u16(),
+        case["expected"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(
+        serde_json::to_value(body).expect("serialize validation error"),
+        case["expected"]["body"]
+    );
+    assert!(ListStreamsRequest::try_from(serde_json::json!({"Limit": 100})).is_ok());
+}

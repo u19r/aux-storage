@@ -5,6 +5,8 @@ mod discovery_tests;
 #[cfg(all(test, feature = "sqlite"))]
 mod lineage_tests;
 mod read;
+#[cfg(test)]
+mod read_tests;
 mod repository;
 mod sql_statements;
 mod write;

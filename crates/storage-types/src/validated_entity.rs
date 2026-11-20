@@ -40,7 +40,11 @@ pub trait StoredEntity: ValidatedEntity + Sized {
         let projection = P::try_from_wire_item(item)?;
         match build(projection) {
             Ok(entity) => Ok(entity),
-            Err(err) => Err(StorageError::internal(&err.to_string())).context(format!(
+            Err(err) => Err(StorageError::internal(&format!(
+                "invalid persisted {}",
+                Self::storage_type_name()
+            )))
+            .context(format!(
                 "invalid persisted {}: {err}",
                 Self::storage_type_name()
             )),
@@ -50,7 +54,11 @@ pub trait StoredEntity: ValidatedEntity + Sized {
     fn validate_loaded(entity: Self) -> StorageResult<Self> {
         match entity.into_validated() {
             Ok(entity) => Ok(entity),
-            Err(err) => Err(StorageError::internal(&err.to_string())).context(format!(
+            Err(err) => Err(StorageError::internal(&format!(
+                "invalid persisted {}",
+                Self::storage_type_name()
+            )))
+            .context(format!(
                 "invalid persisted {}: {err}",
                 Self::storage_type_name()
             )),

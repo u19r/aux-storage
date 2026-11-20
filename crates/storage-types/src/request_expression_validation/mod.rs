@@ -16,6 +16,7 @@ mod functions;
 mod keys;
 mod paths;
 mod shape;
+mod syntax;
 mod update;
 mod validation;
 
@@ -26,12 +27,16 @@ pub(crate) use keys::is_dynamodb_reserved_word;
 use keys::*;
 pub(crate) use keys::{
     validate_expression_attribute_name_keys, validate_expression_attribute_value_keys,
+    validate_transact_expression_attribute_value_keys,
 };
 use paths::*;
 use shape::*;
+pub(crate) use syntax::validate_expression_syntax;
 use update::*;
 use validation::*;
-pub(crate) use validation::{validate_expression_set, validate_expression_value_operands};
+pub(crate) use validation::{
+    validate_expression_set, validate_expression_value_operands, validation_message,
+};
 
 #[cfg(test)]
 mod request_expression_validation_perf_tests;
@@ -44,3 +49,6 @@ mod shape_tests;
 
 #[cfg(test)]
 mod expression_kind_tests;
+
+#[cfg(test)]
+mod syntax_tests;

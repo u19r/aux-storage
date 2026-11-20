@@ -94,7 +94,11 @@ impl SqlFaultProbe for BeforeCommitHold {
         None
     }
 
-    fn at_commit_boundary(&self, boundary: SqlCommitBoundary) -> BoxFuture<'_, StorageResult<()>> {
+    fn at_commit_boundary(
+        &self,
+        boundary: SqlCommitBoundary,
+        _mode: storage_types::AttemptMode,
+    ) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             match boundary {
                 SqlCommitBoundary::BeforeCommit => self.hold_commit().await,
@@ -111,7 +115,11 @@ impl KvFaultProbe for BeforeCommitHold {
         None
     }
 
-    fn at_commit_boundary(&self, boundary: KvCommitBoundary) -> BoxFuture<'_, StorageResult<()>> {
+    fn at_commit_boundary(
+        &self,
+        boundary: KvCommitBoundary,
+        _mode: storage_types::AttemptMode,
+    ) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             match boundary {
                 KvCommitBoundary::BeforeCommit => self.hold_commit().await,

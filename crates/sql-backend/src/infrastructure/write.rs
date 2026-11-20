@@ -3,7 +3,7 @@ use infrastructure_provider::{
     batch::RecordBatch,
     record::{ConditionalWriteResult, RecordChange},
 };
-use storage_types::{InfrastructureResultKind, ReadProtection, Revision, StorageResult};
+use storage_types::{ReadProtection, Revision, StorageResult};
 
 use super::{codec, error::invalid_result, sql_statements};
 use crate::{SqlAttempt, SqlLayout, catalog::SqlCatalogAttempt};
@@ -36,7 +36,7 @@ fn prepare_statements(
     let mut statements = Vec::new();
     statements
         .try_reserve_exact(changes.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for change in changes {
         statements.push(sql_statements::change(engine, change)?);
     }

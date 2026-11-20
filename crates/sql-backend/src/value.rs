@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use storage_types::{InfrastructureResultKind, StorageError, StorageResult};
+use storage_types::{StorageError, StorageResult};
 
 /// Driver-neutral values required by the persisted SQL layout.
 /// Deliberately lacks `Debug` so item data is not accidentally logged.
@@ -64,7 +64,7 @@ impl SqlRow {
         self.values.iter().try_fold(0usize, |total, value| {
             total
                 .checked_add(value.byte_len())
-                .ok_or_else(|| InfrastructureResultKind::NativeCapacityRejected.into())
+                .ok_or_else(|| storage_types::AttemptFailure::CAPACITY.into())
         })
     }
 }
@@ -89,6 +89,7 @@ impl SqlQueryPage {
         }
     }
 
+    #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
     pub(crate) fn charge_work(
         &self,
         settlement: &storage_types::NativeAttemptSettlement,
@@ -99,7 +100,7 @@ impl SqlQueryPage {
                 .checked_mul(std::mem::size_of::<SqlValue>())
                 .and_then(|cells| cells.checked_add(std::mem::size_of::<SqlRow>()))
                 .and_then(|cells| bytes.checked_add(cells))
-                .ok_or(InfrastructureResultKind::NativeCapacityRejected)
+                .ok_or(storage_types::AttemptFailure::CAPACITY)
         })?;
         settlement.charge_data(bytes)
     }
@@ -112,7 +113,7 @@ impl SqlQueryPage {
         };
         self.rows
             .try_reserve(1)
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         self.rows.push(row);
         self.used_bytes = total;
         Ok(true)
@@ -127,14 +128,14 @@ impl SqlQueryPage {
         let bytes = row.iter().try_fold(0usize, |total, value| {
             total
                 .checked_add(value.byte_len())
-                .ok_or(InfrastructureResultKind::NativeCapacityRejected)
+                .ok_or(storage_types::AttemptFailure::CAPACITY)
         })?;
         let Some(total) = self.admit_row_bytes(bytes, max_bytes)? else {
             return Ok(false);
         };
         self.rows
             .try_reserve(1)
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         let row = SqlRow::try_from(row)?;
         self.rows.push(row);
         self.used_bytes = total;
@@ -152,7 +153,7 @@ impl SqlQueryPage {
         let total = self
             .used_bytes
             .checked_add(bytes.max(1))
-            .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         if !self.rows.is_empty() && total > max_bytes.get() {
             self.more = true;
             return Ok(None);

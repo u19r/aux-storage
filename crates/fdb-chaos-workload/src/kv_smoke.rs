@@ -2,6 +2,7 @@ use kv_backend::{
     AttemptMode, KvAttempt as _, KvBackend as _, KvEntry, KvMutation, KvRange, ReadProtection,
     foundationdb::FoundationDbBackend,
 };
+use storage_types::{AttemptPlan, DeadlineClass};
 
 use crate::{common::*, constants::*, imports::*};
 
@@ -20,7 +21,7 @@ pub(crate) struct KvSmokeWorkload {
     multi_get_count: u64,
     audit_count: u64,
     error_count: u64,
-    context: WorkloadContext,
+    context: std::rc::Rc<WorkloadContext>,
 }
 
 impl KvSmokeWorkload {
@@ -47,12 +48,18 @@ impl KvSmokeWorkload {
             multi_get_count: 0,
             audit_count: 0,
             error_count: 0,
-            context,
+            context: std::rc::Rc::new(context),
         }
     }
 
-    fn store(&self, db: SimDatabase) -> FoundationDbBackend {
-        FoundationDbBackend::from_simulation(db, Some(&self.subspace_prefix()), None)
+    fn store(&self, db: SimDatabase, clock: Arc<dyn storage_types::Clock>) -> FoundationDbBackend {
+        FoundationDbBackend::from_simulation(
+            db,
+            Some(&self.subspace_prefix()),
+            None,
+            storage_types::ReadVersionPolicy::Fresh,
+            clock,
+        )
     }
 
     async fn write_changes(
@@ -91,11 +98,27 @@ impl KvSmokeWorkload {
             + 'static,
     {
         for attempt in 1..=KV_SMOKE_NATIVE_ATTEMPTS {
-            let result = store.with_attempt(mode, make_operation()).await;
+            let result = store
+                .with_attempt(
+                    AttemptPlan::new(
+                        mode,
+                        if mode == AttemptMode::ReadOnly {
+                            DeadlineClass::PointRead
+                        } else {
+                            DeadlineClass::Write
+                        },
+                    )
+                    .start(store.attempt_deadlines()),
+                    make_operation(),
+                )
+                .await;
             match result {
                 Err(error)
                     if attempt < KV_SMOKE_NATIVE_ATTEMPTS
-                        && matches!(error.as_ref(), StorageEnum::TransactionConflict { .. }) => {}
+                        && matches!(
+                            error.as_ref(),
+                            StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(_))
+                        ) => {}
                 result => return result,
             }
         }
@@ -160,171 +183,178 @@ impl RustWorkload for KvSmokeWorkload {
         self.start_count += 1;
         self.trace_phase("start");
 
-        let store = self.store(db);
-        let key = self.key();
-        let value = self.value();
-        if let Err(err) = self
-            .write_changes(&store, vec![KvEntry::new(key.clone(), value.clone())])
-            .await
-        {
-            self.trace_error("write", storage_error_detail(&err));
-            return;
-        }
-        self.write_count += 1;
+        // Attempt deadlines sleep on this phase's simulation clock.
+        let context = std::rc::Rc::clone(&self.context);
+        let (clock, requests) = crate::simulation_clock::SimulationClock::new();
+        let store = self.store(db, clock);
+        crate::simulation_clock::drive_operation(context, requests, async {
+            let key = self.key();
+            let value = self.value();
+            if let Err(err) = self
+                .write_changes(&store, vec![KvEntry::new(key.clone(), value.clone())])
+                .await
+            {
+                self.trace_error("write", storage_error_detail(&err));
+                return;
+            }
+            self.write_count += 1;
 
-        match self
-            .retry_attempt(&store, AttemptMode::ReadOnly, || {
-                let key = key.clone();
-                move |attempt: &mut kv_backend::foundationdb::FoundationDbAttempt| {
-                    Box::pin(async move { attempt.get(&key, ReadProtection::Snapshot).await })
-                        as futures::future::BoxFuture<'_, Result<Option<Vec<u8>>, StorageError>>
-                }
-            })
-            .await
-        {
-            Ok(Some(actual)) if actual == value => {
-                self.read_count += 1;
-            }
-            Ok(Some(actual)) => {
-                self.trace_error(
-                    "read",
-                    format!(
-                        "read value mismatch: expected {} bytes, got {}",
-                        value.len(),
-                        actual.len()
-                    ),
-                );
-                return;
-            }
-            Ok(None) => {
-                self.trace_error("read", "missing value after committed write".to_string());
-                return;
-            }
-            Err(err) => {
-                self.trace_error("read", storage_error_detail(&err));
-                return;
-            }
-        }
-
-        let batch_keys = (0..100)
-            .map(|index| format!("kv-smoke/batch/{index}").into_bytes())
-            .collect::<Vec<_>>();
-        let batch_items = batch_keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                KvEntry::new(key.clone(), format!("batch-value-{index}").into_bytes())
-            })
-            .collect();
-        if let Err(err) = self.write_changes(&store, batch_items).await {
-            self.trace_error("multi_get_write", storage_error_detail(&err));
-            return;
-        }
-        let repeat_count = self.operation_count.max(100);
-        for _ in 0..repeat_count {
-            let missing_key = b"kv-smoke/batch/missing".to_vec();
-            let mut requested_keys = Vec::with_capacity(batch_keys.len() + 2);
-            requested_keys.push(batch_keys[0].clone());
-            requested_keys.push(batch_keys[0].clone());
-            requested_keys.extend(batch_keys.iter().skip(1).cloned());
-            requested_keys.push(missing_key);
-            let values = match self
+            match self
                 .retry_attempt(&store, AttemptMode::ReadOnly, || {
-                    let requested_keys = requested_keys.clone();
+                    let key = key.clone();
                     move |attempt: &mut kv_backend::foundationdb::FoundationDbAttempt| {
+                        Box::pin(async move { attempt.get(&key, ReadProtection::Snapshot).await })
+                            as futures::future::BoxFuture<'_, Result<Option<Vec<u8>>, StorageError>>
+                    }
+                })
+                .await
+            {
+                Ok(Some(actual)) if actual == value => {
+                    self.read_count += 1;
+                }
+                Ok(Some(actual)) => {
+                    self.trace_error(
+                        "read",
+                        format!(
+                            "read value mismatch: expected {} bytes, got {}",
+                            value.len(),
+                            actual.len()
+                        ),
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    self.trace_error("read", "missing value after committed write".to_string());
+                    return;
+                }
+                Err(err) => {
+                    self.trace_error("read", storage_error_detail(&err));
+                    return;
+                }
+            }
+
+            let batch_keys = (0..100)
+                .map(|index| format!("kv-smoke/batch/{index}").into_bytes())
+                .collect::<Vec<_>>();
+            let batch_items = batch_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    KvEntry::new(key.clone(), format!("batch-value-{index}").into_bytes())
+                })
+                .collect();
+            if let Err(err) = self.write_changes(&store, batch_items).await {
+                self.trace_error("multi_get_write", storage_error_detail(&err));
+                return;
+            }
+            let repeat_count = self.operation_count.max(100);
+            for _ in 0..repeat_count {
+                let missing_key = b"kv-smoke/batch/missing".to_vec();
+                let mut requested_keys = Vec::with_capacity(batch_keys.len() + 2);
+                requested_keys.push(batch_keys[0].clone());
+                requested_keys.push(batch_keys[0].clone());
+                requested_keys.extend(batch_keys.iter().skip(1).cloned());
+                requested_keys.push(missing_key);
+                let values = match self
+                    .retry_attempt(&store, AttemptMode::ReadOnly, || {
+                        let requested_keys = requested_keys.clone();
+                        move |attempt: &mut kv_backend::foundationdb::FoundationDbAttempt| {
+                            Box::pin(async move {
+                                attempt
+                                    .get_batch(requested_keys, ReadProtection::Snapshot)
+                                    .await
+                            })
+                                as futures::future::BoxFuture<
+                                    '_,
+                                    Result<Vec<Option<Vec<u8>>>, StorageError>,
+                                >
+                        }
+                    })
+                    .await
+                {
+                    Ok(values) => values,
+                    Err(err) => {
+                        self.trace_error("multi_get", storage_error_detail(&err));
+                        return;
+                    }
+                };
+                let duplicate_matches = values.first() == values.get(1)
+                    && values.first().and_then(Option::as_deref)
+                        == Some(b"batch-value-0".as_slice());
+                let missing_is_none = values.last().is_some_and(Option::is_none);
+                let present_values_match = values
+                    .iter()
+                    .skip(2)
+                    .take(batch_keys.len().saturating_sub(1))
+                    .enumerate()
+                    .all(|(index, value)| {
+                        value.as_deref() == Some(format!("batch-value-{}", index + 1).as_bytes())
+                    });
+                if values.len() != requested_keys.len()
+                    || !duplicate_matches
+                    || !missing_is_none
+                    || !present_values_match
+                {
+                    self.trace_error(
+                        "multi_get",
+                        format!(
+                            "multi-key result mismatch: requested={} returned={} \
+                             duplicate_matches={} missing_is_none={} present_values_match={}",
+                            requested_keys.len(),
+                            values.len(),
+                            duplicate_matches,
+                            missing_is_none,
+                            present_values_match,
+                        ),
+                    );
+                    return;
+                }
+                self.multi_get_count += 1;
+            }
+
+            match self
+                .retry_attempt(&store, AttemptMode::ReadOnly, || {
+                    |attempt: &mut kv_backend::foundationdb::FoundationDbAttempt| {
                         Box::pin(async move {
                             attempt
-                                .get_batch(requested_keys, ReadProtection::Snapshot)
+                                .scan(
+                                    KvRange {
+                                        entry_bounds: None,
+                                        begin: b"kv-smoke/primary-item".to_vec(),
+                                        end: b"kv-smoke/primary-iten".to_vec(),
+                                        reverse: false,
+                                        limit: std::num::NonZeroU32::new(10)
+                                            .expect("nonzero scan limit"),
+                                        max_bytes: std::num::NonZeroUsize::new(1024 * 1024)
+                                            .expect("nonzero scan budget"),
+                                    },
+                                    ReadProtection::Snapshot,
+                                )
                                 .await
                         })
                             as futures::future::BoxFuture<
                                 '_,
-                                Result<Vec<Option<Vec<u8>>>, StorageError>,
+                                Result<kv_backend::KvRangePage, StorageError>,
                             >
                     }
                 })
                 .await
             {
-                Ok(values) => values,
+                Ok(range) if range.entries.len() == 1 => {
+                    self.audit_count += 1;
+                }
+                Ok(range) => {
+                    self.trace_error(
+                        "audit",
+                        format!("expected one audit row, got {}", range.entries.len()),
+                    );
+                }
                 Err(err) => {
-                    self.trace_error("multi_get", storage_error_detail(&err));
-                    return;
+                    self.trace_error("audit", storage_error_detail(&err));
                 }
-            };
-            let duplicate_matches = values.first() == values.get(1)
-                && values.first().and_then(Option::as_deref) == Some(b"batch-value-0".as_slice());
-            let missing_is_none = values.last().is_some_and(Option::is_none);
-            let present_values_match = values
-                .iter()
-                .skip(2)
-                .take(batch_keys.len().saturating_sub(1))
-                .enumerate()
-                .all(|(index, value)| {
-                    value.as_deref() == Some(format!("batch-value-{}", index + 1).as_bytes())
-                });
-            if values.len() != requested_keys.len()
-                || !duplicate_matches
-                || !missing_is_none
-                || !present_values_match
-            {
-                self.trace_error(
-                    "multi_get",
-                    format!(
-                        "multi-key result mismatch: requested={} returned={} duplicate_matches={} \
-                         missing_is_none={} present_values_match={}",
-                        requested_keys.len(),
-                        values.len(),
-                        duplicate_matches,
-                        missing_is_none,
-                        present_values_match,
-                    ),
-                );
-                return;
             }
-            self.multi_get_count += 1;
-        }
-
-        match self
-            .retry_attempt(&store, AttemptMode::ReadOnly, || {
-                |attempt: &mut kv_backend::foundationdb::FoundationDbAttempt| {
-                    Box::pin(async move {
-                        attempt
-                            .scan(
-                                KvRange {
-                                    entry_bounds: None,
-                                    begin: b"kv-smoke/primary-item".to_vec(),
-                                    end: b"kv-smoke/primary-iten".to_vec(),
-                                    reverse: false,
-                                    limit: std::num::NonZeroU32::new(10)
-                                        .expect("nonzero scan limit"),
-                                    max_bytes: std::num::NonZeroUsize::new(1024 * 1024)
-                                        .expect("nonzero scan budget"),
-                                },
-                                ReadProtection::Snapshot,
-                            )
-                            .await
-                    })
-                        as futures::future::BoxFuture<
-                            '_,
-                            Result<kv_backend::KvRangePage, StorageError>,
-                        >
-                }
-            })
-            .await
-        {
-            Ok(range) if range.entries.len() == 1 => {
-                self.audit_count += 1;
-            }
-            Ok(range) => {
-                self.trace_error(
-                    "audit",
-                    format!("expected one audit row, got {}", range.entries.len()),
-                );
-            }
-            Err(err) => {
-                self.trace_error("audit", storage_error_detail(&err));
-            }
-        }
+        })
+        .await;
     }
 
     async fn check(&mut self, _db: SimDatabase) {

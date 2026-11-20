@@ -21,7 +21,7 @@ impl TimestampSecondsFractional {
                   compatibility"
     )]
     pub fn now() -> Self {
-        Self(chrono::Utc::now().timestamp_millis() as f64 / 1000.0)
+        Self(crate::ambient::now_millis() as f64 / 1000.0)
     }
 
     #[must_use]

@@ -1,27 +1,26 @@
 //! Ordered KV spans for table and GSI Query and Scan pages.
 
-use storage_condition::Condition;
 use storage_provider::{BoundRangeReadPage, BoundRangeReadPlan};
 use storage_types::{
     AttributeValue, BoundTableInfo, IndexName, ItemKey, KeyAttributeType, KeySchemaElement,
-    StorageError, StorageResult,
+    StorageError, StorageResult, condition::Condition,
 };
 
 use crate::{
-    catalog::{KvIndexKind, KvTableIdentity},
-    constants::{GSI_PROJECTION_FAMILY, PRIMARY_ITEM_FAMILY},
+    catalog::table_id_from_history,
+    constants::GSI_PROJECTION_KEY_PREFIX_BYTES,
     gsi::ordered_projection_key,
     item_read::primary_item_key,
     range::prefix_upper_bound,
+    table_key_layout::{TableSubFamily, table_prefix},
 };
 
-fn index_id(identity: &KvTableIdentity, name: &IndexName) -> StorageResult<u16> {
-    identity
-        .indexes
-        .iter()
-        .find(|index| index.index_kind == KvIndexKind::UserGsi && index.index_name == *name)
+fn index_id(table: &BoundTableInfo, name: &IndexName) -> StorageResult<u16> {
+    table
+        .binding
+        .gsi(name)
         .map(|index| index.index_id)
-        .ok_or_else(|| StorageError::internal("KV index identity is absent"))
+        .ok_or_else(|| StorageError::internal("KV index binding is absent"))
 }
 
 pub(super) struct PhysicalSpan {
@@ -30,7 +29,6 @@ pub(super) struct PhysicalSpan {
 }
 
 pub(super) fn physical_span(
-    identity: &KvTableIdentity,
     table: &BoundTableInfo,
     bound: &BoundRangeReadPlan<'_>,
     page: &BoundRangeReadPage<'_>,
@@ -38,11 +36,11 @@ pub(super) fn physical_span(
     let index_id = bound
         .index_name
         .as_ref()
-        .map(|name| index_id(identity, name))
+        .map(|name| index_id(table, name))
         .transpose()?;
-    let mut span = condition_span(identity, index_id, bound, page.condition)?;
+    let mut span = condition_span(table, index_id, bound, page.condition)?;
     if let Some(start) = page.start.as_ref() {
-        let physical = physical_item_key(identity, table, bound, start)?;
+        let physical = physical_item_key(table, bound, start)?;
         if page.forward {
             span.begin = span.begin.max(after_key(physical));
         } else {
@@ -53,12 +51,12 @@ pub(super) fn physical_span(
 }
 
 fn condition_span(
-    identity: &KvTableIdentity,
+    table: &BoundTableInfo,
     index_id: Option<u16>,
     bound: &BoundRangeReadPlan<'_>,
     condition: Option<&Condition>,
 ) -> StorageResult<PhysicalSpan> {
-    let prefix = range_prefix(identity, index_id, None)?;
+    let prefix = range_prefix(table, index_id, None)?;
     let mut span = PhysicalSpan {
         begin: prefix.clone(),
         end: prefix_upper_bound(&prefix)
@@ -76,7 +74,7 @@ fn condition_span(
             .ok_or_else(|| StorageError::internal("range schema lacks a hash key"))?;
         let hash = hash_equality(condition, &hash_field.attribute_name)
             .ok_or_else(|| StorageError::internal("validated query lacks a hash equality"))?;
-        let partition = range_prefix(identity, index_id, Some((hash, None)))?;
+        let partition = range_prefix(table, index_id, Some((hash, None)))?;
         span.end = prefix_upper_bound(&partition)
             .ok_or_else(|| StorageError::internal("KV range prefix has no upper bound"))?;
         span.begin = partition;
@@ -92,7 +90,7 @@ fn condition_span(
                     StorageError::internal("range sort key has no attribute definition")
                 })?
                 .attribute_type;
-            span.constrain_sort(identity, index_id, (hash, kind), sort)?;
+            span.constrain_sort(table, index_id, (hash, kind), sort)?;
         }
     }
     Ok(span)
@@ -131,12 +129,12 @@ fn find_sort_condition<'a>(condition: &'a Condition, field: &str) -> Option<&'a 
 impl PhysicalSpan {
     fn constrain_sort(
         &mut self,
-        identity: &KvTableIdentity,
+        table: &BoundTableInfo,
         index_id: Option<u16>,
         key: (&AttributeValue, KeyAttributeType),
         condition: &Condition,
     ) -> StorageResult<()> {
-        let [begin, end] = encode_condition_bounds(identity, index_id, key, condition)?;
+        let [begin, end] = encode_condition_bounds(table, index_id, key, condition)?;
         if let Some(begin) = begin
             && begin > self.begin
         {
@@ -152,13 +150,13 @@ impl PhysicalSpan {
 }
 
 fn encode_condition_bounds(
-    identity: &KvTableIdentity,
+    table: &BoundTableInfo,
     index_id: Option<u16>,
     key: (&AttributeValue, KeyAttributeType),
     condition: &Condition,
 ) -> StorageResult<[Option<Vec<u8>>; 2]> {
     let (hash, kind) = key;
-    let exact = |value: &AttributeValue| encode_exact_sort_key(identity, index_id, hash, value);
+    let exact = |value: &AttributeValue| encode_exact_sort_key(table, index_id, hash, value);
     let raw = |value: &str| bind_sort_value(kind, value);
     match condition {
         Condition::Equal { value, .. } => {
@@ -187,7 +185,7 @@ fn encode_condition_bounds(
             ])
         }
         Condition::BeginsWith { prefix, .. } => {
-            let low = range_prefix(identity, index_id, Some((hash, Some(prefix))))?;
+            let low = range_prefix(table, index_id, Some((hash, Some(prefix))))?;
             let high = prefix_upper_bound(&low);
             Ok([Some(low), high])
         }
@@ -206,12 +204,12 @@ fn bind_sort_value(kind: KeyAttributeType, raw: &str) -> AttributeValue {
 }
 
 fn encode_exact_sort_key(
-    identity: &KvTableIdentity,
+    table: &BoundTableInfo,
     index_id: Option<u16>,
     hash: &AttributeValue,
     sort: &AttributeValue,
 ) -> StorageResult<Vec<u8>> {
-    let mut key = range_prefix(identity, index_id, Some((hash, Some(sort))))?;
+    let mut key = range_prefix(table, index_id, Some((hash, Some(sort))))?;
     if index_id.is_some() {
         // The prefix codec omits this terminator for begins_with. Exact GSI
         // bounds need it before the table-key tie suffix.
@@ -231,41 +229,41 @@ fn advance_past_exact_sort_key(key: Vec<u8>, index_id: Option<u16>) -> StorageRe
 }
 
 fn range_prefix(
-    identity: &KvTableIdentity,
+    table: &BoundTableInfo,
     index_id: Option<u16>,
     key: Option<(&AttributeValue, Option<&AttributeValue>)>,
 ) -> StorageResult<Vec<u8>> {
-    let mut prefix = Vec::with_capacity(7 + key.map_or(0, |_| 64));
-    prefix.push(if index_id.is_some() {
-        GSI_PROJECTION_FAMILY
+    let family = if index_id.is_some() {
+        TableSubFamily::GsiEntry
     } else {
-        PRIMARY_ITEM_FAMILY
-    });
-    prefix.extend_from_slice(&identity.table_id.to_be_bytes());
+        TableSubFamily::Item
+    };
+    let mut prefix = Vec::with_capacity(GSI_PROJECTION_KEY_PREFIX_BYTES + key.map_or(0, |_| 64));
+    prefix.extend_from_slice(&table_prefix(
+        table_id_from_history(table.history_id)?,
+        family,
+    ));
     if let Some(index_id) = index_id {
         prefix.extend_from_slice(&index_id.to_be_bytes());
     }
     if let Some((hash, sort_prefix)) = key {
         let key = if let Some(index_id) = index_id {
-            let name = identity
-                .indexes
+            let name = table
+                .binding
+                .gsis
                 .iter()
                 .find(|index| index.index_id == index_id)
-                .ok_or_else(|| StorageError::internal("KV range index identity is absent"))?
-                .index_name
+                .ok_or_else(|| StorageError::internal("KV range index binding is absent"))?
+                .name
                 .clone();
             ItemKey::index_prefix(
-                identity.table_name.clone(),
+                table.table_name.clone(),
                 name,
                 hash.clone(),
                 sort_prefix.cloned(),
             )
         } else {
-            ItemKey::table_key(
-                identity.table_name.clone(),
-                hash.clone(),
-                sort_prefix.cloned(),
-            )
+            ItemKey::table_key(table.table_name.clone(), hash.clone(), sort_prefix.cloned())
         };
         let suffix = match (index_id, sort_prefix) {
             (Some(_), Some(_)) => crate::gsi::ordered_projection_prefix(&key)?,
@@ -283,14 +281,21 @@ pub(super) fn after_key(mut key: Vec<u8>) -> Vec<u8> {
 }
 
 pub(super) fn physical_item_key(
-    identity: &KvTableIdentity,
     table: &BoundTableInfo,
     bound: &BoundRangeReadPlan<'_>,
     key: &ItemKey,
 ) -> StorageResult<Vec<u8>> {
     if let Some(name) = &bound.index_name {
-        ordered_projection_key(identity, index_id(identity, name)?, key)
+        ordered_projection_key(
+            table_id_from_history(table.history_id)?,
+            index_id(table, name)?,
+            key,
+        )
     } else {
-        primary_item_key(identity, table, &key.key_attributes(&table.info)?)
+        primary_item_key(
+            table_id_from_history(table.history_id)?,
+            table,
+            &key.key_attributes(&table.info)?,
+        )
     }
 }

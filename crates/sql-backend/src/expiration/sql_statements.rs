@@ -10,7 +10,8 @@ pub(super) fn expiration_index_page(
     read: &TtlIndexRead,
     history_id: TableHistoryId,
 ) -> StorageResult<SqlStatement> {
-    let physical = engine.ttl_table_name(history_id);
+    let ttl_key = crate::item_schema::ttl_key_identifier();
+    let physical = engine.item_table_name(history_id);
     let cursor = read
         .cursor
         .as_ref()
@@ -18,34 +19,35 @@ pub(super) fn expiration_index_page(
         .transpose()?;
     let mut binds = Vec::new();
     binds
-        .try_reserve_exact(if cursor.is_some() { 5 } else { 2 })
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    binds.push(SqlValue::Integer(read.cutoff_seconds));
+        .try_reserve_exact(if cursor.is_some() { 3 } else { 2 })
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     let mut sql = SqlText::default();
+    // Turso requires the partial-index predicate explicitly.
     sql.append(format_args!(
-        "SELECT ttl_value, key_token FROM \"{physical}\" WHERE ttl_value <= "
+        "SELECT {ttl_key} FROM \"{physical}\" WHERE {ttl_key} IS NOT NULL"
     ))?;
-    sql.append_parameter(engine.engine(), 1, false)?;
+    if let Some(upper) = read.cutoff_seconds.checked_add(1) {
+        binds.push(SqlValue::Blob(
+            storage_common::TtlIndexKey::encode_ordered_seconds(upper).to_vec(),
+        ));
+        sql.append(format_args!(" AND {ttl_key} < "))?;
+        sql.append_parameter(engine.engine(), binds.len(), false)?;
+    }
     if let Some(cursor) = cursor {
-        binds.push(SqlValue::Integer(cursor.expiration_seconds));
-        binds.push(SqlValue::Integer(cursor.expiration_seconds));
-        binds.push(SqlValue::Text(cursor.ttl_item_key));
-        sql.append(format_args!(" AND (ttl_value > "))?;
-        sql.append_parameter(engine.engine(), 2, false)?;
-        sql.append(format_args!(" OR (ttl_value = "))?;
-        sql.append_parameter(engine.engine(), 3, false)?;
-        sql.append(format_args!(" AND key_token > "))?;
-        sql.append_parameter(engine.engine(), 4, false)?;
-        sql.append(format_args!("))"))?;
+        let key =
+            storage_common::TtlIndexKey::new(cursor.expiration_seconds, cursor.ttl_item_key.into());
+        binds.push(SqlValue::Blob(key.encode_ordered_bytes()?));
+        sql.append(format_args!(" AND {ttl_key} > "))?;
+        sql.append_parameter(engine.engine(), binds.len(), false)?;
     }
     let limit = read
         .limit
         .get()
         .checked_add(1)
         .and_then(|limit| i64::try_from(limit).ok())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     binds.push(SqlValue::Integer(limit));
-    sql.append(format_args!(" ORDER BY ttl_value, key_token LIMIT "))?;
+    sql.append(format_args!(" ORDER BY {ttl_key} LIMIT "))?;
     sql.append_parameter(engine.engine(), binds.len(), false)?;
     Ok(SqlStatement::new(sql.finish()?, binds))
 }

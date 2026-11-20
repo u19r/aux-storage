@@ -1,7 +1,9 @@
 //! SQL receipt persistence for the shared TransactWriteItems executor.
 
+use scheduled_bg_jobs::store::StoreKey;
 use storage_provider::{
-    DynamoTransactWriteAttempt, TRANSACT_RECEIPT_READ_BYTES, maintenance::TransactReceiptRow,
+    DynamoTransactWriteAttempt, ReceiptSlot, TRANSACT_RECEIPT_PAGE_BYTES,
+    maintenance::TransactReceiptRow,
 };
 use storage_types::{StorageError, StorageResult};
 
@@ -21,6 +23,23 @@ pub async fn initialize_transact_receipts<A: SqlAttempt>(
 }
 
 impl<A: SqlAttempt, L: SqlLayout> DynamoTransactWriteAttempt for SqlCatalogAttempt<'_, A, L> {
+    async fn read_write_observations(
+        &mut self,
+        batch: storage_provider::WriteObservationBatch<'_>,
+    ) -> StorageResult<storage_provider::WriteObservationBatchResult> {
+        let mut settlement =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = settlement.as_mut();
+        let result = async {
+            if catalog.engine.engine() != SqlEngine::Postgres {
+                return storage_provider::read_write_observations_default(catalog, batch).await;
+            }
+            catalog.read_combined_write_observations(batch).await
+        }
+        .await;
+        settlement.complete(result)
+    }
+
     async fn read_scheduled_jobs(
         &mut self,
         keys: &[scheduled_bg_jobs::store::StoreKey],
@@ -32,18 +51,32 @@ impl<A: SqlAttempt, L: SqlLayout> DynamoTransactWriteAttempt for SqlCatalogAttem
             let mut values = Vec::new();
             values
                 .try_reserve_exact(keys.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             for key in keys {
                 let key = std::slice::from_ref(key);
-                // Await the job-row lock before reading its cancellation
-                // marker. A fresh READ COMMITTED statement must see a
-                // cancellation that committed while the job-row read waited for
-                // that same lock.
+                // Postgres locks the row with a no-op UPDATE. A SERIALIZABLE
+                // job transition that later writes this row then fails and
+                // retries on a fresh snapshot, which sees this effect's
+                // receipt; a FOR UPDATE lock leaves no row version and would
+                // not. Await the job-row lock before reading the cancellation
+                // marker: a fresh READ COMMITTED statement must see a
+                // cancellation that committed while the job-row read waited.
+                let (statement, protection) = if catalog.engine.engine() == SqlEngine::Postgres {
+                    (
+                        crate::job_store::lock_point(catalog.engine.engine(), &key[0])?,
+                        crate::ReadProtection::Snapshot,
+                    )
+                } else {
+                    (
+                        crate::job_store::points(catalog.engine.engine(), key)?,
+                        crate::ReadProtection::Conflict,
+                    )
+                };
                 let page = catalog
                     .attempt
                     .query(
-                        crate::job_store::points(catalog.engine.engine(), key)?,
-                        crate::ReadProtection::Conflict,
+                        statement,
+                        protection,
                         crate::constants::SCHEDULED_JOB_POINT_READ_BYTES,
                     )
                     .await?;
@@ -63,86 +96,92 @@ impl<A: SqlAttempt, L: SqlLayout> DynamoTransactWriteAttempt for SqlCatalogAttem
         settlement.complete(result)
     }
 
-    async fn read_transact_receipt(&mut self, token: &str) -> StorageResult<Option<Vec<u8>>> {
+    async fn read_transact_receipt(
+        &mut self,
+        slot: ReceiptSlot<'_>,
+    ) -> StorageResult<Option<Vec<u8>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
             let mut statements = Vec::with_capacity(2);
-            if catalog.engine.engine() == SqlEngine::Postgres {
-                statements.push((
-                    crate::item_lock::token_lock_statement(token),
-                    crate::ReadProtection::Snapshot,
-                ));
-            }
+            let prefix = catalog
+                .catalog_lock
+                .token_lock_prefix(slot, &mut statements);
             let protection = if catalog.engine.engine() == SqlEngine::Postgres {
                 crate::ReadProtection::Snapshot
             } else {
                 catalog.protection
             };
-            statements.push((
-                sql_statements::read_receipt(catalog.engine, token),
-                protection,
-            ));
-            let expected = statements.len();
-            let mut pages = catalog
+            statements.push((receipt_statement(catalog.engine, slot)?, protection));
+            let pages = catalog
                 .attempt
-                .query_batch_protected(statements, TRANSACT_RECEIPT_READ_BYTES)
+                .query_batch_protected_exact(statements, TRANSACT_RECEIPT_PAGE_BYTES)
                 .await?;
-            if pages.len() != expected {
-                return Err(StorageError::internal(
-                    "SQL transact receipt page count differs",
-                ));
-            }
+            let mut pages = pages.into_iter();
+            catalog
+                .catalog_lock
+                .finish_lock_prefix(prefix, &mut pages)?;
             let page = pages
-                .pop()
-                .ok_or_else(|| StorageError::internal("SQL transact receipt page is missing"))?;
-            if page.more {
-                return Err(StorageError::internal(
-                    "SQL transact token receipt exceeds the read bound",
-                ));
-            }
-            if page.rows.len() > 1 {
-                return Err(StorageError::internal(
-                    "SQL transact token has duplicate receipt rows",
-                ));
-            }
-            page.rows
-                .into_iter()
                 .next()
-                .map(decode_receipt_row)
-                .transpose()
+                .ok_or_else(|| StorageError::internal("SQL transact receipt page is missing"))?;
+            decode_receipt_page(slot, page)
         }
         .await;
         settlement.complete(result)
     }
 
-    async fn write_transact_receipt(&mut self, token: &str, receipt: Vec<u8>) -> StorageResult<()> {
+    fn stage_transact_receipt(
+        &mut self,
+        slot: ReceiptSlot<'_>,
+        receipt: Vec<u8>,
+    ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
-        let result = async {
-            let changed = catalog
-                .attempt
-                .execute(sql_statements::write_receipt(
-                    catalog.engine,
-                    token,
-                    receipt,
-                ))
-                .await?;
-            if changed != 1 {
-                return Err(StorageError::internal(
-                    "SQL transact token receipt write affected another row count",
-                ));
+        let result = (|| {
+            use crate::catalog::{PendingDynamoWrites, SqlDynamoCount, SqlDynamoWriteKind};
+            let engine = catalog.engine;
+            match &mut catalog.dynamo_writes {
+                PendingDynamoWrites::KeepOpen(writes) => {
+                    writes
+                        .try_reserve(1)
+                        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+                    let statement = match slot {
+                        ReceiptSlot::Request(token) => {
+                            sql_statements::write_receipt(engine, token, receipt)
+                        }
+                        ReceiptSlot::JobEffect(key) => {
+                            crate::job_store::put(engine.engine(), key.as_bytes(), &receipt)?
+                        }
+                    };
+                    writes.push((
+                        statement,
+                        SqlDynamoCount::ExactlyOne,
+                        SqlDynamoWriteKind::Receipt,
+                    ));
+                }
+                PendingDynamoWrites::Commit(writes) => {
+                    writes
+                        .try_reserve(1)
+                        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+                    writes.push(match slot {
+                        ReceiptSlot::Request(token) => {
+                            sql_statements::counted_receipt(engine, token, receipt)?
+                        }
+                        ReceiptSlot::JobEffect(key) => {
+                            crate::job_store::counted_put(engine.engine(), key.as_bytes(), receipt)?
+                        }
+                    });
+                }
             }
             Ok(())
-        }
-        .await;
+        })();
         settlement.complete(result)
     }
 }
 
-fn decode_receipt_row(row: SqlRow) -> StorageResult<Vec<u8>> {
+pub(crate) fn decode_receipt_row(row: SqlRow) -> StorageResult<Vec<u8>> {
     let invalid =
         || StorageError::internal("SQL transact token receipt has invalid payload columns");
     let mut values = row.into_values();
@@ -155,6 +194,50 @@ fn decode_receipt_row(row: SqlRow) -> StorageResult<Vec<u8>> {
     Ok(bytes)
 }
 
+pub(crate) fn receipt_statement(
+    engine: impl SqlLayout,
+    slot: ReceiptSlot<'_>,
+) -> StorageResult<crate::SqlStatement> {
+    match slot {
+        ReceiptSlot::Request(token) => Ok(sql_statements::read_receipt(engine, token)),
+        ReceiptSlot::JobEffect(key) => {
+            crate::job_store::points(engine.engine(), std::slice::from_ref(key))
+        }
+    }
+}
+
+pub(crate) fn decode_receipt_page(
+    slot: ReceiptSlot<'_>,
+    page: crate::SqlQueryPage,
+) -> StorageResult<Option<Vec<u8>>> {
+    if page.more || page.rows.len() > 1 {
+        return Err(StorageError::internal(
+            "SQL transact receipt page is invalid",
+        ));
+    }
+    let Some(row) = page.rows.into_iter().next() else {
+        return Ok(None);
+    };
+    match slot {
+        ReceiptSlot::Request(_) => decode_receipt_row(row).map(Some),
+        ReceiptSlot::JobEffect(key) => decode_job_effect_row(row, key).map(Some),
+    }
+}
+
+fn decode_job_effect_row(row: SqlRow, key: &StoreKey) -> StorageResult<Vec<u8>> {
+    let invalid = || StorageError::internal("SQL job effect receipt row is invalid");
+    let mut values = row.into_values().into_iter();
+    let (Some(SqlValue::Blob(stored)), Some(SqlValue::Blob(value)), None) =
+        (values.next(), values.next(), values.next())
+    else {
+        return Err(invalid());
+    };
+    if stored.as_slice() != key.as_bytes() {
+        return Err(invalid());
+    }
+    Ok(value)
+}
+
 pub(crate) async fn scan_receipts<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
@@ -165,7 +248,7 @@ pub(crate) async fn scan_receipts<A: SqlAttempt>(
         .query(
             sql_statements::scan_receipts(engine, after, limit.get()),
             crate::ReadProtection::Conflict,
-            TRANSACT_RECEIPT_READ_BYTES,
+            TRANSACT_RECEIPT_PAGE_BYTES,
         )
         .await?;
     page.rows.into_iter().map(decode_receipt_pair).collect()
@@ -197,4 +280,8 @@ fn decode_receipt_pair(row: SqlRow) -> StorageResult<TransactReceiptRow> {
         return Err(invalid());
     };
     Ok(TransactReceiptRow { token, receipt })
+}
+
+pub(crate) fn receipt_count_error() -> StorageError {
+    StorageError::internal("SQL transact token receipt write affected another row count")
 }

@@ -9,6 +9,9 @@ use stream_provider::{
 use super::{StatefulTestBackend, models::StreamReclamationFixtureTarget};
 use crate::{AdmissionClass, database_manager::ROUTED_DEFAULT_CONNECTION_ID};
 
+/// Default stream lineage count on Postgres and FoundationDB.
+const MAX_STREAM_LANES: usize = 4;
+
 impl StatefulTestBackend {
     pub async fn establish_stream_reclamation_checkpoint(
         &self,
@@ -27,15 +30,34 @@ impl StatefulTestBackend {
         }
         self.drive_gsi_until_idle().await?;
         let scope = database.get_system_stream_scope_for_control().await?;
-        let page = database
-            .get_system_stream_page_for_control(
-                SystemStreamPageRequest::try_new(scope.clone(), None, 1)
-                    .map_err(|error| StorageError::validation(error.to_string()))?,
-            )
-            .await?;
-        assert_eq!(page.records().len(), 1);
-        assert!(!page.terminal());
-        let checkpoint = page.issued_checkpoint().token().clone();
+        // A multi-lineage stream gives the page quota to the least-advanced
+        // lane; a drained lane legally returns an empty non-terminal page and
+        // advances. Follow each issued checkpoint until a page holds the record
+        // (bounded by lanes + 1 pages).
+        let mut cursor = None;
+        let mut checkpoint = None;
+        for _ in 0..=MAX_STREAM_LANES {
+            let page = database
+                .get_system_stream_page_for_control(
+                    SystemStreamPageRequest::try_new(scope.clone(), cursor.take(), 1)
+                        .map_err(|error| StorageError::validation(error.to_string()))?,
+                )
+                .await?;
+            assert!(!page.terminal());
+            let issued = page.issued_checkpoint().token().clone();
+            if page.records().len() == 1 {
+                checkpoint = Some(issued);
+                break;
+            }
+            assert!(
+                page.records().is_empty(),
+                "limit 1 page held several records"
+            );
+            cursor = Some(issued);
+        }
+        let checkpoint = checkpoint.ok_or_else(|| {
+            StorageError::internal("no SystemStream page held a record within the lane bound")
+        })?;
         let catalog = database
             .run_stream_admitted(ROUTED_DEFAULT_CONNECTION_ID, AdmissionClass::PointRead, {
                 let scope = scope.clone();
@@ -129,21 +151,33 @@ impl StatefulTestBackend {
     ) -> Result<Vec<storage_types::SystemStreamPosition>, StorageError> {
         let database = self.database.as_ref().expect("fixture database is open");
         let scope = database.get_system_stream_scope_for_control().await?;
-        let page = database
-            .get_system_stream_page_for_control(
-                SystemStreamPageRequest::try_new(scope, None, 100)
-                    .map_err(|error| StorageError::validation(error.to_string()))?,
-            )
-            .await?;
-        assert!(
-            page.terminal(),
-            "fixture snapshot must include every source record"
-        );
-        Ok(page
-            .records()
-            .iter()
-            .map(|record| record.system_position.clone().expect("system position"))
-            .collect())
+        let mut checkpoint = None;
+        let mut positions = Vec::new();
+        for page_count in 1..=8_usize {
+            let page = database
+                .get_system_stream_page_for_control(
+                    SystemStreamPageRequest::try_new(scope.clone(), checkpoint.take(), 100)
+                        .map_err(|error| StorageError::validation(error.to_string()))?,
+                )
+                .await?;
+            positions.extend(
+                page.records()
+                    .iter()
+                    .map(|record| record.system_position.clone().expect("system position")),
+            );
+            if page.terminal() {
+                return Ok(positions);
+            }
+            checkpoint = Some(page.issued_checkpoint().token().clone());
+            assert!(
+                page_count < 8,
+                "system history did not reach terminal in {page_count} pages: records={} \
+                 terminal={}",
+                positions.len(),
+                page.terminal()
+            );
+        }
+        unreachable!("the loop returns or panics by page 8")
     }
 
     pub async fn read_reclamation_table_records(&self) -> Result<usize, StorageError> {

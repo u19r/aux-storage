@@ -9,20 +9,16 @@ use tokio::sync::Semaphore;
 #[cfg(any(test, feature = "internal-test-routes"))]
 use tokio::sync::{Mutex, Notify};
 
-use crate::{health::HealthTracker, manager::StorageApiManagerImpl};
+use crate::health::HealthTracker;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_manager: Arc<DatabaseManager>,
-    pub storage_manager: Arc<StorageApiManagerImpl>,
-    #[cfg(feature = "queue")]
     pub queue_manager: Option<Arc<queue::QueueManager>>,
-    #[cfg(feature = "queue")]
-    pub queue_public_base_url: String,
-    #[cfg(feature = "queue")]
-    pub queue_account_id: String,
-    #[cfg(feature = "pubsub")]
     pub pubsub_manager: Option<Arc<pubsub::PubsubManager>>,
+    /// The services `prepare_app_state` built; the host starts their
+    /// delivery runner. `None` for a state built with `with_messaging`.
+    pub(crate) messaging: Option<Arc<storage::messaging::MessagingServices>>,
     pub health: Arc<HealthTracker>,
     startup_readiness: Arc<AtomicBool>,
     #[cfg(any(test, feature = "internal-test-routes"))]
@@ -35,27 +31,12 @@ pub struct AppState {
 impl AppState {
     #[must_use]
     pub fn new(db_manager: Arc<DatabaseManager>) -> Self {
-        let storage_manager = Arc::new(StorageApiManagerImpl::new(db_manager.clone()));
-        Self::with_manager(db_manager, storage_manager)
-    }
-
-    #[must_use]
-    pub fn with_manager(
-        db_manager: Arc<DatabaseManager>,
-        storage_manager: Arc<StorageApiManagerImpl>,
-    ) -> Self {
         let ingress_limit = db_manager.fixed_ingress_limit();
         Self {
             db_manager,
-            storage_manager,
-            #[cfg(feature = "queue")]
             queue_manager: None,
-            #[cfg(feature = "queue")]
-            queue_public_base_url: String::new(),
-            #[cfg(feature = "queue")]
-            queue_account_id: "000000000000".to_string(),
-            #[cfg(feature = "pubsub")]
             pubsub_manager: None,
+            messaging: None,
             health: Arc::new(HealthTracker::new()),
             startup_readiness: Arc::new(AtomicBool::new(true)),
             #[cfg(any(test, feature = "internal-test-routes"))]
@@ -81,31 +62,32 @@ impl AppState {
         self.startup_readiness.load(Ordering::Acquire)
     }
 
-    #[cfg(any(feature = "queue", feature = "pubsub"))]
     #[must_use]
     pub fn with_messaging(
         mut self,
-        #[cfg(feature = "queue")] queue_manager: Option<Arc<queue::QueueManager>>,
-        #[cfg(feature = "queue")] queue_public_base_url: String,
-        #[cfg(feature = "queue")] queue_account_id: String,
-        #[cfg(feature = "pubsub")] pubsub_manager: Option<Arc<pubsub::PubsubManager>>,
+        queue_manager: Option<Arc<queue::QueueManager>>,
+        pubsub_manager: Option<Arc<pubsub::PubsubManager>>,
     ) -> Self {
-        #[cfg(feature = "queue")]
-        {
-            self.queue_manager = queue_manager;
-            self.queue_public_base_url = queue_public_base_url;
-            self.queue_account_id = queue_account_id;
-        }
-        #[cfg(feature = "pubsub")]
-        {
-            self.pubsub_manager = pubsub_manager;
-        }
+        self.queue_manager = queue_manager;
+        self.pubsub_manager = pubsub_manager;
+        self
+    }
+
+    /// Serve the managers of `services` and keep them for the host.
+    #[must_use]
+    pub fn with_messaging_services(
+        mut self,
+        services: storage::messaging::MessagingServices,
+    ) -> Self {
+        self.queue_manager = services.queue.clone();
+        self.pubsub_manager = services.pubsub.clone();
+        self.messaging = Some(Arc::new(services));
         self
     }
 }
 
-#[derive(Debug, Clone)]
-
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum Response {
     CreateTable(storage_types::CreateTableResponse),
     ListTables(storage_types::ListTablesResponse),
@@ -132,8 +114,6 @@ pub enum Response {
     GetShardIterator(storage_types::GetShardIteratorResponse),
     GetRecords(storage_types::GetRecordsResponse),
     DescribeTimeToLive(storage_types::DescribeTimeToLiveResponse),
-    ListChangeIndexMarkers(storage_provider::ListChangeIndexMarkersResponse),
-    CanonicalHistory(Arc<storage::CanonicalHistoryResponse>),
     Raw(serde_json::Value),
 }
 

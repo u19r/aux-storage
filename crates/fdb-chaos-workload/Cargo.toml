@@ -19,7 +19,7 @@ fdb-chaos-model = { path = "../fdb-chaos-model" }
 foundationdb = { workspace = true }
 foundationdb-simulation = { workspace = true }
 futures = { workspace = true }
-kv-backend = { path = "../kv-backend", default-features = false, features = ["simulation"] }
+kv-backend = { path = "../kv-backend", default-features = false, features = ["simulation", "fault-injection"] }
 pubsub = { path = "../pubsub", default-features = false, features = ["foundationdb"] }
 pubsub-provider = { path = "../pubsub-provider" }
 queue = { path = "../queue", default-features = false, features = ["foundationdb"] }
@@ -31,6 +31,10 @@ stream-provider = { path = "../stream-provider" }
 
 [dev-dependencies]
 kv-backend = { path = "../kv-backend", default-features = false, features = ["rocksdb", "fault-injection"] }
+pubsub-provider = { path = "../pubsub-provider", features = ["test-support"] }
+storage-provider = { path = "../storage-provider", features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
+stream-provider = { path = "../stream-provider", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 

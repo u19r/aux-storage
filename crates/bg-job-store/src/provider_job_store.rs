@@ -30,7 +30,7 @@ impl ScheduledJobStore {
 
     pub fn bind_native_admission(
         &self,
-        admission: Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        admission: Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> storage_types::StorageResult<()> {
         self.raw.bind_native_admission(admission)
     }

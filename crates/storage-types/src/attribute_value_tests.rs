@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
-use alloc_counter::AllocationGuard;
 use serde::{Deserialize, Serialize};
 
-use crate::{AttributeValue, from_hashmap, to_hashmap};
+use crate::{AttributeMap, AttributeValue, from_hashmap, to_hashmap};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 struct TestStruct {
@@ -93,7 +92,7 @@ fn to_plain_json() {
         AttributeValue::SS(vec!["developer".to_string(), "rust".to_string()]),
     );
 
-    let attr_value = AttributeValue::M(map);
+    let attr_value = AttributeValue::M(AttributeMap::from(map));
     let json_string = attr_value.to_plain_json().unwrap();
 
     // Parse the JSON to verify structure
@@ -189,7 +188,10 @@ fn from_hashmap_decodes_numeric_timestamps_for_datetime_fields() {
         "validAt".to_string(),
         AttributeValue::N((*valid_at).to_string()),
     );
-    map.insert("nested".to_string(), AttributeValue::M(nested));
+    map.insert(
+        "nested".to_string(),
+        AttributeValue::M(AttributeMap::from(nested)),
+    );
 
     let decoded: TimestampStruct = from_hashmap(map).expect("decode timestamp fixture");
     assert_eq!(
@@ -215,7 +217,7 @@ fn consuming_attribute_value_conversion_matches_borrowed_conversion() {
         AttributeValue::N("1e-130".to_string()),
     );
     nested.insert("binary".to_string(), AttributeValue::B("AQI=".to_string()));
-    let value = AttributeValue::M(nested);
+    let value = AttributeValue::M(AttributeMap::from(nested));
 
     let expected = value.to_json_value().expect("borrowed conversion");
     let actual = value.into_json_value().expect("consuming conversion");
@@ -265,13 +267,13 @@ fn canonical_map_fixture(width: usize) -> HashMap<String, AttributeValue> {
                     AttributeValue::S("nested".to_string()),
                     AttributeValue::N("1e-130".to_string()),
                 ]),
-                9 => AttributeValue::M(HashMap::from([
+                9 => AttributeValue::M(AttributeMap::from(HashMap::from([
                     ("zeta".to_string(), AttributeValue::S("last".to_string())),
                     (
                         "alpha".to_string(),
                         AttributeValue::N("not-a-number".to_string()),
                     ),
-                ])),
+                ]))),
                 _ => unreachable!(),
             };
             (name, value)
@@ -287,10 +289,6 @@ fn legacy_canonical_map_json(map: &HashMap<String, AttributeValue>) -> Result<St
     serde_json::to_string(&ordered).map_err(|error| error.to_string())
 }
 
-fn current_canonical_map_json(map: &HashMap<String, AttributeValue>) -> String {
-    crate::canonical_dynamo_map_json(map).expect("canonical map should serialize")
-}
-
 #[test]
 fn canonical_dynamo_map_borrowed_entries_preserve_bytes_for_supported_shapes() {
     for width in [0, 1, 10, 100] {
@@ -301,48 +299,111 @@ fn canonical_dynamo_map_borrowed_entries_preserve_bytes_for_supported_shapes() {
     }
 }
 
-fn measure_canonical_map_allocations(
-    label: &'static str,
-    map: &HashMap<String, AttributeValue>,
-    encode: fn(&HashMap<String, AttributeValue>) -> String,
-) -> alloc_counter::AllocationReport<'static> {
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "canonical_dynamo_map_allocation_profile",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    for _ in 0..128 {
-        std::hint::black_box(encode(std::hint::black_box(map)));
-    }
-    guard.finish()
+/// A nested map of two names in the given order; each value is its own name,
+/// so swapping the arguments changes only the entry order.
+fn nested_pair(first: &str, second: &str) -> AttributeValue {
+    AttributeValue::M(AttributeMap::from_distinct([
+        (first.to_string(), AttributeValue::S(first.to_string())),
+        (second.to_string(), AttributeValue::S(second.to_string())),
+    ]))
 }
 
 #[test]
-#[ignore = "manual paired allocation probe; run in an isolated process"]
-fn canonical_dynamo_map_borrowed_entries_allocation_profile() {
-    for width in [1, 10, 100] {
-        let map = canonical_map_fixture(width);
-        let legacy = measure_canonical_map_allocations("legacy_clone_btree", &map, |map| {
-            legacy_canonical_map_json(map).expect("legacy map should serialize")
-        });
-        let current = measure_canonical_map_allocations(
-            "borrowed_sorted_entries",
-            &map,
-            current_canonical_map_json,
-        );
-        let _ = alloc_counter::emit_report(&legacy);
-        let _ = alloc_counter::emit_report(&current);
-        println!(
-            "canonical_dynamo_map width={width} legacy_allocations={} current_allocations={} \
-             legacy_bytes={} current_bytes={}",
-            legacy.allocation_count / 128,
-            current.allocation_count / 128,
-            legacy.allocated_bytes / 128,
-            current.allocated_bytes / 128,
-        );
-        assert!(current.allocation_count < legacy.allocation_count);
-        assert!(current.allocated_bytes < legacy.allocated_bytes);
+fn nested_map_wire_bytes_unchanged() {
+    let value: AttributeValue =
+        serde_json::from_str(r#"{"M":{"b":{"S":"2"},"a":{"N":"1"}}}"#).expect("decode");
+    assert_eq!(
+        serde_json::to_string(&value).expect("encode"),
+        r#"{"M":{"a":{"N":"1"},"b":{"S":"2"}}}"#
+    );
+
+    let map = AttributeMap::from_dynamo_json(
+        br#"{"z":{"S":"x"},"m":{"M":{"b":{"S":"2"},"a":{"N":"1"}}}}"#,
+    )
+    .expect("decode item");
+    let wire = crate::WireItem::try_from(&map).expect("wire item");
+    assert_eq!(
+        wire.dynamo_json_bytes().expect("bytes").as_ref(),
+        br#"{"z":{"S":"x"},"m":{"M":{"a":{"N":"1"},"b":{"S":"2"}}}}"#
+    );
+}
+
+#[test]
+fn nested_map_equality_ignores_order() {
+    assert_eq!(nested_pair("a", "b"), nested_pair("b", "a"));
+    assert_ne!(nested_pair("a", "b"), nested_pair("a", "c"));
+}
+
+#[test]
+fn nested_map_decode_allocates_less_than_hash_rebuild() {
+    let entries = (0..16)
+        .map(|index| format!(r#""name{index:02}":{{"S":"value{index}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let inner = format!("{{{entries}}}");
+    let outer = format!(r#"{{"M":{inner}}}"#);
+
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "nested_map_decode_current",
+        file!(),
+        line!(),
+        Some("attribute_map_nested"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(serde_json::from_str::<AttributeValue>(&outer).expect("decode"));
     }
+    let current = guard.finish();
+
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "nested_map_decode_attribute_map_only",
+        file!(),
+        line!(),
+        Some("attribute_map_only"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(serde_json::from_str::<AttributeMap>(&inner).expect("decode"));
+    }
+    let map_only = guard.finish();
+
+    let _ = alloc_counter::emit_report(&current);
+    let _ = alloc_counter::emit_report(&map_only);
+    // The `{"M":…}` wrapper may cost one allocation per decode; a hash table
+    // rebuild would add at least one more.
+    assert!(
+        current.allocation_count <= map_only.allocation_count + 256,
+        "map_only={} current={}",
+        map_only.allocation_count,
+        current.allocation_count
+    );
+}
+
+#[test]
+fn to_json_value_sorts_nested_names() {
+    let value: AttributeValue =
+        serde_json::from_str(r#"{"M":{"b":{"S":"2"},"a":{"N":"1"}}}"#).expect("decode");
+    let text = serde_json::to_string(&value.to_json_value().expect("json")).expect("text");
+    assert!(
+        text.find("\"a\"").expect("a") < text.find("\"b\"").expect("b"),
+        "{text}"
+    );
+}
+
+#[test]
+fn to_plain_json_sorts_nested_names() {
+    let value: AttributeValue =
+        serde_json::from_str(r#"{"M":{"b":{"S":"2"},"a":{"N":"1"}}}"#).expect("decode");
+    let text = value.to_plain_json().expect("plain json");
+    assert!(
+        text.find("\"a\"").expect("a") < text.find("\"b\"").expect("b"),
+        "{text}"
+    );
+}
+
+#[test]
+fn given_nested_maps_with_same_entries_in_different_order_when_keys_compared_then_equal() {
+    let left = crate::TableKey::new(crate::TableName::new("t"), nested_pair("a", "b"), None);
+    let right = crate::TableKey::new(crate::TableName::new("t"), nested_pair("b", "a"), None);
+    assert_eq!(left.canonical_cmp(&right), std::cmp::Ordering::Equal);
 }

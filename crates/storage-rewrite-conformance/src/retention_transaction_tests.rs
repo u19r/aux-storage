@@ -10,7 +10,8 @@ use storage_types::{
 };
 
 use super::{
-    image_retention_tests::table_stream,
+    image_retention_tests::canonical_history_reads,
+    native_census_test_support::NativeCensus,
     test_support::{TestStore, hash_table_request},
 };
 
@@ -47,6 +48,7 @@ async fn publish_history(fixture: &TestStore) -> anyhow::Result<TableName> {
         );
         fixture.operations.put_item(put).await?;
     }
+    fixture.wait_until_changes_are_readable().await;
     Ok(table)
 }
 
@@ -71,7 +73,7 @@ async fn discover_wave(
     observed_at: TimestampMillis,
 ) -> anyhow::Result<StreamRetentionWave> {
     let marker = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .list_due_stream_trim_markers(observed_at, 100)
         .await?
@@ -88,12 +90,11 @@ async fn discover_wave(
 }
 
 async fn table_rows(fixture: &TestStore, table: &TableName) -> anyhow::Result<usize> {
-    Ok(fixture
-        .stream_operations
-        .read_forward(table_stream(fixture, table).await?, None, 100)
-        .await?
-        .items
-        .len())
+    super::table_history_retention_tests::history_count(
+        fixture,
+        &canonical_history_reads(fixture, table).await?,
+    )
+    .await
 }
 
 async fn verify_duplicate_wave(fixture: &TestStore) -> anyhow::Result<()> {
@@ -104,7 +105,7 @@ async fn verify_duplicate_wave(fixture: &TestStore) -> anyhow::Result<()> {
     let scopes = [marker.scope.clone()];
     let rows = table_rows(fixture, &table).await?;
     let state = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .load_stream_trim_states(&scopes)
         .await?;
@@ -124,7 +125,7 @@ async fn verify_duplicate_wave(fixture: &TestStore) -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         fixture
-            .stream_retention_repository
+            .maintenance
             .as_ref()
             .load_stream_trim_states(&scopes)
             .await?
@@ -152,7 +153,7 @@ async fn verify_policy_and_replay(fixture: &TestStore) -> anyhow::Result<()> {
 
     set_retention(fixture, &table, StreamRetentionDuration::Forever).await?;
     let stale = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .trim_stream_marker_wave(old_wave)
         .await
@@ -174,33 +175,26 @@ async fn verify_policy_and_replay(fixture: &TestStore) -> anyhow::Result<()> {
     .await?;
     let wave = discover_wave(fixture, &table, now).await?;
     let first = fixture
-        .stream_retention_repository
+        .maintenance
         .trim_stream_marker_wave(wave.clone())
         .await?;
-    let next_due = fixture.advance_time(std::time::Duration::from_millis(1));
-    let next_wave = discover_wave(fixture, &table, next_due).await?;
-    let second = fixture
-        .stream_retention_repository
-        .trim_stream_marker_wave(next_wave)
-        .await?;
-    let reclaimed = first.rows_deleted + second.rows_deleted;
     anyhow::ensure!(
-        reclaimed == 5,
-        "three pointers and two obsolete images must be reclaimed"
+        first.rows_deleted == 3,
+        "three canonical entries must be reclaimed"
     );
     let after_reclaim = table_rows(fixture, &table).await?;
     anyhow::ensure!(
         after_reclaim == 0,
-        "pointer inventory must drain after bounded history cleanup"
+        "canonical inventory must drain after bounded history cleanup"
     );
     let scopes = vec![wave.markers()[0].scope.clone()];
     let state = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .load_stream_trim_states(&scopes)
         .await?;
     let replay = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .trim_stream_marker_wave(wave)
         .await
@@ -215,7 +209,7 @@ async fn verify_policy_and_replay(fixture: &TestStore) -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         fixture
-            .stream_retention_repository
+            .maintenance
             .as_ref()
             .load_stream_trim_states(&scopes)
             .await?
@@ -248,7 +242,7 @@ async fn verify_policy_replacement(fixture: &TestStore) -> anyhow::Result<()> {
     )
     .await?;
     let states = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .load_stream_trim_states(&scopes)
         .await?;
@@ -259,7 +253,7 @@ async fn verify_policy_replacement(fixture: &TestStore) -> anyhow::Result<()> {
     );
     let rows = table_rows(fixture, &table).await?;
     let replay = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .trim_stream_marker_wave(old_wave)
         .await?;
@@ -285,7 +279,7 @@ async fn verify_rejected_combined_update(fixture: &TestStore) -> anyhow::Result<
     let wave = discover_wave(fixture, &table, now).await?;
     let scopes = [wave.markers()[0].scope.clone()];
     let states = fixture
-        .stream_retention_repository
+        .maintenance
         .as_ref()
         .load_stream_trim_states(&scopes)
         .await?;
@@ -302,7 +296,7 @@ async fn verify_rejected_combined_update(fixture: &TestStore) -> anyhow::Result<
     anyhow::ensure!(rejected.is_err(), "invalid combined update succeeded");
     anyhow::ensure!(
         fixture
-            .stream_retention_repository
+            .maintenance
             .as_ref()
             .load_stream_trim_states(&scopes)
             .await?
@@ -366,7 +360,7 @@ async fn verify_policy_restart() -> anyhow::Result<()> {
         second?;
         third?;
         let states = fixture
-            .stream_retention_repository
+            .maintenance
             .as_ref()
             .load_stream_trim_states(&scopes)
             .await?;
@@ -390,7 +384,7 @@ async fn verify_policy_restart() -> anyhow::Result<()> {
         )
         .await?;
         let states = fixture
-            .stream_retention_repository
+            .maintenance
             .as_ref()
             .load_stream_trim_states(&scopes)
             .await?;
@@ -404,7 +398,7 @@ async fn verify_policy_restart() -> anyhow::Result<()> {
         );
         let rows = table_rows(&fixture, &table).await?;
         let result = fixture
-            .stream_retention_repository
+            .maintenance
             .as_ref()
             .trim_stream_marker_wave(old_wave)
             .await?;
@@ -444,6 +438,7 @@ impl kv_backend::KvFaultProbe for RetentionCommitProbe {
     fn at_commit_boundary(
         &self,
         boundary: kv_backend::KvCommitBoundary,
+        _mode: storage_types::AttemptMode,
     ) -> futures::future::BoxFuture<'_, storage_types::StorageResult<()>> {
         Box::pin(async move {
             let mut state = self.0.lock().unwrap();
@@ -458,14 +453,11 @@ impl kv_backend::KvFaultProbe for RetentionCommitProbe {
             if let Some(is_unknown) = state.0.take() {
                 state.1 += 1;
                 return Err(if is_unknown {
-                    storage_types::StorageError::sync_submission_ambiguous(
-                        None,
-                        "injected unknown retention commit",
-                    )
+                    storage_types::StorageError::commit_unknown("injected unknown retention commit")
                 } else {
-                    storage_types::StorageEnum::TransactionConflict {
-                        message: "injected retention conflict".into(),
-                    }
+                    storage_types::StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(
+                        storage_types::ConflictCause::Logical("injected retention conflict"),
+                    ))
                     .into()
                 });
             }
@@ -485,10 +477,7 @@ async fn given_retention_wave_when_commit_conflicts_then_fresh_attempt_reloads_a
         let now = fixture.advance_time(std::time::Duration::from_secs(25 * 3600));
         let wave = discover_wave(&fixture, &table, now).await?;
         *probe.0.lock().unwrap() = (Some(false), 0, 0);
-        fixture
-            .stream_retention_repository
-            .trim_stream_marker_wave(wave)
-            .await?;
+        fixture.maintenance.trim_stream_marker_wave(wave).await?;
         let state = probe.0.lock().unwrap();
         anyhow::ensure!(
             state.1 == 1 && state.2 > 0,
@@ -512,11 +501,7 @@ async fn given_retention_wave_when_commit_is_unknown_then_outcome_is_preserved_w
         let now = fixture.advance_time(std::time::Duration::from_secs(25 * 3600));
         let wave = discover_wave(&fixture, &table, now).await?;
         *probe.0.lock().unwrap() = (Some(true), 0, 0);
-        let Err(error) = fixture
-            .stream_retention_repository
-            .trim_stream_marker_wave(wave)
-            .await
-        else {
+        let Err(error) = fixture.maintenance.trim_stream_marker_wave(wave).await else {
             anyhow::bail!("unknown commit was hidden");
         };
         anyhow::ensure!(error.is_commit_unknown());
@@ -524,6 +509,77 @@ async fn given_retention_wave_when_commit_is_unknown_then_outcome_is_preserved_w
             probe.0.lock().unwrap().2 == 0,
             "unknown outcome was replayed"
         );
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}
+
+#[tokio::test]
+async fn given_two_tables_with_due_entries_when_discovering_then_one_range_and_no_read_conflict()
+-> anyhow::Result<()> {
+    let census = NativeCensus::new();
+    let fixture = TestStore::new_with_census(census.clone()).await;
+    let result = async {
+        let names = [
+            TableName::new("due-discovery-a"),
+            TableName::new("due-discovery-b"),
+        ];
+        for name in &names {
+            let mut request = hash_table_request(name.clone());
+            request.stream_specification = Some(StreamSpecification {
+                stream_enabled: true,
+                stream_view_type: Some(StreamViewType::NewAndOldImages),
+            });
+            fixture.operations.create_table(request).await?;
+            set_retention(
+                &fixture,
+                name,
+                StreamRetentionDuration::from_hours(48).unwrap(),
+            )
+            .await?;
+        }
+        let due_before = TimestampMillis::from_timestamp(*fixture.now() + 49 * 60 * 60 * 1000);
+        let repository = fixture.maintenance.as_ref();
+        // One warm-up call fills statement and binding caches.
+        repository
+            .list_due_stream_trim_markers(due_before, 100)
+            .await?;
+        census.reset();
+        let markers = repository
+            .list_due_stream_trim_markers(due_before, 100)
+            .await?;
+        let counts = census.snapshot();
+        for name in &names {
+            anyhow::ensure!(
+                markers
+                    .iter()
+                    .any(|marker| marker.scope.table_name == *name),
+                "discovery missed table {name}"
+            );
+        }
+        match TestStore::selected_backend().as_str() {
+            "foundationdb" | "rocksdb" => {
+                anyhow::ensure!(counts.ranges == 1, "one range expected: {counts}");
+                anyhow::ensure!(counts.keys == 0, "no point read expected: {counts}");
+                anyhow::ensure!(
+                    counts.conflicts.read_keys == 0,
+                    "no read-key conflict expected: {counts}"
+                );
+                anyhow::ensure!(
+                    counts.conflicts.read_ranges == 0,
+                    "no read-range conflict expected: {counts}"
+                );
+            }
+            // Postgres sends START TRANSACTION in the first wave and counts it
+            // as a statement.
+            "postgres" => anyhow::ensure!(
+                counts.statements == 2,
+                "START TRANSACTION and one range statement expected: {counts}"
+            ),
+            _ => anyhow::ensure!(counts.statements == 1, "one statement expected: {counts}"),
+        }
         Ok(())
     }
     .await;

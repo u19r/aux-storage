@@ -159,46 +159,40 @@ fn storage_openapi_does_not_document_scheduled_job_store_routes() {
     }
 }
 
-#[test]
-fn storage_openapi_auxiliary_route_status_matches_feature() {
-    let spec = serde_json::to_value(openapi()).expect("storage OpenAPI JSON");
-
-    #[cfg(feature = "pubsub")]
-    assert!(
-        spec["paths"]["/pubsub"]["post"]["responses"]
-            .get("200")
-            .and_then(serde_json::Value::as_object)
-            .is_some(),
-        "enabled pubsub route must document success",
-    );
-    #[cfg(not(feature = "pubsub"))]
-    assert!(
-        spec["paths"]["/pubsub"]["post"]["responses"]
-            .get("404")
-            .and_then(serde_json::Value::as_object)
-            .is_some(),
-        "disabled pubsub route must document not found",
-    );
-
-    #[cfg(feature = "queue")]
-    assert!(
-        spec["paths"]["/queue"]["post"]["responses"]
-            .get("200")
-            .and_then(serde_json::Value::as_object)
-            .is_some(),
-        "enabled queue route must document success",
-    );
-    #[cfg(not(feature = "queue"))]
-    assert!(
-        spec["paths"]["/queue"]["post"]["responses"]
-            .get("404")
-            .and_then(serde_json::Value::as_object)
-            .is_some(),
-        "disabled queue route must document not found",
-    );
+#[tokio::test]
+async fn given_default_switches_when_queue_and_pubsub_are_requested_then_routes_answer_not_enabled()
+{
+    for_each_conformance_backend(|_, db| async move {
+        let state = Arc::new(AppState::new(db));
+        assert!(state.queue_manager.is_none() && state.pubsub_manager.is_none());
+        for (path, body, expected) in [
+            ("/queue", "{}", "queue route is not enabled"),
+            (
+                "/pubsub",
+                "Action=ListTopics",
+                "pubsub route is not enabled",
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .expect("messaging request");
+            let response = server_router(state.clone(), false)
+                .oneshot(request)
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body");
+            assert!(String::from_utf8_lossy(&bytes).contains(expected), "{path}");
+        }
+    })
+    .await;
 }
 
-#[cfg(not(any(feature = "queue", feature = "pubsub")))]
 #[test]
 fn storage_openapi_artifacts_match_the_runtime_document() {
     let runtime = serde_json::to_value(openapi()).expect("runtime OpenAPI JSON");

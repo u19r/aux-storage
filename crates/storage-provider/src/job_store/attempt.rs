@@ -53,7 +53,7 @@ impl ContractErrorSlot {
 /// Wait for one native attempt; cancellation after dispatch stays unknown.
 pub async fn run_native_job_attempt<F, Fut>(
     remaining: Duration,
-    admission: Option<Arc<dyn crate::native_admission::NativeAdmission>>,
+    admission: Option<Arc<dyn storage_common::native_admission::NativeAdmission>>,
     operation: F,
 ) -> Result<CommitOutcome, RawOrderedJobStoreError>
 where
@@ -73,8 +73,13 @@ where
     let result = match result {
         Err(error)
             if error.is_commit_unknown()
-                || error.native_attempt_rejection()
-                    == Some(storage_types::NativeAttemptRejection::Capacity) =>
+                || matches!(
+                    error.attempt_kind(),
+                    Some(
+                        storage_types::AttemptKind::Capacity
+                            | storage_types::AttemptKind::TransactionBytes
+                    )
+                ) =>
         {
             return Err(error.into());
         }

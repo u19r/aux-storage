@@ -8,8 +8,9 @@ use queue::{
     CreateQueueRequest, DeleteMessageRequest, MessageId, PublishMessageRequest, QueueManager,
     ReceiveMessageRequest, SendMessageRequest,
 };
-use queue_provider::{RemoteCredentialStrategy, RemoteQueueSettings, RemoteSigv4Settings};
-use queue_remote::RemoteQueueProvider;
+use queue_remote::{
+    RemoteCredentialStrategy, RemoteQueueProvider, RemoteQueueSettings, RemoteSigv4Settings,
+};
 use storage::DatabaseManager;
 use storage_api::{AppState, server_router};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -33,16 +34,18 @@ impl RemotePublicationFixture {
         let database = Arc::new(DatabaseManager::new_for_test().await.unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/queue", listener.local_addr().unwrap());
-        let native = Arc::new(QueueManager::new(
-            database.initialization_queue_provider().unwrap(),
-        ));
-        let state = AppState::new(database).with_messaging(
-            Some(native),
-            endpoint.clone(),
-            "000000000000".into(),
-            #[cfg(feature = "pubsub")]
-            None,
+        let native = Arc::new(
+            QueueManager::new(
+                database
+                    .messaging_store(storage::messaging::MessagingLane::Caller)
+                    .map(|store| store.queue)
+                    .unwrap(),
+            )
+            .with_endpoint(queue::QueueEndpoint {
+                public_base_url: endpoint.clone(),
+            }),
         );
+        let state = AppState::new(database).with_messaging(Some(native), None);
         let requests = Arc::new(AtomicUsize::new(0));
         let lose_reply = Arc::new(AtomicBool::new(false));
         let lost_replies = Arc::new(AtomicUsize::new(0));
@@ -80,6 +83,7 @@ impl RemotePublicationFixture {
             .create_queue(CreateQueueRequest {
                 queue_name: "stable-remote-publication".into(),
                 attributes: None,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -87,7 +91,7 @@ impl RemotePublicationFixture {
         Self {
             manager,
             queue_url,
-            id: MessageId::from_bytes([9; queue::MESSAGE_ID_VERSIONSTAMP_LEN]),
+            id: MessageId::from_bytes([9; queue::MESSAGE_ID_LEN]),
             requests,
             lose_reply,
             lost_replies,
@@ -102,6 +106,7 @@ impl RemotePublicationFixture {
                 message_body: body.into(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             },
         }
     }
@@ -201,4 +206,37 @@ async fn given_native_publication_committed_before_reply_failure_when_replayed_t
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message_id, fixture.id.to_string());
     assert_eq!(messages[0].body, "recoverable work");
+}
+
+/// Review finding 7: through `queue-remote` the remote's timestamps, counts
+/// and `QueueArn` are reported, not values that the client manager makes.
+#[tokio::test]
+async fn given_remote_queue_when_all_attributes_are_read_then_the_remote_values_are_kept() {
+    let fixture = RemotePublicationFixture::new().await;
+    fixture
+        .manager
+        .send_message(SendMessageRequest {
+            queue_url: fixture.queue_url.clone(),
+            message_body: "counted".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let attributes = fixture
+        .manager
+        .get_queue_attributes(queue::GetQueueAttributesRequest {
+            queue_url: fixture.queue_url.clone(),
+            attribute_names: Some(vec!["All".to_owned()]),
+        })
+        .await
+        .unwrap()
+        .attributes;
+    let created = attributes["CreatedTimestamp"].parse::<i64>().unwrap();
+    assert!(created > 0, "{attributes:?}");
+    assert_eq!(attributes["LastModifiedTimestamp"], created.to_string());
+    assert_eq!(attributes["ApproximateNumberOfMessages"], "1");
+    assert!(
+        attributes["QueueArn"].ends_with(":stable-remote-publication"),
+        "{attributes:?}"
+    );
 }

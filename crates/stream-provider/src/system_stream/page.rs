@@ -1,6 +1,6 @@
 //! Logical SystemStream pages retain a lineage frontier and issued checkpoint.
-//! Ordinary stream pages use `StreamRowKind`; both reach the same physical
-//! `StreamAttempt::read_stream` entry point.
+//! Ordinary stream pages use `storage_types::StreamName`; both reach the same
+//! physical `StreamAttempt::read_stream` entry point.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use storage_types::{
@@ -145,7 +145,8 @@ impl<'de> Deserialize<'de> for SystemStreamPageRequest {
 }
 
 /// A provider-owned logical SystemStream page.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SystemStreamPage {
     source_scope: SystemStreamScope,
     records: Vec<StreamRecord>,

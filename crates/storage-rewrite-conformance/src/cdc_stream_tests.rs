@@ -16,6 +16,9 @@ pub(super) async fn system_records(
     store: &TestStore,
     limit: u32,
 ) -> anyhow::Result<Vec<StreamRecord>> {
+    // Postgres publishes a committed entry once the snapshot xmin passes it;
+    // a concurrent test's open transaction can hold that back.
+    store.wait_until_changes_are_readable().await;
     let scope = store.stream_operations.system_stream_scope().await?;
     let mut checkpoint = None;
     let mut records = Vec::new();
@@ -35,6 +38,49 @@ pub(super) async fn system_records(
         checkpoint = Some(page.issued_checkpoint().token().clone());
     }
     anyhow::bail!("snapshot fixture exceeded bounded pagination")
+}
+
+pub(super) async fn system_records_with_count(
+    store: &TestStore,
+    limit: u32,
+    expected: usize,
+) -> anyhow::Result<Vec<StreamRecord>> {
+    let scope = store.stream_operations.system_stream_scope().await?;
+    let lanes = store
+        .stream_operations
+        .system_stream_lineage_catalog(scope.clone())
+        .await?
+        .len();
+    let mut checkpoint = None;
+    let mut records = Vec::new();
+    // Each page consumes a catalog entry or a known record before the empty
+    // tail.
+    for _ in 0..lanes + expected {
+        let page = store
+            .stream_operations
+            .get_system_stream_page(SystemStreamPageRequest::try_new(
+                scope.clone(),
+                checkpoint.clone(),
+                limit,
+            )?)
+            .await?;
+        anyhow::ensure!(page.source_scope() == &scope && page.records().len() <= limit as usize);
+        if !page.terminal() {
+            anyhow::ensure!(Some(page.issued_checkpoint().token()) != checkpoint.as_ref());
+        }
+        records.extend_from_slice(page.records());
+        checkpoint = Some(page.issued_checkpoint().token().clone());
+        if page.terminal() || records.len() >= expected {
+            break;
+        }
+    }
+    anyhow::ensure!(records.len() == expected);
+    let tail = store
+        .stream_operations
+        .get_system_stream_page(SystemStreamPageRequest::try_new(scope, checkpoint, 100)?)
+        .await?;
+    anyhow::ensure!(tail.records().is_empty() && tail.terminal());
+    Ok(records)
 }
 
 async fn create_table(store: &TestStore) -> anyhow::Result<TableName> {
@@ -63,6 +109,7 @@ async fn put(store: &TestStore, table: &TableName, key: &str, value: &str) -> an
             .unwrap(),
         )
         .await?;
+    store.wait_until_changes_are_readable().await;
     Ok(())
 }
 
@@ -138,10 +185,26 @@ async fn given_three_committed_items_when_cdc_is_paged_then_every_change_appears
         for key in ["A", "B", "C"] {
             put(&store, &table, key, key).await?;
         }
-        let paged = system_records(&store, 1).await?;
+        let paged = system_records_with_count(&store, 1, 3).await?;
         let complete = system_records(&store, 10).await?;
         anyhow::ensure!(paged.len() == 3);
-        anyhow::ensure!(serde_json::to_value(&paged)? == serde_json::to_value(complete)?);
+        for (index, record) in paged.iter().enumerate() {
+            let position = record.system_position.as_ref().unwrap();
+            for later in &paged[index + 1..] {
+                let later = later.system_position.as_ref().unwrap();
+                if position.lineage_id() == later.lineage_id() {
+                    anyhow::ensure!(position.offset() < later.offset());
+                }
+            }
+        }
+        // Page limits may change the order between independent lineages.
+        let mut paged_records: Vec<_> = paged.iter().collect();
+        let mut complete_records: Vec<_> = complete.iter().collect();
+        paged_records.sort_by(|left, right| left.system_position.cmp(&right.system_position));
+        complete_records.sort_by(|left, right| left.system_position.cmp(&right.system_position));
+        anyhow::ensure!(
+            serde_json::to_value(paged_records)? == serde_json::to_value(complete_records)?
+        );
         anyhow::ensure!(
             paged
                 .iter()
@@ -175,13 +238,17 @@ async fn given_two_stream_enabled_tables_when_writes_interleave_then_each_table_
         for (table, values) in [(&first, ["A1", "A2"]), (&second, ["B1", "B2"])] {
             let records = table_records(&store, table).await?;
             anyhow::ensure!(records.len() == 2);
-            for (record, expected) in records.iter().zip(values) {
-                anyhow::ensure!(
-                    serde_json::to_value(&record.item)?["value"] == json!({"S": expected})
-                );
+            let observed = records
+                .iter()
+                .map(|record| {
+                    serde_json::to_value(&record.item).map(|image| image["value"].clone())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for expected in values {
+                anyhow::ensure!(observed.contains(&json!({"S": expected})));
             }
         }
-        anyhow::ensure!(system_records(&store, 1).await?.len() == 4);
+        anyhow::ensure!(system_records_with_count(&store, 1, 4).await?.len() == 4);
         Ok(())
     }
     .await;
@@ -236,5 +303,45 @@ async fn system_stream_page_reads_history_in_a_read_only_attempt() {
         .await
         .unwrap();
     assert!(second.records().is_empty());
+    store.finish().await;
+}
+
+#[tokio::test]
+async fn given_fresh_provider_when_system_stream_is_opened_then_initial_roots_match_provider_policy()
+ {
+    let expected = match TestStore::selected_backend().as_str() {
+        "postgres" | "foundationdb" => 4,
+        _ => 1,
+    };
+    let store = TestStore::new_durable().await;
+    let scope = store.stream_operations.system_stream_scope().await.unwrap();
+    let page = store
+        .stream_operations
+        .get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 100).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        page.issued_checkpoint().checkpoint().frontier().len(),
+        expected
+    );
+    let before = page.issued_checkpoint().checkpoint().clone();
+    let store = store.reopen().await;
+    assert_eq!(
+        store.stream_operations.system_stream_scope().await.unwrap(),
+        scope
+    );
+    let page = store
+        .stream_operations
+        .get_system_stream_page(SystemStreamPageRequest::try_new(scope, None, 100).unwrap())
+        .await
+        .unwrap();
+    let after = page.issued_checkpoint().checkpoint();
+    assert_eq!(after.scope(), before.scope());
+    assert_eq!(after.frontier().len(), before.frontier().len());
+    for (previous, current) in before.frontier().iter().zip(after.frontier()) {
+        assert_eq!(current.shard_id(), previous.shard_id());
+        assert_eq!(current.lineage_id(), previous.lineage_id());
+        assert!(current.offset() >= previous.offset());
+    }
     store.finish().await;
 }

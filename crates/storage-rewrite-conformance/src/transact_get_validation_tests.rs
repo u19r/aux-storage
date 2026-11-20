@@ -9,8 +9,8 @@ use std::{
 
 use futures::FutureExt as _;
 use storage_types::{
-    AttributeValue, CreateTableRequest, KeyAttributes, StorageEnum, TableName, TransactGetItem,
-    TransactGetItemsRequest, TransactGetRequest, context::WrappedError as _,
+    AttributeValue, CancellationReason, CreateTableRequest, KeyAttributes, StorageEnum, TableName,
+    TransactGetItem, TransactGetItemsRequest, TransactGetRequest, context::WrappedError as _,
 };
 
 use super::test_support::TestStore;
@@ -170,10 +170,11 @@ async fn given_invalid_transact_get_requests_when_executed_then_error_precedence
                 StorageEnum::TransactionCanceled { reasons }
                 if reasons.as_slice()
                     == [
-                        "None".to_string(),
-                        "None".to_string(),
-                        "ValidationError\tThe provided key element does not match the schema"
-                            .to_string(),
+                        CancellationReason::none(),
+                        CancellationReason::none(),
+                        CancellationReason::validation_error(
+                            "The provided key element does not match the schema",
+                        ),
                     ]
             ),
             "trailing key reasons changed: {error:?}"
@@ -206,10 +207,11 @@ async fn given_invalid_transact_get_requests_when_executed_then_error_precedence
                 StorageEnum::TransactionCanceled { reasons }
                 if reasons.as_slice()
                     == [
-                        "ValidationError\tThe provided key element does not match the schema"
-                            .to_string(),
-                        "None".to_string(),
-                        "None".to_string(),
+                        CancellationReason::validation_error(
+                            "The provided key element does not match the schema",
+                        ),
+                        CancellationReason::none(),
+                        CancellationReason::none(),
                     ]
             ),
             "leading key reasons changed: {error:?}"

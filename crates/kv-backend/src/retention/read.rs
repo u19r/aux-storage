@@ -26,7 +26,10 @@ pub(crate) async fn load_table_retention<A: KvAttempt>(
         ));
     }
     attempt
-        .get(&key_layout::state_key(scope), ReadProtection::Conflict)
+        .get(
+            &key_layout::require_state_key(scope)?,
+            ReadProtection::Conflict,
+        )
         .await?
         .map(|bytes| decode_trim_state(&bytes, scope))
         .transpose()
@@ -68,20 +71,20 @@ pub(crate) async fn load_stream_trim_states<A: KvAttempt>(
     scopes: &[StreamTrimScope],
     protection: ReadProtection,
 ) -> StorageResult<Vec<Option<StreamTrimState>>> {
-    let keys = scopes.iter().map(key_layout::state_key).collect();
-    let values = attempt.get_batch(keys, protection).await?;
-    if values.len() != scopes.len() {
-        return Err(StorageError::internal(
-            "KV stream trim state batch count differs",
-        ));
-    }
+    let keys = scopes.iter().map(key_layout::state_key).collect::<Vec<_>>();
+    let present = keys.iter().flatten().cloned().collect::<Vec<_>>();
+    let values = attempt.get_batch_exact(present, protection).await?;
+    let mut values = values.into_iter();
     scopes
         .iter()
-        .zip(values)
-        .map(|(scope, value)| {
-            value
+        .zip(keys)
+        .map(|(scope, key)| match key {
+            None => Ok(None),
+            Some(_) => values
+                .next()
+                .flatten()
                 .map(|bytes| decode_trim_state(&bytes, scope))
-                .transpose()
+                .transpose(),
         })
         .collect()
 }
@@ -89,27 +92,28 @@ pub(crate) async fn load_stream_trim_states<A: KvAttempt>(
 pub(crate) async fn load_stream_trim_observations<A: KvAttempt>(
     attempt: &mut A,
     markers: &[StreamTrimDueMarker],
-) -> StorageResult<Vec<StreamRetentionObservation>> {
-    let mut keys = markers.iter().map(key_layout::due_key).collect::<Vec<_>>();
+) -> StorageResult<storage_types::Exact<StreamRetentionObservation>> {
+    let mut keys = markers
+        .iter()
+        .map(key_layout::due_key)
+        .collect::<StorageResult<Vec<_>>>()?;
     keys.extend(
         markers
             .iter()
-            .map(|marker| key_layout::state_key(&marker.scope)),
+            .map(|marker| key_layout::require_state_key(&marker.scope))
+            .collect::<StorageResult<Vec<_>>>()?,
     );
-    let values = attempt.get_batch(keys, ReadProtection::Conflict).await?;
-    if values.len() != markers.len() * 2 {
-        return Err(StorageError::internal(
-            "KV stream trim observation batch count differs",
-        ));
-    }
-    let (present, states) = values.split_at(markers.len());
-    markers
+    let values = attempt
+        .get_batch_exact(keys, ReadProtection::Conflict)
+        .await?;
+    let (present, states) = values.as_slice().split_at(markers.len());
+    let observations = markers
         .iter()
         .zip(present)
         .zip(states)
         .map(|((marker, value), state)| {
             if let Some(bytes) = value
-                && bytes.as_slice() != storage_serde::to_bytes(marker)?.as_slice()
+                && bytes.as_slice() != key_layout::due_value(marker).as_slice()
             {
                 return Err(StorageError::internal(
                     "KV stream trim marker payload differs",
@@ -121,7 +125,8 @@ pub(crate) async fn load_stream_trim_observations<A: KvAttempt>(
                 .transpose()?;
             Ok((value.is_some(), state).into())
         })
-        .collect()
+        .collect::<StorageResult<Vec<_>>>()?;
+    storage_types::Exact::try_new(markers.len(), observations)
 }
 
 pub(crate) fn decode_trim_state(

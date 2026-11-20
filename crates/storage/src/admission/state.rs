@@ -41,6 +41,8 @@ pub(crate) struct ControllerState {
 pub(crate) struct Inner {
     pub(super) connection_id: Arc<str>,
     pub(super) config: AdmissionConfig,
+    /// Sampling window length; `WINDOW` outside tests.
+    pub(super) window: std::time::Duration,
     pub(super) metrics: AdmissionMetrics,
     pub(super) state: Mutex<ControllerState>,
     /// Existing recovery reserve, with FIFO cancellation-safe acquisition.

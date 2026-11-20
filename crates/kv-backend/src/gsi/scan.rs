@@ -10,10 +10,9 @@ use super::read::target_index;
 use crate::{
     KvAttempt, KvRange, KvRangePage, ReadProtection,
     catalog::KvTableIdentity,
-    constants::{PAGE_READ_BYTES, PRIMARY_ITEM_FAMILY},
+    constants::PAGE_READ_BYTES,
     item_read::{decode_primary_items, primary_item_key},
     range::prefix_upper_bound,
-    stream_history::capture_high,
 };
 
 pub(crate) async fn read_scan_source_page<A: KvAttempt>(
@@ -44,7 +43,7 @@ pub(crate) async fn read_scan_source_page<A: KvAttempt>(
             next.ok_or_else(|| StorageError::internal("KV GSI scan page has no cursor"))?,
         )
     } else {
-        GsiScanPageEnd::Complete(capture_high(catalog.attempt).await?)
+        GsiScanPageEnd::Complete(())
     };
     Ok(GsiScanSourcePage {
         table: table.info.clone(),
@@ -70,7 +69,7 @@ fn decode_scan_entries(
         let item = item.ok_or_else(|| StorageError::internal("Missing GSI source content"))?;
         let stored = item.stored;
         let key = table.info.table_key_from_wire(&stored.item)?;
-        if primary_item_key(identity, table, &key)? != entry.key {
+        if primary_item_key(identity.table_id, table, &key)? != entry.key {
             return Err(StorageError::internal(
                 "KV GSI source item differs from its key",
             ));
@@ -78,7 +77,6 @@ fn decode_scan_entries(
         items.push(GsiScannedSourceItem {
             item: stored.item,
             indexers: stored.indexers,
-            revision: item.revision,
         });
     }
     Ok(items)
@@ -89,8 +87,11 @@ fn scan_range(
     after: Option<&Vec<u8>>,
     limit: GsiPageLimit,
 ) -> StorageResult<KvRange> {
-    let mut prefix = vec![PRIMARY_ITEM_FAMILY];
-    prefix.extend_from_slice(&identity.table_id.to_be_bytes());
+    let prefix = crate::table_key_layout::table_prefix(
+        identity.table_id,
+        crate::table_key_layout::TableSubFamily::Item,
+    )
+    .to_vec();
     let mut begin = prefix.clone();
     if let Some(after) = after {
         if !after.starts_with(&prefix) {

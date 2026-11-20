@@ -4,8 +4,16 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use storage_provider::maintenance::{ExpirationRepository, ExpirationRequest};
-use storage_types::{StorageError, StorageResult, maintenance::StepResult};
+use storage_provider::{
+    MaintenanceOperations, StreamTrimDueMarker, StreamTrimScope, StreamTrimState, TableReclaimStep,
+    maintenance::{
+        ExpirationRequest, GsiBuildRequest, StreamDurationTrimStats, StreamRetentionWave,
+    },
+};
+use storage_types::{
+    StorageError, StorageResult, TableName, TimestampMillis, context::WrappedError as _,
+    maintenance::StepResult,
+};
 use tokio::{sync::Notify, task::JoinHandle};
 
 use super::{FixtureGap, StatefulTestBackend};
@@ -73,22 +81,30 @@ impl ExpirationFaults {
     }
 }
 
-pub(super) struct FaultingExpirationRepository {
-    repository: Arc<dyn ExpirationRepository>,
+/// The fixture's maintenance value: expiration faults and the last GSI build
+/// error, over the store's own operations.
+pub(super) struct InstrumentedMaintenance {
+    inner: Arc<dyn MaintenanceOperations>,
     faults: Arc<ExpirationFaults>,
+    gsi_error: Arc<Mutex<Option<String>>>,
 }
 
-impl FaultingExpirationRepository {
+impl InstrumentedMaintenance {
     pub(super) fn new(
-        repository: Arc<dyn ExpirationRepository>,
+        inner: Arc<dyn MaintenanceOperations>,
         faults: Arc<ExpirationFaults>,
+        gsi_error: Arc<Mutex<Option<String>>>,
     ) -> Self {
-        Self { repository, faults }
+        Self {
+            inner,
+            faults,
+            gsi_error,
+        }
     }
 }
 
 #[async_trait]
-impl ExpirationRepository for FaultingExpirationRepository {
+impl MaintenanceOperations for InstrumentedMaintenance {
     async fn advance_expiration(
         &self,
         request: ExpirationRequest,
@@ -97,7 +113,7 @@ impl ExpirationRepository for FaultingExpirationRepository {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        let result = self.repository.advance_expiration(request).await?;
+        let result = self.inner.advance_expiration(request).await?;
         if self.faults.lose_ack.swap(false, Ordering::AcqRel) {
             return Err(StorageError::internal(
                 "expiration commit acknowledgement was lost",
@@ -111,9 +127,73 @@ impl ExpirationRepository for FaultingExpirationRepository {
         after: Option<String>,
         limit: std::num::NonZeroU32,
     ) -> StorageResult<Option<String>> {
-        self.repository
-            .trim_transact_receipts_page(after, limit)
+        self.inner.trim_transact_receipts_page(after, limit).await
+    }
+
+    async fn advance_gsi_build(&self, request: GsiBuildRequest) -> StorageResult<StepResult<()>> {
+        let result = self.inner.advance_gsi_build(request).await;
+        if let Err(error) = &result {
+            let (kind, context) = error.recursive_context(Vec::new());
+            *self.gsi_error.lock().expect("GSI diagnostic lock") =
+                Some(format!("{kind:?}; context={context:?}"));
+        }
+        result
+    }
+
+    async fn trim_stream_marker_wave(
+        &self,
+        wave: StreamRetentionWave,
+    ) -> StorageResult<StreamDurationTrimStats> {
+        self.inner.trim_stream_marker_wave(wave).await
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        due_before: TimestampMillis,
+        limit: usize,
+    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
+        self.inner
+            .list_due_stream_trim_markers(due_before, limit)
             .await
+    }
+
+    async fn load_stream_trim_states(
+        &self,
+        scopes: &[StreamTrimScope],
+    ) -> StorageResult<Vec<Option<StreamTrimState>>> {
+        self.inner.load_stream_trim_states(scopes).await
+    }
+
+    async fn trim_system_stream_page(
+        &self,
+        request: stream_provider::SystemStreamTrimPageRequest,
+    ) -> StorageResult<stream_provider::SystemStreamTrimPageResult> {
+        self.inner.trim_system_stream_page(request).await
+    }
+
+    async fn reclaim_table_page(&self) -> StorageResult<TableReclaimStep> {
+        self.inner.reclaim_table_page().await
+    }
+
+    async fn read_ttl_sweep_policy(
+        &self,
+        table_name: &TableName,
+    ) -> StorageResult<Option<storage_common::TtlSweepPolicy>> {
+        self.inner.read_ttl_sweep_policy(table_name).await
+    }
+
+    async fn execute_ttl_sweep_page(
+        &self,
+        command: storage_common::TtlSweepPageCommand,
+    ) -> StorageResult<storage_common::TtlSweepPageResult> {
+        self.inner.execute_ttl_sweep_page(command).await
+    }
+
+    async fn execute_ttl_sweep_request(
+        &self,
+        request: storage_common::TtlSweepRequest,
+    ) -> StorageResult<storage_common::TtlSweepPageResult> {
+        self.inner.execute_ttl_sweep_request(request).await
     }
 }
 

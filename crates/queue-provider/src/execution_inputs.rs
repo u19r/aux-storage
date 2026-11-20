@@ -68,18 +68,21 @@ impl ReceiveMessagesInput {
     }
 
     pub fn max_messages(&self) -> QueueResult<u32> {
-        self.request.max_number_of_messages.ok_or_else(|| {
-            QueueError::validation_with_detail(
-                QueueValidationKind::InvalidParameterValue,
-                "receive message input is missing max messages",
-            )
-        })
+        self.request
+            .max_number_of_messages
+            .map(crate::validated_u32)
+            .ok_or_else(|| {
+                QueueError::validation_with_detail(
+                    QueueValidationKind::InvalidParameterValue,
+                    "receive message input is missing max messages",
+                )
+            })
     }
 
     pub fn visibility_timeout(&self) -> QueueResult<DurationSeconds> {
         self.request
             .visibility_timeout
-            .map(Into::into)
+            .map(|seconds| crate::validated_u32(seconds).into())
             .ok_or_else(|| {
                 QueueError::validation_with_detail(
                     QueueValidationKind::InvalidParameterValue,
@@ -160,7 +163,7 @@ impl ChangeMessageVisibilityInput {
     #[must_use]
     pub fn new_visibility_timestamp(&self) -> TimestampMillis {
         self.captured_at
-            .add_duration_seconds(&self.request.visibility_timeout.into())
+            .add_duration_seconds(&crate::validated_u32(self.request.visibility_timeout).into())
     }
 }
 

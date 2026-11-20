@@ -5,9 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::Utc;
 use clap::Parser;
 use config::{CompileTimeManifest, CrateFeature, ManifestCrate};
+use jiff::Timestamp;
 use serde_json::Value;
 
 #[derive(Parser, Debug)]
@@ -57,7 +57,7 @@ fn load_json(path: &Path) -> Result<Value, Box<dyn Error>> {
 }
 
 fn render_header(buffer: &mut String) -> Result<(), std::fmt::Error> {
-    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
     writeln!(buffer, "# aux-storage Configuration Guide")?;
     writeln!(buffer)?;
     writeln!(

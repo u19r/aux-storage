@@ -55,7 +55,7 @@ async fn given_equivalent_numeric_keys_when_get_item_runs_then_latest_item_or_ab
             serde_json::to_value(read.result.expect("read equivalent key"))
                 .expect("serialize GetItem"),
             json!({
-                "Item": {"pk": {"N": "1.0"}, "payload": {"S": "second"}}
+                "Item": {"pk": {"N": "1"}, "payload": {"S": "second"}}
             })
         );
 

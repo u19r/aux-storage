@@ -12,7 +12,7 @@ use sql_backend::turso::TursoBackend;
 #[cfg(feature = "turso")]
 use crate::{
     DatabaseManager, DatabaseManagerRuntimeOptions,
-    provider::{StorageBackend, StorageConnectionConfig, StorageConnectionRegistry, TursoSettings},
+    provider::{StorageBackend, StorageConfig, StorageConnectionRegistry, TursoSettings},
 };
 #[cfg(feature = "turso")]
 fn unique_database_path(label: &str) -> PathBuf {
@@ -27,8 +27,9 @@ fn unique_database_path(label: &str) -> PathBuf {
 }
 
 #[cfg(feature = "turso")]
-fn turso_connection(path: &Path) -> StorageConnectionConfig {
-    StorageConnectionConfig {
+fn turso_connection(path: &Path) -> StorageConfig {
+    StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::Turso,
         connection_string: Some(path.to_string_lossy().into_owned()),
         file_path: None,
@@ -125,14 +126,20 @@ async fn given_distinct_turso_paths_with_a_dot_prefix_and_database_extension_whe
     let primary_path = PathBuf::from(format!("{}.feature_primary.db", stem.display()));
     let secondary_path = PathBuf::from(format!("{}.feature_secondary.db", stem.display()));
 
-    let primary = TursoBackend::initialize(primary_path.to_string_lossy().as_ref())
-        .await
-        .expect("first Turso database must start");
+    let primary = TursoBackend::initialize(
+        primary_path.to_string_lossy().as_ref(),
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .expect("first Turso database must start");
     drop(primary);
 
-    let secondary = TursoBackend::initialize(secondary_path.to_string_lossy().as_ref())
-        .await
-        .expect("second Turso database must start");
+    let secondary = TursoBackend::initialize(
+        secondary_path.to_string_lossy().as_ref(),
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .expect("second Turso database must start");
     drop(secondary);
 
     for path in [primary_path, secondary_path] {

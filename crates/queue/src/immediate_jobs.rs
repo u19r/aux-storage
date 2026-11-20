@@ -80,6 +80,7 @@ impl ImmediateJobQueueRuntime {
                     "MessageRetentionPeriod".into(),
                     crate::MAX_MESSAGE_RETENTION_SECONDS.to_string(),
                 )])),
+                ..Default::default()
             })
             .await?
             .queue_url;

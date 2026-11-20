@@ -142,9 +142,9 @@ impl TableAtomicityWorkload {
             return;
         }
         if self.client_id == 0
-            && let Err(err) = self.check_direct_stream_pointers(db, &provider).await
+            && let Err(err) = self.check_canonical_stream_entries(db, &provider).await
         {
-            self.trace_invariant_error("check_direct_stream_pointers", err);
+            self.trace_invariant_error("check_canonical_stream_entries", err);
             return;
         }
         for event in self.history.events().to_vec() {

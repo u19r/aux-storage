@@ -6,10 +6,10 @@ use storage_types::{
     TableStreamCheckpoint, TableStreamFrontier, TableStreamLaneFrontier, TableStreamSequence,
 };
 use stream_provider::{
-    ReadDirection, SystemStreamHistory, SystemStreamLineage, TableHistoryIndexRead,
+    ReadDirection, SystemStreamHistory, SystemStreamLineage, TableHistoryBoundaryRead,
 };
 
-use crate::{DynamoTableStreamAttempt, StreamTrimState};
+use crate::{StreamRetentionPort, StreamTrimState};
 
 pub(crate) struct TableHistoryReadLane {
     pub lane: TableHistoryLane,
@@ -26,7 +26,7 @@ pub(crate) struct TableHistoryReadState {
 
 impl TableHistoryReadState {
     pub(crate) async fn load(
-        attempt: &mut impl DynamoTableStreamAttempt,
+        attempt: &mut impl StreamRetentionPort,
         table: &BoundTableInfo,
     ) -> StorageResult<Self> {
         let source = attempt.read_system_page_start().await?;
@@ -72,7 +72,11 @@ impl TableHistoryReadState {
             })
             .collect::<Vec<_>>();
         if lanes.is_empty() {
-            return Err(crate::dynamodb_streams::read::stream_not_found());
+            return Err(if shard.is_some() {
+                crate::dynamodb_streams::read::shard_not_found()
+            } else {
+                crate::dynamodb_streams::read::stream_not_found()
+            });
         }
         Ok(lanes)
     }
@@ -94,7 +98,7 @@ impl TableHistoryReadState {
 
     pub(crate) async fn frontier(
         &self,
-        attempt: &mut impl DynamoTableStreamAttempt,
+        attempt: &mut impl StreamRetentionPort,
         table: &BoundTableInfo,
     ) -> StorageResult<TableStreamFrontier> {
         let reads = self
@@ -105,7 +109,7 @@ impl TableHistoryReadState {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let pages = stream_provider::read_table_history_indexes(attempt, &reads).await?;
+        let pages = stream_provider::read_table_history_boundaries(attempt, &reads).await?;
         let lanes = self
             .lanes
             .iter()
@@ -121,16 +125,14 @@ impl TableHistoryReadState {
 }
 
 impl TableHistoryReadLane {
-    fn boundary_reads(&self) -> StorageResult<[TableHistoryIndexRead; 2]> {
+    fn boundary_reads(&self) -> StorageResult<[TableHistoryBoundaryRead; 2]> {
         let through = TableStreamSequence::try_from(self.through.offset())?;
         Ok(
             [ReadDirection::Forward, ReadDirection::Backward].map(|direction| {
-                TableHistoryIndexRead {
+                TableHistoryBoundaryRead {
                     lane: self.lane.clone(),
-                    exclusive_start: None,
                     through,
                     direction,
-                    limit: std::num::NonZeroU32::MIN,
                 }
             }),
         )
@@ -138,7 +140,7 @@ impl TableHistoryReadLane {
 
     fn decode_frontier(
         &self,
-        pages: &[stream_provider::TableHistoryIndexPage],
+        pages: &[Option<SystemStreamPosition>],
     ) -> StorageResult<TableStreamLaneFrontier> {
         let [oldest, head] = pages else {
             return Err(StorageError::internal("Table frontier omitted a boundary"));
@@ -147,12 +149,10 @@ impl TableHistoryReadLane {
             shard_id: self.lane.shard_id().clone(),
             lineage_id: self.lane.lineage_id().clone(),
             oldest: oldest
-                .last_position
                 .as_ref()
                 .map(|position| TableStreamSequence::try_from(position.offset()))
                 .transpose()?,
             head: head
-                .last_position
                 .as_ref()
                 .map(|position| TableStreamSequence::try_from(position.offset()))
                 .transpose()?,

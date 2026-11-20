@@ -1,22 +1,21 @@
 #![allow(dead_code)]
 
-#[cfg(feature = "postgres")]
-use std::sync::Mutex;
-use std::{future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use http_error::HttpApiError;
 use serde_json::Value;
 use storage::{AdmissionClass, DatabaseManager, DatabaseManagerRuntimeOptions, PutItemInput};
 use storage_provider::{StorageBackend, StorageConfig};
 use storage_types::{
-    BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
-    DescribeTableRequest, DescribeTimeToLiveRequest, GetItemRequest, ListTablesRequest,
-    PutItemRequest, PutItemResponse, QueryRequest, ScanRequest, StorageResult,
-    TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
+    AttributeDefinition, AttributeMap, AttributeValue, BatchGetItemRequest, BatchWriteItemRequest,
+    CreateTableRequest, DeleteItemRequest, DescribeTableRequest, DescribeTimeToLiveRequest,
+    GetItemRequest, KeyAttributeType, KeySchemaElement, KeyType, ListTablesRequest, PutItemRequest,
+    PutItemResponse, QueryRequest, ScanRequest, StorageResult, TableName, TransactGetItemsRequest,
+    TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
 };
 
 use crate::{
-    manager::{StorageApiManager, StorageApiManagerImpl},
+    storage_operations::{clear_all_tables, dynamo_admitted},
     types::Response,
 };
 
@@ -24,7 +23,7 @@ use crate::{
 fn given_request_path_sources_when_scanned_then_provider_calls_are_admitted() {
     let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut violations = Vec::new();
-    for directory in ["manager", "routes"] {
+    for directory in ["storage_operations", "routes"] {
         let mut directories = vec![source_root.join(directory)];
         while let Some(directory) = directories.pop() {
             let entries = std::fs::read_dir(&directory).expect("request-path source directory");
@@ -42,6 +41,7 @@ fn given_request_path_sources_when_scanned_then_provider_calls_are_admitted() {
                     .and_then(std::ffi::OsStr::to_str)
                     .unwrap_or_default();
                 if file_name.ends_with("_tests.rs")
+                    || file_name == "test_support.rs"
                     || path.components().any(|component| {
                         component.as_os_str().to_string_lossy().ends_with("_tests")
                     })
@@ -99,12 +99,125 @@ pub async fn seed_item(
     .await
 }
 
+/// Creates a table whose key attributes are strings.
+pub async fn create_string_key_table(
+    db: &DatabaseManager,
+    table_name: &str,
+    hash_key: &str,
+    range_key: Option<&str>,
+) {
+    let mut definitions = vec![AttributeDefinition {
+        attribute_name: hash_key.to_string(),
+        attribute_type: KeyAttributeType::S,
+    }];
+    let mut key_schema = vec![KeySchemaElement {
+        attribute_name: hash_key.to_string(),
+        key_type: KeyType::Hash,
+    }];
+    if let Some(range_key) = range_key {
+        definitions.push(AttributeDefinition {
+            attribute_name: range_key.to_string(),
+            attribute_type: KeyAttributeType::S,
+        });
+        key_schema.push(KeySchemaElement {
+            attribute_name: range_key.to_string(),
+            key_type: KeyType::Range,
+        });
+    }
+    let request = CreateTableRequest::new(
+        TableName::new(table_name),
+        definitions,
+        key_schema,
+        storage_types::BillingMode::PayPerRequest,
+    );
+    db.create_table(&request).await.unwrap();
+}
+
+/// Writes one item built from attribute pairs.
+pub async fn seed_attributes(
+    db: &DatabaseManager,
+    table_name: &str,
+    attributes: Vec<(&str, AttributeValue)>,
+) {
+    let item = attributes
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect::<HashMap<_, _>>();
+    seed_item(
+        db,
+        PutItemInput::builder()
+            .table_name(TableName::new(table_name))
+            .item(item)
+            .build(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Writes the nested item used by the projection tests, keyed by
+/// `key_attribute` = "item-1".
+pub async fn seed_nested_projection_item(
+    db: &DatabaseManager,
+    table_name: &str,
+    key_attribute: &str,
+) {
+    let item = HashMap::from([
+        (
+            key_attribute.to_string(),
+            AttributeValue::S("item-1".to_string()),
+        ),
+        (
+            "status".to_string(),
+            AttributeValue::S("active".to_string()),
+        ),
+        (
+            "tags".to_string(),
+            AttributeValue::L(vec![
+                AttributeValue::S("red".to_string()),
+                AttributeValue::S("blue".to_string()),
+            ]),
+        ),
+        (
+            "profile".to_string(),
+            AttributeValue::M(AttributeMap::from(HashMap::from([
+                ("name".to_string(), AttributeValue::S("Ada".to_string())),
+                ("age".to_string(), AttributeValue::N("37".to_string())),
+                ("city".to_string(), AttributeValue::S("London".to_string())),
+            ]))),
+        ),
+        (
+            "nested".to_string(),
+            AttributeValue::M(AttributeMap::from(HashMap::from([(
+                "list".to_string(),
+                AttributeValue::L(vec![
+                    AttributeValue::M(AttributeMap::from(HashMap::from([
+                        ("v".to_string(), AttributeValue::S("first".to_string())),
+                        ("x".to_string(), AttributeValue::S("drop".to_string())),
+                    ]))),
+                    AttributeValue::M(AttributeMap::from(HashMap::from([(
+                        "v".to_string(),
+                        AttributeValue::S("second".to_string()),
+                    )]))),
+                ]),
+            )]))),
+        ),
+    ]);
+
+    seed_item(
+        db,
+        PutItemInput::builder()
+            .table_name(TableName::new(table_name))
+            .item(item)
+            .build(),
+    )
+    .await
+    .unwrap();
+}
+
 #[derive(Clone, Debug)]
 pub struct ConformanceTestBackend {
     pub name: &'static str,
     config: StorageConfig,
-    #[cfg(feature = "postgres")]
-    postgres_cleanup: Option<Arc<PostgresSchemaCleanupRegistry>>,
 }
 
 impl ConformanceTestBackend {
@@ -128,10 +241,6 @@ impl ConformanceTestBackend {
                     .to_string_lossy()
                     .into_owned(),
             );
-            config
-                .sqlite
-                .get_or_insert_with(storage_provider::SqliteSettings::default)
-                .force_file_backed_database = true;
         }
         Arc::new(
             DatabaseManager::new_with_config_and_runtime_options(
@@ -149,42 +258,7 @@ impl ConformanceTestBackend {
     }
 
     fn isolated_config(&self) -> StorageConfig {
-        match self.config.backend_type {
-            #[cfg(feature = "postgres")]
-            StorageBackend::Postgres => {
-                let isolated = isolated_postgres_config(&self.config);
-                if let Some(cleanup) = self.postgres_cleanup.as_ref() {
-                    cleanup.register(PostgresSchemaCleanup {
-                        dsn: isolated.base_dsn,
-                        schema: isolated.schema,
-                    });
-                }
-                isolated.config
-            }
-            StorageBackend::RocksDB => {
-                let mut config = self.config.clone();
-                config.file_path = Some(
-                    crate::storage_api_test_support_tests::unique_path("rocksdb-conformance")
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                config
-            }
-            StorageBackend::FoundationDb => {
-                let mut config = self.config.clone();
-                config
-                    .foundationdb
-                    .as_mut()
-                    .expect("FoundationDB settings")
-                    .subspace_prefix = Some(
-                    crate::storage_api_test_support_tests::unique_path("fdb-conformance")
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                config
-            }
-            _ => self.config.clone(),
-        }
+        self.config.clone()
     }
 }
 
@@ -220,6 +294,7 @@ fn conformance_runtime_options() -> DatabaseManagerRuntimeOptions {
 
 pub async fn create_sqlite_transactional_test_db() -> Arc<DatabaseManager> {
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(
             crate::storage_api_test_support_tests::unique_path("sqlite-transactional")
@@ -227,10 +302,7 @@ pub async fn create_sqlite_transactional_test_db() -> Arc<DatabaseManager> {
                 .into_owned(),
         ),
         file_path: None,
-        sqlite: Some(storage_provider::SqliteSettings {
-            force_file_backed_database: true,
-            ..storage_provider::SqliteSettings::default()
-        }),
+        sqlite: Some(storage_provider::SqliteSettings {}),
         postgres: None,
         turso: None,
         rocksdb: None,
@@ -245,454 +317,218 @@ pub async fn create_sqlite_transactional_test_db() -> Arc<DatabaseManager> {
 }
 
 pub fn default_conformance_backends() -> Vec<ConformanceTestBackend> {
-    reject_uncompiled_external_selection();
-    let backends = vec![
-        #[cfg(feature = "sqlite")]
-        ConformanceTestBackend {
-            name: "sqlite",
-            config: StorageConfig {
-                backend_type: StorageBackend::SQLite,
-                connection_string: Some(":memory:".to_string()),
-                file_path: None,
-                sqlite: Some(storage_provider::SqliteSettings {
-                    immediate_gsi_consistency: true,
-                    ..storage_provider::SqliteSettings::default()
-                }),
-                postgres: None,
-                turso: None,
-                rocksdb: None,
-                foundationdb: None,
-                remote: None,
-            },
-            #[cfg(feature = "postgres")]
-            postgres_cleanup: None,
+    vec![ConformanceTestBackend {
+        name: "sqlite",
+        config: StorageConfig {
+            initial_stream_lineages: None,
+            backend_type: StorageBackend::SQLite,
+            connection_string: Some(":memory:".to_string()),
+            file_path: None,
+            sqlite: Some(storage_provider::SqliteSettings::default()),
+            postgres: None,
+            turso: None,
+            rocksdb: None,
+            foundationdb: None,
+            remote: None,
         },
-        #[cfg(feature = "turso")]
-        ConformanceTestBackend {
-            name: "turso",
-            config: StorageConfig {
-                backend_type: StorageBackend::Turso,
-                connection_string: Some(":memory:".to_string()),
-                file_path: None,
-                sqlite: None,
-                postgres: None,
-                turso: Some(storage_provider::TursoSettings {
-                    immediate_gsi_consistency: true,
-                }),
-                rocksdb: None,
-                foundationdb: None,
-                remote: None,
-            },
-            #[cfg(feature = "postgres")]
-            postgres_cleanup: None,
-        },
-        #[cfg(feature = "rocksdb")]
-        ConformanceTestBackend {
-            name: "rocksdb",
-            config: StorageConfig {
-                backend_type: StorageBackend::RocksDB,
-                connection_string: None,
-                file_path: Some(
-                    crate::storage_api_test_support_tests::unique_path("rocksdb-conformance")
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                sqlite: None,
-                postgres: None,
-                turso: None,
-                rocksdb: Some(storage_provider::RocksdbSettings {
-                    immediate_gsi_consistency: true,
-                }),
-                foundationdb: None,
-                remote: None,
-            },
-            #[cfg(feature = "postgres")]
-            postgres_cleanup: None,
-        },
-    ];
-    #[cfg(any(feature = "postgres", feature = "foundationdb"))]
-    let mut backends = backends;
-
-    #[cfg(feature = "postgres")]
-    if let Some(dsn) = postgres_conformance_dsn() {
-        backends.push(ConformanceTestBackend {
-            name: "postgres",
-            config: StorageConfig {
-                backend_type: StorageBackend::Postgres,
-                connection_string: Some(dsn.clone()),
-                file_path: None,
-                sqlite: None,
-                postgres: Some(storage_provider::PostgresSettings {
-                    dsn,
-                    max_pool_size: 8,
-                    background_max_pool_size: 2,
-                    tls: false,
-                    immediate_gsi_consistency: true,
-                }),
-                turso: None,
-                rocksdb: None,
-                foundationdb: None,
-                remote: None,
-            },
-            postgres_cleanup: Some(Arc::new(PostgresSchemaCleanupRegistry::default())),
-        });
-    }
-
-    #[cfg(feature = "foundationdb")]
-    if foundationdb_conformance_selected() {
-        backends.push(ConformanceTestBackend {
-            name: "foundationdb",
-            config: StorageConfig {
-                backend_type: StorageBackend::FoundationDb,
-                connection_string: None,
-                file_path: None,
-                sqlite: None,
-                postgres: None,
-                turso: None,
-                rocksdb: None,
-                foundationdb: Some(storage_provider::FoundationDbSettings {
-                    cluster_file: std::env::var("TEST_FDB_CLUSTER_FILE").ok(),
-                    subspace_prefix: Some(
-                        crate::storage_api_test_support_tests::unique_path("fdb-conformance")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    immediate_gsi_consistency: true,
-                    ..storage_provider::FoundationDbSettings::default()
-                }),
-                remote: None,
-            },
-            #[cfg(feature = "postgres")]
-            postgres_cleanup: None,
-        });
-    }
-
-    require_selected_conformance_backends(backends)
-}
-
-fn reject_uncompiled_external_selection() {
-    #[cfg(not(feature = "postgres"))]
-    if std::env::var_os("AUX_STORAGE_CONFORMANCE_POSTGRES_DSN").is_some() {
-        panic!("AUX_STORAGE_CONFORMANCE_POSTGRES_DSN requires the postgres feature");
-    }
-
-    #[cfg(not(feature = "foundationdb"))]
-    if std::env::var_os("AUX_STORAGE_CONFORMANCE_FOUNDATIONDB").is_some() {
-        panic!("AUX_STORAGE_CONFORMANCE_FOUNDATIONDB requires the foundationdb feature");
-    }
-}
-
-fn require_selected_conformance_backends(
-    backends: Vec<ConformanceTestBackend>,
-) -> Vec<ConformanceTestBackend> {
-    assert!(
-        !backends.is_empty(),
-        concat!(
-            "no storage-api conformance backend selected; compile a provider feature or configure ",
-            "AUX_STORAGE_CONFORMANCE_POSTGRES_DSN/AUX_STORAGE_CONFORMANCE_FOUNDATIONDB"
-        )
-    );
-    backends
-}
-
-#[cfg(feature = "postgres")]
-fn postgres_conformance_dsn() -> Option<String> {
-    match std::env::var("AUX_STORAGE_CONFORMANCE_POSTGRES_DSN") {
-        Ok(dsn) => {
-            assert!(
-                !dsn.trim().is_empty(),
-                "AUX_STORAGE_CONFORMANCE_POSTGRES_DSN must not be empty"
-            );
-            Some(dsn)
-        }
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            panic!("AUX_STORAGE_CONFORMANCE_POSTGRES_DSN must be valid Unicode")
-        }
-    }
-}
-
-#[cfg(feature = "foundationdb")]
-fn foundationdb_conformance_selected() -> bool {
-    match std::env::var("AUX_STORAGE_CONFORMANCE_FOUNDATIONDB") {
-        Ok(value) => parse_foundationdb_selector(Some(&value))
-            .unwrap_or_else(|message| panic!("{message}, got {value:?}")),
-        Err(std::env::VarError::NotPresent) => false,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            panic!("AUX_STORAGE_CONFORMANCE_FOUNDATIONDB must be valid Unicode")
-        }
-    }
-}
-
-fn parse_foundationdb_selector(value: Option<&str>) -> Result<bool, &'static str> {
-    match value {
-        None => Ok(false),
-        Some("1") => Ok(true),
-        Some(_) => Err("AUX_STORAGE_CONFORMANCE_FOUNDATIONDB must be exactly 1 when set"),
-    }
-}
-
-mod conformance_registry_tests;
-#[cfg(feature = "postgres")]
-struct IsolatedPostgresConfig {
-    config: StorageConfig,
-    base_dsn: String,
-    schema: String,
-}
-
-#[cfg(feature = "postgres")]
-fn isolated_postgres_config(config: &StorageConfig) -> IsolatedPostgresConfig {
-    let mut config = config.clone();
-    let schema = format!("aux_storage_conformance_{}", uuid::Uuid::new_v4().simple());
-    let base_dsn = config
-        .postgres
-        .as_ref()
-        .map(|postgres| postgres.dsn.as_str())
-        .or(config.connection_string.as_deref())
-        .expect("postgres conformance DSN")
-        .to_string();
-    create_postgres_schema(&base_dsn, &schema);
-    let schema_dsn = postgres_dsn_with_search_path(&base_dsn, &schema);
-    config.connection_string = Some(schema_dsn.clone());
-    if let Some(postgres) = config.postgres.as_mut() {
-        postgres.dsn = schema_dsn;
-    }
-    IsolatedPostgresConfig {
-        config,
-        base_dsn,
-        schema,
-    }
-}
-
-#[cfg(feature = "postgres")]
-#[derive(Debug, Default)]
-struct PostgresSchemaCleanupRegistry {
-    schemas: Mutex<Vec<PostgresSchemaCleanup>>,
-}
-
-#[cfg(feature = "postgres")]
-impl PostgresSchemaCleanupRegistry {
-    fn register(&self, cleanup: PostgresSchemaCleanup) {
-        self.schemas
-            .lock()
-            .expect("postgres schema cleanup registry lock")
-            .push(cleanup);
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl Drop for PostgresSchemaCleanupRegistry {
-    fn drop(&mut self) {
-        let Ok(schemas) = self.schemas.get_mut() else {
-            eprintln!("postgres conformance cleanup registry was poisoned; schemas may remain");
-            return;
-        };
-        let schemas = schemas.drain(..).rev().collect::<Vec<_>>();
-        if schemas.is_empty() {
-            return;
-        }
-
-        if tokio::runtime::Handle::try_current().is_ok() {
-            for cleanup in schemas {
-                cleanup.drop_schema_detached();
-            }
-        } else {
-            for cleanup in schemas {
-                cleanup.drop_schema_blocking();
-            }
-        }
-    }
-}
-
-#[cfg(feature = "postgres")]
-#[derive(Debug)]
-struct PostgresSchemaCleanup {
-    dsn: String,
-    schema: String,
-}
-
-#[cfg(feature = "postgres")]
-impl PostgresSchemaCleanup {
-    fn drop_schema_detached(self) {
-        let result = self.drop_schema_command().spawn();
-        if let Err(err) = result {
-            eprintln!(
-                "failed to run psql to drop postgres conformance schema {}: {err}",
-                self.schema
-            );
-        }
-    }
-
-    fn drop_schema_blocking(self) {
-        let status = self.drop_schema_command().status();
-        match status {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!(
-                "failed to drop postgres conformance schema {}: psql exited with {status}",
-                self.schema
-            ),
-            Err(err) => eprintln!(
-                "failed to run psql to drop postgres conformance schema {}: {err}",
-                self.schema
-            ),
-        }
-    }
-
-    fn drop_schema_command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new("psql");
-        command
-            .arg(&self.dsn)
-            .arg("-v")
-            .arg("ON_ERROR_STOP=1")
-            .arg("-q")
-            .arg("-c")
-            .arg(format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema));
-        command
-    }
-}
-
-#[cfg(feature = "postgres")]
-fn create_postgres_schema(dsn: &str, schema: &str) {
-    let status = std::process::Command::new("psql")
-        .arg(dsn)
-        .arg("-v")
-        .arg("ON_ERROR_STOP=1")
-        .arg("-c")
-        .arg(format!("CREATE SCHEMA \"{schema}\""))
-        .status()
-        .expect("run psql to create postgres conformance schema");
-    assert!(
-        status.success(),
-        "create postgres conformance schema {schema}"
-    );
-}
-
-#[cfg(feature = "postgres")]
-fn postgres_dsn_with_search_path(dsn: &str, schema: &str) -> String {
-    let mut url = url::Url::parse(dsn).expect("postgres conformance DSN should be a URL");
-    url.query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
-    url.into()
+    }]
 }
 
 pub async fn handle_create_table(
     db: Arc<DatabaseManager>,
     request: CreateTableRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).create_table(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::CreateTable,
+        move |d| async move { d.create_table(request).await },
+    )
+    .await
 }
 
 pub async fn handle_list_tables(
     db: Arc<DatabaseManager>,
     request: ListTablesRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).list_tables(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::RangeRead,
+        Response::ListTables,
+        move |d| async move { d.list_tables(request).await },
+    )
+    .await
 }
 
 pub async fn handle_put_item(
     db: Arc<DatabaseManager>,
     request: PutItemRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).put_item(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::PutItem,
+        move |d| async move { d.put_item(request).await },
+    )
+    .await
 }
 
 pub async fn handle_get_item(
     db: Arc<DatabaseManager>,
     request: GetItemRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).get_item(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::PointRead,
+        Response::GetItem,
+        move |d| async move { d.get_item(request).await },
+    )
+    .await
 }
 
 pub async fn handle_delete_item(
     db: Arc<DatabaseManager>,
     request: DeleteItemRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).delete_item(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::DeleteItem,
+        move |d| async move { d.delete_item(request).await },
+    )
+    .await
 }
 
 pub async fn handle_update_item(
     db: Arc<DatabaseManager>,
     request: UpdateItemRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).update_item(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::UpdateItem,
+        move |d| async move { d.update_item(request).await },
+    )
+    .await
 }
 
 pub async fn handle_describe_table(
     db: Arc<DatabaseManager>,
     request: DescribeTableRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).describe_table(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::PointRead,
+        Response::DescribeTable,
+        move |d| async move { d.describe_table(request).await },
+    )
+    .await
 }
 
 pub async fn handle_update_table(
     db: Arc<DatabaseManager>,
     request: UpdateTableRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).update_table(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::UpdateTable,
+        move |d| async move { d.update_table(request).await },
+    )
+    .await
 }
 
 pub async fn handle_batch_write_item(
     db: Arc<DatabaseManager>,
     request: BatchWriteItemRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db)
-        .batch_write_item(request)
-        .await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::BatchWriteItem,
+        move |d| async move { d.batch_write_item(request).await },
+    )
+    .await
 }
 
 pub async fn handle_batch_get_item(
     db: Arc<DatabaseManager>,
     request: BatchGetItemRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).batch_get_item(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::RangeRead,
+        Response::BatchGetItem,
+        move |d| async move { d.batch_get_item(request).await },
+    )
+    .await
 }
 
 pub async fn handle_transact_write_items(
     db: Arc<DatabaseManager>,
     request: TransactWriteItemsRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db)
-        .transact_write_items(request)
-        .await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::Write,
+        Response::TransactWriteItems,
+        move |d| async move { d.transact_write_items(request).await },
+    )
+    .await
 }
 
 pub async fn handle_transact_get_items(
     db: Arc<DatabaseManager>,
     request: TransactGetItemsRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db)
-        .transact_get_items(request)
+    db.transact_get_items(request)
         .await
+        .map(Response::TransactGetItems)
+        .map_err(HttpApiError::from)
 }
 
 pub async fn handle_scan(
     db: Arc<DatabaseManager>,
     request: ScanRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).scan(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::RangeRead,
+        Response::Scan,
+        move |d| async move { d.scan(request).await },
+    )
+    .await
 }
 
 pub async fn handle_query(
     db: Arc<DatabaseManager>,
     request: QueryRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db).query(request).await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::RangeRead,
+        Response::Query,
+        move |d| async move { d.query(request).await },
+    )
+    .await
 }
 
 pub async fn handle_describe_time_to_live(
     db: Arc<DatabaseManager>,
     request: DescribeTimeToLiveRequest,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db)
-        .describe_time_to_live(request)
-        .await
+    dynamo_admitted(
+        &db,
+        AdmissionClass::PointRead,
+        Response::DescribeTimeToLive,
+        move |d| async move { d.describe_time_to_live(request).await },
+    )
+    .await
 }
 
 pub async fn handle_clear_all_tables(
     db: Arc<DatabaseManager>,
-    payload: Value,
+    _payload: Value,
 ) -> Result<Response, HttpApiError> {
-    StorageApiManagerImpl::new(db)
-        .clear_all_tables(payload)
-        .await
+    clear_all_tables(&db).await
 }

@@ -8,27 +8,28 @@ use storage_common::{
         PartitionLoadSample, PartitionLoadSampleRecord, PartitionState, ResolvedPartitionFamily,
     },
 };
-use storage_provider::{
-    DynamoPort,
-    maintenance::{
-        PartitionPort, PartitionReconciliationRepository, PartitionReconciliationRequest,
-    },
+use storage_provider::maintenance::{
+    PartitionPort, PartitionReconciliationRepository, PartitionReconciliationRequest,
 };
 use storage_types::{
-    AttemptMode, BoundedVec, StreamName, TimestampMillis, UserStreamName, maintenance::StepResult,
+    AttemptMode, AttemptPlan, BoundedVec, DeadlineClass, StreamName, TimestampMillis,
+    UserStreamName, maintenance::StepResult,
 };
-use stream_provider::{StreamOperations, StreamPartitioningMode, StreamRowKind};
+use stream_provider::{StreamOperations, StreamPartitioningMode};
 
 type Store = KvStore<RocksDbBackend>;
 
 async fn load_family(store: &Store, stream: &StreamName) -> ResolvedPartitionFamily {
     let stream = stream.clone();
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |port| {
-            Box::pin(async move { port.load_partition_family(&stream).await })
-        })
-        .await
-        .expect("canonical family")
+    storage_provider::DynamoPort::with_attempt(
+        store,
+        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |port| Box::pin(async move { port.load_partition_family(&stream).await }),
+    )
+    .await
+    .expect("canonical family")
 }
 
 fn request(fence: u64, now: i64) -> PartitionReconciliationRequest {
@@ -64,10 +65,17 @@ async fn given_hot_keyed_stream_when_fenced_reconciliation_splits_then_history_a
             .expect("clock")
             .as_nanos()
     ));
-    let store =
-        Store::initialize_format(RocksDbBackend::initialize(directory.clone()).expect("driver"))
-            .await
-            .expect("initialized owner");
+    let store = Store::initialize_format(
+        RocksDbBackend::initialize(
+            directory.clone(),
+            storage_types::AttemptDeadlines::default(),
+            256,
+        )
+        .expect("driver"),
+        storage_types::InitialStreamLineages::ONE,
+    )
+    .await
+    .expect("initialized owner");
     let name = UserStreamName::new("partition-history");
     let stream = store
         .create_stream(name.clone(), None, StreamPartitioningMode::KeyOrdered)
@@ -160,7 +168,7 @@ async fn given_hot_keyed_stream_when_fenced_reconciliation_splits_then_history_a
         );
     }
     let page = store
-        .read_forward(StreamRowKind::User(stream.clone()), None, 100)
+        .read_forward(stream.clone().into(), None, 100)
         .await
         .expect("read lineage");
     assert_eq!(page.items.len(), acknowledged.len());
@@ -223,12 +231,15 @@ async fn given_hot_keyed_stream_when_fenced_reconciliation_splits_then_history_a
     let deleted = stream.clone();
     let storage_provider::maintenance::PartitionSamplePage {
         family, records, ..
-    } = store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |port| {
-            Box::pin(async move { port.load_partition_samples(&deleted).await })
-        })
-        .await
-        .expect("physical cleanup");
+    } = storage_provider::DynamoPort::with_attempt(
+        &store,
+        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(&store),
+        ),
+        move |port| Box::pin(async move { port.load_partition_samples(&deleted).await }),
+    )
+    .await
+    .expect("physical cleanup");
     assert!(family.is_none());
     assert!(records.is_empty());
     let recreated = store
@@ -315,9 +326,17 @@ async fn given_ten_job_nodes_when_claiming_one_partition_job_then_one_canonical_
             .as_nanos()
     ));
     let store = Arc::new(
-        Store::initialize_format(RocksDbBackend::initialize(directory.clone()).expect("driver"))
-            .await
-            .expect("owner"),
+        Store::initialize_format(
+            RocksDbBackend::initialize(
+                directory.clone(),
+                storage_types::AttemptDeadlines::default(),
+                256,
+            )
+            .expect("driver"),
+            storage_types::InitialStreamLineages::ONE,
+        )
+        .await
+        .expect("owner"),
     );
     let stream = store
         .create_stream(
@@ -386,7 +405,7 @@ async fn given_ten_job_nodes_when_claiming_one_partition_job_then_one_canonical_
 #[tokio::test]
 async fn given_keyed_appends_when_pressure_is_recorded_then_samples_join_the_item_transaction() {
     use storage_types::StorageError;
-    use stream_provider::{StreamAttempt, StreamDataType, StreamPort, StreamRowValue};
+    use stream_provider::{StreamAttempt, StreamDataType, StreamRowValue};
     let directory = std::env::temp_dir().join(format!(
         "partition-sampling-{}",
         std::time::SystemTime::now()
@@ -394,18 +413,29 @@ async fn given_keyed_appends_when_pressure_is_recorded_then_samples_join_the_ite
             .expect("clock")
             .as_nanos()
     ));
-    let store =
-        Store::initialize_format(RocksDbBackend::initialize(directory.clone()).expect("driver"))
-            .await
-            .expect("owner");
+    let store = Store::initialize_format(
+        RocksDbBackend::initialize(
+            directory.clone(),
+            storage_types::AttemptDeadlines::default(),
+            256,
+        )
+        .expect("driver"),
+        storage_types::InitialStreamLineages::ONE,
+    )
+    .await
+    .expect("owner");
     let name = UserStreamName::new("automatic-samples");
     let stream = store
         .create_stream(name.clone(), None, StreamPartitioningMode::KeyOrdered)
         .await
         .expect("stream");
     let target = stream.clone();
-    let rolled_back: storage_types::StorageResult<()> = store
-        .with_stream_attempt(AttemptMode::ReadWrite, move |port| {
+    let rolled_back: storage_types::StorageResult<()> = stream_provider::StreamPort::with_attempt(
+        &store,
+        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(&store),
+        ),
+        move |port| {
             Box::pin(async move {
                 let family = StreamAttempt::load_partition_family(port, &target).await?;
                 let partition = family.route_ordered_log(b"sample-key")?;
@@ -427,12 +457,13 @@ async fn given_keyed_appends_when_pressure_is_recorded_then_samples_join_the_ite
                     "reject after staging both effects",
                 ))
             })
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(rolled_back.is_err());
     assert!(
         store
-            .read_forward(StreamRowKind::User(stream.clone()), None, 100)
+            .read_forward(stream.clone().into(), None, 100)
             .await
             .expect("aborted row absent")
             .items
@@ -447,10 +478,14 @@ async fn given_keyed_appends_when_pressure_is_recorded_then_samples_join_the_ite
                 .expect("happy append");
         }
         let target = stream.clone();
-        let storage_provider::maintenance::PartitionSamplePage { records, .. } = store
-            .with_dynamo_attempt(AttemptMode::ReadWrite, move |port| {
-                Box::pin(async move { port.load_partition_samples(&target).await })
-            })
+        let storage_provider::maintenance::PartitionSamplePage { records, .. } =
+            storage_provider::DynamoPort::with_attempt(
+                &store,
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+                    storage_types::AttemptDeadlineSource::attempt_deadlines(&store),
+                ),
+                move |port| Box::pin(async move { port.load_partition_samples(&target).await }),
+            )
             .await
             .expect("pressure page");
         if !records.is_empty() {

@@ -5,26 +5,17 @@ mod models;
 mod prepared_put;
 mod projection;
 mod status;
-mod stream;
 
 pub use errors::{GsiLifecycleError, GsiRecordError};
 pub use models::{
-    GsiActivationObservation, GsiActivationState, GsiActive, GsiBlocked, GsiBuild,
-    GsiBuildCandidates, GsiBuildDiscovery, GsiBuildProjectionObservation, GsiBuildTarget,
-    GsiCatchingUp, GsiChange, GsiFailureReason, GsiIndexWriteActions, GsiKeyPart, GsiKeyParts,
-    GsiObservation, GsiPageLimit, GsiProjectedRow, GsiProjection, GsiProjectionChange,
-    GsiProjectionKey, GsiProjectionLifecycle, GsiProjectionStateRead, GsiProjectionStateReadBatch,
-    GsiProjectionWrite, GsiProjectionWriteBatch, GsiReadRequest, GsiRecord, GsiScanObservation,
-    GsiScanPageEnd, GsiScanSourcePage, GsiScannedSourceItem, GsiScanning, GsiSourceProjection,
-    GsiState, GsiStateRecord, GsiStreamCandidate, GsiStreamObservation, GsiStreamPageEnd,
-    GsiStreamSourcePage, GsiWriteAction, GsiWriteRequest,
+    GsiActivationState, GsiActive, GsiBuild, GsiBuildCandidates, GsiBuildDiscovery, GsiBuildTarget,
+    GsiChange, GsiIndexWriteActions, GsiKeyPart, GsiKeyParts, GsiNativeBuilding, GsiPageLimit,
+    GsiProjectedRow, GsiProjectionKey, GsiProjectionLifecycle, GsiProjectionWrite,
+    GsiProjectionWriteBatch, GsiRecord, GsiScanObservation, GsiScanPageEnd, GsiScanSourcePage,
+    GsiScannedSourceItem, GsiScanning, GsiState, GsiStateRecord, GsiWriteAction, GsiWriteRequest,
 };
 pub use prepared_put::PreparedGsiPut;
 pub use status::{GsiBuildPhase, GsiBuildStatus};
-pub use stream::GsiStreamPageAssembly;
 
 #[cfg(test)]
 mod status_tests;
-
-#[cfg(test)]
-mod stream_tests;

@@ -12,8 +12,7 @@ use storage_types::{
     StreamSpecification, StreamViewType, TableName, TableNamespace, TimestampMillis,
     TransactEncodeItem, TransactEncodePutRequest, TransactPutRequest, TransactUpdateRequest,
     TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest, WireItem,
-    WriteRequest, context::WrappedError as _, project_attribute_map,
-    single_table_entity::SingleTableEntity,
+    WriteRequest, context::WrappedError as _, single_table_entity::SingleTableEntity,
 };
 
 use crate::{
@@ -174,6 +173,7 @@ async fn foundationdb_database_manager_bootstraps_system_tables() {
         .expect("system time should be after epoch")
         .as_nanos();
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::FoundationDb,
         connection_string: None,
         file_path: None,
@@ -186,7 +186,7 @@ async fn foundationdb_database_manager_bootstraps_system_tables() {
             tenant_name: None,
             subspace_prefix: Some(format!("tests/storage-manager-bootstrap/{nanos}/")),
             cache_read_version_ms: 0,
-            immediate_gsi_consistency: true,
+            reply_byte_limit: storage_types::FOUNDATIONDB_DEFAULT_REPLY_BYTE_LIMIT,
             transaction_byte_limit: None,
         }),
         remote: None,
@@ -370,13 +370,11 @@ async fn given_fresh_sqlite_manager_when_reopened_then_system_gsi_done_state_is_
     let database_path =
         crate::storage_test_support_tests::unique_path("sqlite-system-gsi-bootstrap");
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(database_path.to_string_lossy().into_owned()),
         file_path: None,
-        sqlite: Some(SqliteSettings {
-            immediate_gsi_consistency: true,
-            force_file_backed_database: true,
-        }),
+        sqlite: Some(SqliteSettings {}),
         postgres: None,
         turso: None,
         rocksdb: None,
@@ -1145,12 +1143,13 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
     assert!(!page.items[0].contains_key("pk"));
     assert!(!page.items[0].contains_key("category"));
     assert_eq!(
-        project_attribute_map(
-            page.items[0].clone(),
+        storage_types::AttributeProjection::new(
             Some("#selected"),
             None,
             Some(&expression_attribute_names),
         )
+        .map_or(page.items[0].clone(), |projection| projection
+            .project(&page.items[0]))
         .get("score"),
         Some(&AttributeValue::N("42".to_string()))
     );

@@ -3,11 +3,12 @@
 use std::num::NonZeroU32;
 
 use pubsub_provider::{
-    AcceptedPublication, PublishCandidate, PublishIntent, PubsubMessageId, Subscription,
-    SubscriptionSnapshotGeneration,
+    AcceptedPublication, DueRow, PublishCandidate, PublishDueRequest, PublishIntent,
+    PublishIntentClaim, PubsubMessageId, Subscription, SubscriptionSnapshotGeneration,
+    UndecodableRow,
 };
 use storage_types::{
-    ReadProtection, StorageEnum, StorageError, StorageResult, TimestampMillis, storage_serde,
+    MissExpectation, ReadProtection, StorageError, StorageResult, TimestampMillis, storage_serde,
 };
 
 use crate::{
@@ -18,50 +19,6 @@ use crate::{
     },
     range::prefix_upper_bound,
 };
-
-pub(crate) async fn read_publish_intent<A: KvAttempt>(
-    native: &mut A,
-    protection: ReadProtection,
-    id: &PubsubMessageId,
-) -> StorageResult<Option<PublishIntent>> {
-    native
-        .get(&intent_key(id), protection)
-        .await?
-        .map(|bytes| {
-            let intent: PublishIntent = storage_serde::from_bytes(&bytes)?;
-            if &intent.acceptance.message_id != id {
-                return Err(StorageError::internal("KV publish intent identity differs"));
-            }
-            Ok(intent)
-        })
-        .transpose()
-}
-
-pub(crate) async fn read_publish_candidate<A: KvAttempt>(
-    native: &mut A,
-    protection: ReadProtection,
-    id: &PubsubMessageId,
-) -> StorageResult<Option<PublishCandidate>> {
-    let Some(intent) = read_publish_intent(native, protection, id).await? else {
-        return Ok(None);
-    };
-    let subscriptions = if intent.snapshot.chunk_count == 0 {
-        Vec::new()
-    } else {
-        let bytes = native
-            .get(
-                &chunk_key(intent.snapshot.generation, intent.next_chunk),
-                protection,
-            )
-            .await?
-            .ok_or_else(|| StorageError::internal("KV publish chunk is missing"))?;
-        storage_serde::from_bytes(&bytes)?
-    };
-    Ok(Some(PublishCandidate {
-        intent,
-        subscriptions,
-    }))
-}
 
 pub(crate) async fn write_publication<A: KvAttempt>(
     native: &mut A,
@@ -75,14 +32,9 @@ pub(crate) async fn write_publication<A: KvAttempt>(
             Ok(chunk_key(generation, index))
         })
         .collect::<StorageResult<Vec<_>>>()?;
-    if native
-        .get_batch(keys.clone(), ReadProtection::Conflict)
-        .await?
-        .into_iter()
-        .any(|value| value.is_some())
-    {
-        return Err(conflict());
-    }
+    // No read of the chunk keys (W3 C8): the generation is new for this
+    // acceptance (`SubscriptionSnapshotGeneration::new`), as the message id
+    // of the intent key is (review C7); a retry follows only a proven abort.
     let mut mutations = keys
         .into_iter()
         .zip(publication.snapshot.chunks)
@@ -104,12 +56,15 @@ pub(crate) async fn write_publication<A: KvAttempt>(
     native.stage(mutations)
 }
 
+/// A snapshot scan of `request.window` due entries, the slot choice, then
+/// a conflict read of the chosen intents and their current chunks only
+/// (design 7.2, review D8): concurrent claims conflict only on a shared
+/// intent. An intent that changed after the scan is left out.
 pub(crate) async fn read_due_publish_chunks<A: KvAttempt>(
     native: &mut A,
-    now: TimestampMillis,
-    limit: NonZeroU32,
-) -> StorageResult<Vec<PublishCandidate>> {
-    let due_prefix = due_time_prefix(now.timestamp_millis());
+    request: &PublishDueRequest,
+) -> StorageResult<Vec<DueRow<PublishCandidate>>> {
+    let due_prefix = due_time_prefix(request.now.timestamp_millis());
     let end = prefix_upper_bound(&due_prefix)
         .ok_or_else(|| StorageError::internal("KV publish due bound is invalid"))?;
     let page = native
@@ -119,15 +74,18 @@ pub(crate) async fn read_due_publish_chunks<A: KvAttempt>(
                 begin: PUBSUB_PUBLISH_DUE_PREFIX.to_vec(),
                 end,
                 reverse: false,
-                limit,
+                limit: request.window,
                 max_bytes: CATALOG_BYTES,
             },
-            ReadProtection::Conflict,
+            ReadProtection::Snapshot,
         )
         .await?;
-    let ids = page
-        .entries
-        .iter()
+    let window_full = page.entries.len() >= request.window.get() as usize || page.more;
+    let chosen = request
+        .slot
+        .positions(page.entries.len(), window_full)
+        .into_iter()
+        .filter_map(|position| page.entries.get(position))
         .map(|entry| {
             let suffix = entry
                 .key
@@ -136,31 +94,48 @@ pub(crate) async fn read_due_publish_chunks<A: KvAttempt>(
             let id = suffix
                 .get(8..)
                 .ok_or_else(|| StorageError::internal("KV publish due key is short"))?;
-            decode_message_id(id)
+            let id = std::str::from_utf8(id)
+                .map_err(|_| StorageError::internal("KV publish message ID is not UTF-8"))?;
+            let due_at = decode_due_time(&entry.key, PUBSUB_PUBLISH_DUE_PREFIX)?;
+            Ok((id.to_owned(), due_at))
         })
         .collect::<StorageResult<Vec<_>>>()?;
     let values = native
         .get_batch(
-            ids.iter().map(intent_key).collect(),
+            chosen
+                .iter()
+                .map(|(id, _)| [PUBSUB_PUBLISH_INTENT_PREFIX, id.as_bytes()].concat())
+                .collect(),
             ReadProtection::Conflict,
         )
         .await?;
-    let intents = values
-        .into_iter()
-        .zip(&ids)
-        .zip(&page.entries)
-        .map(|((bytes, id), entry)| {
-            let bytes =
-                bytes.ok_or_else(|| StorageError::internal("KV publish due index is dangling"))?;
-            let intent: PublishIntent = storage_serde::from_bytes(&bytes)?;
-            if intent.acceptance.message_id != *id || due_key(&intent) != entry.key {
-                return Err(StorageError::internal("KV publish due index differs"));
+    let mut rows = Vec::with_capacity(chosen.len());
+    let mut intents = Vec::with_capacity(chosen.len());
+    for (bytes, (id, due_at)) in values.into_iter().zip(chosen) {
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let undecodable = |reason| {
+            DueRow::Undecodable(UndecodableRow {
+                key: id.clone(),
+                due_at,
+                reason,
+            })
+        };
+        // A row that does not decode is a typed observation (review D4).
+        // The scanned key is the only due source (finding 2): after a poison
+        // move it differs from the intent's own times, and the claim
+        // replaces that scanned key (W3S review finding 1).
+        match storage_serde::from_bytes::<PublishIntent>(&bytes) {
+            Ok(intent) if intent.acceptance.message_id.as_str() == id => {
+                intents.push((intent, due_at));
             }
-            Ok(intent)
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
+            _ => rows.push(undecodable("publish intent does not decode")),
+        }
+    }
     let chunk_keys = intents
         .iter()
+        .map(|(intent, _)| intent)
         .filter(|intent| intent.snapshot.chunk_count != 0)
         .map(|intent| chunk_key(intent.snapshot.generation, intent.next_chunk))
         .collect::<Vec<_>>();
@@ -168,41 +143,128 @@ pub(crate) async fn read_due_publish_chunks<A: KvAttempt>(
         .get_batch(chunk_keys, ReadProtection::Conflict)
         .await?;
     let mut chunks = chunks.into_iter();
-    intents
-        .into_iter()
-        .map(|intent| {
-            let subscriptions = if intent.snapshot.chunk_count == 0 {
-                Vec::new()
-            } else {
-                let bytes = chunks
-                    .next()
-                    .flatten()
-                    .ok_or_else(|| StorageError::internal("KV publish chunk is missing"))?;
-                storage_serde::from_bytes::<Vec<Subscription>>(&bytes)?
-            };
-            Ok(PublishCandidate {
+    for (intent, due_at) in intents {
+        let subscriptions = if intent.snapshot.chunk_count == 0 {
+            Some(Vec::new())
+        } else {
+            chunks
+                .next()
+                .flatten()
+                .and_then(|bytes| storage_serde::from_bytes::<Vec<Subscription>>(&bytes).ok())
+        };
+        rows.push(match subscriptions {
+            Some(subscriptions) => DueRow::Decoded(PublishCandidate {
                 intent,
                 subscriptions,
-            })
-        })
-        .collect()
+                due_at,
+            }),
+            None => DueRow::Undecodable(UndecodableRow {
+                key: intent.acceptance.message_id.to_string(),
+                due_at,
+                reason: "publish chunk is missing or does not decode",
+            }),
+        });
+    }
+    Ok(rows)
 }
 
+/// Move the due entry of one undecodable intent (review D4).
+pub(crate) async fn move_publish_due<A: KvAttempt>(
+    native: &mut A,
+    row: &UndecodableRow,
+    until: TimestampMillis,
+) -> StorageResult<()> {
+    let id = row.key.as_bytes();
+    native.stage(vec![
+        KvMutation::Delete {
+            key: [due_time_prefix(row.due_at.timestamp_millis()), id.to_vec()].concat(),
+        },
+        KvMutation::Put {
+            key: [due_time_prefix(until.timestamp_millis()), id.to_vec()].concat(),
+            value: Vec::new(),
+        },
+    ])
+}
+
+/// The least due time of an intent, read at `Snapshot` with a limit of one.
+pub(crate) async fn read_next_publish_due<A: KvAttempt>(
+    native: &mut A,
+) -> StorageResult<Option<TimestampMillis>> {
+    let end = prefix_upper_bound(PUBSUB_PUBLISH_DUE_PREFIX)
+        .ok_or_else(|| StorageError::internal("KV publish due bound is invalid"))?;
+    let page = native
+        .scan(
+            KvRange {
+                entry_bounds: None,
+                begin: PUBSUB_PUBLISH_DUE_PREFIX.to_vec(),
+                end,
+                reverse: false,
+                limit: NonZeroU32::MIN,
+                max_bytes: CATALOG_BYTES,
+            },
+            ReadProtection::Snapshot,
+        )
+        .await?;
+    page.entries
+        .first()
+        .map(|entry| decode_due_time(&entry.key, PUBSUB_PUBLISH_DUE_PREFIX))
+        .transpose()
+}
+
+/// The time of a due key: 8 bytes after the prefix, sign bit flipped.
+fn decode_due_time(key: &[u8], prefix: &[u8]) -> StorageResult<TimestampMillis> {
+    let bytes: [u8; 8] = key
+        .strip_prefix(prefix)
+        .and_then(|suffix| suffix.get(..8))
+        .and_then(|time| time.try_into().ok())
+        .ok_or_else(|| StorageError::internal("KV due key is short"))?;
+    let ordered = u64::from_be_bytes(bytes) ^ (1_u64 << 63);
+    Ok(TimestampMillis::from_timestamp(ordered as i64))
+}
+
+/// The stored intent must equal `expected`: KV has no conditional write, so
+/// the key is read with conflict protection and compared (a physical check).
 pub(crate) async fn replace_publish_intent<A: KvAttempt>(
     native: &mut A,
     expected: PublishIntent,
     next: Option<PublishIntent>,
 ) -> StorageResult<()> {
+    let stored = native
+        .get_batch(
+            vec![intent_key(&expected.acceptance.message_id)],
+            ReadProtection::Conflict,
+        )
+        .await?
+        .pop()
+        .flatten();
+    if stored != Some(storage_serde::to_bytes(&expected)?) {
+        return Err(conflict());
+    }
     native.stage(intent_mutations(expected, next)?)
 }
 
 pub(crate) async fn replace_publish_intents<A: KvAttempt>(
     native: &mut A,
-    replacements: Vec<(PublishIntent, PublishIntent)>,
+    replacements: Vec<PublishIntentClaim>,
 ) -> StorageResult<()> {
     let mut changes = Vec::with_capacity(replacements.len() * 3);
-    for (expected, next) in replacements {
-        changes.extend(intent_mutations(expected, Some(next))?);
+    for claim in replacements {
+        let id = claim.previous.acceptance.message_id.as_str().as_bytes();
+        changes.push(KvMutation::Delete {
+            key: [
+                due_time_prefix(claim.scanned_due.timestamp_millis()),
+                id.to_vec(),
+            ]
+            .concat(),
+        });
+        changes.push(KvMutation::Put {
+            key: due_key(&claim.claimed),
+            value: Vec::new(),
+        });
+        changes.push(KvMutation::Put {
+            key: intent_key(&claim.claimed.acceptance.message_id),
+            value: storage_serde::to_bytes(&claim.claimed)?,
+        });
     }
     if changes.is_empty() {
         return Ok(());
@@ -238,7 +300,7 @@ fn intent_mutations(
     Ok(changes)
 }
 
-fn intent_key(id: &PubsubMessageId) -> Vec<u8> {
+pub(crate) fn intent_key(id: &PubsubMessageId) -> Vec<u8> {
     [PUBSUB_PUBLISH_INTENT_PREFIX, id.as_str().as_bytes()].concat()
 }
 
@@ -251,11 +313,9 @@ pub fn chunk_key(generation: SubscriptionSnapshotGeneration, index: u32) -> Vec<
     .concat()
 }
 
+/// Unleased intents are due at their acceptance (review D2).
 fn due_key(intent: &PublishIntent) -> Vec<u8> {
-    let due = intent
-        .lease_expires_at
-        .map(|time| time.timestamp_millis())
-        .unwrap_or(i64::MIN);
+    let due = intent.due_at().timestamp_millis();
     [
         due_time_prefix(due),
         intent.acceptance.message_id.as_str().as_bytes().to_vec(),
@@ -268,16 +328,6 @@ fn due_time_prefix(due: i64) -> Vec<u8> {
     [PUBSUB_PUBLISH_DUE_PREFIX, &ordered.to_be_bytes()].concat()
 }
 
-fn decode_message_id(bytes: &[u8]) -> StorageResult<PubsubMessageId> {
-    let value = std::str::from_utf8(bytes)
-        .map_err(|_| StorageError::internal("KV publish message ID is not UTF-8"))?;
-    PubsubMessageId::new_from_string(value.to_owned())
-        .map_err(|_| StorageError::internal("KV publish message ID is invalid"))
-}
-
 fn conflict() -> StorageError {
-    StorageEnum::TransactionConflict {
-        message: "publish snapshot generation already exists".to_owned(),
-    }
-    .into()
+    StorageError::write_miss("pubsub_publish_generation", MissExpectation::Absent)
 }

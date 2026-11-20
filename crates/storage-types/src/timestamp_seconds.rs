@@ -1,6 +1,6 @@
 use std::ops::{Add, Deref};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use utoipa::ToSchema;
@@ -13,7 +13,7 @@ pub struct TimestampSeconds(i64);
 impl TimestampSeconds {
     #[must_use]
     pub fn now() -> Self {
-        Self(chrono::Utc::now().timestamp())
+        Self(crate::ambient::now_millis().div_euclid(1_000))
     }
 
     #[must_use]
@@ -38,9 +38,7 @@ impl TimestampSeconds {
 
     #[must_use]
     pub fn to_rfc3339(self) -> String {
-        DateTime::from_timestamp(self.0, 0)
-            .unwrap_or_else(Utc::now)
-            .to_rfc3339()
+        self.to_string()
     }
 }
 
@@ -60,31 +58,29 @@ impl Add<i64> for TimestampSeconds {
     }
 }
 
-impl Add<ChronoDuration> for TimestampSeconds {
+impl Add<SignedDuration> for TimestampSeconds {
     type Output = Self;
 
-    fn add(self, rhs: ChronoDuration) -> Self::Output {
-        Self(self.0.saturating_add(rhs.num_seconds()))
+    fn add(self, rhs: SignedDuration) -> Self::Output {
+        Self(self.0.saturating_add(rhs.as_secs()))
     }
 }
 
 impl std::fmt::Display for TimestampSeconds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Some(datetime) = DateTime::from_timestamp(self.0, 0) else {
-            return write!(f, "{}", Utc::now().to_rfc3339());
-        };
+        let datetime = Timestamp::from_second(self.0).unwrap_or_else(|_| Timestamp::now());
         write_rfc3339_utc(datetime, f)
     }
 }
 
-impl From<&chrono::DateTime<Utc>> for TimestampSeconds {
-    fn from(value: &chrono::DateTime<Utc>) -> Self {
-        Self(value.timestamp())
+impl From<&Timestamp> for TimestampSeconds {
+    fn from(value: &Timestamp) -> Self {
+        Self(value.as_second() - i64::from(value.subsec_nanosecond() < 0))
     }
 }
 
-impl From<chrono::DateTime<Utc>> for TimestampSeconds {
-    fn from(value: chrono::DateTime<Utc>) -> Self {
+impl From<Timestamp> for TimestampSeconds {
+    fn from(value: Timestamp) -> Self {
         TimestampSeconds::from(&value)
     }
 }

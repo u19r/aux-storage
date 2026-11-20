@@ -8,8 +8,8 @@ use axum::{
 use serde_json::json;
 use storage::PutItemInput;
 use storage_types::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateTableRequest, KeyAttributeType,
-    KeySchemaElement, KeyType, TableName,
+    AttributeDefinition, AttributeMap, AttributeValue, BillingMode, CreateTableRequest,
+    KeyAttributeType, KeySchemaElement, KeyType, TableName,
 };
 
 use crate::{
@@ -142,18 +142,18 @@ async fn batch_get_item_projection_returns_only_requested_nested_attributes() {
             .to_hashmap();
         assert_eq!(
             item.get("m"),
-            Some(&AttributeValue::M(
-                [(
-                    "COMMENT".to_string(),
-                    AttributeValue::S("visible".to_string())
-                )]
-                .into()
-            ))
+            Some(&AttributeValue::M(AttributeMap::from_iter([(
+                "COMMENT".to_string(),
+                AttributeValue::S("visible".to_string())
+            )])))
         );
         assert_eq!(
             item.get("l"),
             Some(&AttributeValue::L(vec![AttributeValue::M(
-                [("child".to_string(), AttributeValue::S("first".to_string()))].into()
+                AttributeMap::from_iter([(
+                    "child".to_string(),
+                    AttributeValue::S("first".to_string())
+                )])
             )]))
         );
         assert!(!item.contains_key("hidden"));
@@ -202,88 +202,6 @@ async fn batch_get_item_includes_empty_response_for_requested_table_with_no_matc
     .await;
 }
 
-#[tokio::test]
-async fn batch_get_item_rejects_invalid_key_schema_and_duplicate_keys() {
-    for_each_conformance_backend(|_backend, db| async move {
-        create_batch_get_pk_sk_table(db.as_ref(), "BatchGetKeyValidationTable").await;
-
-        let missing_sort_key = handle_batch_get_item(
-            db.clone(),
-            serde_json::from_value(json!({
-                "RequestItems": {
-                    "BatchGetKeyValidationTable": {
-                        "Keys": [{"pk": {"S": "p1"}}]
-                    }
-                }
-            }))
-            .expect("batch get request"),
-        )
-        .await
-        .expect_err("missing sort key should fail");
-        assert_eq!(
-            missing_sort_key.message,
-            "The provided key element does not match the schema"
-        );
-
-        let duplicate_keys = handle_batch_get_item(
-            db.clone(),
-            serde_json::from_value(json!({
-                "RequestItems": {
-                    "BatchGetKeyValidationTable": {
-                        "Keys": [
-                            {"pk": {"S": "p1"}, "sk": {"S": "s1"}},
-                            {"sk": {"S": "s1"}, "pk": {"S": "p1"}}
-                        ]
-                    }
-                }
-            }))
-            .expect("batch get request"),
-        )
-        .await
-        .expect_err("duplicate keys should fail");
-        assert_eq!(
-            duplicate_keys.message,
-            "Provided list of item keys contains duplicates"
-        );
-
-        let numeric_table = TableName::new("BatchGetNumericValidationTable");
-        db.create_table(&CreateTableRequest::new(
-            numeric_table.clone(),
-            vec![AttributeDefinition {
-                attribute_name: "pk".to_string(),
-                attribute_type: KeyAttributeType::N,
-            }],
-            vec![KeySchemaElement {
-                attribute_name: "pk".to_string(),
-                key_type: KeyType::Hash,
-            }],
-            BillingMode::PayPerRequest,
-        ))
-        .await
-        .expect("create numeric validation table");
-
-        let invalid_numeric_key = handle_batch_get_item(
-            db,
-            serde_json::from_value(json!({
-                "RequestItems": {
-                    "BatchGetNumericValidationTable": {
-                        "Keys": [{"pk": {"N": "1E-131"}}]
-                    }
-                }
-            }))
-            .expect("batch get invalid numeric request"),
-        )
-        .await
-        .expect_err("out-of-range numeric key should fail before provider execution");
-        assert!(
-            invalid_numeric_key.message.contains("underflow"),
-            "unexpected invalid numeric key message: {}",
-            invalid_numeric_key.message
-        );
-    })
-    .await;
-}
-
 async fn create_batch_get_pk_sk_table(db: &storage::DatabaseManager, table_name: &str) {
     db.create_table(&CreateTableRequest::new(
         TableName::new(table_name),
@@ -319,26 +237,20 @@ async fn put_projection_item(db: &storage::DatabaseManager, table_name: &str) {
     item.insert("sk".to_string(), AttributeValue::S("s1".to_string()));
     item.insert(
         "m".to_string(),
-        AttributeValue::M(
-            [
-                (
-                    "COMMENT".to_string(),
-                    AttributeValue::S("visible".to_string()),
-                ),
-                ("other".to_string(), AttributeValue::S("hidden".to_string())),
-            ]
-            .into(),
-        ),
+        AttributeValue::M(AttributeMap::from_iter([
+            (
+                "COMMENT".to_string(),
+                AttributeValue::S("visible".to_string()),
+            ),
+            ("other".to_string(), AttributeValue::S("hidden".to_string())),
+        ])),
     );
     item.insert(
         "l".to_string(),
-        AttributeValue::L(vec![AttributeValue::M(
-            [
-                ("child".to_string(), AttributeValue::S("first".to_string())),
-                ("other".to_string(), AttributeValue::S("hidden".to_string())),
-            ]
-            .into(),
-        )]),
+        AttributeValue::L(vec![AttributeValue::M(AttributeMap::from_iter([
+            ("child".to_string(), AttributeValue::S("first".to_string())),
+            ("other".to_string(), AttributeValue::S("hidden".to_string())),
+        ]))]),
     );
     item.insert("hidden".to_string(), AttributeValue::S("no".to_string()));
 

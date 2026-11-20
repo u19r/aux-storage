@@ -29,7 +29,7 @@ pub(super) fn require_protocol_shape(
     value_bytes: usize,
 ) -> StorageResult<()> {
     if parameters > u16::MAX as usize {
-        return Err(InfrastructureResultKind::NativeCapacityRejected.into());
+        return Err(storage_types::AttemptFailure::CAPACITY.into());
     }
     let parse = parameters
         .checked_mul(constants::POSTGRES_PARSE_PARAMETER_BYTES)
@@ -42,7 +42,7 @@ pub(super) fn require_protocol_shape(
         .and_then(|bytes| bytes.checked_add(constants::POSTGRES_BIND_FRAME_BYTES))
         .ok_or_else(invalid_input)?;
     if parse.max(bind) > i32::MAX as usize {
-        return Err(InfrastructureResultKind::NativeCapacityRejected.into());
+        return Err(storage_types::AttemptFailure::CAPACITY.into());
     }
     Ok(())
 }

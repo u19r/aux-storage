@@ -63,8 +63,8 @@ pub(in crate::gsi) fn activate_ttl_statement(
     activation: &storage_common::TtlConfigActivation,
 ) -> StorageResult<SqlStatement> {
     let sql = format!(
-        "UPDATE {relation_tables} SET ttl_config_blob = {}, catalog_revision = catalog_revision + \
-         1 WHERE table_name = {} AND id = {} AND ttl_config_blob = {} AND catalog_revision < {}",
+        "UPDATE {relation_tables} SET ttl_blob = {}, catalog_revision = catalog_revision + 1 \
+         WHERE table_name = {} AND id = {} AND ttl_blob = {} AND catalog_revision < {}",
         engine.engine().placeholder(1),
         engine.engine().placeholder(2),
         engine.engine().placeholder(3),
@@ -75,14 +75,10 @@ pub(in crate::gsi) fn activate_ttl_statement(
     Ok(SqlStatement::new(
         sql,
         vec![
-            SqlValue::Blob(storage_types::storage_serde::to_bytes(
-                &activation.activated,
-            )?),
+            SqlValue::Blob(crate::ttl_policy::encode_ttl_policy(&activation.activated)?),
             SqlValue::Text(activation.table_name.to_string()),
             SqlValue::Text(uuid::Uuid::from_bytes(*table_history_id.as_ref()).to_string()),
-            SqlValue::Blob(storage_types::storage_serde::to_bytes(
-                &activation.expected,
-            )?),
+            SqlValue::Blob(crate::ttl_policy::encode_ttl_policy(&activation.expected)?),
         ],
     ))
 }

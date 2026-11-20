@@ -11,7 +11,7 @@ use scheduled_bg_jobs::store::{
     CommitOutcome, RangePage, RangeRequest, StoreCapabilities, StoreCapabilitiesInput, StoreKey,
     StoreLevel, StoreTransaction,
 };
-use storage_provider::{RawOrderedJobStore, RawOrderedJobStoreError, StorageProvider};
+use storage_provider::{RawOrderedJobStore, RawOrderedJobStoreError};
 use storage_types::{
     AttributeDefinition, BillingMode, CreateTableRequest, KeyAttributeType, KeySchemaElement,
     KeyType, StorageEnum, StorageError, StorageResult, StreamSpecification, TableName, TableStatus,
@@ -19,7 +19,7 @@ use storage_types::{
 };
 
 use super::{commit, constants::*, read};
-use crate::provider::implementation::RemoteStorageProvider;
+use crate::provider::{implementation::RemoteStorageProvider, provider_helpers::compute_backoff};
 
 #[derive(Clone)]
 struct RemoteRawOrderedJobStore {
@@ -96,10 +96,11 @@ pub async fn connect_scheduled_job_store(
     settings: storage_provider::RemoteStorageSettings,
 ) -> StorageResult<ScheduledJobStore> {
     let store = build_scheduled_job_store(settings).await?;
-    store
-        .bootstrap()
-        .await
-        .map_err(|_| StorageError::internal("bootstrap scheduled job store"))?;
+    store.bootstrap().await.map_err(|error| {
+        // `ScheduledJobStoreError` Display is a fixed category (bg-job-store
+        // `error.rs`): no key or value.
+        StorageError::internal(&format!("bootstrap scheduled job store: {error}"))
+    })?;
     Ok(store)
 }
 
@@ -118,12 +119,20 @@ pub async fn build_scheduled_job_store(
 pub(super) fn apply_default_timeout(settings: &mut storage_provider::RemoteStorageSettings) {
     let default_timeout_ms = MAX_TRANSACTION_DURATION.as_millis() as u64;
     let timeouts = settings.timeouts.get_or_insert_with(Default::default);
-    timeouts
-        .connect_timeout_ms
-        .get_or_insert(default_timeout_ms);
-    timeouts
+    let request_timeout_ms = *timeouts
         .request_timeout_ms
         .get_or_insert(default_timeout_ms);
+    let connect_timeout = connect_timeout_for(std::time::Duration::from_millis(request_timeout_ms));
+    timeouts
+        .connect_timeout_ms
+        .get_or_insert(u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX));
+}
+
+/// The default connect timeout of every remote storage client. A refused or
+/// dropped connect must fail well before the request deadline so it is a
+/// pre-send failure that fails over.
+pub fn connect_timeout_for(request_timeout: std::time::Duration) -> std::time::Duration {
+    (request_timeout / 4).min(crate::constants::MAX_DEFAULT_CONNECT_TIMEOUT)
 }
 
 fn scheduled_job_store(provider: RemoteStorageProvider) -> StorageResult<ScheduledJobStore> {
@@ -145,7 +154,7 @@ fn validate_http_settings(settings: &storage_provider::RemoteStorageSettings) ->
 impl RawOrderedJobStore for RemoteRawOrderedJobStore {
     fn bind_native_admission(
         &self,
-        _: std::sync::Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        _: std::sync::Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> storage_types::StorageResult<()> {
         Err(storage_types::StorageError::unsupported(
             "remote job stores do not bind local native admission",
@@ -193,10 +202,42 @@ impl RawOrderedJobStore for RemoteRawOrderedJobStore {
     }
 }
 
-async fn ensure_job_table(
+pub(crate) async fn ensure_job_table(
     provider: &RemoteStorageProvider,
     table: &TableName,
 ) -> Result<(), RawOrderedJobStoreError> {
+    let request = job_table_request(table.clone());
+    let mut last_error = None;
+    for round in 0..MAX_CREATE_TABLE_SENDS {
+        if provider
+            .table_exists(table)
+            .await
+            .map_err(RawOrderedJobStoreError::Backend)?
+        {
+            return Ok(());
+        }
+        if round > 0 {
+            tokio::time::sleep(compute_backoff(round)).await;
+        }
+        match provider
+            .invoke::<_, storage_types::CreateTableResponse>(
+                "DynamoDB_20120810.CreateTable",
+                &request,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if matches!(error.to_enum(), StorageEnum::TableAlreadyExists { .. }) => {
+                return Ok(());
+            }
+            // The create may or may not have applied: observe again, then
+            // decide whether to send it again.
+            Err(error) if matches!(error.class(), storage_types::ErrorClass::CommitUnknown) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(RawOrderedJobStoreError::Backend(error)),
+        }
+    }
     if provider
         .table_exists(table)
         .await
@@ -204,16 +245,14 @@ async fn ensure_job_table(
     {
         return Ok(());
     }
-    let request = job_table_request(table.clone());
-    match provider
-        .invoke::<_, storage_types::CreateTableResponse>("DynamoDB_20120810.CreateTable", &request)
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) if matches!(error.to_enum(), StorageEnum::TableAlreadyExists { .. }) => Ok(()),
-        Err(error) => Err(RawOrderedJobStoreError::Backend(error)),
-    }
+    Err(last_error.map_or_else(
+        || RawOrderedJobStoreError::Backend(StorageError::internal("create job table")),
+        RawOrderedJobStoreError::Backend,
+    ))
 }
+
+/// CreateTable sends `ensure_job_table` makes before it gives up.
+const MAX_CREATE_TABLE_SENDS: usize = 3;
 
 fn job_table_request(table: TableName) -> CreateTableRequest {
     let mut request = CreateTableRequest::new(

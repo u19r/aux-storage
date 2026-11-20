@@ -1,5 +1,8 @@
 use http::StatusCode;
-use storage_types::{StorageEnum, context::WrappedError as _};
+use storage_types::{
+    AttemptFailure, AttributeMap, CancellationCode, CancellationReason, ConflictCause,
+    DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, StorageEnum, context::WrappedError as _,
+};
 
 use crate::error::{RemoteCancellationReason, RemoteErrorResponse, classify_error_response};
 
@@ -231,10 +234,14 @@ fn transaction_cancellation_preserves_conditional_reason_without_retrying_transp
     assert!(matches!(
         error.to_enum(),
         StorageEnum::TransactionCanceled { reasons }
-            if reasons.iter().map(String::as_str).eq([
-                "ConditionalCheckFailed\tThe conditional request failed.",
-                "None"
-            ])
+            if reasons.as_slice() == [
+                CancellationReason::from_parts(
+                    CancellationCode::ConditionalCheckFailed,
+                    Some("The conditional request failed.".into()),
+                    None,
+                ),
+                CancellationReason::none(),
+            ]
     ));
 }
 
@@ -284,12 +291,16 @@ fn transaction_cancellation_preserves_reason_message_and_item() {
     );
 
     assert!(!retryable);
+    let expected_item: AttributeMap =
+        serde_json::from_value(serde_json::json!({"pk": {"S": "item-1"}})).unwrap();
     assert!(matches!(
         error.to_enum(),
         StorageEnum::TransactionCanceled { reasons }
-            if reasons.iter().map(String::as_str).eq([
-                "ConditionalCheckFailed\tThe conditional request failed.\t{\"pk\":{\"S\":\"item-1\"}}"
-            ])
+            if reasons.as_slice() == [CancellationReason::from_parts(
+                CancellationCode::ConditionalCheckFailed,
+                Some("The conditional request failed.".into()),
+                Some(expected_item),
+            )]
     ));
 }
 
@@ -314,7 +325,7 @@ fn transaction_cancellation_defaults_null_code_to_none() {
     assert!(matches!(
         error.to_enum(),
         StorageEnum::TransactionCanceled { reasons }
-            if reasons.iter().map(String::as_str).eq(["None"])
+            if reasons.as_slice() == [CancellationReason::none()]
     ));
 }
 
@@ -333,4 +344,134 @@ fn given_trimmed_stream_response_when_classified_then_typed_error_is_not_retryab
     assert!(!retryable);
     assert_eq!(code.as_deref(), Some("TrimmedDataAccessException"));
     assert!(matches!(error.to_enum(), StorageEnum::TrimmedDataAccess));
+}
+
+#[test]
+fn given_remote_transaction_conflict_when_mapped_then_remote_conflict_retryable() {
+    let (error, retryable, _) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some("TransactionConflictException".to_string()),
+            code: None,
+            message: Some("conflict".to_string()),
+            item: None,
+            cancellation_reasons: None,
+        },
+    );
+    assert!(retryable);
+    assert_eq!(
+        error.attempt_failure(),
+        Some(&AttemptFailure::Conflict(ConflictCause::Remote))
+    );
+}
+
+#[test]
+fn given_remote_internal_error_body_when_mapped_then_text_not_kept() {
+    let (error, _, _) = classify_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        RemoteErrorResponse {
+            error_type: Some("InternalServerError".to_string()),
+            code: None,
+            message: Some("remote secret detail".to_string()),
+            item: None,
+            cancellation_reasons: None,
+        },
+    );
+    assert_eq!(
+        error.to_string(),
+        "internal error: remote InternalServerError"
+    );
+}
+
+fn cancellation_body(
+    message: Option<&str>,
+    reasons: Vec<RemoteCancellationReason>,
+) -> RemoteErrorResponse {
+    RemoteErrorResponse {
+        error_type: Some("TransactionCanceledException".to_string()),
+        code: None,
+        message: message.map(str::to_string),
+        item: None,
+        cancellation_reasons: Some(reasons),
+    }
+}
+
+fn remote_reason(code: &str) -> RemoteCancellationReason {
+    RemoteCancellationReason {
+        code: Some(code.to_string()),
+        message: None,
+        item: None,
+    }
+}
+
+#[test]
+fn given_reasons_without_message_when_classified_then_code_default_message() {
+    let (error, retryable, _) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        cancellation_body(
+            None,
+            vec![
+                remote_reason("ConditionalCheckFailed"),
+                remote_reason("ValidationError"),
+                remote_reason("TransactionConflict"),
+            ],
+        ),
+    );
+
+    assert!(!retryable);
+    let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+        panic!(
+            "expected TransactionCanceled, got variant {}",
+            error.label()
+        );
+    };
+    let messages: Vec<Option<&str>> = reasons.iter().map(|r| r.message.as_deref()).collect();
+    assert_eq!(
+        messages,
+        [
+            Some(DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE),
+            Some(""),
+            None
+        ]
+    );
+}
+
+#[test]
+fn given_unknown_reason_code_when_classified_then_aws_service_not_retryable() {
+    let (error, retryable, code) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        cancellation_body(
+            Some("cancelled"),
+            vec![remote_reason("None"), remote_reason("SomethingNew")],
+        ),
+    );
+
+    assert!(!retryable);
+    assert_eq!(code.as_deref(), Some("TransactionCanceledException"));
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::AwsService { code: Some(code), message }
+            if code == "TransactionCanceledException" && message == "cancelled"
+    ));
+}
+
+#[test]
+fn given_reason_item_not_attribute_map_when_classified_then_item_dropped() {
+    let (error, _, _) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        cancellation_body(
+            None,
+            vec![RemoteCancellationReason {
+                code: Some("ConditionalCheckFailed".to_string()),
+                message: None,
+                item: Some(serde_json::json!("text")),
+            }],
+        ),
+    );
+
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::TransactionCanceled { reasons }
+            if reasons.as_slice() == [CancellationReason::conditional_check_failed(None)]
+    ));
 }

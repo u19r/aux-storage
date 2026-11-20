@@ -1,8 +1,22 @@
-use httpmock::prelude::*;
-use storage_provider::{RemoteCredentialStrategy, RemoteStorageSettings, RemoteTimeoutOverrides};
-use storage_types::{DescribeTableRequest, TableName};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-use super::{constants::MAX_TRANSACTION_DURATION, provider::apply_default_timeout};
+use httpmock::prelude::*;
+use storage_provider::{
+    RawOrderedJobStoreError, RemoteCredentialStrategy, RemoteStorageSettings,
+    RemoteTimeoutOverrides,
+};
+use storage_types::{DescribeTableRequest, ErrorClass, TableName};
+
+use super::{
+    constants::MAX_TRANSACTION_DURATION,
+    provider::{apply_default_timeout, connect_timeout_for, ensure_job_table},
+};
 
 fn settings(timeouts: Option<RemoteTimeoutOverrides>) -> RemoteStorageSettings {
     RemoteStorageSettings {
@@ -22,8 +36,27 @@ fn given_missing_connector_timeouts_when_defaults_are_applied_then_requests_are_
 
     let timeouts = settings.timeouts.expect("default timeouts");
     let default_timeout_ms = u64::try_from(MAX_TRANSACTION_DURATION.as_millis()).unwrap();
-    assert_eq!(timeouts.connect_timeout_ms, Some(default_timeout_ms));
+    let connect_timeout_ms =
+        u64::try_from(connect_timeout_for(MAX_TRANSACTION_DURATION).as_millis()).unwrap();
+    assert_eq!(timeouts.connect_timeout_ms, Some(connect_timeout_ms));
     assert_eq!(timeouts.request_timeout_ms, Some(default_timeout_ms));
+}
+
+#[test]
+fn given_request_timeouts_when_connect_timeout_is_computed_then_it_is_a_quarter_capped_at_two_seconds()
+ {
+    assert_eq!(
+        connect_timeout_for(Duration::from_millis(400)),
+        Duration::from_millis(100)
+    );
+    assert_eq!(
+        connect_timeout_for(Duration::from_secs(8)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        connect_timeout_for(Duration::from_secs(30)),
+        Duration::from_secs(2)
+    );
 }
 
 #[test]
@@ -256,4 +289,173 @@ fn settings_for(endpoint: String) -> RemoteStorageSettings {
         credentials: RemoteCredentialStrategy::DefaultChain,
         timeouts: None,
     }
+}
+
+const JOB_TABLE: &str = "remote-job-table";
+
+fn job_table_not_found_body() -> String {
+    serde_json::json!({
+        "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+        "message": "Requested resource not found"
+    })
+    .to_string()
+}
+
+fn job_table_description_body() -> String {
+    serde_json::json!({
+        "Table": {
+            "TableName": JOB_TABLE,
+            "TableStatus": "ACTIVE",
+            "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, JOB_TABLE.as_bytes()).to_string(),
+            "CreationDateTime": 0,
+            "AttributeDefinitions": [],
+            "KeySchema": [],
+            "TableArn": format!("arn:aws:dynamodb:local:table/{JOB_TABLE}"),
+            "ItemCount": 0,
+            "TableSizeBytes": 0
+        }
+    })
+    .to_string()
+}
+
+async fn provider_on(
+    server: &MockServer,
+) -> crate::provider::implementation::RemoteStorageProvider {
+    let mut settings = settings(None);
+    settings.endpoint_urls = vec![server.url("/")];
+    crate::provider::implementation::RemoteStorageProvider::new(settings)
+        .await
+        .expect("remote provider")
+}
+
+fn create_table_unknown_mock(server: &MockServer) -> httpmock::Mock<'_> {
+    server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "DynamoDB_20120810.CreateTable");
+        then.status(500).body(
+            serde_json::json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#InternalServerError",
+                "message": "internal"
+            })
+            .to_string(),
+        );
+    })
+}
+
+#[tokio::test]
+async fn given_job_table_create_with_unknown_outcome_when_table_then_exists_then_bootstrap_accepts_it()
+ {
+    let server = MockServer::start_async().await;
+    let describe_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&describe_calls);
+    let describe = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.DescribeTable");
+            then.respond_with(move |_| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    HttpMockResponse::builder()
+                        .status(400)
+                        .body(job_table_not_found_body())
+                        .build()
+                } else {
+                    HttpMockResponse::builder()
+                        .status(200)
+                        .body(job_table_description_body())
+                        .build()
+                }
+            });
+        })
+        .await;
+    let create = create_table_unknown_mock(&server);
+    let provider = provider_on(&server).await;
+
+    ensure_job_table(&provider, &TableName::new(JOB_TABLE))
+        .await
+        .expect("an unknown create followed by an existing table is accepted");
+
+    create.assert_calls_async(1).await;
+    describe.assert_calls_async(2).await;
+}
+
+fn create_table_ok_body() -> String {
+    let description: serde_json::Value =
+        serde_json::from_str(&job_table_description_body()).expect("describe body");
+    serde_json::json!({"TableDescription": description["Table"]}).to_string()
+}
+
+#[tokio::test]
+async fn given_job_table_create_with_unknown_outcome_when_table_is_absent_then_create_is_sent_again()
+ {
+    let server = MockServer::start_async().await;
+    let describe = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.DescribeTable");
+            then.status(400).body(job_table_not_found_body());
+        })
+        .await;
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&create_calls);
+    let create = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.CreateTable");
+            then.respond_with(move |_| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    HttpMockResponse::builder()
+                        .status(500)
+                        .body(
+                            serde_json::json!({
+                                "__type": "com.amazonaws.dynamodb.v20120810#InternalServerError",
+                                "message": "internal"
+                            })
+                            .to_string(),
+                        )
+                        .build()
+                } else {
+                    HttpMockResponse::builder()
+                        .status(200)
+                        .body(create_table_ok_body())
+                        .build()
+                }
+            });
+        })
+        .await;
+    let provider = provider_on(&server).await;
+
+    ensure_job_table(&provider, &TableName::new(JOB_TABLE))
+        .await
+        .expect("an unknown create on an absent table is sent again and succeeds");
+
+    create.assert_calls_async(2).await;
+    // One observation before the first send and one between the sends.
+    assert!(describe.calls_async().await >= 2);
+}
+
+#[tokio::test]
+async fn given_job_table_create_that_always_answers_unknown_when_table_stays_absent_then_three_sends_then_unknown_is_returned()
+ {
+    let server = MockServer::start_async().await;
+    let describe = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.DescribeTable");
+            then.status(400).body(job_table_not_found_body());
+        })
+        .await;
+    let create = create_table_unknown_mock(&server);
+    let provider = provider_on(&server).await;
+
+    let result = ensure_job_table(&provider, &TableName::new(JOB_TABLE)).await;
+
+    match result {
+        Err(RawOrderedJobStoreError::Backend(error)) => {
+            assert_eq!(error.class(), ErrorClass::CommitUnknown);
+        }
+        Err(_) => panic!("expected a backend error"),
+        Ok(()) => panic!("an absent table must not be accepted"),
+    }
+    create.assert_calls_async(3).await;
+    assert!(describe.calls_async().await >= 3);
 }

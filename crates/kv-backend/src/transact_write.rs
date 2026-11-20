@@ -1,6 +1,6 @@
 //! One KV token key in the caller's protected transaction.
 
-use storage_provider::{DynamoTransactWriteAttempt, maintenance::TransactReceiptRow};
+use storage_provider::{DynamoTransactWriteAttempt, ReceiptSlot, maintenance::TransactReceiptRow};
 use storage_types::{StorageError, StorageResult};
 
 use crate::{
@@ -34,17 +34,22 @@ impl<A: KvAttempt> DynamoTransactWriteAttempt for KvCatalogAttempt<'_, A> {
         settlement.complete(result)
     }
 
-    async fn read_transact_receipt(&mut self, token: &str) -> StorageResult<Option<Vec<u8>>> {
+    async fn read_transact_receipt(
+        &mut self,
+        slot: ReceiptSlot<'_>,
+    ) -> StorageResult<Option<Vec<u8>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let result = async {
-            let maximum = storage_provider::TRANSACT_RECEIPT_READ_BYTES.get();
-            settlement
-                .as_mut()
+            let key = physical_receipt_key(slot)?;
+            let catalog = settlement.as_mut();
+            let protection = catalog.protection;
+            let maximum = storage_provider::TRANSACT_RECEIPT_WRITE_BYTES;
+            catalog
                 .attempt
                 .get_admitted(
-                    &receipt_key(token)?,
-                    ReadProtection::Conflict,
+                    &key,
+                    protection,
                     crate::KvValueAllowance::new(maximum, maximum),
                 )
                 .await
@@ -53,17 +58,27 @@ impl<A: KvAttempt> DynamoTransactWriteAttempt for KvCatalogAttempt<'_, A> {
         settlement.complete(result)
     }
 
-    async fn write_transact_receipt(&mut self, token: &str, receipt: Vec<u8>) -> StorageResult<()> {
+    fn stage_transact_receipt(
+        &mut self,
+        slot: ReceiptSlot<'_>,
+        receipt: Vec<u8>,
+    ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let result = (|| {
             let mut changes = Vec::new();
             changes
                 .try_reserve_exact(1)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            changes.push(KvMutation::Put {
-                key: receipt_key(token)?,
-                value: receipt,
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+            changes.push(match slot {
+                ReceiptSlot::Request(token) => KvMutation::PutUnchunked {
+                    key: receipt_key(token)?,
+                    value: receipt,
+                },
+                ReceiptSlot::JobEffect(key) => KvMutation::PutUnchunked {
+                    key: crate::job_store::data_key(key.as_bytes())?,
+                    value: receipt,
+                },
             });
             settlement.as_mut().attempt.stage(changes)
         })();
@@ -71,21 +86,30 @@ impl<A: KvAttempt> DynamoTransactWriteAttempt for KvCatalogAttempt<'_, A> {
     }
 }
 
+fn physical_receipt_key(slot: ReceiptSlot<'_>) -> StorageResult<Vec<u8>> {
+    match slot {
+        ReceiptSlot::Request(token) => receipt_key(token),
+        ReceiptSlot::JobEffect(key) => crate::job_store::data_key(key.as_bytes()),
+    }
+}
+
 fn receipt_key(token: &str) -> StorageResult<Vec<u8>> {
     let count = TRANSACT_RECEIPT_PREFIX
         .len()
         .checked_add(token.len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut key = Vec::new();
     key.try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     key.extend_from_slice(TRANSACT_RECEIPT_PREFIX);
     key.extend_from_slice(token.as_bytes());
     Ok(key)
 }
 
 /// Ordered receipt page after `after`. Receipts live under one prefix, so the
-/// range starts just past the last token already scanned.
+/// range starts just past the last token already scanned. The scan is a
+/// snapshot, so new receipts do not conflict with the sweep; `delete_receipts`
+/// reads each deleted key again under conflict.
 pub(crate) async fn scan_receipts<A: KvAttempt>(
     attempt: &A,
     after: Option<&str>,
@@ -107,14 +131,15 @@ pub(crate) async fn scan_receipts<A: KvAttempt>(
         end,
         reverse: false,
         limit,
-        max_bytes: storage_provider::TRANSACT_RECEIPT_READ_BYTES,
+        max_bytes: storage_provider::TRANSACT_RECEIPT_PAGE_BYTES,
         entry_bounds: None,
     };
-    let [page]: [_; 1] = attempt
-        .scan_batch(vec![range], ReadProtection::Conflict)
-        .await?
-        .try_into()
-        .map_err(|_| StorageError::internal("KV transact receipt scan page count differs"))?;
+    // Receipts are never chunked: each is at most TRANSACT_RECEIPT_WRITE_BYTES.
+    let maximum = std::num::NonZeroUsize::new(storage_provider::TRANSACT_RECEIPT_WRITE_BYTES)
+        .ok_or_else(|| StorageError::internal("KV transact receipt bound is zero"))?;
+    let page = attempt
+        .scan_unchunked(range, ReadProtection::Snapshot, maximum)
+        .await?;
     page.entries
         .into_iter()
         .map(|entry| {
@@ -150,7 +175,7 @@ pub(crate) async fn delete_receipts<A: KvAttempt>(
         .zip(current)
         .zip(receipts)
         .filter(|((_, stored), row)| stored.as_deref() == Some(row.receipt.as_slice()))
-        .map(|((key, _), _)| KvMutation::Delete { key })
+        .map(|((key, _), _)| KvMutation::DeleteUnchunked { key })
         .collect::<Vec<_>>();
     if changes.is_empty() {
         return Ok(());

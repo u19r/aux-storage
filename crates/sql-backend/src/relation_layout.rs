@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use storage_types::{TableHistoryId, maintenance::TargetIncarnation};
+use storage_types::{BoundGsi, TableHistoryId};
 
 use crate::SqlEngine;
 
@@ -22,16 +22,8 @@ pub trait SqlLayout: Copy + Send + Sync {
         self.qualify_relation(self.engine().item_table_name(history))
     }
 
-    fn ttl_table_name(self, history: TableHistoryId) -> String {
-        self.qualify_relation(self.engine().ttl_table_name(history))
-    }
-
-    fn gsi_table_name(self, incarnation: &TargetIncarnation) -> String {
-        self.qualify_relation(self.engine().gsi_table_name(incarnation))
-    }
-
-    fn gsi_read_index_name(self, incarnation: &TargetIncarnation) -> String {
-        self.qualify_relation(self.engine().gsi_read_index_name(incarnation))
+    fn gsi_index_name(self, history: TableHistoryId, gsi: &BoundGsi) -> String {
+        self.qualify_relation(self.engine().gsi_index_name(history, gsi))
     }
 }
 

@@ -147,7 +147,7 @@ impl PartitionReadState<'_> {
     ) -> StorageResult<()> {
         let count = NonZeroUsize::new(pending.len())
             .ok_or_else(|| StorageError::internal("pending stream scans are empty"))?;
-        let budget = NonZeroUsize::new((STREAM_READ_BYTES.get() / count.get()).max(1))
+        let budget = NonZeroUsize::new((STREAM_READ_BYTES.get() / count).max(1))
             .ok_or_else(|| StorageError::internal("pending stream scans have no byte budget"))?;
         let ranges = pending
             .iter()

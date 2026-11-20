@@ -1,8 +1,8 @@
-//! Internal queue service implementation and provider factory.
+//! Internal queue service implementation.
 //!
 //! This crate is the public queue facade. Consumers should depend on this crate
-//! for queue managers, provider traits, request/response types, and runtime
-//! construction.
+//! for queue managers, provider traits and request/response types. A process
+//! opens its queue store through `storage::DatabaseManager`.
 
 mod immediate_jobs;
 mod immediate_queue_worker;
@@ -25,11 +25,12 @@ mod queue_tests;
 mod constants;
 #[cfg(test)]
 mod constants_tests;
-mod factory;
-pub use factory::create_queue_provider;
 
 #[cfg(test)]
 mod immediate_queue_worker_tests;
 
 #[cfg(test)]
 mod queue_publication_tests;
+
+#[cfg(test)]
+mod quint_queue_claim_tests;

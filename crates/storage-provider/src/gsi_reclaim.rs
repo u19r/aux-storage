@@ -1,33 +1,22 @@
 //! Index retirement policy shared by all physical providers.
 
-use std::future::Future;
-
 use infrastructure_provider::{
     batch::RecordBatch,
     physical_attempt::PhysicalRecordAttempt,
     record::{ConditionalWriteResult, RecordChange, RecordExpectation},
 };
 use storage_backfill::GsiBuildTarget;
-use storage_types::{StorageEnum, StorageResult, TableHistoryId, maintenance::TargetIncarnation};
+use storage_types::{StorageResult, TableHistoryId};
 
 use crate::{
-    CatalogAttempt, TableReclaimStep,
+    ReclaimAttempt, TableReclaimStep,
     gsi_reclaim_discovery::GsiReclaimDiscovery,
     gsi_reclaim_record::{GsiReclaimRecord, invalid_marker},
 };
 
-/// Physical index binding observations and exact bounded family deletion.
-pub trait GsiReclaimAttempt: CatalogAttempt + PhysicalRecordAttempt {
-    fn load_index_incarnation(
-        &mut self,
-        history: TableHistoryId,
-        target: &GsiBuildTarget,
-    ) -> impl Future<Output = StorageResult<Option<TargetIncarnation>>> + Send;
-    fn delete_index_page(
-        &mut self,
-        history: TableHistoryId,
-        target: &GsiBuildTarget,
-    ) -> impl Future<Output = StorageResult<TableReclaimStep>> + Send;
+pub struct NativeGsiRetirement {
+    pub index: storage_types::BoundGsi,
+    pub unused_columns: Vec<storage_types::KeyColumn>,
 }
 
 /// Publish before removing the writable binding in this same native attempt.
@@ -35,12 +24,13 @@ pub async fn register_index_retirement(
     attempt: &mut impl PhysicalRecordAttempt,
     history: TableHistoryId,
     target: GsiBuildTarget,
+    native_index: Option<storage_types::BoundGsi>,
 ) -> StorageResult<()> {
     let mut settlement_guard =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement_guard.as_mut();
     let result = async {
-        let marker = GsiReclaimRecord::try_new(history, target)?;
+        let marker = GsiReclaimRecord::try_new(history, target, native_index)?;
         store_changes(attempt, &[marker.prepare_store(RecordExpectation::Absent)?]).await
     }
     .await;
@@ -49,7 +39,7 @@ pub async fn register_index_retirement(
 
 /// Fresh protected authority checks precede every retirement page.
 pub async fn reclaim_index_page(
-    attempt: &mut impl GsiReclaimAttempt,
+    attempt: &mut impl ReclaimAttempt,
 ) -> StorageResult<TableReclaimStep> {
     let mut settlement_guard =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -62,8 +52,9 @@ pub async fn reclaim_index_page(
         let advance = discovery.prepare_advance(row.key.clone())?;
         let marker = GsiReclaimRecord::decode(&row)?;
         require_retired_binding(attempt, &marker).await?;
+        let native = prepare_native_retirement(attempt, &marker).await?;
         let change = match attempt
-            .delete_index_page(marker.history, &marker.target)
+            .delete_index_page(marker.history, &marker.target, native)
             .await?
         {
             TableReclaimStep::Advanced => None,
@@ -81,8 +72,48 @@ pub async fn reclaim_index_page(
     settlement_guard.complete(result)
 }
 
+async fn prepare_native_retirement(
+    attempt: &mut impl ReclaimAttempt,
+    marker: &GsiReclaimRecord,
+) -> StorageResult<Option<NativeGsiRetirement>> {
+    let Some(index) = &marker.native_index else {
+        return Ok(None);
+    };
+    let current = if let Some(stamp) = attempt
+        .read_catalog_stamp(&marker.target.table_name)
+        .await?
+    {
+        Some(
+            attempt
+                .read_table_at_stamp(&marker.target.table_name, stamp)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let unused_columns = index
+        .columns
+        .iter()
+        .filter(|column| {
+            current.as_ref().is_none_or(|table| {
+                table.history_id != marker.history
+                    || !table
+                        .binding
+                        .gsis
+                        .iter()
+                        .any(|gsi| !gsi.name.is_ttl_index() && gsi.columns.contains(column))
+            })
+        })
+        .cloned()
+        .collect();
+    Ok(Some(NativeGsiRetirement {
+        index: index.clone(),
+        unused_columns,
+    }))
+}
+
 async fn require_retired_binding(
-    attempt: &mut impl GsiReclaimAttempt,
+    attempt: &mut impl ReclaimAttempt,
     marker: &GsiReclaimRecord,
 ) -> StorageResult<()> {
     let Some(stamp) = attempt
@@ -111,10 +142,10 @@ async fn store_changes(
         attempt.store_records(&batch).await?,
         ConditionalWriteResult::Applied
     ) {
-        return Err(StorageEnum::TransactionConflict {
-            message: "Index retirement authority changed".into(),
-        }
-        .into());
+        return Err(storage_types::StorageError::write_miss(
+            "gsi_retirement",
+            storage_types::MissExpectation::Revision,
+        ));
     }
     Ok(())
 }

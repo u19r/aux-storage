@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 
-use alloc_counter::AllocationGuard;
-
 use crate::{
-    AttributeDefinition, AttributeProjection, AttributeValue, GlobalSecondaryIndex, IndexName,
-    KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType, QueryTableRequest,
+    AttributeDefinition, AttributeMap, AttributeProjection, AttributeValue, GlobalSecondaryIndex,
+    IndexName, KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType,
     StorageResult, StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
-    TimestampMillis, WireItem, WireItemKeyAttributes, project_wire_items, validate_gsi_projection,
-    validate_gsi_required_attributes,
+    TimestampMillis, WireItem, validate_gsi_filter_attributes, validate_gsi_projection,
+    validate_gsi_required_attributes, validate_gsi_select,
 };
 
 fn projection_wire_variants() -> Vec<WireItem> {
@@ -21,13 +19,13 @@ fn projection_wire_variants() -> Vec<WireItem> {
         ("binary".to_string(), AttributeValue::B("AQID".to_string())),
         (
             "profile".to_string(),
-            AttributeValue::M(HashMap::from([
+            AttributeValue::M(AttributeMap::from(HashMap::from([
                 ("name".to_string(), AttributeValue::S("Ada".to_string())),
                 (
                     "secret".to_string(),
                     AttributeValue::S("hidden".to_string()),
                 ),
-            ])),
+            ]))),
         ),
         (
             "tags".to_string(),
@@ -37,21 +35,7 @@ fn projection_wire_variants() -> Vec<WireItem> {
             ]),
         ),
     ]);
-    let primary = WireItemKeyAttributes::new(
-        "pk".to_string(),
-        attributes["pk"].clone(),
-        Some("sk".to_string()),
-        Some(attributes["sk"].clone()),
-    );
-    let non_keys = attributes
-        .iter()
-        .filter(|(name, _)| name.as_str() != "pk" && name.as_str() != "sk")
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect::<HashMap<_, _>>();
-    vec![
-        WireItem::try_from(&attributes).unwrap(),
-        WireItem::local_split(primary, None, Some(serde_json::to_vec(&non_keys).unwrap())),
-    ]
+    vec![WireItem::try_from(&attributes).unwrap()]
 }
 
 #[test]
@@ -77,13 +61,13 @@ fn given_both_wire_representations_when_projecting_paths_then_map_semantics_hold
             HashMap::from([
                 (
                     "profile".to_string(),
-                    AttributeValue::M(HashMap::from([
+                    AttributeValue::M(AttributeMap::from(HashMap::from([
                         ("name".to_string(), AttributeValue::S("Ada".to_string())),
                         (
                             "secret".to_string(),
                             AttributeValue::S("hidden".to_string()),
                         ),
-                    ])),
+                    ]))),
                 ),
                 (
                     "tags".to_string(),
@@ -95,23 +79,23 @@ fn given_both_wire_representations_when_projecting_paths_then_map_semantics_hold
             "profile, profile.name",
             HashMap::from([(
                 "profile".to_string(),
-                AttributeValue::M(HashMap::from([(
+                AttributeValue::M(AttributeMap::from(HashMap::from([(
                     "name".to_string(),
                     AttributeValue::S("Ada".to_string()),
-                )])),
+                )]))),
             )]),
         ),
         (
             "profile.name, profile",
             HashMap::from([(
                 "profile".to_string(),
-                AttributeValue::M(HashMap::from([
+                AttributeValue::M(AttributeMap::from(HashMap::from([
                     ("name".to_string(), AttributeValue::S("Ada".to_string())),
                     (
                         "secret".to_string(),
                         AttributeValue::S("hidden".to_string()),
                     ),
-                ])),
+                ]))),
             )]),
         ),
         ("absent, tags[7]", HashMap::new()),
@@ -120,13 +104,11 @@ fn given_both_wire_representations_when_projecting_paths_then_map_semantics_hold
         let decoded = item.to_attribute_map().unwrap();
         for (expression, expected) in &cases {
             let projection = AttributeProjection::from_expression(expression, Some(&aliases));
-            let projected =
-                project_wire_items(vec![item.clone()], Some(expression), Some(&aliases))
-                    .unwrap()
-                    .pop()
-                    .unwrap()
-                    .into_attribute_map()
-                    .unwrap();
+            let projected = projection
+                .project_wire(&item)
+                .unwrap()
+                .into_attribute_map()
+                .unwrap();
             assert_eq!(
                 projected,
                 crate::AttributeMap::from(expected.clone()),
@@ -146,34 +128,6 @@ fn given_both_wire_representations_when_projecting_paths_then_map_semantics_hold
         assert_eq!(projected.get("pk"), decoded.get("pk"));
         assert_eq!(projected.get("binary"), decoded.get("binary"));
     }
-}
-
-#[test]
-fn given_malformed_selected_or_unselected_bytes_when_projecting_then_error_is_preserved() {
-    for data in [
-        br#"{"pk":{"wrong":"value"},"unused":{"S":"valid"}}"#.to_vec(),
-        br#"{"pk":{"S":"valid"},"unused":{"wrong":"value"}}"#.to_vec(),
-        br#"{"pk":{"S":"valid"}} trailing"#.to_vec(),
-    ] {
-        let item = WireItem::DynamoJson { data };
-        let old_error = item.to_attribute_map().unwrap_err();
-        let wire_error = project_wire_items(vec![item.clone()], Some("pk"), None).unwrap_err();
-        assert_eq!(wire_error.to_string(), old_error.to_string());
-    }
-    let primary = WireItemKeyAttributes::new(
-        "pk".to_string(),
-        AttributeValue::S("valid".to_string()),
-        None,
-        None,
-    );
-    let item = WireItem::local_split(
-        primary,
-        None,
-        Some(br#"{"unused":{"wrong":"value"}}"#.to_vec()),
-    );
-    let old_error = item.to_attribute_map().unwrap_err();
-    let wire_error = project_wire_items(vec![item.clone()], Some("pk"), None).unwrap_err();
-    assert_eq!(wire_error.to_string(), old_error.to_string());
 }
 
 fn include_projection_table() -> StoredTableInfo {
@@ -197,7 +151,6 @@ fn include_projection_table() -> StoredTableInfo {
             key_type: KeyType::Hash,
         }],
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
-            capture_for_build: false,
             index_name: IndexName::new("gsi1"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi1pk".to_string(),
@@ -211,99 +164,10 @@ fn include_projection_table() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
-}
-
-#[test]
-fn projection_expression_preserves_alias_and_document_path_semantics() {
-    let item = WireItem::try_from(&HashMap::from([
-        ("pk".to_string(), AttributeValue::S("tenant#1".to_string())),
-        (
-            "profile".to_string(),
-            AttributeValue::M(HashMap::from([
-                (
-                    "display_name".to_string(),
-                    AttributeValue::S("Ada".to_string()),
-                ),
-                (
-                    "private_note".to_string(),
-                    AttributeValue::S("hidden".to_string()),
-                ),
-            ])),
-        ),
-        (
-            "tags".to_string(),
-            AttributeValue::L(vec![
-                AttributeValue::S("first".to_string()),
-                AttributeValue::S("second".to_string()),
-            ]),
-        ),
-    ]))
-    .unwrap();
-
-    let projected = project_wire_items(
-        vec![item],
-        Some("#pk, profile.#name, tags[1]"),
-        Some(&crate::VecMap::from_iter([
-            ("#pk".to_string(), "pk".to_string()),
-            ("#name".to_string(), "display_name".to_string()),
-        ])),
-    )
-    .unwrap()
-    .pop()
-    .unwrap()
-    .into_attribute_map()
-    .unwrap();
-
-    assert_eq!(projected.len(), 3);
-    assert_eq!(
-        projected.get("pk"),
-        Some(&AttributeValue::S("tenant#1".to_string()))
-    );
-    assert_eq!(
-        projected.get("profile"),
-        Some(&AttributeValue::M(HashMap::from([(
-            "display_name".to_string(),
-            AttributeValue::S("Ada".to_string()),
-        )])))
-    );
-    assert_eq!(
-        projected.get("tags"),
-        Some(&AttributeValue::L(vec![AttributeValue::S(
-            "second".to_string()
-        )]))
-    );
-}
-
-#[test]
-fn query_table_request_rejects_reserved_projection_attribute_name() {
-    let request = QueryTableRequest {
-        table_name: TableName::new("tenant_data"),
-        index_name: Some(IndexName::new("gsi1")),
-        key_condition_expression: "#pk = :pk".to_string(),
-        expression_attribute_names: Some(crate::VecMap::from_iter([(
-            "#pk".to_string(),
-            "gsi1pk".to_string(),
-        )])),
-        expression_attribute_values: Some(crate::AttributeMap::from_iter([(
-            ":pk".to_string(),
-            AttributeValue::S("tenant#1".to_string()),
-        )])),
-        projection_expression: Some("COMMENT".to_string()),
-        limit: None,
-        exclusive_start_key: None,
-        scan_index_forward: None,
-        consistent_read: false,
-    };
-
-    let error = request.validate_for_dynamodb().unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
-         COMMENT"
-    );
 }
 
 #[test]
@@ -346,20 +210,38 @@ fn gsi_projection_rejects_aliased_unprojected_attributes_in_expression_order() {
 }
 
 #[test]
-fn all_projection_accepts_any_requested_attribute() {
+fn gsi_filter_rejects_unprojected_attributes_with_the_filter_message() {
+    let table = include_projection_table();
+    let error = validate_gsi_filter_attributes(
+        &table,
+        Some(&IndexName::new("gsi1")),
+        ["private_note", "pk", "missing", "private_note"],
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "One or more parameter values were invalid: Secondary index gsi1 does not project one or \
+         more filter attributes: [private_note, missing]"
+    );
+}
+
+#[test]
+fn gsi_select_all_attributes_requires_all_projection() {
     let mut table = include_projection_table();
+    let index_name = IndexName::new("gsi1");
+    let error = validate_gsi_select(&table, Some(&index_name), Some("ALL_ATTRIBUTES")).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported \
+         for global secondary index gsi1 because its projection type is not ALL"
+    );
+    assert!(validate_gsi_select(&table, Some(&index_name), Some("COUNT")).is_ok());
+    assert!(validate_gsi_select(&table, None, Some("ALL_ATTRIBUTES")).is_ok());
     table.global_secondary_indexes.as_mut().unwrap()[0]
         .projection
         .projection_type = Some(ProjectionType::All);
-
-    validate_gsi_projection(
-        &table,
-        Some(&IndexName::new("gsi1")),
-        Some("private_note"),
-        None,
-        None,
-    )
-    .unwrap();
+    assert!(validate_gsi_select(&table, Some(&index_name), Some("ALL_ATTRIBUTES")).is_ok());
 }
 
 fn legacy_validate_all_projection(
@@ -381,26 +263,6 @@ fn current_validate_all_projection(
     attributes: &[String],
 ) -> StorageResult<()> {
     validate_gsi_projection(table, Some(index_name), None, Some(attributes), None)
-}
-
-fn measure_all_projection_validation_allocations(
-    label: &'static str,
-    table: &StoredTableInfo,
-    index_name: &IndexName,
-    attributes: &[String],
-    validate: fn(&StoredTableInfo, &IndexName, &[String]) -> StorageResult<()>,
-) -> alloc_counter::AllocationReport<'static> {
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "gsi_all_projection_validation_allocation_profile",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    for _ in 0..128 {
-        let _ = std::hint::black_box(validate(table, index_name, attributes));
-    }
-    guard.finish()
 }
 
 #[test]
@@ -437,48 +299,6 @@ fn all_projection_guard_preserves_results_for_empty_and_wide_attribute_lists() {
 }
 
 #[test]
-#[ignore = "manual paired allocation probe; run in an isolated process"]
-fn all_projection_guard_allocation_profile() {
-    let mut table = include_projection_table();
-    table.global_secondary_indexes.as_mut().unwrap()[0]
-        .projection
-        .projection_type = Some(ProjectionType::All);
-    let index_name = IndexName::new("gsi1");
-
-    for width in [1, 10, 100] {
-        let attributes = (0..width)
-            .map(|index| format!("attribute-{index}"))
-            .collect::<Vec<_>>();
-        let legacy = measure_all_projection_validation_allocations(
-            "legacy_materialize_requested_attributes",
-            &table,
-            &index_name,
-            &attributes,
-            legacy_validate_all_projection,
-        );
-        let current = measure_all_projection_validation_allocations(
-            "guard_before_projection_materialization",
-            &table,
-            &index_name,
-            &attributes,
-            current_validate_all_projection,
-        );
-        let _ = alloc_counter::emit_report(&legacy);
-        let _ = alloc_counter::emit_report(&current);
-        println!(
-            "gsi_all_projection width={width} legacy_allocations={} current_allocations={} \
-             legacy_bytes={} current_bytes={}",
-            legacy.allocation_count / 128,
-            current.allocation_count / 128,
-            legacy.allocated_bytes / 128,
-            current.allocated_bytes / 128,
-        );
-        assert!(current.allocation_count < legacy.allocation_count);
-        assert!(current.allocated_bytes < legacy.allocated_bytes);
-    }
-}
-
-#[test]
 fn gsi_projection_validates_attributes_to_get_without_building_an_expression() {
     let table = include_projection_table();
     validate_gsi_projection(
@@ -501,155 +321,223 @@ fn gsi_projection_validates_attributes_to_get_without_building_an_expression() {
     assert!(error.to_string().contains("private_note"));
 }
 
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_projection_scenarios_when_repeated_then_report_cpu_and_allocations() {
-    use std::hint::black_box;
-
-    const ITERATIONS: usize = 10_000;
-    let aliases = crate::VecMap::from_iter([
-        ("#p".to_owned(), "profile".to_owned()),
-        ("#n".to_owned(), "name".to_owned()),
-    ]);
-    for (label, expression) in [
-        ("parse_flat", "pk, sk, binary, unused"),
-        ("parse_nested", "#p.#n, tags[1], profile.secret, absent"),
-        ("parse_missing", "absent, missing.deep[4].value"),
-    ] {
-        measure_projection_cost(label, ITERATIONS, || {
-            black_box(AttributeProjection::from_expression(
-                black_box(expression),
-                Some(&aliases),
-            ));
-        });
-    }
-    let variants = projection_wire_variants();
-    for (label, expression, count) in [
-        ("wire_flat", "pk, sk, binary, unused", 1),
-        ("wire_nested", "#p.#n, tags[1], profile.secret, absent", 1),
-        ("wire_page", "#p.#n, tags[1], profile.secret, absent", 16),
-        ("wire_missing", "absent, missing.deep[4].value", 1),
-    ] {
-        for (variant, item) in variants.iter().enumerate() {
-            let items = vec![item.clone(); count];
-            let label = format!("{label}_{variant}");
-            measure_projection_cost(&label, ITERATIONS, || {
-                let projected = project_wire_items(
-                    black_box(items.clone()),
-                    Some(black_box(expression)),
-                    Some(&aliases),
-                )
-                .unwrap();
-                black_box(serde_json::to_vec(&projected).unwrap());
-            });
-        }
-    }
-}
-
-fn measure_projection_cost(label: &str, iterations: usize, mut operation: impl FnMut()) {
-    for _ in 0..100 {
-        operation();
-    }
-    let guard = AllocationGuard::start(module_path!(), "projection", file!(), line!(), Some(label));
-    let cpu_started = cpu_time::ProcessTime::try_now().unwrap();
-    for _ in 0..iterations {
-        operation();
-    }
-    let cpu_ns = cpu_started.try_elapsed().unwrap().as_nanos();
-    alloc_counter::emit_report(&guard.finish()).unwrap();
-    eprintln!("projection label={label} iterations={iterations} cpu_ns={cpu_ns}");
-}
-
-#[test]
-fn given_unicode_aliases_and_invalid_paths_when_projecting_then_preserves_selection() {
-    let item = crate::AttributeMap::from_iter([
+fn wire_projection_item() -> AttributeMap {
+    AttributeMap::from(HashMap::from([
+        ("a".to_string(), AttributeValue::S("A".to_string())),
         (
-            "étiquette".to_owned(),
-            AttributeValue::S("value".to_owned()),
+            "b".to_string(),
+            AttributeValue::M(AttributeMap::from(HashMap::from([
+                ("c".to_string(), AttributeValue::N("1".to_string())),
+                ("d".to_string(), AttributeValue::S("D".to_string())),
+            ]))),
         ),
-        ("other".to_owned(), AttributeValue::S("hidden".to_owned())),
+        (
+            "e".to_string(),
+            AttributeValue::L(vec![
+                AttributeValue::S("e0".to_string()),
+                AttributeValue::S("e1".to_string()),
+            ]),
+        ),
+        ("f".to_string(), AttributeValue::S("F".to_string())),
+        ("f.g".to_string(), AttributeValue::S("G".to_string())),
+    ]))
+}
+
+#[test]
+fn project_wire_equals_full_decode_projection() {
+    let map = wire_projection_item();
+    let item = WireItem::try_from(&map).expect("wire item");
+    let attributes = ["f".to_string(), "missing".to_string()];
+    let names = crate::VecMap::from_iter([
+        ("#b".to_string(), "b".to_string()),
+        ("#lit".to_string(), "f.g".to_string()),
     ]);
-    let names = crate::VecMap::from_iter([("#é".to_owned(), "étiquette".to_owned())]);
-    for expression in ["étiquette", "#é", "#é, other[", "#é, other[wrong]"] {
-        let projected =
-            AttributeProjection::from_expression(expression, Some(&names)).project(&item);
-        assert_eq!(projected.len(), 1);
-        assert_eq!(projected.get("étiquette"), item.get("étiquette"));
+    let aliased = AttributeProjection::from_expression("#b.c, #lit", Some(&names));
+    for projection in [
+        AttributeProjection::from_expression("a, b.c, e[1]", None),
+        AttributeProjection::from_attributes(&attributes),
+        AttributeProjection::from_expression("#b.c, #lit", Some(&names)),
+    ] {
+        let wire = projection.project_wire(&item).expect("project wire");
+        let expected = projection.project(&AttributeMap::try_from(&item).expect("decode"));
+        assert_eq!(
+            AttributeMap::try_from(&wire).expect("decode projected"),
+            expected
+        );
     }
-    for expression in ["", " , ", "[0]", "other[", "other[wrong]", "absent"] {
+    let aliased = AttributeMap::try_from(&aliased.project_wire(&item).expect("project wire"))
+        .expect("decode projected");
+    assert_eq!(
+        aliased.get("f.g"),
+        Some(&AttributeValue::S("G".to_string()))
+    );
+    assert_eq!(
+        aliased.get("b"),
+        Some(&AttributeValue::M(AttributeMap::from_distinct([(
+            "c".to_string(),
+            AttributeValue::N("1".to_string())
+        )])))
+    );
+}
+
+#[test]
+fn project_wire_allocates_less_than_full_decode() {
+    let map = (0..32)
+        .map(|index| {
+            (
+                if index == 0 {
+                    "a".to_string()
+                } else {
+                    format!("attr{index:02}")
+                },
+                AttributeValue::S(format!("{index:02}").repeat(128)),
+            )
+        })
+        .collect::<AttributeMap>();
+    let item = WireItem::try_from(&map).expect("wire item");
+    let projection = AttributeProjection::from_expression("a", None);
+
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "project_wire_current",
+        file!(),
+        line!(),
+        Some("project_wire"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(projection.project_wire(&item).expect("project wire"));
+    }
+    let current = guard.finish();
+
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "project_wire_full_decode_legacy",
+        file!(),
+        line!(),
+        Some("full_decode"),
+    );
+    for _ in 0..256 {
+        let decoded = AttributeMap::try_from(&item).expect("decode");
+        std::hint::black_box(WireItem::try_from(&projection.project(&decoded)).expect("encode"));
+    }
+    let legacy = guard.finish();
+
+    let _ = alloc_counter::emit_report(&current);
+    let _ = alloc_counter::emit_report(&legacy);
+    assert!(
+        current.allocation_count < legacy.allocation_count,
+        "legacy={} current={}",
+        legacy.allocation_count,
+        current.allocation_count
+    );
+}
+
+#[test]
+fn given_list_index_duplicates_and_out_of_range_when_projecting_wire_then_matches_selection() {
+    let attributes = AttributeMap::from(HashMap::from([
+        (
+            "étiquette".to_string(),
+            AttributeValue::S("value".to_string()),
+        ),
+        (
+            "tags".to_string(),
+            AttributeValue::L(vec![
+                AttributeValue::S("first".to_string()),
+                AttributeValue::S("second".to_string()),
+            ]),
+        ),
+    ]));
+    let item = WireItem::try_from(&attributes).expect("encode item");
+    let names = crate::VecMap::from_iter([("#é".to_string(), "étiquette".to_string())]);
+
+    let projected =
+        AttributeProjection::from_expression("#é, tags[1], absent, tags[bad]", Some(&names))
+            .project_wire_nonempty(&item)
+            .expect("project")
+            .expect("selected attributes")
+            .to_attribute_map()
+            .expect("decode projected");
+    assert_eq!(projected.len(), 2);
+    assert_eq!(
+        projected.get("étiquette"),
+        Some(&AttributeValue::S("value".to_string()))
+    );
+    assert_eq!(
+        projected.get("tags"),
+        Some(&AttributeValue::L(vec![AttributeValue::S(
+            "second".to_string()
+        )]))
+    );
+
+    for expression in ["", " , ", "tags[99]", "tags[", "[0]", "absent"] {
+        let projection = AttributeProjection::from_expression(expression, None);
         assert!(
-            AttributeProjection::from_expression(expression, Some(&names))
-                .project(&item)
+            projection
+                .project_wire_nonempty(&item)
+                .expect("project")
+                .is_none()
+        );
+        assert!(
+            projection
+                .project_wire(&item)
+                .expect("project wire")
+                .to_attribute_map()
+                .expect("decode empty")
                 .is_empty()
         );
     }
+
+    let duplicate = AttributeProjection::from_expression("étiquette, étiquette", None)
+        .project_wire_nonempty(&item)
+        .expect("project")
+        .expect("selected attribute")
+        .to_attribute_map()
+        .expect("decode duplicate");
+    assert_eq!(duplicate.len(), 1);
+
+    // Repeated and out-of-order list indexes keep list order, as GetItem does.
+    let reordered = AttributeProjection::from_expression("tags[1], tags[0]", None)
+        .project_wire_nonempty(&item)
+        .expect("project")
+        .expect("selected attributes")
+        .to_attribute_map()
+        .expect("decode reordered");
+    assert_eq!(
+        reordered.get("tags"),
+        Some(&AttributeValue::L(vec![
+            AttributeValue::S("first".to_string()),
+            AttributeValue::S("second".to_string()),
+        ]))
+    );
 }
 
 #[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_projection_path_shapes_when_parsed_then_report_cpu_and_allocations() {
-    use std::hint::black_box;
-    let aliases = crate::VecMap::from_iter([("#alias".to_owned(), "étiquette".to_owned())]);
-    for (label, path) in [
-        ("path_short", "field".to_owned()),
-        ("path_alias", "#alias.child[12]".to_owned()),
-        ("path_long", format!("field{}", "_x".repeat(1000))),
-        (
-            "path_unicode",
-            format!("{}.child[12]", "étiquette".repeat(64)),
-        ),
-        (
-            "path_deep",
-            (0..16)
-                .map(|n| format!("field_{n}"))
-                .collect::<Vec<_>>()
-                .join("."),
-        ),
-        (
-            "path_indices",
-            format!(
-                "matrix{}",
-                (0..16).map(|n| format!("[{n}]")).collect::<String>()
-            ),
-        ),
-        (
-            "path_invalid_index",
-            "field[99999999999999999999999999999999999]".to_owned(),
-        ),
-    ] {
-        measure_projection_cost(label, 20_000, || {
-            black_box(crate::parse_projection_path(
-                black_box(&path),
-                Some(&aliases),
-            ));
-        });
-    }
-}
+fn given_two_paths_into_one_list_element_when_projecting_wire_then_one_merged_map() {
+    let attributes = AttributeMap::from(HashMap::from([(
+        "m".to_string(),
+        AttributeValue::L(vec![AttributeValue::M(AttributeMap::from(HashMap::from(
+            [
+                ("a".to_string(), AttributeValue::S("one".to_string())),
+                ("b".to_string(), AttributeValue::S("two".to_string())),
+                ("c".to_string(), AttributeValue::S("three".to_string())),
+            ],
+        )))]),
+    )]));
+    let item = WireItem::try_from(&attributes).expect("encode item");
 
-#[test]
-fn given_unicode_and_invalid_indices_when_parsed_then_preserve_path_rules() {
-    use crate::{
-        ProjectionSegment::{Index, Key},
-        VecMap, parse_projection_path,
-    };
-    let aliases = VecMap::from_iter([("#name".to_owned(), "étiquette".to_owned())]);
-    let parsed = parse_projection_path("#name.child[+12][0]", Some(&aliases)).unwrap();
+    let projected = AttributeProjection::from_expression("m[0].a, m[0].b", None)
+        .project_wire_nonempty(&item)
+        .expect("project")
+        .expect("selected attributes")
+        .to_attribute_map()
+        .expect("decode projected");
     assert_eq!(
-        &*parsed,
-        &[Key("étiquette"), Key("child"), Index(12), Index(0)]
+        projected.get("m"),
+        Some(&AttributeValue::L(vec![AttributeValue::M(
+            AttributeMap::from(HashMap::from([
+                ("a".to_string(), AttributeValue::S("one".to_string())),
+                ("b".to_string(), AttributeValue::S("two".to_string())),
+            ]))
+        )]))
     );
-    assert_eq!(
-        &*parse_projection_path("..étiquette..", None).unwrap(),
-        &[Key("étiquette")]
-    );
-    assert!(parse_projection_path("", None).unwrap().is_empty());
-    for invalid in [
-        "field[",
-        "field[]",
-        "field[-1]",
-        "field[1x]",
-        "field[99999999999999999999999999999999999]",
-    ] {
-        assert!(parse_projection_path(invalid, None).is_none(), "{invalid}");
-    }
 }

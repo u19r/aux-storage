@@ -1,41 +1,44 @@
 use storage_types::{
-    AttemptMode, BoundTableInfo, GetRecordsRequest, GetRecordsResponse, GetStreamRecordsRequest,
-    StorageEnum, StorageError, StorageResult, TableHistoryTarget, context::WrappedError as _,
-    stream_identity,
+    BoundTableInfo, GetRecordsRequest, GetRecordsResponse, GetStreamRecordsRequest, StorageEnum,
+    StorageError, StorageResult, TableHistoryTarget, TableName, context::WrappedError as _,
+    stream_arn_table_name, stream_identity,
 };
 
 use super::{
-    iterator::{StreamIterator, validate_streams_page_limit},
+    iterator::{StreamIterator, invalid_shard_iterator, validate_streams_page_limit},
     record::dynamodb_stream_record,
 };
 use crate::{
-    DynamoPort,
+    DynamoPort, StreamRetentionPort,
     dynamo_table_stream::{
-        DynamoTableStreamAttempt, TableStreamImageSelection, TableStreamReadOptions,
-        read_table_stream_page,
+        TableStreamImageSelection, TableStreamReadOptions, read_table_stream_page,
     },
 };
 
-pub trait DynamoStreamRead: Send + 'static {
+pub trait DynamoStreamRead: Send + Sync + 'static {
     type Response: Send + 'static;
-    fn target(&self) -> &TableHistoryTarget;
+    fn table_name(&self) -> &TableName;
     fn stream_arn(&self) -> &str;
-    fn metadata_failure(self, error: StorageError) -> StorageResult<Self::Response>
+    /// The error for a stream the request names but the table does not have.
+    fn stream_missing(&self) -> StorageError {
+        stream_not_found()
+    }
+    fn metadata_failure(&self, error: StorageError) -> StorageResult<Self::Response>
     where Self: Sized {
         Err(match error.to_enum() {
-            StorageEnum::TableNotFound { .. } => stream_not_found(),
+            StorageEnum::TableNotFound { .. } => self.stream_missing(),
             _ => error,
         })
     }
-    fn read<A: DynamoTableStreamAttempt>(
-        self,
+    fn read<A: StreamRetentionPort>(
+        &self,
         attempt: &mut A,
         table: &BoundTableInfo,
         now: storage_types::TimestampMillis,
     ) -> impl Future<Output = StorageResult<Self::Response>> + Send;
 
-    fn execute<A: DynamoTableStreamAttempt>(
-        self,
+    fn execute<A: StreamRetentionPort>(
+        &self,
         attempt: &mut A,
         table: &BoundTableInfo,
         now: storage_types::TimestampMillis,
@@ -44,7 +47,8 @@ pub trait DynamoStreamRead: Send + 'static {
         Self: Sized,
     {
         async move {
-            require_stream_table(table, self.target(), self.stream_arn())?;
+            require_stream_table(table, self.table_name(), self.stream_arn())
+                .map_err(|_| self.stream_missing())?;
             self.read(attempt, table, now).await
         }
     }
@@ -55,40 +59,61 @@ pub(crate) async fn read_dynamo_stream<P: DynamoPort, S: DynamoStreamRead>(
     request: S,
 ) -> StorageResult<S::Response> {
     let now = port.now();
-    let cache = port.metadata_cache();
-    let publication_cache = cache.clone();
-    let (response, publication) = port
-        .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
+    let state = std::sync::Arc::new(request);
+    crate::dynamo_operation_port::read_operation(
+        port,
+        crate::constants::RANGE_READ,
+        move |attempt, session| {
             Box::pin(async move {
-                let observed =
-                    crate::resolve_table_in_attempt(attempt, &cache, &request.target().table_name)
-                        .await;
+                let request = state.as_ref();
+                let observed = session.resolve_table(attempt, request.table_name()).await;
                 let (table, publication) = match observed {
                     Ok(observed) => observed,
                     Err(error) => return Ok((request.metadata_failure(error)?, None)),
                 };
+                if let Err(error) = table.require_data_readable() {
+                    return Ok((request.metadata_failure(error)?, None));
+                }
                 let response = request.execute(attempt, &table, now).await?;
                 Ok((response, publication))
             })
-        })
-        .await?;
-    publication_cache.publish(publication);
-    Ok(response)
+        },
+    )
+    .await
 }
 
 fn require_stream_table(
     table: &BoundTableInfo,
-    target: &TableHistoryTarget,
+    table_name: &TableName,
     arn: &str,
 ) -> StorageResult<()> {
-    if table.history_id != target.history_id
-        || table.info.table_name != target.table_name
+    if &table.info.table_name != table_name
         || !table.info.has_enabled_stream()
-        || stream_identity(&table.info.table_name, table.stream_identity()).0 != arn
+        || table
+            .stream_identity()
+            .is_none_or(|identity| stream_identity(&table.info.table_name, identity).0 != arn)
     {
         return Err(stream_not_found());
     }
     Ok(())
+}
+
+/// An unknown shard of an existing stream.
+pub(crate) fn shard_not_found() -> StorageError {
+    StorageEnum::ResourceNotFound {
+        resource_type: "shard",
+        resource_id: String::new(),
+    }
+    .into()
+}
+
+/// A stream ARN naming no stream, reported with the ARN as DescribeStream does.
+pub(crate) fn stream_arn_not_found(arn: &str) -> StorageError {
+    StorageEnum::ResourceNotFound {
+        resource_type: "stream",
+        resource_id: arn.to_owned(),
+    }
+    .into()
 }
 
 pub(crate) fn stream_not_found() -> StorageError {
@@ -101,7 +126,7 @@ pub(crate) fn stream_not_found() -> StorageError {
 
 pub struct GetDynamoStreamRecords {
     iterator: StreamIterator,
-    target: TableHistoryTarget,
+    table_name: TableName,
     limit: u32,
 }
 
@@ -110,10 +135,10 @@ impl TryFrom<GetRecordsRequest> for GetDynamoStreamRecords {
     fn try_from(request: GetRecordsRequest) -> StorageResult<Self> {
         validate_streams_page_limit(request.limit, 1_000)?;
         let iterator = StreamIterator::decode(&request.shard_iterator)?;
-        let target = TableHistoryTarget::try_from(iterator.stream_arn.as_str())?;
+        let table_name = stream_arn_table_name(iterator.stream_arn.as_str())?;
         Ok(Self {
             iterator,
-            target,
+            table_name,
             limit: request.limit.unwrap_or(1_000),
         })
     }
@@ -121,14 +146,14 @@ impl TryFrom<GetRecordsRequest> for GetDynamoStreamRecords {
 
 impl DynamoStreamRead for GetDynamoStreamRecords {
     type Response = GetRecordsResponse;
-    fn target(&self) -> &TableHistoryTarget {
-        &self.target
+    fn table_name(&self) -> &TableName {
+        &self.table_name
     }
     fn stream_arn(&self) -> &str {
         &self.iterator.stream_arn
     }
-    async fn read<A: DynamoTableStreamAttempt>(
-        self,
+    async fn read<A: StreamRetentionPort>(
+        &self,
         attempt: &mut A,
         table: &BoundTableInfo,
         now: storage_types::TimestampMillis,
@@ -137,7 +162,11 @@ impl DynamoStreamRead for GetDynamoStreamRecords {
         let response = read_table_stream_page(
             attempt,
             table,
-            &GetStreamRecordsRequest::table_at_incarnation(self.target, start, Some(self.limit)),
+            &GetStreamRecordsRequest::table_at_incarnation(
+                TableHistoryTarget::from(table),
+                start,
+                Some(self.limit),
+            ),
             TableStreamReadOptions {
                 now,
                 selection: TableStreamImageSelection::DynamoDbImages,
@@ -147,6 +176,9 @@ impl DynamoStreamRead for GetDynamoStreamRecords {
         .await
         .map_err(|error| match error.as_ref() {
             StorageEnum::HistoryUnavailable => StorageEnum::TrimmedDataAccess.into(),
+            StorageEnum::ResourceNotFound { resource_type, .. } if *resource_type == "shard" => {
+                invalid_shard_iterator()
+            }
             _ => error,
         })?;
         let specification = table
@@ -160,11 +192,12 @@ impl DynamoStreamRead for GetDynamoStreamRecords {
         let stream_arn = self.iterator.stream_arn.clone();
         Ok(GetRecordsResponse {
             next_shard_iterator: (!response.sealed_end).then(|| match next {
-                Some(token) => {
-                    StreamIterator::new(self.iterator.stream_arn, self.iterator.shard_id)
-                        .with_page_token(Some(token))
-                        .encode()
-                }
+                Some(token) => StreamIterator::new(
+                    self.iterator.stream_arn.clone(),
+                    self.iterator.shard_id.clone(),
+                )
+                .with_page_token(Some(token))
+                .encode(),
                 None => self.iterator.encode(),
             }),
             records: records

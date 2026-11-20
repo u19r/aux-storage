@@ -212,23 +212,8 @@ impl StreamError {
         })
     }
 
-    pub fn item_not_found(id: impl Into<String>) -> Self {
-        Self::from(StreamEnum::ResourceNotFound {
-            resource_type: "stream_item",
-            resource_id: id.into(),
-        })
-    }
-
-    pub fn cleanup_task(message: impl Into<String>) -> Self {
-        Self::internal_with_detail(StreamInternalKind::CleanupTask, message.into())
-    }
-
     pub fn serialization_error(context: impl Into<String>) -> Self {
         Self::internal_with_detail(StreamInternalKind::Serialization, context.into())
-    }
-
-    pub fn deserialization_error(context: impl Into<String>) -> Self {
-        Self::internal_with_detail(StreamInternalKind::Deserialization, context.into())
     }
 }
 
@@ -320,6 +305,15 @@ impl StreamError {
             }
             .into(),
             StreamEnum::Validation { message, .. } => StorageError::validation(message),
+            StreamEnum::Serialization(error) => {
+                let error = error.as_ref();
+                StorageError::internal(&format!(
+                    "Serialization error: {:?} at {}:{}",
+                    error.classify(),
+                    error.line(),
+                    error.column()
+                ))
+            }
             other => StorageError::internal(&other.to_string()),
         }
     }

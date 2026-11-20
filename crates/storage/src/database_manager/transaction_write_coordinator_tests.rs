@@ -54,16 +54,89 @@ fn system(
     .test_system()
 }
 
+#[cfg(feature = "postgres")]
+static OWNED_POSTGRES_SCHEMAS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The base DSN of the owned Postgres fixture; it names a database, never a
+/// schema.
+#[cfg(feature = "postgres")]
+fn base_postgres_dsn() -> String {
+    std::env::var("TEST_JOB_EFFECT_POSTGRES_DSN").expect("owned Postgres fixture required")
+}
+
+/// The DSN whose `search_path` is the schema owned by the fixture of `table`.
+/// The schema is named after the table, which is unique per fixture.
+#[cfg(feature = "postgres")]
+fn owned_postgres_dsn(table: &TableName) -> String {
+    let dsn = base_postgres_dsn();
+    let schema = table.as_ref();
+    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}options=-csearch_path%3D{schema}&application_name={schema}")
+    } else {
+        format!("{dsn} options='-c search_path={schema}' application_name={schema}")
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn schema_admin_client(dsn: &str) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+#[cfg(feature = "postgres")]
+async fn create_owned_postgres_schema(table: &TableName) {
+    let schema = table.as_ref().to_string();
+    schema_admin_client(&base_postgres_dsn())
+        .await
+        .execute(&format!("CREATE SCHEMA \"{schema}\""), &[])
+        .await
+        .unwrap();
+    eprintln!("OWNED_FIXTURE created postgres schema={schema}");
+    OWNED_POSTGRES_SCHEMAS.lock().unwrap().push(schema);
+}
+
+/// Drops every schema this process's fixtures created. Call at the end of a
+/// Postgres test.
+#[cfg(feature = "postgres")]
+async fn drop_owned_postgres_schemas() {
+    let schemas = std::mem::take(&mut *OWNED_POSTGRES_SCHEMAS.lock().unwrap());
+    let client = schema_admin_client(&base_postgres_dsn()).await;
+    for schema in schemas {
+        client
+            .execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"), &[])
+            .await
+            .unwrap();
+        eprintln!("OWNED_FIXTURE deleted postgres schema={schema}");
+    }
+}
+
 async fn fixture(
     backend: storage_provider::StorageBackend,
 ) -> (DatabaseManager, TableName, Timestamp) {
+    let table = TableName::new(&format!(
+        "job_destination_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    #[cfg_attr(
+        not(any(feature = "postgres", feature = "foundationdb")),
+        expect(unused_mut, reason = "only external providers add settings")
+    )]
     let mut config = native_config(backend.clone());
     match backend {
         #[cfg(feature = "postgres")]
         storage_provider::StorageBackend::Postgres => {
+            create_owned_postgres_schema(&table).await;
             config.postgres = Some(storage_provider::PostgresSettings {
-                dsn: std::env::var("TEST_JOB_EFFECT_POSTGRES_DSN")
-                    .expect("owned Postgres fixture required"),
+                dsn: owned_postgres_dsn(&table),
                 tls: false,
                 ..Default::default()
             });
@@ -93,13 +166,6 @@ async fn fixture(
     )
     .await
     .unwrap();
-    let table = TableName::new(&format!(
-        "job_destination_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
     db.create_table(&table_request(&table)).await.unwrap();
     (
         db,
@@ -120,6 +186,7 @@ fn local_backends() -> Vec<storage_provider::StorageBackend> {
 
 fn native_config(backend: storage_provider::StorageBackend) -> storage_provider::StorageConfig {
     storage_provider::StorageConfig {
+        initial_stream_lineages: None,
         backend_type: backend,
         connection_string: Some(
             crate::storage_test_support_tests::unique_path("job-effects")
@@ -363,131 +430,17 @@ async fn verify_replacement_claim_when_old_owner_writes_then_effect_and_checkpoi
 }
 
 #[tokio::test]
-async fn given_large_effects_and_a_prior_format_receipt_when_the_completed_execution_replays_then_payload_copies_are_compacted_without_rewriting_the_destination()
+async fn given_committed_effect_when_replayed_after_completion_then_receipt_is_gone_and_replay_is_rejected()
  {
-    let config = native_config(storage_provider::StorageBackend::SQLite);
-    let path = config.connection_string.clone().unwrap();
-    let db = DatabaseManager::new_with_config_and_runtime_options(
-        config,
-        super::DatabaseManagerRuntimeOptions::builder()
-            .enable_database_jobs(false)
-            .build(),
-    )
-    .await
-    .unwrap();
-    let table = TableName::new("compact_execution_receipt");
-    db.create_table(&table_request(&table)).await.unwrap();
-    let now = Timestamp::from_millis(storage_types::TimestampMillis::now().timestamp_millis());
-    let system = system(&db, 1, &table);
-    enqueue(&system, 2, now).await;
-    let claim = system.claim(JobId::from([2; 16]), now).await.unwrap();
-    let authority = claim.context().unwrap().effect_authority().unwrap();
-    let payload = (0_u64..10_000)
-        .map(|index| format!("{:x}", md5::compute(index.to_be_bytes())))
-        .collect::<String>();
-    let input = request(&table, "large-effect", &payload);
-    db.transact_write_job_effect(input.clone(), authority.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        read(&db, &table, "effect").await.unwrap().get("payload"),
-        Some(&AttributeValue::S(payload))
-    );
-
-    let connection = rusqlite::Connection::open(&path).unwrap();
-    let (token, bytes): (String, Vec<u8>) = connection
-        .query_row(
-            "SELECT token, receipt_blob FROM sys_transact_receipts",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert!(
-        bytes.len() < 4096,
-        "a native execution receipt must not retain staged bytes: {}",
-        bytes.len()
-    );
-    let mut receipt: serde_json::Value = storage_types::storage_serde::from_bytes(&bytes).unwrap();
-    let mut binding = Vec::new();
-    authority.bind_request_identity(&mut binding);
-    let mut request_identity = serde_json::to_value(&input).unwrap();
-    request_identity
-        .as_object_mut()
-        .unwrap()
-        .remove("ClientRequestToken");
-    receipt["request_identity"] =
-        serde_json::to_value(serde_json::to_vec(&(binding, request_identity)).unwrap()).unwrap();
-    let previous = storage_types::storage_serde::to_bytes(&receipt).unwrap();
-    assert!(previous.len() > 100_000);
-    connection
-        .execute(
-            "UPDATE sys_transact_receipts SET receipt_blob = ?1 WHERE token = ?2",
-            rusqlite::params![previous, token],
-        )
-        .unwrap();
-    drop(connection);
-    system
-        .complete(
-            claim,
-            JobOutcome::Complete(scheduled_bg_jobs::OutcomeCode::try_new("done").unwrap()),
-            now,
-        )
-        .await
-        .unwrap();
-    assert!(
-        db.find_job_effect_receipt("large-effect", authority.clone())
-            .await
-            .unwrap()
-            .is_some()
-    );
-    db.transact_write_items(request(&table, "new-value", "replacement"))
-        .await
-        .unwrap();
-    db.transact_write_job_effect(input, authority.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        read(&db, &table, "effect").await.unwrap().get("payload"),
-        Some(&AttributeValue::S("replacement".to_owned()))
-    );
-    let error = db
-        .transact_write_job_effect(request(&table, "large-effect", "changed"), authority)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error.to_enum(),
-        StorageEnum::IdempotentParameterMismatch
-    ));
-    let connection = rusqlite::Connection::open(&path).unwrap();
-    let compacted: Vec<u8> = connection
-        .query_row(
-            "SELECT receipt_blob FROM sys_transact_receipts WHERE token = ?1",
-            [&token],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        compacted.len() < 4096,
-        "canonical replay must remove the prior receipt's copied payload"
-    );
-    drop(connection);
-    drop(system);
-    drop(db);
-    std::fs::remove_file(path).unwrap();
-}
-
-#[tokio::test]
-async fn given_committed_effect_when_replayed_after_completion_then_receipt_wins_without_rewriting()
-{
     for backend in local_backends() {
-        verify_committed_effect_when_replayed_after_completion_then_receipt_wins_without_rewriting(
+        verify_committed_effect_when_replayed_after_completion_then_receipt_is_gone_and_replay_is_rejected(
             backend,
         )
         .await;
     }
 }
 
-async fn verify_committed_effect_when_replayed_after_completion_then_receipt_wins_without_rewriting(
+async fn verify_committed_effect_when_replayed_after_completion_then_receipt_is_gone_and_replay_is_rejected(
     backend: storage_provider::StorageBackend,
 ) {
     let (db, table, now) = fixture(backend.clone()).await;
@@ -505,6 +458,12 @@ async fn verify_committed_effect_when_replayed_after_completion_then_receipt_win
     db.transact_write_job_effect(accepted.clone(), authority.clone())
         .await
         .unwrap();
+    assert!(
+        db.find_job_effect_receipt("lost-ack", authority.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
     system
         .complete(
             claim,
@@ -517,8 +476,30 @@ async fn verify_committed_effect_when_replayed_after_completion_then_receipt_win
         db.find_job_effect_receipt("lost-ack", authority.clone())
             .await
             .unwrap()
-            .is_some()
+            .is_none(),
+        "completion removes the execution's receipts"
     );
+    {
+        use scheduled_bg_jobs::store::{RangeDirection, RangeRequest, RangeRequestInput};
+        let group = authority.receipt_group().unwrap();
+        let page = db
+            .scheduled_job_store()
+            .unwrap()
+            .read_range(
+                RangeRequest::try_from(RangeRequestInput {
+                    start: Some(group.prefix().clone()),
+                    end: Some(group.end().clone()),
+                    direction: RangeDirection::Forward,
+                    item_limit: std::num::NonZeroU32::new(16).unwrap(),
+                    byte_limit: std::num::NonZeroUsize::new(1_048_576).unwrap(),
+                    continuation: None,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(page.entries.is_empty());
+    }
     assert!(
         db.find_job_effect_receipt("other-target", authority.clone())
             .await
@@ -544,16 +525,13 @@ async fn verify_committed_effect_when_replayed_after_completion_then_receipt_win
         invalid.to_enum(),
         StorageEnum::RawValidation { .. }
     ));
-    db.transact_write_job_effect(accepted, authority.clone())
-        .await
-        .unwrap();
     let error = db
-        .transact_write_job_effect(request(&table, "lost-ack", "changed"), authority)
+        .transact_write_job_effect(accepted, authority)
         .await
         .unwrap_err();
     assert!(
-        matches!(error.to_enum(), StorageEnum::IdempotentParameterMismatch),
-        "unexpected changed-request error: {error}"
+        matches!(error.to_enum(), StorageEnum::ConditionalCheckFailed),
+        "a completed execution rejects the replay: {error}"
     );
     for key in ["effect", "checkpoint"] {
         assert_eq!(
@@ -746,14 +724,6 @@ async fn given_legacy_stamping_enabled_when_replaying_job_intent_then_identity_a
     db.transact_write_job_effect(input.clone(), authority.clone())
         .await
         .unwrap();
-    system
-        .complete(
-            claim,
-            JobOutcome::Complete(scheduled_bg_jobs::OutcomeCode::try_new("done").unwrap()),
-            now,
-        )
-        .await
-        .unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
     db.transact_write_job_effect(input.clone(), authority.clone())
         .await
@@ -772,10 +742,20 @@ async fn given_legacy_stamping_enabled_when_replaying_job_intent_then_identity_a
         error.to_enum(),
         StorageEnum::IdempotentParameterMismatch
     ));
+    system
+        .complete(
+            claim,
+            JobOutcome::Complete(scheduled_bg_jobs::OutcomeCode::try_new("done").unwrap()),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(read(&db, &table, "effect").await.is_some());
 }
 
 #[tokio::test]
-async fn given_old_job_receipt_when_ordinary_token_is_reused_then_durable_replay_still_wins() {
+async fn given_job_effect_receipt_when_ordinary_token_is_reused_then_request_receipts_are_separate()
+{
     use std::sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -788,19 +768,24 @@ async fn given_old_job_receipt_when_ordinary_token_is_reused_then_durable_replay
         }
     }
     let clock = Arc::new(Clock(AtomicI64::new(1_800_000_000_000)));
-    let driver = sql_backend::sqlite::SqliteBackend::initialize(":memory:")
-        .await
-        .unwrap();
+    let driver = sql_backend::sqlite::SqliteBackend::initialize(
+        ":memory:",
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .unwrap();
     let store = Arc::new(
-        sql_backend::SqlStore::initialize_schema(driver)
-            .await
-            .unwrap()
-            .with_clock(clock.clone()),
+        sql_backend::SqlStore::initialize_schema(
+            driver,
+            storage_types::InitialStreamLineages::ONE,
+            true,
+        )
+        .await
+        .unwrap()
+        .with_clock(clock.clone()),
     );
-    let bundle =
-        crate::StorageProviderBundle::try_from_initialized_store(store.clone(), Default::default())
-            .unwrap();
     let config = storage_provider::StorageConfig {
+        initial_stream_lineages: None,
         backend_type: storage_provider::StorageBackend::SQLite,
         connection_string: Some(":memory:".to_string()),
         file_path: None,
@@ -811,9 +796,9 @@ async fn given_old_job_receipt_when_ordinary_token_is_reused_then_durable_replay
         foundationdb: None,
         remote: None,
     };
-    let db = DatabaseManager::from_initialized_bundle(
+    let db = DatabaseManager::from_initialized_store(
         config,
-        bundle,
+        crate::InitializedStore::native(store.clone()),
         super::DatabaseManagerRuntimeOptions::builder()
             .enable_database_jobs(false)
             .build(),
@@ -822,90 +807,72 @@ async fn given_old_job_receipt_when_ordinary_token_is_reused_then_durable_replay
     .unwrap();
     let table = TableName::new("durable_effect_receipt");
     db.create_table(&table_request(&table)).await.unwrap();
-    // A literal prior-format receipt has no retention field. It must remain
-    // authoritative inside the ordinary window and expire at the boundary.
-    #[derive(serde::Serialize)]
-    struct LegacyReceipt {
-        request_identity: Vec<u8>,
-        response: Vec<u8>,
-        completed_at: storage_types::TimestampMillis,
-    }
-    let legacy_input = request(&table, "legacy-token", "original");
-    let mut identity = legacy_input.clone();
-    identity.client_request_token = None;
-    let legacy = LegacyReceipt {
-        request_identity: serde_json::to_vec(&identity).unwrap(),
-        response: serde_json::to_vec(&storage_types::TransactWriteItemsResponse {
-            consumed_capacity: None,
-            item_collection_metrics: None,
-        })
-        .unwrap(),
-        completed_at: storage_types::TimestampMillis::from_timestamp(
-            clock.0.load(Ordering::SeqCst),
-        ),
-    };
-    let bytes = storage_types::storage_serde::to_bytes(&legacy).unwrap();
-    use storage_provider::{DynamoPort as _, DynamoTransactWriteAttempt as _};
-    store
-        .with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move { attempt.write_transact_receipt("legacy-token", bytes).await })
-        })
-        .await
-        .unwrap();
-    db.transact_write_items(legacy_input).await.unwrap();
-    assert!(read(&db, &table, "effect").await.is_none());
-    let changed = request(&table, "legacy-token", "changed");
-    let error = db.transact_write_items(changed.clone()).await.unwrap_err();
-    assert!(matches!(
-        error.to_enum(),
-        StorageEnum::IdempotentParameterMismatch
-    ));
-    clock.0.fetch_add(
-        storage_provider::TRANSACT_WRITE_IDEMPOTENCY_WINDOW_MILLIS,
-        Ordering::SeqCst,
-    );
-    db.transact_write_items(changed).await.unwrap();
-    assert_eq!(
-        read(&db, &table, "effect").await.unwrap().get("payload"),
-        Some(&AttributeValue::S("changed".to_string()))
-    );
     let now = Timestamp::from_millis(clock.0.load(Ordering::SeqCst));
     let system = system(&db, 1, &table);
     enqueue(&system, 9, now).await;
     let claim = system.claim(JobId::from([9; 16]), now).await.unwrap();
     let authority = claim.context().unwrap().effect_authority().unwrap();
-    let input = request(&table, "shared-token", "accepted");
-    db.transact_write_job_effect(input.clone(), authority.clone())
-        .await
-        .unwrap();
-    system
-        .complete(
-            claim,
-            JobOutcome::Complete(scheduled_bg_jobs::OutcomeCode::try_new("done").unwrap()),
-            now,
+    db.transact_write_job_effect(
+        request(&table, "shared-token", "accepted"),
+        authority.clone(),
+    )
+    .await
+    .unwrap();
+    // Far past the ten-minute request-receipt window.
+    clock.0.fetch_add(24 * 60 * 60 * 1_000, Ordering::SeqCst);
+    assert!(
+        db.find_job_effect_receipt("shared-token", authority.clone())
+            .await
+            .unwrap()
+            .is_some(),
+        "a job effect receipt has no time expiry"
+    );
+    let request_receipt = || async {
+        use storage_provider::DynamoTransactWriteAttempt as _;
+        storage_provider::DynamoPort::with_attempt(
+            store.as_ref(),
+            storage_types::AttemptPlan::new(
+                storage_types::AttemptMode::ReadWrite,
+                storage_types::DeadlineClass::Write,
+            )
+            .start(storage_types::AttemptDeadlineSource::attempt_deadlines(
+                store.as_ref(),
+            )),
+            move |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .read_transact_receipt(storage_provider::ReceiptSlot::Request(
+                            "shared-token",
+                        ))
+                        .await
+                })
+            },
         )
         .await
-        .unwrap();
-    clock.0.fetch_add(24 * 60 * 60 * 1_000, Ordering::SeqCst);
+        .unwrap()
+    };
+    assert!(
+        request_receipt().await.is_none(),
+        "a job effect writes no request receipt"
+    );
     db.transact_write_items(request(&table, "shared-token", "ordinary"))
-        .await
-        .unwrap();
-    db.transact_write_job_effect(input, authority.clone())
         .await
         .unwrap();
     assert_eq!(
         read(&db, &table, "effect").await.unwrap().get("payload"),
         Some(&AttributeValue::S("ordinary".to_string())),
-        "receipt replay must not execute an old effect again"
+        "an ordinary request with the same token executes as a new request"
     );
-    let error = db
-        .transact_write_job_effect(request(&table, "shared-token", "changed"), authority)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error.to_enum(),
-        StorageEnum::IdempotentParameterMismatch
-    ));
+    assert!(
+        request_receipt().await.is_some(),
+        "the ordinary request created its own receipt in sys_transact_receipts"
+    );
+    assert!(
+        db.find_job_effect_receipt("shared-token", authority)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[cfg(feature = "postgres")]
@@ -918,7 +885,7 @@ async fn given_native_postgres_when_exercising_job_effects_then_fences_receipts_
         storage_provider::StorageBackend::Postgres,
     )
     .await;
-    verify_committed_effect_when_replayed_after_completion_then_receipt_wins_without_rewriting(
+    verify_committed_effect_when_replayed_after_completion_then_receipt_is_gone_and_replay_is_rejected(
         storage_provider::StorageBackend::Postgres,
     )
     .await;
@@ -938,6 +905,7 @@ async fn given_native_postgres_when_exercising_job_effects_then_fences_receipts_
         storage_provider::StorageBackend::Postgres,
     )
     .await;
+    drop_owned_postgres_schemas().await;
 }
 
 #[cfg(feature = "foundationdb")]
@@ -950,7 +918,7 @@ async fn given_native_foundationdb_when_exercising_job_effects_then_fences_recei
         storage_provider::StorageBackend::FoundationDb,
     )
     .await;
-    verify_committed_effect_when_replayed_after_completion_then_receipt_wins_without_rewriting(
+    verify_committed_effect_when_replayed_after_completion_then_receipt_is_gone_and_replay_is_rejected(
         storage_provider::StorageBackend::FoundationDb,
     )
     .await;
@@ -996,12 +964,10 @@ async fn given_native_postgres_cancellation_when_effect_waits_on_job_row_then_no
         .await
         .unwrap()
         .unwrap();
-    let (client, connection) = tokio_postgres::connect(
-        &std::env::var("TEST_JOB_EFFECT_POSTGRES_DSN").unwrap(),
-        tokio_postgres::NoTls,
-    )
-    .await
-    .unwrap();
+    let (client, connection) =
+        tokio_postgres::connect(&owned_postgres_dsn(&table), tokio_postgres::NoTls)
+            .await
+            .unwrap();
     let connection_task = tokio::spawn(async move {
         connection.await.unwrap();
     });
@@ -1035,7 +1001,7 @@ async fn given_native_postgres_cancellation_when_effect_waits_on_job_row_then_no
                 .query_one(
                     "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = \
                      current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' \
-                     AND query LIKE '%sys_scheduled_jobs_v2%FOR UPDATE%')",
+                     AND query LIKE '%UPDATE sys_scheduled_jobs_v2 SET value = value%')",
                     &[],
                 )
                 .await
@@ -1071,6 +1037,114 @@ async fn given_native_postgres_cancellation_when_effect_waits_on_job_row_then_no
     assert!(read(&db, &table, "checkpoint").await.is_none());
     drop(client);
     connection_task.await.unwrap();
+    drop_owned_postgres_schemas().await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "requires an owned postgres fixture"]
+async fn given_native_postgres_effect_racing_completion_when_both_commit_then_no_receipt_survives()
+{
+    use std::sync::Arc;
+
+    use sha2::{Digest as _, Sha256};
+
+    let (db, table, now) = fixture(storage_provider::StorageBackend::Postgres).await;
+    db.get_table_info(&table).await.unwrap();
+    let system = system(&db, 1, &table);
+    enqueue(&system, 11, now).await;
+    let claim = system.claim(JobId::from([11; 16]), now).await.unwrap();
+    let authority = claim.context().unwrap().effect_authority().unwrap();
+    let group = authority.receipt_group().unwrap();
+    let receipt_key = authority
+        .receipt_key(&Sha256::digest("race").into())
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let (client, connection) =
+        tokio_postgres::connect(&owned_postgres_dsn(&table), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    let connection_task = tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    // The open admin insert holds the effect's receipt key.
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute(
+            "INSERT INTO sys_scheduled_jobs_v2 (key, value) VALUES ($1, $2)",
+            &[&receipt_key, &b"x".as_slice()],
+        )
+        .await
+        .unwrap();
+    let db = Arc::new(db);
+    let effect = {
+        let db = db.clone();
+        let input = request(&table, "race", "effect");
+        let authority = authority.clone();
+        tokio::spawn(async move { db.transact_write_job_effect(input, authority).await })
+    };
+    let completion = {
+        let system = system.clone();
+        tokio::spawn(async move {
+            system
+                .complete(
+                    claim,
+                    JobOutcome::Complete(scheduled_bg_jobs::OutcomeCode::try_new("done").unwrap()),
+                    now,
+                )
+                .await
+                .map(|_| ())
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            client
+                .simple_query("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let blocked: bool = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = \
+                     current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' \
+                     AND query LIKE '%FROM sys_scheduled_jobs_v2 WHERE key IN%FOR UPDATE%')",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "completion must reach its protected read: {error}; effect finished: {}; completion \
+             finished: {}",
+            effect.is_finished(),
+            completion.is_finished()
+        )
+    });
+    client.batch_execute("ROLLBACK").await.unwrap();
+    effect.await.unwrap().unwrap();
+    completion.await.unwrap().unwrap();
+    let prefix = group.prefix().as_bytes().to_vec();
+    let end = group.end().as_bytes().to_vec();
+    let remaining: i64 = client
+        .query_one(
+            "SELECT count(*) FROM sys_scheduled_jobs_v2 WHERE key >= $1 AND key < $2",
+            &[&prefix, &end],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 0);
+    drop(client);
+    connection_task.await.unwrap();
+    drop_owned_postgres_schemas().await;
 }
 
 #[tokio::test]
@@ -1371,4 +1445,306 @@ async fn given_native_claim_when_capped_business_guard_rejects_then_entity_count
             Some(&AttributeValue::S("accepted".into()))
         );
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InvalidJobWrite {
+    ResultCondition,
+    IndexCondition,
+    CounterCondition,
+    RepeatedTarget,
+    OversizedItem,
+    BadExpression,
+}
+
+fn terminal_related_writes(
+    table: &TableName,
+    token: &str,
+    invalid_write: Option<InvalidJobWrite>,
+) -> storage_provider::JobTerminalProjection {
+    let mut result = terminal_projection_request(table, token, "failed")
+        .transact_items
+        .remove(0)
+        .update
+        .unwrap();
+    let mut index = request(table, token, "indexed")
+        .transact_items
+        .remove(0)
+        .put
+        .unwrap();
+    index.item = WireItem::try_from(&AttributeMap::from_iter([
+        ("pk".to_string(), AttributeValue::S("index".to_string())),
+        (
+            "payload".to_string(),
+            AttributeValue::S("indexed".to_string()),
+        ),
+    ]))
+    .unwrap();
+    index.condition_expression = Some("attribute_not_exists(pk)".to_string());
+    let mut counter = result.clone();
+    counter.key =
+        KeyAttributes::from_iter([("pk".to_string(), AttributeValue::S("counter".to_string()))]);
+    counter.update_expression = "ADD result_count :one".to_string();
+    counter.condition_expression = Some("attribute_not_exists(blocked)".to_string());
+    counter.expression_attribute_values = Some(AttributeMap::from_iter([(
+        ":one".to_string(),
+        AttributeValue::N("1".to_string()),
+    )]));
+    match invalid_write {
+        Some(InvalidJobWrite::ResultCondition) => {
+            result.condition_expression = Some("payload = :value".to_string());
+            result
+                .expression_attribute_values
+                .as_mut()
+                .unwrap()
+                .remove(":pending");
+        }
+        Some(InvalidJobWrite::IndexCondition) => {
+            index.condition_expression = Some("attribute_exists(pk)".to_string());
+        }
+        Some(InvalidJobWrite::CounterCondition) => {
+            counter.condition_expression = Some("attribute_exists(blocked)".to_string());
+        }
+        Some(InvalidJobWrite::RepeatedTarget) => counter.key = result.key.clone(),
+        Some(InvalidJobWrite::OversizedItem) => {
+            index.item = WireItem::try_from(&AttributeMap::from_iter([
+                ("pk".to_string(), AttributeValue::S("index".to_string())),
+                (
+                    "payload".to_string(),
+                    AttributeValue::S("x".repeat(401 * 1024)),
+                ),
+            ]))
+            .unwrap();
+        }
+        Some(InvalidJobWrite::BadExpression) => {
+            counter.update_expression = "not an update".to_string();
+        }
+        None => {}
+    }
+    storage_provider::JobTerminalProjection::try_with_index_and_counter(
+        result,
+        index,
+        counter,
+        token.to_string(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn given_terminal_jobs_when_related_writes_retry_then_rows_commit_once_and_conditions_roll_back()
+ {
+    for backend in local_backends() {
+        for cancelled in [false, true] {
+            for failed_write in [
+                InvalidJobWrite::ResultCondition,
+                InvalidJobWrite::IndexCondition,
+                InvalidJobWrite::CounterCondition,
+            ] {
+                verify_terminal_related_writes(backend.clone(), cancelled, failed_write).await;
+            }
+        }
+    }
+}
+
+async fn verify_terminal_related_writes(
+    backend: storage_provider::StorageBackend,
+    cancelled: bool,
+    failed_write: InvalidJobWrite,
+) {
+    use scheduled_bg_jobs::{
+        OutcomeCode,
+        test_support::raw::{LifecycleObservation, RedriveExecution, RedriveRequest},
+    };
+    let (db, table, now) = fixture(backend.clone()).await;
+    let system = system(&db, 1, &table);
+    let id = JobId::from([31; 16]);
+    enqueue(&system, 31, now).await;
+    let claim = system.claim(id, now).await.unwrap();
+    let live = claim.context().unwrap().effect_authority().unwrap();
+    let outcome = if cancelled {
+        JobOutcome::Cancelled
+    } else {
+        JobOutcome::DeadLetter {
+            code: OutcomeCode::try_new("permanent").unwrap(),
+        }
+    };
+    system.apply_outcome(claim, outcome, now).await.unwrap();
+    let terminal = system.terminal_authority(id).await.unwrap().unwrap();
+    db.transact_write_items(request(&table, "initial", "pending"))
+        .await
+        .unwrap();
+    assert!(
+        db.transact_write_job_effect(request(&table, "inactive", "forbidden"), live,)
+            .await
+            .is_err()
+    );
+    for (invalid_write, position) in [
+        (InvalidJobWrite::ResultCondition, 0),
+        (InvalidJobWrite::IndexCondition, 1),
+        (InvalidJobWrite::CounterCondition, 2),
+    ] {
+        let token = format!("failed-{invalid_write:?}");
+        let error = db
+            .transact_write_job_projection(
+                terminal_related_writes(&table, &token, Some(invalid_write)),
+                terminal.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.is_canceled_condition_check_failed(position),
+            "expected {invalid_write:?} at position {position}, got {error:?}",
+        );
+        assert_eq!(
+            read(&db, &table, "effect").await.unwrap().get("payload"),
+            Some(&AttributeValue::S("pending".to_string())),
+        );
+        assert!(read(&db, &table, "index").await.is_none());
+        assert!(read(&db, &table, "counter").await.is_none());
+        // A rejected attempt must not save a request result under its token.
+        assert!(
+            db.transact_write_job_projection(
+                terminal_related_writes(&table, &token, Some(invalid_write)),
+                terminal.clone(),
+            )
+            .await
+            .is_err()
+        );
+    }
+    for invalid_write in [
+        InvalidJobWrite::RepeatedTarget,
+        InvalidJobWrite::OversizedItem,
+        InvalidJobWrite::BadExpression,
+    ] {
+        assert!(
+            db.transact_write_job_projection(
+                terminal_related_writes(
+                    &table,
+                    &format!("invalid-{invalid_write:?}"),
+                    Some(invalid_write)
+                ),
+                terminal.clone(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(read(&db, &table, "index").await.is_none());
+        assert!(read(&db, &table, "counter").await.is_none());
+    }
+    assert!(
+        db.transact_write_job_projection(
+            terminal_related_writes(&table, &"x".repeat(37), None),
+            terminal.clone(),
+        )
+        .await
+        .is_err()
+    );
+    // A failed condition does not reserve its token: the corrected request can
+    // commit.
+    let token = format!("failed-{failed_write:?}");
+    let writes = terminal_related_writes(&table, &token, None);
+    db.transact_write_job_projection(writes.clone(), terminal.clone())
+        .await
+        .unwrap();
+    db.transact_write_job_projection(writes.clone(), terminal.clone())
+        .await
+        .unwrap();
+    let changed = db
+        .transact_write_job_projection(
+            terminal_related_writes(&table, &token, Some(InvalidJobWrite::CounterCondition)),
+            terminal.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        changed.to_enum(),
+        StorageEnum::IdempotentParameterMismatch
+    ));
+    assert!(read(&db, &table, "index").await.is_some());
+    assert_eq!(
+        read(&db, &table, "counter")
+            .await
+            .unwrap()
+            .get("result_count"),
+        Some(&AttributeValue::N("1".to_string())),
+    );
+    if cancelled {
+        system.settle_terminal(terminal.clone()).await.unwrap();
+    } else {
+        let LifecycleObservation::Current {
+            record,
+            operation_id: Some(operation),
+            ..
+        } = system.observe_lifecycle(id).await.unwrap()
+        else {
+            panic!("terminal record")
+        };
+        system
+            .redrive_job(
+                id,
+                RedriveRequest::new(
+                    record.revision,
+                    operation,
+                    RedriveExecution::ReuseExecutionId,
+                    now,
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    // Make every destination condition true before testing the old job token.
+    db.transact_write_items(request(&table, "restore-pending", "pending"))
+        .await
+        .unwrap();
+    db.delete_item(
+        crate::DeleteItemInput::builder()
+            .table_name(table.clone())
+            .key(KeyAttributes::from_iter([(
+                "pk".to_string(),
+                AttributeValue::S("index".to_string()),
+            )]))
+            .build(),
+    )
+    .await
+    .unwrap();
+    let stale = db
+        .transact_write_job_projection(
+            terminal_related_writes(&table, "fresh-stale", None),
+            terminal.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale.to_enum(),
+        StorageEnum::ConditionalCheckFailed
+    ));
+    assert_eq!(
+        read(&db, &table, "effect").await.unwrap().get("payload"),
+        Some(&AttributeValue::S("pending".to_string())),
+    );
+    assert!(read(&db, &table, "index").await.is_none());
+    // Retrying the saved request does not overwrite later changes to its rows.
+    // Settlement deletes the job and its saved results, so the retry is stale;
+    // a reused execution keeps the saved result.
+    let retry = db.transact_write_job_projection(writes, terminal).await;
+    if cancelled {
+        assert!(matches!(
+            retry.unwrap_err().to_enum(),
+            StorageEnum::ConditionalCheckFailed
+        ));
+    } else {
+        retry.unwrap();
+    }
+    assert_eq!(
+        read(&db, &table, "effect").await.unwrap().get("payload"),
+        Some(&AttributeValue::S("pending".to_string())),
+    );
+    assert!(read(&db, &table, "index").await.is_none());
+    assert_eq!(
+        read(&db, &table, "counter")
+            .await
+            .unwrap()
+            .get("result_count"),
+        Some(&AttributeValue::N("1".to_string())),
+    );
 }

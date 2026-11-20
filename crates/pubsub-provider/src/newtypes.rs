@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::{PubsubError, PubsubValidationKind};
 
@@ -80,7 +79,11 @@ impl SubscriptionArn {
 
     #[must_use]
     pub fn compose(topic_arn: &TopicArn) -> Self {
-        Self(format!("{}:{}", topic_arn.as_str(), Uuid::now_v7()))
+        Self(format!(
+            "{}:{}",
+            topic_arn.as_str(),
+            storage_types::ambient::uuid_now_v7()
+        ))
     }
 
     #[must_use]
@@ -101,7 +104,7 @@ pub struct PubsubMessageId(String);
 impl PubsubMessageId {
     #[must_use]
     pub fn new() -> Self {
-        Self(Uuid::now_v7().to_string())
+        Self(storage_types::ambient::uuid_now_v7().to_string())
     }
 
     pub fn new_from_string(value: impl Into<String>) -> Result<Self, PubsubError> {

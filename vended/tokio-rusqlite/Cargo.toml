@@ -8,7 +8,6 @@ authors = [
 edition = "2024"
 description = "Asynchronous handle for rusqlite library."
 documentation = "https://docs.rs/tokio-rusqlite"
-homepage = "https://github.com/programatik29/tokio-rusqlite"
 repository = "https://github.com/programatik29/tokio-rusqlite"
 license = "MIT"
 readme = "README.md"
@@ -20,12 +19,15 @@ bundled = ["rusqlite/bundled"]
 
 [dependencies]
 crossbeam-channel = "0.5.17"
-rusqlite = { version = "0.41.1", features = ["bundled", "uuid"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 tokio = { version = "1.54.1", features = ["sync"] }
 # Local aux-storage diagnostic patch (phase 7 §2.3): ordinary enqueue event,
 # same in every build. Uses the existing workspace tracing version.
 tracing = "0.1.44"
 
 [dev-dependencies]
-rusqlite = { version = "0.41.1", features = ["bundled", "uuid"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 tokio = { version = "1.54.1", features = ["full"] }
+
+[lints]
+workspace = true

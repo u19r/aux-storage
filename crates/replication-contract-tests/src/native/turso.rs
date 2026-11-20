@@ -50,13 +50,16 @@ impl FileTurso {
         let path = path
             .to_str()
             .ok_or_else(|| StorageError::internal("Turso fixture path is not valid UTF-8"))?;
-        let backend = TursoBackend::initialize(path).await?;
+        let backend =
+            TursoBackend::initialize(path, storage_types::AttemptDeadlines::default()).await?;
         let backend = if let Some(probe) = probe {
             backend.with_fault_probe(probe)
         } else {
             backend
         };
-        let store = SqlStore::initialize_schema(backend).await?;
+        let store =
+            SqlStore::initialize_schema(backend, storage_types::InitialStreamLineages::ONE, true)
+                .await?;
         store.initialize_records(fixture::limits()?).await?;
         Ok(store)
     }

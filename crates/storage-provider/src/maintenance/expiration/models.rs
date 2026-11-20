@@ -300,7 +300,7 @@ pub struct DirectExpirationCandidateRead {
 }
 
 pub struct DirectExpirationPageWrite {
-    pub config: TtlConfigRecord,
+    pub config: crate::TtlCheckpointChange,
     pub table_info: storage_types::BoundTableInfo,
     pub table_name: TableName,
     pub deletions: ExpirationDeletionBatch,

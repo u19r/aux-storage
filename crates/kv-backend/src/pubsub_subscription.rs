@@ -1,10 +1,15 @@
 //! One subscription key layout for RocksDB and FoundationDB.
 
+use std::num::NonZeroU32;
+
 use pubsub_provider::{
-    SubscriptionArn, SubscriptionIdentity, SubscriptionPage, SubscriptionPageRequest,
-    SubscriptionRecord, TopicIncarnation, digest_bytes,
+    PendingSubscription, PendingSubscriptionCursor, PendingSubscriptionPage, SubscriptionArn,
+    SubscriptionIdentity, SubscriptionPage, SubscriptionPageRequest, SubscriptionRecord,
+    TopicIncarnation, digest_bytes,
 };
-use storage_types::{ReadProtection, StorageEnum, StorageError, StorageResult, storage_serde};
+use storage_types::{
+    MissExpectation, ReadProtection, StorageError, StorageResult, TimestampMillis, storage_serde,
+};
 
 use crate::{
     KvAttempt, KvMutation, KvRange,
@@ -54,16 +59,17 @@ pub(crate) async fn find_subscription_by_token<A: KvAttempt>(
     incarnation: TopicIncarnation,
     token: &str,
 ) -> StorageResult<Option<SubscriptionRecord>> {
-    let Some(arn) = native
+    let Some(value) = native
         .get(&token_key(incarnation, token), protection)
         .await?
     else {
         return Ok(None);
     };
-    let arn = decode_arn(&arn)?;
+    let (created_at, arn) = decode_token_value(&value)?;
     let record = read_index_target(native, protection, &arn).await?;
     if record.topic_incarnation != incarnation
         || record.subscription.confirmation.token() != Some(token)
+        || record.subscription.created_at != created_at
     {
         return Err(StorageError::internal(
             "KV subscription token index differs",
@@ -78,6 +84,14 @@ pub(crate) async fn write_subscription<A: KvAttempt>(
     expected: Option<SubscriptionRecord>,
 ) -> StorageResult<()> {
     let arn = &record.subscription.subscription_arn;
+    if expected
+        .as_ref()
+        .is_some_and(|previous| previous.topic_incarnation != record.topic_incarnation)
+    {
+        return Err(StorageError::internal(
+            "KV subscription changed its topic incarnation",
+        ));
+    }
     let mut mutations = Vec::new();
     let previous_token = expected
         .as_ref()
@@ -91,10 +105,6 @@ pub(crate) async fn write_subscription<A: KvAttempt>(
             });
         }
     } else {
-        mutations.push(KvMutation::Put {
-            key: topic_key(record.topic_incarnation, arn),
-            value: Vec::new(),
-        });
         mutations.push(KvMutation::Put {
             key: identity_key(&SubscriptionIdentity {
                 topic_incarnation: record.topic_incarnation,
@@ -116,12 +126,19 @@ pub(crate) async fn write_subscription<A: KvAttempt>(
         }
         mutations.push(KvMutation::Put {
             key,
-            value: arn.as_str().as_bytes().to_vec(),
+            value: token_value(record.subscription.created_at, arn),
         });
     }
+    // The topic index carries the whole record, so a topic page is one
+    // scan (W8-E-f). Both copies are staged together.
+    let value = storage_serde::to_bytes(&record)?;
+    mutations.push(KvMutation::Put {
+        key: topic_key(record.topic_incarnation, arn),
+        value: value.clone(),
+    });
     mutations.push(KvMutation::Put {
         key: subscription_key(arn),
-        value: storage_serde::to_bytes(&record)?,
+        value,
     });
     native.stage(mutations)
 }
@@ -188,47 +205,84 @@ pub(crate) async fn read_subscription_page<A: KvAttempt>(
             ReadProtection::Snapshot,
         )
         .await?;
-    let arns =
+    let rows =
         page.entries
             .iter()
             .map(|entry| {
                 let suffix = entry.key.strip_prefix(prefix.as_slice()).ok_or_else(|| {
                     StorageError::internal("KV subscription row has another prefix")
                 })?;
-                decode_arn(suffix)
-            })
-            .collect::<StorageResult<Vec<_>>>()?;
-    let rows = if let Some(incarnation) = request.topic_incarnation {
-        let keys = arns.iter().map(subscription_key).collect();
-        native
-            .get_batch(keys, ReadProtection::Snapshot)
-            .await?
-            .into_iter()
-            .zip(&arns)
-            .map(|(bytes, arn)| {
-                let bytes = bytes.ok_or_else(|| {
-                    StorageError::internal("KV subscription topic index is dangling")
-                })?;
-                let record = decode_record(&bytes, arn)?;
-                if record.topic_incarnation != incarnation {
+                let arn = decode_arn(suffix)?;
+                // `~p/s` rows and `~p/x` index entries hold the same record.
+                let record = decode_record(&entry.value, &arn)?;
+                if request
+                    .topic_incarnation
+                    .is_some_and(|incarnation| record.topic_incarnation != incarnation)
+                {
                     return Err(StorageError::internal(
                         "KV subscription topic index differs",
                     ));
                 }
                 Ok(record)
             })
-            .collect::<StorageResult<Vec<_>>>()?
-    } else {
-        page.entries
-            .iter()
-            .zip(&arns)
-            .map(|(entry, arn)| decode_record(&entry.value, arn))
-            .collect::<StorageResult<Vec<_>>>()?
-    };
+            .collect::<StorageResult<Vec<_>>>()?;
     Ok(SubscriptionPage {
         rows,
         more: page.more,
     })
+}
+
+/// Pending subscriptions after `after` in token-index key order (topic
+/// incarnation, then token digest), read at `Snapshot`.
+pub(crate) async fn read_pending_subscription_page<A: KvAttempt>(
+    native: &mut A,
+    after: Option<&PendingSubscriptionCursor>,
+    limit: NonZeroU32,
+) -> StorageResult<PendingSubscriptionPage> {
+    let prefix = PUBSUB_SUBSCRIPTION_TOKEN_PREFIX;
+    let mut begin = prefix.to_vec();
+    if let Some(after) = after {
+        begin.extend_from_slice(&after.0);
+        begin.push(0);
+    }
+    let end = prefix_upper_bound(prefix)
+        .ok_or_else(|| StorageError::internal("KV token prefix has no upper bound"))?;
+    let scan_limit = limit
+        .get()
+        .checked_add(1)
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| StorageError::internal("KV pending subscription limit overflowed"))?;
+    let page = native
+        .scan(
+            KvRange {
+                entry_bounds: None,
+                begin,
+                end,
+                reverse: false,
+                limit: scan_limit,
+                max_bytes: CATALOG_BYTES,
+            },
+            ReadProtection::Snapshot,
+        )
+        .await?;
+    let more = page.more || page.entries.len() > limit.get() as usize;
+    let rows =
+        page.entries
+            .iter()
+            .take(limit.get() as usize)
+            .map(|entry| {
+                let suffix = entry.key.strip_prefix(prefix).ok_or_else(|| {
+                    StorageError::internal("KV token index row has another prefix")
+                })?;
+                let (created_at, subscription_arn) = decode_token_value(&entry.value)?;
+                Ok(PendingSubscription {
+                    cursor: PendingSubscriptionCursor(suffix.to_vec()),
+                    subscription_arn,
+                    created_at,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+    Ok(PendingSubscriptionPage { rows, more })
 }
 
 async fn read_index_target<A: KvAttempt>(
@@ -273,6 +327,29 @@ fn token_key(incarnation: TopicIncarnation, token: &str) -> Vec<u8> {
     .concat()
 }
 
+/// The token-index value: the creation time of the subscription (big-endian
+/// milliseconds), then its ARN. The stale sweep reads the time from the index
+/// alone.
+pub(crate) fn token_value(created_at: TimestampMillis, arn: &SubscriptionArn) -> Vec<u8> {
+    [
+        &created_at.timestamp_millis().to_be_bytes()[..],
+        arn.as_str().as_bytes(),
+    ]
+    .concat()
+}
+
+pub(crate) fn decode_token_value(
+    bytes: &[u8],
+) -> StorageResult<(TimestampMillis, SubscriptionArn)> {
+    let (created_at, arn) = bytes
+        .split_first_chunk::<8>()
+        .ok_or_else(|| StorageError::internal("KV subscription token value is too short"))?;
+    Ok((
+        TimestampMillis::from_timestamp(i64::from_be_bytes(*created_at)),
+        decode_arn(arn)?,
+    ))
+}
+
 fn decode_arn(bytes: &[u8]) -> StorageResult<SubscriptionArn> {
     let value = std::str::from_utf8(bytes)
         .map_err(|_| StorageError::internal("KV subscription ARN is not UTF-8"))?;
@@ -291,8 +368,5 @@ fn decode_record(bytes: &[u8], arn: &SubscriptionArn) -> StorageResult<Subscript
 }
 
 fn conflict() -> StorageError {
-    StorageEnum::TransactionConflict {
-        message: "KV subscription token already exists".to_owned(),
-    }
-    .into()
+    StorageError::write_miss("pubsub_subscription_token", MissExpectation::Absent)
 }

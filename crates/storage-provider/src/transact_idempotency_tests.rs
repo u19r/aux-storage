@@ -36,42 +36,43 @@ fn token_request() -> TransactWriteItemsRequest {
 }
 
 #[test]
-fn given_equivalent_or_changed_job_requests_when_replay_identity_is_encoded_then_object_order_is_ignored_and_changed_input_is_distinct()
- {
-    use sha2::{Digest as _, Sha256};
-
+fn given_job_requests_when_replay_identity_is_encoded_then_changed_input_or_execution_is_distinct()
+{
     use super::transact_request_identity::TransactRequestIdentity;
 
-    fn identity(execution: &[u8], request: &[u8]) -> Vec<u8> {
-        let mut identity = TransactRequestIdentity::from_stored(request).unwrap();
-        identity.bind_execution(Sha256::digest(execution).into());
+    fn identity(execution: [u8; 32], request: &TransactWriteItemsRequest) -> Vec<u8> {
+        let mut identity = TransactRequestIdentity::try_from_request(request).unwrap();
+        identity.bind_execution(execution);
         identity.stored_bytes().as_slice().to_vec()
     }
 
-    let first = br#"{"put":{"item":{"b":2,"a":1}},"checks":[{"y":2,"x":1}]}"#;
-    let reordered = br#"{"checks":[{"x":1,"y":2}],"put":{"item":{"a":1,"b":2}}}"#;
-    let changed = br#"{"checks":[{"x":1,"y":2}],"put":{"item":{"a":1,"b":3}}}"#;
-    let encoded = identity(&[7; 16], first);
-    assert_eq!(encoded, identity(&[7; 16], reordered));
-    assert_ne!(encoded, identity(&[7; 16], changed));
-    assert_ne!(encoded, identity(&[8; 16], first));
-    let execution_digest: [u8; 32] = Sha256::digest([7; 16]).into();
-    let mut value: serde_json::Value = serde_json::from_slice(first).unwrap();
-    value.sort_all_objects();
-    let request_digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&value).unwrap()).into();
-    let prior = serde_json::to_vec(&serde_json::json!({
-        "execution_digest": execution_digest,
-        "request_digest": request_digest,
-    }))
-    .unwrap();
-    assert_eq!(
-        encoded,
-        TransactRequestIdentity::from_stored(&prior)
-            .unwrap()
-            .stored_bytes()
-            .as_slice()
+    let first = token_request();
+    let mut changed = token_request();
+    changed.client_request_token = None;
+    changed.return_item_collection_metrics = Some("SIZE".to_string());
+    let encoded = identity([7; 32], &first);
+    assert_eq!(encoded, identity([7; 32], &token_request()));
+    assert_ne!(encoded, identity([7; 32], &changed));
+    assert_ne!(encoded, identity([8; 32], &first));
+    assert!(
+        TransactRequestIdentity::from_stored(&encoded).unwrap() == {
+            let mut expected = TransactRequestIdentity::try_from_request(&first).unwrap();
+            expected.bind_execution([7; 32]);
+            expected
+        }
     );
-    assert!(TransactRequestIdentity::from_stored(br#"{"execution_digest":[]}"#).is_err());
+}
+
+#[test]
+fn given_json_identity_of_a_prior_format_when_read_then_it_is_rejected() {
+    use super::transact_request_identity::TransactRequestIdentity;
+
+    assert!(TransactRequestIdentity::from_stored(br#"{"put":{"item":{"a":1}}}"#).is_err());
+    assert!(TransactRequestIdentity::from_stored(br#"[[7],{"put":{}}]"#).is_err());
+    assert!(
+        TransactRequestIdentity::from_stored(br#"{"execution_digest":[],"request_digest":[]}"#)
+            .is_err()
+    );
 }
 
 #[test]
@@ -119,4 +120,68 @@ fn given_completion_time_when_expiry_is_checked_then_window_boundary_applies() {
 
     assert!(!transact_write_token_expired(completed_at, within));
     assert!(transact_write_token_expired(completed_at, boundary));
+}
+
+#[test]
+fn given_request_window_receipt_when_trim_is_checked_then_it_survives_until_window_plus_trim_delay()
+{
+    use super::transact_idempotency::{
+        TRANSACT_RECEIPT_TRIM_DELAY_MILLIS, TransactTokenRequest, encode_transact_receipt,
+        transact_receipt_is_trimmable,
+    };
+
+    const MINUTE: i64 = 60_000;
+    assert_eq!(TRANSACT_RECEIPT_TRIM_DELAY_MILLIS, 5 * MINUTE);
+    let completed = 1_000_000;
+    let request = TransactTokenRequest::try_from_request(&token_request())
+        .unwrap()
+        .unwrap();
+    let receipt =
+        encode_transact_receipt(&request, TimestampMillis::from_timestamp(completed)).unwrap();
+    let at = |offset: i64| {
+        TimestampMillis::from_timestamp(
+            completed + TRANSACT_WRITE_IDEMPOTENCY_WINDOW_MILLIS + offset,
+        )
+    };
+
+    for offset in [1_000, 4 * MINUTE + 59_000, 5 * MINUTE - 1] {
+        assert!(
+            !transact_receipt_is_trimmable(&receipt, at(offset)).unwrap(),
+            "{offset}"
+        );
+    }
+    assert!(transact_receipt_is_trimmable(&receipt, at(5 * MINUTE)).unwrap());
+
+    // A retry captured inside the window still replays the surviving receipt.
+    let replay = super::transact_idempotency::accept_transact_response(
+        Some(&request),
+        Some(receipt),
+        at(-1_000),
+    )
+    .unwrap();
+    assert!(matches!(replay, crate::SemanticDecision::Accepted(Some(_))));
+}
+
+#[test]
+fn given_request_receipt_when_encoding_then_it_has_no_retention_field_and_fits_the_bound() {
+    use super::transact_idempotency::{
+        TRANSACT_RECEIPT_WRITE_BYTES, TransactTokenRequest, encode_transact_receipt,
+    };
+
+    let request = TransactTokenRequest::try_from_request(&token_request())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        request.slot(),
+        crate::ReceiptSlot::Request("token")
+    ));
+    let bytes =
+        encode_transact_receipt(&request, TimestampMillis::from_timestamp(1_000_000)).unwrap();
+    assert!(
+        !bytes
+            .windows(b"retention".len())
+            .any(|window| window == b"retention"),
+        "receipt must not carry a retention field"
+    );
+    assert!(bytes.len() <= TRANSACT_RECEIPT_WRITE_BYTES);
 }

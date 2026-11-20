@@ -24,10 +24,12 @@ pub struct DatabaseManagerRuntimeOptions {
     /// each permit through provider settlement, including response
     /// cancellation.
     pub admission_config: AdmissionConfig,
-    /// Startup-only operator inputs keyed by storage connection ID.
-    #[cfg(feature = "regional")]
+    /// Native attempt budgets given to each provider constructor.
+    pub attempt_deadlines: storage_types::AttemptDeadlines,
+    /// Validated regional files, keyed by native connection id (REG-9 starts
+    /// their servers).
     pub regional_connections:
-        std::collections::HashMap<String, regional_replication::runtime::RegionalStartup>,
+        std::collections::HashMap<String, Arc<regional_replication::RegionalConfig>>,
 }
 
 impl Default for DatabaseManagerRuntimeOptions {
@@ -39,8 +41,8 @@ impl Default for DatabaseManagerRuntimeOptions {
             database_job_intervals: DatabaseJobIntervals::default(),
             metrics_facade: None,
             admission_config: AdmissionConfig::default(),
-            #[cfg(feature = "regional")]
-            regional_connections: Default::default(),
+            attempt_deadlines: storage_types::AttemptDeadlines::default(),
+            regional_connections: std::collections::HashMap::new(),
         }
     }
 }
@@ -60,19 +62,6 @@ pub struct DatabaseManagerRuntimeOptionsBuilder {
 }
 
 impl DatabaseManagerRuntimeOptionsBuilder {
-    #[cfg(feature = "regional")]
-    #[must_use]
-    pub fn regional_connection(
-        mut self,
-        connection_id: String,
-        startup: regional_replication::runtime::RegionalStartup,
-    ) -> Self {
-        self.options
-            .regional_connections
-            .insert(connection_id, startup);
-        self
-    }
-
     #[must_use]
     pub fn enable_database_jobs(mut self, enable_database_jobs: bool) -> Self {
         self.options.enable_database_jobs = enable_database_jobs;
@@ -117,22 +106,13 @@ impl DatabaseManagerRuntimeOptionsBuilder {
     }
 
     #[must_use]
+    pub fn attempt_deadlines(mut self, attempt_deadlines: storage_types::AttemptDeadlines) -> Self {
+        self.options.attempt_deadlines = attempt_deadlines;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> DatabaseManagerRuntimeOptions {
         self.options
-    }
-}
-
-#[cfg(not(feature = "regional"))]
-impl DatabaseManagerRuntimeOptions {
-    pub(crate) fn load_regional_connections(
-        &mut self,
-        files: &std::collections::HashMap<String, std::path::PathBuf>,
-    ) -> storage_types::StorageResult<()> {
-        if !files.is_empty() {
-            return Err(storage_types::StorageError::validation(
-                "regional configuration requires regional support in this binary",
-            ));
-        }
-        Ok(())
     }
 }

@@ -10,21 +10,23 @@ doctest = false
 
 [features]
 default = []
-regional = []
 sqlite = []
 postgres = []
 rocksdb = []
 turso = []
+# Debug for customer-data types; enable only from [dev-dependencies].
+test-support = []
 
 [dependencies]
 base64 = { workspace = true }
-chrono = { workspace = true }
 hex = { workspace = true }
 inventory = { workspace = true }
+jiff = { workspace = true }
 lru-ttl-cache = { workspace = true }
 lz4_flex = { workspace = true }
 sha2 = { workspace = true }
 
+rand = { workspace = true }
 rust_decimal = { workspace = true }
 scheduled-bg-jobs = { workspace = true }
 schemars = { workspace = true }
@@ -41,9 +43,9 @@ xxhash-rust = { workspace = true }
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
-cpu-time = { workspace = true }
 proptest = { workspace = true }
 storage-derive = { path = "../storage-derive" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

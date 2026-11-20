@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    AttributeValue, KeySchemaElement, KeyType, StorageEnum,
+    AttributeMap, AttributeValue, KeySchemaElement, KeyType, StorageEnum,
     context::WrappedError,
     dynamodb_limits::{
         attribute_map_numbers_need_write_normalization, dynamodb_number_size,
@@ -52,10 +52,10 @@ fn normalize_attribute_map_numbers_for_write_walks_nested_values() {
         ("pk".to_string(), AttributeValue::N("1E2".to_string())),
         (
             "nested".to_string(),
-            AttributeValue::M(HashMap::from([(
+            AttributeValue::M(AttributeMap::from(HashMap::from([(
                 "numbers".to_string(),
                 AttributeValue::NS(vec!["2E2".to_string(), "3".to_string()]),
-            )])),
+            )]))),
         ),
         (
             "list".to_string(),
@@ -68,10 +68,10 @@ fn normalize_attribute_map_numbers_for_write_walks_nested_values() {
     assert_eq!(item.get("pk"), Some(&AttributeValue::N("100".to_string())));
     assert_eq!(
         item.get("nested"),
-        Some(&AttributeValue::M(HashMap::from([(
+        Some(&AttributeValue::M(AttributeMap::from(HashMap::from([(
             "numbers".to_string(),
             AttributeValue::NS(vec!["200".to_string(), "3".to_string()])
-        )])))
+        )]))))
     );
     assert_eq!(
         item.get("list"),

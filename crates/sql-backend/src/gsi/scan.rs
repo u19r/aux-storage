@@ -3,15 +3,11 @@
 use storage_backfill::{GsiScanPageEnd, GsiScanSourcePage, GsiScannedSourceItem};
 use storage_provider::{CATALOG_READ_BYTES, maintenance::GsiScanSource};
 use storage_types::{
-    BoundTableInfo, ItemRevision, KeyAttributes, StorageError, StorageResult, StoredWireItem,
-    storage_serde,
+    BoundTableInfo, KeyAttributes, StorageError, StorageResult, StoredWireItem, storage_serde,
 };
 
 use super::sql_statements;
-use crate::{
-    ReadProtection, SqlAttempt, SqlLayout, SqlQueryPage, SqlRow, SqlValue,
-    stream_history::capture_high,
-};
+use crate::{ReadProtection, SqlAttempt, SqlLayout, SqlQueryPage, SqlRow, SqlValue};
 
 pub(crate) async fn read_scan_source_page<A: SqlAttempt, L: SqlLayout>(
     catalog: &mut crate::catalog::SqlCatalogAttempt<'_, A, L>,
@@ -38,12 +34,16 @@ pub(crate) async fn read_scan_source_page<A: SqlAttempt, L: SqlLayout>(
     let count = usize::try_from(u32::from(limit))
         .map_err(|_| StorageError::internal("GSI scan limit exceeds platform capacity"))?;
     let (items, next, more) = decode_scan_page(catalog, table, page, count).await?;
-    let end = if more {
+    // A completing page changes the binding phase under the exclusive catalog
+    // lock. Leave that to a separate empty page: a page that holds FOR UPDATE
+    // row locks must not wait for the exclusive lock behind a writer that
+    // waits for one of those rows.
+    let end = if more || !items.is_empty() {
         GsiScanPageEnd::Continue(
             next.ok_or_else(|| StorageError::internal("SQL GSI scan page has no cursor"))?,
         )
     } else {
-        GsiScanPageEnd::Complete(capture_high(catalog.attempt, engine).await?)
+        GsiScanPageEnd::Complete(())
     };
     Ok(GsiScanSourcePage {
         table: table.info.clone(),
@@ -99,23 +99,13 @@ fn decode_scan_row(
     row: SqlRow,
     stored: StoredWireItem,
 ) -> StorageResult<(GsiScannedSourceItem, KeyAttributes)> {
-    let mut values = row.into_values();
-    if values.len() != 2 + table.key_schema.len() {
+    let values = row.into_values();
+    if values.len() != 1 + table.key_schema.len() {
         return Err(StorageError::internal(
             "SQL GSI source row has invalid width",
         ));
     }
-    let physical = decode_source_key(engine, table, &values[2..])?;
-    let [_value, revision]: [SqlValue; 2] = values
-        .drain(..2)
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| StorageError::internal("SQL GSI source row is truncated"))?;
-    let SqlValue::Integer(revision) = revision else {
-        return Err(StorageError::internal(
-            "SQL GSI source row has invalid types",
-        ));
-    };
+    let physical = decode_source_key(engine, table, &values[1..])?;
     if !stored.item.has_verified_keys(&physical)? {
         return Err(StorageError::internal(
             "SQL GSI source content differs from physical key",
@@ -126,13 +116,12 @@ fn decode_scan_row(
         GsiScannedSourceItem {
             item: stored.item,
             indexers: stored.indexers,
-            revision: ItemRevision::try_from(revision)?,
         },
         key,
     ))
 }
 
-fn decode_source_key(
+pub(super) fn decode_source_key(
     engine: impl SqlLayout,
     table: &BoundTableInfo,
     values: &[SqlValue],

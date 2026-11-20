@@ -4,11 +4,9 @@ use super::stateful_test_support::StatefulTestBackend;
 
 const REINCARNATED_BODY: &str = "queue-cleanup-incarnation-b";
 
+#[cfg(feature = "rocksdb")]
 #[tokio::test]
 async fn given_live_queue_reference_when_message_cleanup_advances_then_reincarnation_survives() {
-    if !cfg!(feature = "rocksdb") {
-        return;
-    }
     assert_live_queue_reference_survives_cleanup(
         StatefulTestBackend::rocksdb()
             .await
@@ -17,6 +15,7 @@ async fn given_live_queue_reference_when_message_cleanup_advances_then_reincarna
     .await;
 }
 
+#[cfg(feature = "foundationdb")]
 #[tokio::test]
 #[ignore = "requires a configured external database service"]
 async fn given_live_queue_reference_on_foundationdb_when_message_cleanup_advances_then_reincarnation_survives()

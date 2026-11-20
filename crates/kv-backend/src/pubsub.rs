@@ -1,27 +1,34 @@
 //! One KV native attempt for shared pubsub decisions.
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use futures::future::BoxFuture;
 use pubsub_provider::{
-    AcceptedPublication, DeliveryRecord, DeliveryRecordId, PublishCandidate, PublishIntent,
-    PubsubAttempt, PubsubMessageId, PubsubPort, SubscriptionArn, SubscriptionIdentity,
-    SubscriptionPage, SubscriptionPageRequest, SubscriptionRecord, TopicArn, TopicIncarnation,
-    TopicPage, TopicRecord,
+    AcceptedPublication, ClaimRows, ClaimScan, DeliveryFence, DeliveryLocator, DeliveryPayload,
+    DeliveryRecordId, DeliveryState, PayloadRow, PendingSubscriptionCursor,
+    PendingSubscriptionPage, PublishCandidate, PublishIntent, PubsubAttempt, PubsubPort,
+    RecordObservations, RecordReads, StateChange, StateRow, SubscriptionArn, SubscriptionIdentity,
+    SubscriptionPage, SubscriptionPageRequest, SubscriptionRecord, SweepCursor, SweepPage,
+    TopicArn, TopicIncarnation, TopicPage, TopicRecord,
 };
-use storage_types::{AttemptMode, StorageResult};
+use storage_types::{AttemptRequest, ReadProtection, StorageResult};
 
 use crate::{
-    KvAttempt, KvBackend, KvStore, catalog::KvCatalogAttempt, pubsub_delivery, pubsub_publication,
+    KvAttempt, KvBackend, KvStore, catalog::KvCatalogAttempt, pubsub_publication, pubsub_schedule,
     pubsub_subscription, pubsub_topic,
 };
 
 impl<A: KvAttempt> PubsubAttempt for KvCatalogAttempt<'_, A> {
+    fn default_protection(&self) -> ReadProtection {
+        self.protection
+    }
+
     fn read_topics(
         &mut self,
         arns: Vec<TopicArn>,
-    ) -> impl Future<Output = StorageResult<Vec<Option<TopicRecord>>>> + Send {
-        pubsub_topic::read_topics(self.attempt, self.protection, arns)
+        protection: ReadProtection,
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<Option<TopicRecord>>>> + Send {
+        pubsub_topic::read_topics(self.attempt, protection, arns)
     }
 
     fn write_topic(
@@ -50,8 +57,9 @@ impl<A: KvAttempt> PubsubAttempt for KvCatalogAttempt<'_, A> {
     fn read_subscription(
         &mut self,
         arn: &SubscriptionArn,
+        protection: ReadProtection,
     ) -> impl Future<Output = StorageResult<Option<SubscriptionRecord>>> + Send {
-        pubsub_subscription::read_subscription(self.attempt, self.protection, arn)
+        pubsub_subscription::read_subscription(self.attempt, protection, arn)
     }
 
     fn find_subscription_by_identity(
@@ -96,18 +104,12 @@ impl<A: KvAttempt> PubsubAttempt for KvCatalogAttempt<'_, A> {
         pubsub_subscription::read_subscription_page(self.attempt, request)
     }
 
-    fn read_publish_intent(
+    fn read_pending_subscription_page(
         &mut self,
-        id: &PubsubMessageId,
-    ) -> impl Future<Output = StorageResult<Option<PublishIntent>>> + Send {
-        pubsub_publication::read_publish_intent(self.attempt, self.protection, id)
-    }
-
-    fn read_publish_candidate(
-        &mut self,
-        message_id: &PubsubMessageId,
-    ) -> impl Future<Output = StorageResult<Option<PublishCandidate>>> + Send {
-        pubsub_publication::read_publish_candidate(self.attempt, self.protection, message_id)
+        after: Option<&PendingSubscriptionCursor>,
+        limit: std::num::NonZeroU32,
+    ) -> impl Future<Output = StorageResult<PendingSubscriptionPage>> + Send {
+        pubsub_subscription::read_pending_subscription_page(self.attempt, after, limit)
     }
 
     fn write_publication(
@@ -119,10 +121,18 @@ impl<A: KvAttempt> PubsubAttempt for KvCatalogAttempt<'_, A> {
 
     fn read_due_publish_chunks(
         &mut self,
-        now: storage_types::TimestampMillis,
-        limit: std::num::NonZeroU32,
-    ) -> impl Future<Output = StorageResult<Vec<PublishCandidate>>> + Send {
-        pubsub_publication::read_due_publish_chunks(self.attempt, now, limit)
+        request: &pubsub_provider::PublishDueRequest,
+    ) -> impl Future<Output = StorageResult<Vec<pubsub_provider::DueRow<PublishCandidate>>>> + Send
+    {
+        pubsub_publication::read_due_publish_chunks(self.attempt, request)
+    }
+
+    fn move_publish_due(
+        &mut self,
+        row: &pubsub_provider::UndecodableRow,
+        until: storage_types::TimestampMillis,
+    ) -> impl Future<Output = StorageResult<()>> + Send {
+        pubsub_publication::move_publish_due(self.attempt, row, until)
     }
 
     fn replace_publish_intent(
@@ -135,38 +145,113 @@ impl<A: KvAttempt> PubsubAttempt for KvCatalogAttempt<'_, A> {
 
     fn replace_publish_intents(
         &mut self,
-        replacements: Vec<(PublishIntent, PublishIntent)>,
+        replacements: Vec<pubsub_provider::PublishIntentClaim>,
     ) -> impl Future<Output = StorageResult<()>> + Send {
         pubsub_publication::replace_publish_intents(self.attempt, replacements)
     }
 
-    fn write_delivery_records(
+    fn store_new_deliveries(
         &mut self,
-        records: Vec<DeliveryRecord>,
+        rows: Vec<(DeliveryPayload, DeliveryState)>,
     ) -> impl Future<Output = StorageResult<()>> + Send {
-        pubsub_delivery::write_delivery_records(self.attempt, records)
+        pubsub_schedule::store_new_deliveries(self.attempt, rows)
     }
 
-    fn read_deliveries(
+    fn scan_claimable(
         &mut self,
-        ids: Vec<DeliveryRecordId>,
-    ) -> impl Future<Output = StorageResult<Vec<Option<DeliveryRecord>>>> + Send {
-        pubsub_delivery::read_deliveries(self.attempt, self.protection, ids)
+        scan: &ClaimScan,
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<ClaimRows>>> + Send {
+        pubsub_schedule::scan_claimable(self.attempt, scan)
     }
 
-    fn read_due_deliveries(
+    fn store_claimed_states(
         &mut self,
-        now: storage_types::TimestampMillis,
+        claims: Vec<(DeliveryState, DeliveryState)>,
+    ) -> impl Future<Output = StorageResult<()>> + Send {
+        pubsub_schedule::store_claimed_states(self.attempt, claims)
+    }
+
+    fn store_delivery_states(
+        &mut self,
+        changes: Vec<StateChange>,
+    ) -> impl Future<Output = StorageResult<Vec<bool>>> + Send {
+        pubsub_schedule::store_delivery_states(self.attempt, changes)
+    }
+
+    fn delete_deliveries(
+        &mut self,
+        fences: Vec<DeliveryFence>,
+    ) -> impl Future<Output = StorageResult<Vec<bool>>> + Send {
+        pubsub_schedule::delete_deliveries(self.attempt, fences)
+    }
+
+    async fn load_records(&mut self, reads: RecordReads<'_>) -> StorageResult<RecordObservations> {
+        let queue_name = reads.queue_name;
+        let message_ids = reads.message_ids;
+        let hints = self.queue_catalog_hints.clone();
+        // The hint only chooses extra keys of this wave; the row the
+        // operation uses is the one read in it (W8-E-e).
+        let hinted = match (&hints, queue_name) {
+            (Some((hints, now)), Some(name)) if !message_ids.is_empty() => {
+                hints.get(name, *now).map(|record| record.incarnation)
+            }
+            _ => None,
+        };
+        let (observed, present) =
+            pubsub_schedule::load_records(&mut *self.attempt, reads, hinted).await?;
+        if let (Some((hints, now)), Some(name)) = (&hints, queue_name) {
+            hints.observe(name, observed.queue.as_ref(), *now);
+        }
+        self.queue_absence = match (hinted, observed.queue.as_ref()) {
+            (Some(incarnation), Some(record)) if record.incarnation == incarnation => {
+                Some(crate::queue::CheckedAbsence {
+                    incarnation,
+                    present: message_ids.iter().copied().zip(present).collect(),
+                })
+            }
+            _ => None,
+        };
+        Ok(observed)
+    }
+
+    fn stage_delivery_deletes(&mut self, fences: Vec<DeliveryFence>) -> StorageResult<()> {
+        pubsub_schedule::stage_delivery_deletes(self.attempt, fences)
+    }
+
+    fn move_undecodable_state(
+        &mut self,
+        locator: &DeliveryLocator,
+        until: storage_types::TimestampMillis,
+    ) -> impl Future<Output = StorageResult<()>> + Send {
+        pubsub_schedule::move_undecodable_state(self.attempt, locator, until)
+    }
+
+    fn delete_state_at(
+        &mut self,
+        locator: &DeliveryLocator,
+    ) -> impl Future<Output = StorageResult<()>> + Send {
+        pubsub_schedule::delete_state_at(self.attempt, locator)
+    }
+
+    fn scan_destination_heads(
+        &mut self,
+        after: &SweepCursor,
         limit: std::num::NonZeroU32,
-    ) -> impl Future<Output = StorageResult<Vec<DeliveryRecord>>> + Send {
-        pubsub_delivery::read_due_deliveries(self.attempt, now, limit)
+    ) -> impl Future<Output = StorageResult<SweepPage>> + Send {
+        pubsub_schedule::scan_destination_heads(self.attempt, after, limit)
     }
 
-    fn replace_deliveries(
+    fn load_delivery(
         &mut self,
-        replacements: Vec<(DeliveryRecord, DeliveryRecord)>,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        pubsub_delivery::replace_deliveries(self.attempt, replacements)
+        id: &DeliveryRecordId,
+    ) -> impl Future<Output = StorageResult<Option<(StateRow, PayloadRow)>>> + Send {
+        pubsub_schedule::load_delivery(self.attempt, self.protection, id)
+    }
+
+    fn read_next_publish_due(
+        &mut self,
+    ) -> impl Future<Output = StorageResult<Option<storage_types::TimestampMillis>>> + Send {
+        pubsub_publication::read_next_publish_due(self.attempt)
     }
 }
 
@@ -175,10 +260,10 @@ impl<B: KvBackend + 'static> PubsubPort for KvStore<B> {
         = KvCatalogAttempt<'native, B::Attempt>
     where Self: 'native;
 
-    fn with_pubsub_attempt<R, F>(
+    fn with_attempt<R, F>(
         &self,
-        mode: AttemptMode,
-        operation: F,
+        request: AttemptRequest,
+        step: F,
     ) -> impl Future<Output = StorageResult<R>> + Send
     where
         R: Send + 'static,
@@ -188,11 +273,41 @@ impl<B: KvBackend + 'static> PubsubPort for KvStore<B> {
             + Send
             + 'static,
     {
-        self.backend.with_attempt(mode, move |native| {
-            Box::pin(async move {
-                let mut attempt = KvCatalogAttempt::new(native, mode.read_protection());
-                operation(&mut attempt).await
-            })
-        })
+        let board = self.queue_wake.clone();
+        let hints = Arc::clone(&self.queue_catalog_hints);
+        let clock = Arc::clone(&self.clock);
+        // The board is told after commit and before the permit is released.
+        let attempt = crate::queue::run_and_publish(
+            Arc::clone(&self.backend),
+            board,
+            move |backend, slots| async move {
+                backend
+                    .with_attempt(request, move |native| {
+                        Box::pin(async move {
+                            let mut attempt =
+                                KvCatalogAttempt::new(native, request.mode.read_protection());
+                            attempt.queue_catalog_hints = Some((hints, clock.now()));
+                            let result = step(&mut attempt).await;
+                            // As the queue attempt: a hinted row that no read
+                            // verified is read before the attempt returns. No
+                            // pubsub path calls `read_queue_for_messages`
+                            // today, so this is `Ok(true)` with no I/O.
+                            match (result, attempt.verify_pending_queue_catalog().await) {
+                                (_, Ok(false)) => Err(crate::queue::stale_queue_catalog()),
+                                (Ok(result), Ok(true)) => {
+                                    crate::queue::store_wake_slots(
+                                        &slots,
+                                        attempt.queue_wakes.take(),
+                                    );
+                                    Ok(result)
+                                }
+                                (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+                            }
+                        })
+                    })
+                    .await
+            },
+        );
+        self.admission.settle(request, attempt)
     }
 }

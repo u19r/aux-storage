@@ -36,14 +36,6 @@ pub(crate) async fn load_value_prefixes<A: KvAttempt + ?Sized>(
     if prefix_bytes.get() > KV_CHUNK_BYTES {
         return Err(invalid_prefix());
     }
-    let mut output = Vec::new();
-    let mut pending = Vec::new();
-    output
-        .try_reserve_exact(keys.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    pending
-        .try_reserve_exact(keys.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
     let heads = load_value_heads(
         attempt,
         keys,
@@ -51,6 +43,27 @@ pub(crate) async fn load_value_prefixes<A: KvAttempt + ?Sized>(
         allowance.for_head_reads(keys.len())?,
     )
     .await?;
+    resolve_value_prefixes(attempt, keys, heads, protection, prefix_bytes).await
+}
+
+pub(crate) async fn resolve_value_prefixes<A: KvAttempt + ?Sized>(
+    attempt: &A,
+    keys: &[Vec<u8>],
+    heads: Vec<Option<Vec<u8>>>,
+    protection: ReadProtection,
+    prefix_bytes: NonZeroUsize,
+) -> StorageResult<Vec<Option<KvValuePrefix>>> {
+    if prefix_bytes.get() > KV_CHUNK_BYTES || heads.len() != keys.len() {
+        return Err(invalid_prefix());
+    }
+    let mut output = Vec::new();
+    let mut pending = Vec::new();
+    output
+        .try_reserve_exact(keys.len())
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+    pending
+        .try_reserve_exact(keys.len())
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for (index, head) in heads.into_iter().enumerate() {
         match head.as_deref().map(parse_header).transpose()? {
             None => output.push(None),
@@ -98,7 +111,7 @@ fn copy_prefix(value: &[u8], prefix_bytes: NonZeroUsize) -> StorageResult<Vec<u8
     let mut copied = Vec::new();
     copied
         .try_reserve_exact(prefix.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     copied.extend_from_slice(prefix);
     Ok(copied)
 }
@@ -110,14 +123,14 @@ fn prepare_prefix_chunks(
     let mut addresses = Vec::new();
     addresses
         .try_reserve_exact(pending.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for (index, _) in pending {
         addresses.push(ChunkAddress::prepare(keys[*index].as_slice())?);
     }
     let mut chunks = Vec::new();
     chunks
         .try_reserve_exact(addresses.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for address in addresses {
         chunks.push(address.chunk_key(0)?);
     }

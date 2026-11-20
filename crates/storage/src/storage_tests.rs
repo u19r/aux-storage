@@ -1,5 +1,5 @@
 use serde_json::json;
-use storage_types::{AttributeValue, PutItemRequest, TableName};
+use storage_types::{AttributeMap, AttributeValue, PutItemRequest, TableName};
 
 #[test]
 fn attribute_value_string_serialize() {
@@ -214,7 +214,7 @@ fn attribute_value_invalid_empty_object() {
         result
             .unwrap_err()
             .to_string()
-            .contains("AttributeValue cannot be empty")
+            .contains("Supplied AttributeValue is empty")
     );
 }
 
@@ -227,7 +227,7 @@ fn attribute_value_invalid_multiple_fields() {
         result
             .unwrap_err()
             .to_string()
-            .contains("AttributeValue must have exactly one field")
+            .contains("Supplied AttributeValue has more than one datatypes set")
     );
 }
 
@@ -351,7 +351,7 @@ fn attribute_value_map_serialize() {
     map.insert("key2".to_string(), AttributeValue::N("123".to_string()));
     map.insert("key3".to_string(), AttributeValue::BOOL(false));
 
-    let attr = AttributeValue::M(map);
+    let attr = AttributeValue::M(AttributeMap::from(map));
     let json = serde_json::to_value(&attr).unwrap();
     let expected = json!({
         "M": {
@@ -379,7 +379,7 @@ fn attribute_value_map_deserialize() {
     expected_map.insert("key2".to_string(), AttributeValue::N("123".to_string()));
     expected_map.insert("key3".to_string(), AttributeValue::BOOL(false));
 
-    let expected = AttributeValue::M(expected_map);
+    let expected = AttributeValue::M(AttributeMap::from(expected_map));
     assert_eq!(attr, expected);
 }
 
@@ -394,7 +394,7 @@ fn attribute_value_nested_list_and_map() {
 
     let attr = AttributeValue::L(vec![
         AttributeValue::S("string_item".to_string()),
-        AttributeValue::M(inner_map),
+        AttributeValue::M(AttributeMap::from(inner_map)),
         AttributeValue::N("456".to_string()),
     ]);
 
@@ -424,7 +424,7 @@ fn attribute_value_empty_list_and_map() {
     assert_eq!(deserialized, empty_list);
 
     // Test empty map
-    let empty_map = AttributeValue::M(std::collections::HashMap::new());
+    let empty_map = AttributeValue::M(AttributeMap::new());
     let json = serde_json::to_value(&empty_map).unwrap();
     assert_eq!(json, json!({"M": {}}));
 

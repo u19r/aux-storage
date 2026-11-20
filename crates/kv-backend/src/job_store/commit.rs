@@ -5,7 +5,7 @@ use storage_provider::{
         AtomicCommit, JobCommitError, execute_commit, run_native_job_attempt, settle_native_commit,
     },
 };
-use storage_types::AttemptMode;
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass};
 
 use super::{KvRawOrderedJobStore, data_key, data_keys, point_allowance};
 use crate::{KvAttempt, KvBackend, KvMutation, ReadProtection};
@@ -32,14 +32,18 @@ async fn commit_once<B: KvBackend + 'static>(
         store.admission.get().cloned(),
         move |slot| async move {
             backend
-                .with_attempt(AttemptMode::ReadWrite, move |attempt| {
-                    Box::pin(async move {
-                        let mut commit = KvJobCommit { attempt };
-                        slot.preserve(
-                            execute_commit(&mut commit, &transaction, max_value_bytes).await,
-                        )
-                    })
-                })
+                .with_attempt(
+                    AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::BackgroundPage)
+                        .start(backend.attempt_deadlines()),
+                    move |attempt| {
+                        Box::pin(async move {
+                            let mut commit = KvJobCommit { attempt };
+                            slot.preserve(
+                                execute_commit(&mut commit, &transaction, max_value_bytes).await,
+                            )
+                        })
+                    },
+                )
                 .await
         },
     )
@@ -73,14 +77,14 @@ impl<A: KvAttempt> AtomicCommit for KvJobCommit<'_, A> {
         let mut changes = Vec::new();
         changes
             .try_reserve_exact(mutations.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for mutation in mutations {
             changes.push(match mutation {
                 Mutation::Put(key, bytes) => {
                     let mut value = Vec::new();
-                    value.try_reserve_exact(bytes.len()).map_err(|_| {
-                        storage_types::InfrastructureResultKind::NativeCapacityRejected
-                    })?;
+                    value
+                        .try_reserve_exact(bytes.len())
+                        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
                     value.extend_from_slice(bytes);
                     KvMutation::Put {
                         key: data_key(key.as_bytes())?,
@@ -89,6 +93,10 @@ impl<A: KvAttempt> AtomicCommit for KvJobCommit<'_, A> {
                 }
                 Mutation::Delete(key) => KvMutation::Delete {
                     key: data_key(key.as_bytes())?,
+                },
+                Mutation::ClearEffectReceipts(group) => KvMutation::ClearUnchunkedRange {
+                    begin: data_key(group.prefix().as_bytes())?,
+                    end: data_key(group.end().as_bytes())?,
                 },
             });
         }

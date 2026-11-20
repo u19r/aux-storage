@@ -1,39 +1,22 @@
 //! Primary item reads over the shared ordered KV key/value format.
 
-use storage_provider::GetItemAttempt;
+use storage_provider::{
+    BoundRangeReadPage, BoundRangeReadPlan, ItemReadAttempt, RangeReadItem, RangeReadPage,
+};
 use storage_types::{
-    BoundTableInfo, ItemKey, ItemProvenance, ItemRevision, KeyAttributes, StorageError,
-    StorageResult, StoredWireItem, WireItem,
+    BoundTableInfo, ItemKey, ItemProvenance, KeyAttributes, StorageError, StorageResult,
+    StoredWireItem, WireItem,
 };
 
 use crate::{
     KvAttempt,
-    catalog::{KvCatalogAttempt, KvTableIdentity},
-    constants::PRIMARY_ITEM_FAMILY,
+    catalog::{KvCatalogAttempt, table_id_from_history},
     item_codec::PrimaryItemEnvelope,
+    range_read::{PublicImage, RangeReadInput},
+    table_key_layout::{TableSubFamily, table_key},
 };
 
-impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
-    async fn read_primary_live_revisions(
-        &mut self,
-        reads: &[(&BoundTableInfo, &KeyAttributes)],
-    ) -> StorageResult<Vec<Option<ItemRevision>>> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        let result = async {
-            let keys = reads
-                .iter()
-                .map(|(table, key)| {
-                    primary_item_key(catalog.identity_for(&table.table_name)?, table, key)
-                })
-                .collect::<StorageResult<Vec<_>>>()?;
-            load_live_revisions(catalog.attempt, &keys, catalog.protection).await
-        }
-        .await;
-        operation.complete(result)
-    }
-
+impl<A: KvAttempt> ItemReadAttempt for KvCatalogAttempt<'_, A> {
     async fn read_primary_item(
         &mut self,
         table: &BoundTableInfo,
@@ -41,14 +24,14 @@ impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
     ) -> StorageResult<Option<WireItem>> {
         self.read_primary_pairs(&[(table, key)])
             .await?
-            .pop()
+            .into_single()
             .ok_or_else(|| StorageError::internal("Missing primary point-read result"))
     }
 
     async fn read_primary_pairs(
         &mut self,
         reads: &[(&BoundTableInfo, &KeyAttributes)],
-    ) -> StorageResult<Vec<Option<WireItem>>> {
+    ) -> StorageResult<storage_types::Exact<Option<WireItem>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -58,25 +41,30 @@ impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
             let mut results = Vec::new();
             physical
                 .try_reserve_exact(reads.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             requests
                 .try_reserve_exact(reads.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             results
                 .try_reserve_exact(reads.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             for (table, key) in reads {
-                let identity = catalog.identity_for(&table.info.table_name)?;
-                physical.push(primary_item_key(identity, table, key)?);
+                physical.push(primary_item_key(
+                    table_id_from_history(table.history_id)?,
+                    table,
+                    key,
+                )?);
             }
             let values = catalog
                 .attempt
-                .get_batch(physical, catalog.protection)
+                .get_batch_exact(physical, catalog.protection)
                 .await?;
-            if values.len() != reads.len() {
-                return Err(StorageError::internal(
-                    "KV point-read batch returned the wrong count",
-                ));
+            if catalog
+                .attempt
+                .root_attempt()
+                .native_pipelined_version_moved()
+            {
+                return Ok(None);
             }
             requests.extend(
                 reads
@@ -89,9 +77,6 @@ impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
                 .checked_mul(storage_types::MaterializedItemRecord::encoded_length_bound())
                 .ok_or_else(|| StorageError::internal("Primary batch bound overflow"))?;
             let hydrated = decode_primary_items(requests, bound)?;
-            if hydrated.len() != reads.len() {
-                return Err(StorageError::internal("KV primary hydration count differs"));
-            }
             for (item, (_, key)) in hydrated.into_iter().zip(reads) {
                 if let Some(item) = &item
                     && !item.stored.item.has_verified_keys(key)?
@@ -102,76 +87,54 @@ impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
                 }
                 results.push(item.map(|item| item.stored.item));
             }
-            Ok(results)
+            storage_types::Exact::try_new(reads.len(), results).map(Some)
         }
         .await;
-        settlement.complete(result)
+        match settlement.complete(result)? {
+            Some(items) => Ok(items),
+            None => Err(crate::catalog::pipelined_version_moved()),
+        }
     }
-}
 
-async fn load_live_revisions<A: KvAttempt>(
-    attempt: &A,
-    keys: &[Vec<u8>],
-    protection: crate::ReadProtection,
-) -> StorageResult<Vec<Option<ItemRevision>>> {
-    let bound = crate::constants::KV_UNQUALIFIED_VALUE_BYTES;
-    let maximum = crate::constants::KV_MAX_VALUE_BYTES;
-    let per_head = attempt.native_value_limit().min(maximum).max(1);
-    let group_size = (bound / per_head).max(1);
-    let mut revisions = Vec::with_capacity(keys.len());
-    for keys in keys.chunks(group_size) {
-        let call = attempt.settlement().begin_call()?;
-        let prefixes = call.complete(
-            crate::value_prefix::load_value_prefixes(
-                attempt,
-                keys,
-                crate::value_prefix::KvPrefixRead {
-                    protection,
-                    prefix_bytes: crate::constants::PRIMARY_ITEM_HEADER_BYTES,
-                    allowance: crate::KvValueAllowance::new(maximum, bound.max(per_head)),
-                },
-            )
-            .await,
-        )?;
-        revisions.extend(
-            prefixes
-                .into_iter()
-                .map(|prefix| {
-                    prefix
-                        .map(|prefix| crate::item_codec::decode_primary_revision(&prefix.bytes))
-                        .transpose()
-                })
-                .collect::<StorageResult<Vec<_>>>()?,
-        );
+    async fn read_range_page(
+        &mut self,
+        table: &BoundTableInfo,
+        bound: &BoundRangeReadPlan<'_>,
+        page: &BoundRangeReadPage<'_>,
+    ) -> StorageResult<RangeReadPage<RangeReadItem>> {
+        let mut settlement =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = settlement.as_mut();
+        let result = async {
+            catalog
+                .read_projected_range::<PublicImage>(RangeReadInput { table, bound, page })
+                .await
+        }
+        .await;
+        match settlement.complete(result)? {
+            Some(page) => Ok(page),
+            None => Err(crate::catalog::pipelined_version_moved()),
+        }
     }
-    Ok(revisions)
 }
 
 pub(crate) fn primary_item_key(
-    identity: &KvTableIdentity,
+    table_id: u32,
     table: &BoundTableInfo,
     key: &KeyAttributes,
 ) -> StorageResult<Vec<u8>> {
     let item_key =
         ItemKey::from_key_schema(table.info.table_name.clone(), &table.info.key_schema, key)?;
-    let suffix = item_key.sorted_storage_suffix()?;
-    let count = 5usize
-        .checked_add(suffix.len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut physical = Vec::new();
-    physical
-        .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    physical.push(PRIMARY_ITEM_FAMILY);
-    physical.extend_from_slice(&identity.table_id.to_be_bytes());
-    physical.extend_from_slice(&suffix);
-    Ok(physical)
+    item_key_from_suffix(table_id, &item_key.sorted_storage_suffix()?)
 }
 
-/// Verified primary content and native revision authority remain distinct.
+pub(crate) fn item_key_from_suffix(table_id: u32, suffix: &[u8]) -> StorageResult<Vec<u8>> {
+    table_key(table_id, TableSubFamily::Item, &[suffix])
+}
+
+/// Verified primary content and live row metadata.
 pub(crate) struct HydratedPrimaryItem {
     pub stored: StoredWireItem,
-    pub revision: ItemRevision,
     pub provenance: ItemProvenance,
     pub ttl_epoch: Option<i64>,
 }
@@ -196,13 +159,10 @@ pub(crate) fn decode_primary_items(
                         storage_types::MaterializedItemRecord::encoded_length_bound(),
                     )?;
                     if !budget.admit(record.decoded_bytes()) {
-                        return Err(
-                            storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-                        );
+                        return Err(storage_types::AttemptFailure::CAPACITY.into());
                     }
                     Ok(HydratedPrimaryItem {
                         stored: record.into_stored(table.info.max_indexers)?,
-                        revision: envelope.revision,
                         provenance: envelope.decode_provenance()?,
                         ttl_epoch: envelope.ttl_epoch,
                     })

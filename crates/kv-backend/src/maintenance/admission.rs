@@ -6,16 +6,13 @@ use storage_types::{
     maintenance::{MaintenanceKind, TargetIncarnation, TaskProgress},
 };
 
-use super::{
-    identity, key_layout,
-    progress::{self, ProgressFence},
-};
+use super::{identity, key_layout, progress};
 use crate::{KvAttempt, ReadProtection, constants::MAINTENANCE_IDENTITY_KEY};
 
 pub(crate) async fn read_admission<A: KvAttempt, P: DeserializeOwned>(
     attempt: &mut A,
     kind: MaintenanceKind,
-) -> StorageResult<(TargetIncarnation, Option<TaskProgress<P>>, ProgressFence)> {
+) -> StorageResult<(TargetIncarnation, Option<TaskProgress<P>>)> {
     let values = attempt
         .get_batch(
             vec![
@@ -31,6 +28,5 @@ pub(crate) async fn read_admission<A: KvAttempt, P: DeserializeOwned>(
     let identity = identity::decode_identity(identity)?
         .ok_or_else(|| StorageError::internal("KV maintenance identity is missing"))?;
     let progress = progress::decode_progress(progress, kind)?;
-    let fence = ProgressFence::from_read(progress.as_ref());
-    Ok((identity, progress, fence))
+    Ok((identity, progress))
 }

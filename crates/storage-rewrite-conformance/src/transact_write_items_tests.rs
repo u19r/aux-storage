@@ -42,6 +42,7 @@ async fn given_failing_middle_check_when_transaction_runs_then_items_and_cdc_rem
             })).unwrap();
             store.operations.put_item(put).await.unwrap();
         }
+        store.wait_until_changes_are_readable().await;
         let before = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
         assert_eq!(before.len(), 2);
@@ -244,7 +245,7 @@ async fn given_committed_token_when_transaction_changes_then_mismatch_response_a
             serde_json::to_value(body).unwrap(),
             json!({
                 "__type": "com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException",
-                "message": "The request was rejected because the same client request token was used with different parameters."
+                "message": "Specified idempotent token was used with different request parameters within the idempotency window"
             })
         );
         assert_eq!(
@@ -295,7 +296,7 @@ async fn given_completed_token_when_window_expires_then_changed_transaction_can_
         assert_dynamo_error_response_exact(
             before_expiry.result.unwrap_err(),
             axum::http::StatusCode::BAD_REQUEST,
-            r#"{"__type":"com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException","message":"The request was rejected because the same client request token was used with different parameters."}"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException","message":"Specified idempotent token was used with different request parameters within the idempotency window"}"#,
         );
         assert!(read_item(&store, table.clone(), "second").await.is_null());
 
@@ -370,6 +371,82 @@ async fn given_failed_tokenized_transaction_when_retried_then_token_and_items_ca
             json!({"pk": {"S": "first"}})
         );
         assert!(read_item(&store, table, "second").await.is_null());
+    })
+    .catch_unwind()
+    .await;
+    store.finish().await;
+    if let Err(panic) = outcome {
+        resume_unwind(panic);
+    }
+}
+
+async fn trim_receipts_at(store: &TestStore, at: storage_types::TimestampMillis) {
+    store.set_time(at);
+    let limit = std::num::NonZeroU32::new(100).unwrap();
+    let mut after = None;
+    while let Some(next) = store
+        .maintenance
+        .trim_transact_receipts_page(after, limit)
+        .await
+        .unwrap()
+    {
+        after = Some(next);
+    }
+}
+
+// RS1: a retry captured inside the idempotency window can read its receipt
+// only after another node's trim pass. The receipt survives until window +
+// 5 min, so that retry replays instead of applying the transaction again.
+#[tokio::test]
+async fn given_receipt_trim_passes_after_window_when_retry_captured_inside_window_then_receipt_replays_until_trim_delay()
+ {
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        let table = store.create_standard_table().await;
+        let request = TransactWriteItemsRequest::try_from(json!({
+            "ClientRequestToken": "trim-window-retry",
+            "TransactItems": [{"Update": {
+                "TableName": table.as_ref(),
+                "Key": {"pk": {"S": "counter"}},
+                "UpdateExpression": "ADD applied :one",
+                "ExpressionAttributeValues": {":one": {"N": "1"}}
+            }}]
+        }))
+        .unwrap();
+        let completed = store.now();
+        let window = storage_provider::TRANSACT_WRITE_IDEMPOTENCY_WINDOW_MILLIS;
+        let at = |offset: i64| completed + (window + offset);
+        let retry_inside_window = |expected: &'static str| {
+            let request = request.clone();
+            let store = &store;
+            let table = table.clone();
+            async move {
+                store.set_time(at(-1_000));
+                store
+                    .operations
+                    .transact_write_items(request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_item(store, table, "counter").await["applied"],
+                    json!({"N": expected})
+                );
+            }
+        };
+        store
+            .operations
+            .transact_write_items(request.clone())
+            .await
+            .unwrap();
+
+        trim_receipts_at(&store, at(1_000)).await;
+        retry_inside_window("1").await;
+        trim_receipts_at(&store, at(4 * 60_000 + 59_000)).await;
+        retry_inside_window("1").await;
+        // At window + 5 min the receipt is trimmed: the same in-window retry
+        // now finds no receipt and applies again, which proves the trim.
+        trim_receipts_at(&store, at(5 * 60_000)).await;
+        retry_inside_window("2").await;
     })
     .catch_unwind()
     .await;

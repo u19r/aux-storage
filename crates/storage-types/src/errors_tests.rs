@@ -1,7 +1,10 @@
 use crate::{
-    StorageEnum, StorageError, StorageValidationKind,
+    AttemptFailure, AttributeMap, AttributeValue, CancellationCode, CancellationReason, ErrorClass,
+    InfrastructureContext, InfrastructureResultKind, ItemKeyError, NativeUnavailable, StorageEnum,
+    StorageError, StorageValidationKind,
     context::{ErrorContext as _, WrappedError as _},
     dynamodb_table_not_found_message,
+    item_key::ItemKeyEnum,
 };
 
 #[test]
@@ -92,11 +95,15 @@ fn storage_guard_and_unsupported_helpers_preserve_internal_messages() {
 #[test]
 fn transaction_canceled_errors_are_not_retryable_writes() {
     let error: StorageError = StorageEnum::TransactionCanceled {
-        reasons: vec!["TransactionConflict".to_string()],
+        reasons: vec![CancellationReason::from_parts(
+            CancellationCode::TransactionConflict,
+            None,
+            None,
+        )],
     }
     .into();
 
-    assert!(!error.is_retryable_write());
+    assert!(!error.class().is_retryable());
 }
 
 #[test]
@@ -106,8 +113,12 @@ fn conditional_write_contention_requires_only_conditional_cancellation_reasons()
 
     let conditional: StorageError = StorageEnum::TransactionCanceled {
         reasons: vec![
-            "None".to_string(),
-            "ConditionalCheckFailed\tcondition did not match".to_string(),
+            CancellationReason::none(),
+            CancellationReason::from_parts(
+                CancellationCode::ConditionalCheckFailed,
+                Some("condition did not match".into()),
+                None,
+            ),
         ],
     }
     .into();
@@ -115,10 +126,277 @@ fn conditional_write_contention_requires_only_conditional_cancellation_reasons()
 
     let mixed: StorageError = StorageEnum::TransactionCanceled {
         reasons: vec![
-            "ConditionalCheckFailed".to_string(),
-            "TransactionConflict".to_string(),
+            CancellationReason::conditional_check_failed(None),
+            CancellationReason::from_parts(CancellationCode::TransactionConflict, None, None),
         ],
     }
     .into();
     assert!(!mixed.is_conditional_write_contention());
+}
+
+/// One value per `StorageEnum` variant (35) with the label
+/// `StorageError::label` must give it.
+fn one_error_per_variant_with_label() -> Vec<(StorageError, &'static str)> {
+    let variants: Vec<(StorageEnum, &'static str)> = vec![
+        (StorageEnum::Database(std::fmt::Error), "database"),
+        (
+            StorageEnum::AwsSerialization("x".into()),
+            "aws_serialization",
+        ),
+        (
+            StorageEnum::Serialization(
+                serde_json::from_str::<u8>("x")
+                    .expect_err("invalid json")
+                    .into(),
+            ),
+            "serialization",
+        ),
+        (
+            StorageEnum::InfrastructureResult(InfrastructureResultKind::Encoding {
+                context: InfrastructureContext::RecordEncoding,
+            }),
+            "internal_server_error",
+        ),
+        (
+            StorageEnum::Attempt(AttemptFailure::FRESH_VALIDATION),
+            "fresh_validation",
+        ),
+        (
+            StorageEnum::ResourceNotFound {
+                resource_type: "cursor",
+                resource_id: "x".into(),
+            },
+            "resource_not_found",
+        ),
+        (
+            StorageEnum::ResourceExists {
+                resource_type: "cursor",
+                resource_id: "x".into(),
+            },
+            "resource_exists",
+        ),
+        (
+            StorageEnum::IndexNotFound {
+                index_name: "i".into(),
+                table_name: "t".into(),
+            },
+            "index_not_found",
+        ),
+        (
+            StorageEnum::KeyValidation(ItemKeyError::from(ItemKeyEnum::Validation("x".into()))),
+            "key_validation",
+        ),
+        (
+            StorageEnum::InternalServerError {
+                message: "x".into(),
+            },
+            "internal_server_error",
+        ),
+        (StorageEnum::HistoryUnavailable, "history_unavailable"),
+        (StorageEnum::HistoryExpired, "history_expired"),
+        (StorageEnum::TrimmedDataAccess, "trimmed_data_access"),
+        (
+            StorageEnum::ConditionalCheckFailed,
+            "conditional_check_failed",
+        ),
+        (
+            StorageEnum::ConditionalCheckFailedWithItem {
+                item: AttributeMap::new(),
+            },
+            "conditional_check_failed",
+        ),
+        (
+            StorageEnum::GuardConflict {
+                message: "x".into(),
+            },
+            "guard_conflict",
+        ),
+        (
+            StorageEnum::Unsupported {
+                message: "x".into(),
+            },
+            "unsupported",
+        ),
+        (
+            StorageEnum::TableAlreadyExists { name: "t".into() },
+            "table_exists",
+        ),
+        (
+            StorageEnum::TableNotFound {
+                name: "t".into(),
+                message: "x".into(),
+            },
+            "table_not_found",
+        ),
+        (
+            StorageEnum::Validation {
+                kind: StorageValidationKind::Message,
+                message: "x".into(),
+            },
+            "validation",
+        ),
+        (
+            StorageEnum::RawValidation {
+                message: "x".into(),
+            },
+            "validation",
+        ),
+        (
+            StorageEnum::DeletionProtectionEnabled {
+                table_name: "t".into(),
+                message: "x".into(),
+            },
+            "validation",
+        ),
+        (
+            StorageEnum::TransactionInProgress {
+                message: "x".into(),
+            },
+            "transaction_in_progress",
+        ),
+        (
+            StorageEnum::IdempotentParameterMismatch,
+            "idempotent_parameter_mismatch",
+        ),
+        (
+            StorageEnum::IdempotencyReplay { response: vec![1] },
+            "idempotency_replay",
+        ),
+        (
+            StorageEnum::TransactionCanceled {
+                reasons: vec![CancellationReason::none()],
+            },
+            "transaction_canceled",
+        ),
+        (
+            StorageEnum::ProvisionedThroughputExceeded {
+                message: "x".into(),
+            },
+            "provisioned_throughput",
+        ),
+        (
+            StorageEnum::Throttled {
+                message: "x".into(),
+            },
+            "throttled",
+        ),
+        (
+            StorageEnum::ServiceUnavailable {
+                message: "x".into(),
+                retry_after_seconds: 3,
+            },
+            "service_unavailable",
+        ),
+        (
+            StorageEnum::LimitExceeded {
+                message: "x".into(),
+            },
+            "limit_exceeded",
+        ),
+        (
+            StorageEnum::Authentication {
+                message: "x".into(),
+            },
+            "authentication",
+        ),
+        (
+            StorageEnum::AccessDenied {
+                message: "x".into(),
+            },
+            "access_denied",
+        ),
+        (StorageEnum::RequestLimitExceeded, "request_limit_exceeded"),
+        (
+            StorageEnum::MissingAuthenticationToken,
+            "missing_authentication_token",
+        ),
+        (
+            StorageEnum::AwsService {
+                code: None,
+                message: "x".into(),
+            },
+            "aws_service",
+        ),
+    ];
+    variants
+        .into_iter()
+        .map(|(variant, label)| (StorageError::from(variant), label))
+        .collect()
+}
+
+#[test]
+fn given_every_variant_when_labelled_then_fixed_snake_case_label() {
+    let mut cases = one_error_per_variant_with_label();
+    assert_eq!(cases.len(), 35, "one value per StorageEnum variant");
+    cases.extend([
+        (StorageError::logical_conflict("test conflict"), "conflict"),
+        (
+            StorageError::from(AttemptFailure::FRESH_VALIDATION),
+            "fresh_validation",
+        ),
+        (StorageError::from(AttemptFailure::CAPACITY), "capacity"),
+        (
+            StorageError::from(AttemptFailure::TRANSACTION_BYTES),
+            "transaction_bytes",
+        ),
+        (
+            StorageError::from(AttemptFailure::Unavailable(
+                NativeUnavailable::ConnectionLost,
+            )),
+            "unavailable",
+        ),
+        (
+            crate::expired_in(crate::AttemptPhase::Statement),
+            "deadline",
+        ),
+        (StorageError::commit_unknown("lost"), "commit_unknown"),
+    ]);
+
+    for (error, expected) in cases {
+        let label = error.label();
+        assert_eq!(label, expected, "label of {error:?}");
+        assert!(
+            !label.is_empty() && label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+            "label {label:?} is not snake_case"
+        );
+    }
+
+    assert_eq!(ErrorClass::Retryable.as_str(), "retryable");
+    assert_eq!(ErrorClass::Capacity.as_str(), "capacity");
+    assert_eq!(ErrorClass::CommitUnknown.as_str(), "commit_unknown");
+    assert_eq!(ErrorClass::Client.as_str(), "client");
+    assert_eq!(ErrorClass::Internal.as_str(), "internal");
+}
+
+#[test]
+fn given_typed_reasons_when_index_queried_then_condition_failure_by_code() {
+    let item = AttributeMap::from_iter([("pk".to_string(), AttributeValue::S("a".into()))]);
+    let error: StorageError = StorageEnum::TransactionCanceled {
+        reasons: vec![
+            CancellationReason::none(),
+            CancellationReason::conditional_check_failed(Some(item)),
+            CancellationReason::from_parts(CancellationCode::TransactionConflict, None, None),
+        ],
+    }
+    .into();
+
+    assert!(error.is_canceled_condition_check_failed(1));
+    assert!(!error.is_canceled_condition_check_failed(0));
+    assert!(!error.is_canceled_condition_check_failed(2));
+    assert!(!error.is_canceled_condition_check_failed(3));
+    assert_eq!(error.cancellation_reasons().map(<[_]>::len), Some(3));
+}
+
+#[test]
+fn given_other_error_when_reasons_queried_then_none() {
+    let direct: StorageError = StorageEnum::ConditionalCheckFailed.into();
+    assert!(direct.cancellation_reasons().is_none());
+    assert!(!direct.is_canceled_condition_check_failed(0));
+    assert!(direct.is_conditional_write_contention());
+
+    let no_failure: StorageError = StorageEnum::TransactionCanceled {
+        reasons: vec![CancellationReason::none()],
+    }
+    .into();
+    assert!(!no_failure.is_conditional_write_contention());
 }

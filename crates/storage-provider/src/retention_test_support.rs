@@ -1,10 +1,9 @@
 //! Native fixtures seed missing policy state; one contract checks worker
 //! cleanup and reopen.
-use storage_types::{StorageResult, TimestampMillis};
+use storage_types::TimestampMillis;
 
 use crate::{
-    StorageProvider, StreamDurationTrimConfig, StreamDurationTrimWorker, StreamRetentionRepository,
-    StreamTrimDueMarker, StreamTrimPageLimit,
+    StreamDurationTrimConfig, StreamDurationTrimWorker, StreamTrimDueMarker, StreamTrimPageLimit,
 };
 
 #[cfg(test)]
@@ -30,86 +29,10 @@ pub(crate) fn scope(table_name: &str) -> crate::StreamTrimScope {
     )
 }
 
-pub struct MissingPolicyMarker {
-    marker: StreamTrimDueMarker,
-    catalog: serde_json::Value,
-}
-
-impl MissingPolicyMarker {
-    pub async fn reclaim(
-        provider: &(impl StorageProvider + StreamRetentionRepository),
-    ) -> StorageResult<Self> {
-        let due = TimestampMillis::from_timestamp(i64::MAX);
-        let markers = provider.list_due_stream_trim_markers(due, 2).await?;
-        assert_eq!(
-            markers.len(),
-            1,
-            "fixture must have exactly one orphaned marker"
-        );
-        let marker = markers.into_iter().next().expect("marker");
-        assert!(
-            provider
-                .load_stream_trim_states(std::slice::from_ref(&marker.scope))
-                .await?
-                == vec![None]
-        );
-        let catalog =
-            serde_json::to_value(provider.get_table_info(&marker.scope.table_name).await?)
-                .expect("catalog JSON");
-        let stats = StreamDurationTrimWorker::new(
-            provider,
-            StreamDurationTrimConfig {
-                marker_page_size: StreamTrimPageLimit::try_from(1usize)?,
-                stream_page_size: StreamTrimPageLimit::try_from(1usize)?,
-            },
-        )
-        .run_due_page(due, TimestampMillis::now())
-        .await?;
-        assert_eq!(stats.due_markers_scanned, 1);
-        assert_eq!(stats.missing_states, 1);
-        assert_eq!(stats.state_writes, 0);
-        assert_eq!(stats.rows_deleted, 0);
-        let proof = Self { marker, catalog };
-        proof.verify(provider).await?;
-        Ok(proof)
-    }
-
-    pub async fn verify(
-        &self,
-        provider: &(impl StorageProvider + StreamRetentionRepository),
-    ) -> StorageResult<()> {
-        assert!(
-            provider
-                .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 2)
-                .await?
-                .is_empty(),
-            "orphaned marker must remain removed after reopen"
-        );
-        assert!(
-            provider
-                .load_stream_trim_states(std::slice::from_ref(&self.marker.scope))
-                .await?
-                == vec![None],
-            "cleanup must not recreate policy state"
-        );
-        assert_eq!(
-            serde_json::to_value(
-                provider
-                    .get_table_info(&self.marker.scope.table_name)
-                    .await?
-            )
-            .expect("catalog JSON"),
-            self.catalog,
-            "cleanup must preserve table metadata"
-        );
-        Ok(())
-    }
-}
-
 /// A later deadline must not hide due work at a native discovery page boundary.
-pub async fn qualify_due_marker_progress<P: crate::DynamoPort>(provider: &P)
-where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort {
-    use crate::StreamRetentionRepository;
+pub async fn qualify_due_marker_progress<P: crate::DynamoPort + crate::MaintenanceOperations>(
+    provider: &P,
+) where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort {
     let markers = create_deadline_tables(provider).await;
     let future_scope = markers[0].scope.clone();
     let due_scope = markers[1].scope.clone();
@@ -145,9 +68,12 @@ where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort 
 
 /// Repeated work on one table must yield to another table with the same due
 /// time.
-pub async fn qualify_pending_marker_progress<P: crate::DynamoPort>(provider: &P)
-where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort {
-    use crate::{DynamoOperations, StreamRetentionRepository};
+pub async fn qualify_pending_marker_progress<
+    P: crate::DynamoPort + crate::MaintenanceOperations,
+>(
+    provider: &P,
+) where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort {
+    use crate::DynamoOperations;
     let markers = create_deadline_tables(provider).await;
     for key in ["one", "two"] {
         provider
@@ -210,9 +136,11 @@ where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort 
     }
 }
 
-async fn create_deadline_tables<P: crate::DynamoPort>(provider: &P) -> Vec<StreamTrimDueMarker>
+async fn create_deadline_tables<P: crate::DynamoPort + crate::MaintenanceOperations>(
+    provider: &P,
+) -> Vec<StreamTrimDueMarker>
 where for<'native> P::Attempt<'native>: crate::maintenance::StreamRetentionPort {
-    use crate::{DynamoOperations, StreamRetentionRepository};
+    use crate::DynamoOperations;
     for name in ["deadline-first", "deadline-second"] {
         provider
             .create_table(
@@ -246,7 +174,7 @@ fn select_test_deadline() -> TimestampMillis {
     )
 }
 
-async fn run_one_marker_page<P: crate::DynamoPort>(
+async fn run_one_marker_page<P: crate::DynamoPort + crate::MaintenanceOperations>(
     provider: &P,
     now: TimestampMillis,
 ) -> crate::maintenance::StreamDurationTrimStats
@@ -275,8 +203,16 @@ async fn seed_marker_deadlines<P: crate::DynamoPort>(
     use crate::maintenance::{
         StreamRetentionFinish, StreamRetentionFinishReason, StreamRetentionPort,
     };
-    provider
-        .with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
+    crate::DynamoPort::with_attempt(
+        provider,
+        storage_types::AttemptPlan::new(
+            storage_types::AttemptMode::ReadWrite,
+            storage_types::DeadlineClass::Write,
+        )
+        .start(storage_types::AttemptDeadlineSource::attempt_deadlines(
+            provider,
+        )),
+        move |attempt| {
             Box::pin(async move {
                 let scopes = deadlines
                     .iter()
@@ -306,9 +242,10 @@ async fn seed_marker_deadlines<P: crate::DynamoPort>(
                         }
                     })
                     .collect();
-                attempt.finish_stream_trim_markers(finishes).await
+                crate::maintenance::finish_stream_trim_markers(attempt, finishes).await
             })
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
 }

@@ -7,6 +7,7 @@ use storage_types::TimestampMillis;
 
 use crate::{
     MessageId, ReceiptHandle,
+    request_validation::QueueRequestValidation,
     types::{
         ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
         DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest,
@@ -17,13 +18,25 @@ use crate::{
     },
 };
 
+/// The typed decode and the one validation of the wire owner.
+fn decode<T: serde::de::DeserializeOwned + QueueRequestValidation>(
+    value: serde_json::Value,
+) -> Result<T, http_error::HttpApiError> {
+    let request: T = serde_json::from_value(value)
+        .map_err(|error| http_error::HttpApiError::validation_error(error.to_string()))?;
+    request
+        .validate_request()
+        .map_err(http_error::HttpApiError::from)?;
+    Ok(request)
+}
+
 #[test]
 fn create_queue_request_valid() {
     let json = json!({
         "QueueName": "valid-queue_name"
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_ok());
     let request = result.unwrap();
     assert_eq!(request.queue_name, "valid-queue_name");
@@ -35,7 +48,7 @@ fn create_queue_request_empty_name() {
         "QueueName": ""
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(error.message, "Queue name cannot be empty");
@@ -48,7 +61,7 @@ fn create_queue_request_name_too_long() {
         "QueueName": long_name
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
@@ -64,7 +77,7 @@ fn create_queue_request_name_max_length() {
         "QueueName": max_name
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -74,7 +87,7 @@ fn create_queue_request_invalid_characters() {
         "QueueName": "invalid@queue"
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
@@ -89,7 +102,7 @@ fn create_queue_request_valid_characters() {
         "QueueName": "Valid-Queue_Name123"
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -99,7 +112,7 @@ fn create_queue_request_rejects_fifo_name() {
         "QueueName": "jobs.fifo"
     });
 
-    let result = CreateQueueRequest::from_json(json);
+    let result = decode::<CreateQueueRequest>(json);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().message, "FIFO queues are not supported");
 }
@@ -110,7 +123,7 @@ fn delete_queue_request_valid() {
         "QueueUrl": "https://queue.example.com/000000000000/test-queue"
     });
 
-    let result = DeleteQueueRequest::from_json(json);
+    let result = decode::<DeleteQueueRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -120,7 +133,7 @@ fn list_queues_request_valid_prefix() {
         "QueueNamePrefix": "billing_"
     });
 
-    let result = ListQueuesRequest::from_json(json);
+    let result = decode::<ListQueuesRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -130,7 +143,7 @@ fn list_queues_request_invalid_prefix() {
         "QueueNamePrefix": "bad prefix"
     });
 
-    let result = ListQueuesRequest::from_json(json);
+    let result = decode::<ListQueuesRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
@@ -145,21 +158,20 @@ fn get_queue_url_request_valid() {
         "QueueName": "queue_name-01"
     });
 
-    let result = GetQueueUrlRequest::from_json(json);
+    let result = decode::<GetQueueUrlRequest>(json);
     assert!(result.is_ok());
 }
 
 #[test]
-fn get_queue_attributes_request_empty_attribute_name() {
+fn given_empty_attribute_name_when_decoded_then_it_is_an_unknown_attribute() {
     let json = json!({
         "QueueUrl": "https://queue.example.com/000000000000/test-queue",
         "AttributeNames": [""]
     });
 
-    let result = GetQueueAttributesRequest::from_json(json);
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    assert_eq!(error.message, "Attribute name cannot be empty");
+    let error = decode::<GetQueueAttributesRequest>(json).unwrap_err();
+    assert_eq!(error.error_type, "InvalidAttributeName");
+    assert_eq!(error.message, "Unknown Attribute .");
 }
 
 #[test]
@@ -171,25 +183,21 @@ fn set_queue_attributes_request_valid() {
         }
     });
 
-    let result = SetQueueAttributesRequest::from_json(json);
+    let result = decode::<SetQueueAttributesRequest>(json);
     assert!(result.is_ok());
 }
 
+/// W14 C8: `Policy` is stored; an unknown name is `InvalidAttributeName`.
 #[test]
-fn set_queue_attributes_request_rejects_unsupported_attribute() {
-    let json = json!({
-        "QueueUrl": "https://queue.example.com/000000000000/test-queue",
-        "Attributes": {
-            "Policy": "{}"
-        }
-    });
+fn given_policy_or_unknown_attribute_when_set_then_policy_is_accepted_and_unknown_rejected() {
+    let url = "https://queue.example.com/000000000000/test-queue";
+    let policy = json!({"QueueUrl": url, "Attributes": {"Policy": "{}"}});
+    assert!(decode::<SetQueueAttributesRequest>(policy).is_ok());
 
-    let result = SetQueueAttributesRequest::from_json(json);
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().message,
-        "Unsupported queue attribute: Policy"
-    );
+    let unknown = json!({"QueueUrl": url, "Attributes": {"Bogus": "1"}});
+    let error = decode::<SetQueueAttributesRequest>(unknown).unwrap_err();
+    assert_eq!(error.error_type, "InvalidAttributeName");
+    assert_eq!(error.message, "Unknown Attribute Bogus.");
 }
 
 #[test]
@@ -201,11 +209,11 @@ fn set_queue_attributes_request_rejects_out_of_range_retention() {
         }
     });
 
-    let result = SetQueueAttributesRequest::from_json(json);
+    let result = decode::<SetQueueAttributesRequest>(json);
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().message,
-        "MessageRetentionPeriod must be between 60 and 1209600"
+        "Invalid value for the parameter MessageRetentionPeriod."
     );
 }
 
@@ -218,7 +226,7 @@ fn set_queue_attributes_request_rejects_fifo_attribute() {
         }
     });
 
-    let result = SetQueueAttributesRequest::from_json(json);
+    let result = decode::<SetQueueAttributesRequest>(json);
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().message,
@@ -232,7 +240,7 @@ fn purge_queue_request_valid() {
         "QueueUrl": "https://queue.example.com/000000000000/test-queue"
     });
 
-    let result = PurgeQueueRequest::from_json(json);
+    let result = decode::<PurgeQueueRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -243,7 +251,7 @@ fn send_message_request_valid() {
         "MessageBody": "Hello World"
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -254,7 +262,7 @@ fn send_message_request_empty_body() {
         "MessageBody": ""
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
@@ -271,12 +279,13 @@ fn send_message_request_body_too_large() {
         "MessageBody": large_body
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
+    // The AWS text, observed live on 2026-11-10.
     assert_eq!(
         error.message,
-        "Message body cannot exceed 1 MiB (1,048,576 bytes)"
+        "One or more parameters are invalid. Reason: Message must be shorter than 1048576 bytes."
     );
 }
 
@@ -288,7 +297,7 @@ fn send_message_request_body_max_size() {
         "MessageBody": max_body
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -299,7 +308,7 @@ fn send_message_request_valid_unicode() {
         "MessageBody": "Hello\t\n\rWorld 🌍"
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -311,7 +320,7 @@ fn send_message_request_delay_seconds_valid() {
         "DelaySeconds": 300
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -323,10 +332,14 @@ fn send_message_request_delay_seconds_too_high() {
         "DelaySeconds": 901
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.message, "DelaySeconds must be between 0 and 900");
+    assert_eq!(
+        error.message,
+        "Value 901 for parameter DelaySeconds is invalid. Reason: DelaySeconds must be >= 0 and \
+         <= 900."
+    );
 }
 
 #[test]
@@ -346,7 +359,7 @@ fn send_message_batch_request_valid() {
         ]
     });
 
-    let result = SendMessageBatchRequest::from_json(json);
+    let result = decode::<SendMessageBatchRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -366,7 +379,7 @@ fn send_message_batch_request_rejects_duplicate_ids() {
         ]
     });
 
-    let result = SendMessageBatchRequest::from_json(json);
+    let result = decode::<SendMessageBatchRequest>(json);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().message, "Id same repeated.");
 }
@@ -386,11 +399,11 @@ fn delete_message_batch_request_rejects_too_many_entries() {
         "Entries": entries
     });
 
-    let result = DeleteMessageBatchRequest::from_json(json);
+    let result = decode::<DeleteMessageBatchRequest>(json);
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().message,
-        "Batch request cannot include more than 10 entries"
+        "Maximum number of entries per request are 10. You have sent 11."
     );
 }
 
@@ -407,11 +420,12 @@ fn change_message_visibility_batch_request_validates_visibility_timeout() {
         ]
     });
 
-    let result = ChangeMessageVisibilityBatchRequest::from_json(json);
+    let result = decode::<ChangeMessageVisibilityBatchRequest>(json);
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().message,
-        "VisibilityTimeout must be between 0 and 43200 seconds"
+        "Value 43201 for parameter VisibilityTimeout is invalid. Reason: VisibilityTimeout must \
+         be an integer between 0 and 43200."
     );
 }
 
@@ -423,39 +437,39 @@ fn send_message_request_delay_seconds_negative() {
         "DelaySeconds": -1
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.message, "DelaySeconds must be between 0 and 900");
+    assert_eq!(
+        error.message,
+        "Value -1 for parameter DelaySeconds is invalid. Reason: DelaySeconds must be >= 0 and <= \
+         900."
+    );
 }
 
 #[test]
-fn send_message_request_delay_seconds_string_and_malformed_values_preserve_contracts() {
+fn given_negative_or_non_integer_delay_when_decoded_then_range_or_type_error() {
     let base = json!({
         "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
         "MessageBody": "Hello"
     });
 
-    for value in [json!("-1"), json!(901)] {
+    for value in [json!(-1), json!(901), json!(u64::from(u32::MAX) + 1)] {
         let mut request = base.clone();
-        request["DelaySeconds"] = value;
+        request["DelaySeconds"] = value.clone();
         assert_eq!(
-            SendMessageRequest::from_json(request).unwrap_err().message,
-            "DelaySeconds must be between 0 and 900"
+            decode::<SendMessageRequest>(request).unwrap_err().message,
+            format!(
+                "Value {value} for parameter DelaySeconds is invalid. Reason: DelaySeconds must \
+                 be >= 0 and <= 900."
+            )
         );
     }
 
-    for value in [
-        json!(u64::from(u32::MAX) + 1),
-        json!(1.5),
-        json!("not-a-number"),
-    ] {
+    for value in [json!(1.5), json!("not-a-number")] {
         let mut request = base.clone();
         request["DelaySeconds"] = value;
-        assert_eq!(
-            SendMessageRequest::from_json(request).unwrap_err().message,
-            "DelaySeconds must be a unsigned 32-bit integer"
-        );
+        assert!(decode::<SendMessageRequest>(request).is_err());
     }
 
     for request in [
@@ -466,24 +480,23 @@ fn send_message_request_delay_seconds_string_and_malformed_values_preserve_contr
             "DelaySeconds": null
         }),
     ] {
-        assert!(SendMessageRequest::from_json(request).is_ok());
+        assert!(decode::<SendMessageRequest>(request).is_ok());
     }
 }
 
 #[test]
-fn send_message_batch_request_negative_delay_uses_range_error() {
-    let result = SendMessageBatchRequest::from_json(json!({
+fn send_message_batch_request_negative_delay_fails_its_entry_alone() {
+    let request = decode::<SendMessageBatchRequest>(json!({
         "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
         "Entries": [{
             "Id": "entry",
             "MessageBody": "Hello",
-            "DelaySeconds": "-1"
+            "DelaySeconds": -1
         }]
-    }));
-    assert_eq!(
-        result.unwrap_err().message,
-        "DelaySeconds must be between 0 and 900"
-    );
+    }))
+    .expect("entry faults are per entry");
+    let error = request.entries[0].validate(1).unwrap_err();
+    assert!(error.to_string().contains("DelaySeconds"), "{error}");
 }
 
 #[test]
@@ -499,7 +512,7 @@ fn send_message_request_message_attributes_valid() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -621,6 +634,7 @@ fn sample_queue_message() -> QueueMessage {
         )),
         created_at: TimestampMillis::from_timestamp(1_700_000_000_123),
         visibility_timestamp: None,
+        ..Default::default()
     }
 }
 
@@ -756,12 +770,12 @@ fn send_message_request_too_many_message_attributes() {
         "MessageAttributes": attributes
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "Message can have at most 10 message attributes"
+        "Number of message attributes [11] exceeds the allowed maximum [10]."
     );
 }
 
@@ -771,7 +785,7 @@ fn receive_message_request_valid() {
         "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -782,7 +796,7 @@ fn receive_message_request_max_messages_valid() {
         "MaxNumberOfMessages": 5
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -793,7 +807,7 @@ fn receive_message_request_max_messages_too_high() {
         "MaxNumberOfMessages": 11
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
@@ -810,7 +824,7 @@ fn receive_message_request_max_messages_zero() {
         "MaxNumberOfMessages": 0
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
@@ -827,7 +841,7 @@ fn receive_message_request_visibility_timeout_valid() {
         "VisibilityTimeout": 30
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -838,12 +852,13 @@ fn receive_message_request_visibility_timeout_too_high() {
         "VisibilityTimeout": 43201
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "VisibilityTimeout must be between 0 and 43200 seconds"
+        "Value 43201 for parameter VisibilityTimeout is invalid. Reason: VisibilityTimeout must \
+         be an integer between 0 and 43200."
     );
 }
 
@@ -854,7 +869,7 @@ fn receive_message_request_wait_time_valid() {
         "WaitTimeSeconds": 10
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -865,10 +880,14 @@ fn receive_message_request_wait_time_too_high() {
         "WaitTimeSeconds": 21
     });
 
-    let result = ReceiveMessageRequest::from_json(json);
+    let result = decode::<ReceiveMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.message, "WaitTimeSeconds must be between 0 and 20");
+    assert_eq!(
+        error.message,
+        "Value 21 for parameter WaitTimeSeconds is invalid. Reason: Must be >= 0 and <= 20, if \
+         provided."
+    );
 }
 
 #[test]
@@ -878,7 +897,7 @@ fn delete_message_request_valid() {
         "ReceiptHandle": "AQEBwJnKyrHigUMZj6rYigCgxlaS3SLy0a..."
     });
 
-    let result = DeleteMessageRequest::from_json(json);
+    let result = decode::<DeleteMessageRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -889,7 +908,7 @@ fn delete_message_request_empty_receipt_handle() {
         "ReceiptHandle": ""
     });
 
-    let result = DeleteMessageRequest::from_json(json);
+    let result = decode::<DeleteMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(error.message, "Receipt handle cannot be empty");
@@ -903,7 +922,7 @@ fn change_message_visibility_request_valid() {
         "VisibilityTimeout": 60
     });
 
-    let result = ChangeMessageVisibilityRequest::from_json(json);
+    let result = decode::<ChangeMessageVisibilityRequest>(json);
     assert!(result.is_ok());
 }
 
@@ -915,18 +934,19 @@ fn change_message_visibility_request_invalid_timeout() {
         "VisibilityTimeout": -1
     });
 
-    let result = ChangeMessageVisibilityRequest::from_json(json);
+    let result = decode::<ChangeMessageVisibilityRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "VisibilityTimeout must be between 0 and 43200 seconds"
+        "Value -1 for parameter VisibilityTimeout is invalid. Reason: VisibilityTimeout must be \
+         an integer between 0 and 43200."
     );
 }
 
 #[test]
 fn change_message_visibility_batch_negative_timeout_uses_range_error() {
-    let result = ChangeMessageVisibilityBatchRequest::from_json(json!({
+    let result = decode::<ChangeMessageVisibilityBatchRequest>(json!({
         "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
         "Entries": [{
             "Id": "entry",
@@ -936,7 +956,8 @@ fn change_message_visibility_batch_negative_timeout_uses_range_error() {
     }));
     assert_eq!(
         result.unwrap_err().message,
-        "VisibilityTimeout must be between 0 and 43200 seconds"
+        "Value -1 for parameter VisibilityTimeout is invalid. Reason: VisibilityTimeout must be \
+         an integer between 0 and 43200."
     );
 }
 
@@ -954,12 +975,12 @@ fn message_attribute_name_too_long() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "Message attribute name cannot exceed 256 characters"
+        "Message (user) attribute name must be shorter than 256 bytes."
     );
 }
 
@@ -976,13 +997,13 @@ fn message_attribute_name_invalid_characters() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "Message attribute name can only contain alphanumeric characters, underscores, hyphens, \
-         and periods"
+        "Message (user) attribute name contains invalid non-alphanumeric character '#x40'. You \
+         can use only alphanumeric characters, hyphens (-), underscores (_), or periods (.)."
     );
 }
 
@@ -999,10 +1020,14 @@ fn message_attribute_empty_data_type() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.message, "Message attribute data type cannot be empty");
+    assert_eq!(
+        error.message,
+        "The type of message (user) attribute 'test' is invalid. You must use only the following \
+         supported type prefixes: Binary, Number, String."
+    );
 }
 
 #[test]
@@ -1018,13 +1043,13 @@ fn message_attribute_invalid_data_type() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "Message attribute data type must be String, Number, or Binary (with optional .custom \
-         suffix)"
+        "The type of message (user) attribute 'test' is invalid. You must use only the following \
+         supported type prefixes: Binary, Number, String."
     );
 }
 
@@ -1042,12 +1067,12 @@ fn message_attribute_both_values() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "Message attribute cannot have both StringValue and BinaryValue"
+        "Message (user) attribute 'test' with type 'String' must use field 'String'."
     );
 }
 
@@ -1063,12 +1088,12 @@ fn message_attribute_no_value() {
         }
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
-        "Message attribute must have either StringValue or BinaryValue"
+        "Message (user) attribute 'test' must contain a non-empty value of type 'String'."
     );
 }
 
@@ -1079,47 +1104,33 @@ fn empty_queue_url() {
         "MessageBody": "Hello"
     });
 
-    let result = SendMessageRequest::from_json(json);
+    let result = decode::<SendMessageRequest>(json);
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(error.message, "Queue URL cannot be empty");
 }
 
 #[test]
-fn invalid_json_structure() {
-    let json = json!({
-        "InvalidField": "value"
-    });
+fn given_only_unknown_fields_when_decoded_then_required_member_is_missing() {
+    // The wire maps this to `MissingParameter` (route protocol tests).
+    let error = decode::<CreateQueueRequest>(json!({"InvalidField": "value"})).unwrap_err();
+    assert!(
+        error.message.starts_with("missing field `QueueName`"),
+        "{error:?}"
+    );
+}
 
-    let result = CreateQueueRequest::from_json(json);
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    assert_eq!(error.message, "Unknown field: InvalidField");
+/// D3 and probe 12: AWS ignores an unknown top-level member.
+#[test]
+fn given_unknown_field_when_decoded_then_it_is_ignored() {
+    let request =
+        decode::<CreateQueueRequest>(json!({"QueueName": "MyQueue", "Tags": {"a": "1"}})).unwrap();
+    assert_eq!(request.queue_name, "MyQueue");
 }
 
 #[test]
-fn unknown_field_is_preserved_as_unknown_field_error() {
-    let json = json!({
-        "QueueName": "MyQueue",
-        "ExtraField": "value"
-    });
-
-    let result = CreateQueueRequest::from_json(json);
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    assert_eq!(error.message, "Unknown field: ExtraField");
-}
-
-#[test]
-fn wrong_type_is_preserved_as_wrong_type_error() {
-    let json = json!({
-        "QueueName": 10
-    });
-
-    let result = CreateQueueRequest::from_json(json);
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    assert_eq!(error.message, "QueueName must be a string");
+fn given_wrong_member_type_when_decoded_then_request_is_rejected() {
+    assert!(decode::<CreateQueueRequest>(json!({"QueueName": 10})).is_err());
 }
 
 #[test]
@@ -1129,7 +1140,7 @@ fn given_invalid_number_message_attribute_when_validated_then_it_is_rejected() {
         binary_value: None,
         data_type: "Number".to_string(),
     };
-    assert!(attribute.validate().is_err());
+    assert!(attribute.validate_named("attr").is_err());
 }
 
 #[test]
@@ -1139,7 +1150,7 @@ fn given_invalid_binary_message_attribute_when_validated_then_it_is_rejected() {
         binary_value: Some("!!!!".to_string()),
         data_type: "Binary".to_string(),
     };
-    assert!(attribute.validate().is_err());
+    assert!(attribute.validate_named("attr").is_err());
 }
 
 #[test]
@@ -1156,7 +1167,9 @@ fn given_valid_number_and_binary_attributes_when_validated_then_they_are_accepte
             data_type: "Binary".to_string(),
         },
     ] {
-        attribute.validate().expect("valid message attribute");
+        attribute
+            .validate_named("attr")
+            .expect("valid message attribute");
     }
 }
 
@@ -1173,7 +1186,7 @@ fn given_invalid_attribute_type_or_value_variant_when_validated_then_request_is_
             string_value: string_value.map(str::to_owned),
             binary_value: binary_value.map(str::to_owned),
         };
-        assert!(attribute.validate().is_err(), "{data_type}");
+        assert!(attribute.validate_named("attr").is_err(), "{data_type}");
     }
 }
 
@@ -1193,6 +1206,42 @@ fn given_sqs_number_attributes_when_validated_then_sqs_magnitude_and_precision_l
             string_value: Some(value.into()),
             binary_value: None,
         };
-        assert_eq!(attribute.validate().is_ok(), valid, "{value}");
+        assert_eq!(attribute.validate_named("attr").is_ok(), valid, "{value}");
     }
+}
+
+/// W2 D8 (C3): the sum of body and attribute bytes of a batch is at most
+/// 1,048,576; one byte more is `BatchRequestTooLong` with the AWS text.
+#[test]
+fn given_batch_payload_at_and_over_the_limit_when_validated_then_only_the_larger_is_rejected() {
+    let batch = |second_body: usize| {
+        json!({
+            "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
+            "Entries": [
+                {
+                    "Id": "first",
+                    "MessageBody": "a".repeat(524_288 - 8),
+                    "MessageAttributes": {
+                        "k": {"DataType": "String", "StringValue": "v"}
+                    }
+                },
+                {"Id": "second", "MessageBody": "b".repeat(second_body)}
+            ]
+        })
+    };
+    // Attribute bytes count: name (1), data type (6), and value (1).
+    assert!(decode::<SendMessageBatchRequest>(batch(524_288)).is_ok());
+    let error = decode::<SendMessageBatchRequest>(batch(524_289)).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Batch requests cannot be longer than 1048576 bytes. You have sent 1048577 bytes."
+    );
+    assert_eq!(
+        crate::sqs_validation_error_type(&error.message),
+        "AWS.SimpleQueueService.BatchRequestTooLong"
+    );
+    assert_eq!(
+        crate::sqs_json_error_type(crate::sqs_validation_error_type(&error.message)),
+        "com.amazonaws.sqs#BatchRequestTooLong"
+    );
 }

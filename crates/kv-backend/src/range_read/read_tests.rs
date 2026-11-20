@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::sync::Arc;
 
 use storage_provider::{RangeReadPlan, RangeReadiness};
 use storage_types::{
@@ -12,10 +12,7 @@ use super::{
     projection::{PublicImage, RangeContent},
     read::RangeReadInput,
 };
-use crate::{
-    catalog::{KvIndexIdentity, KvIndexKind, KvTableIdentity},
-    constants::{GSI_PROJECTION_KEY_PREFIX_BYTES, PRIMARY_ITEM_KEY_PREFIX_BYTES},
-};
+use crate::constants::{GSI_PROJECTION_KEY_PREFIX_BYTES, PRIMARY_ITEM_KEY_PREFIX_BYTES};
 
 #[test]
 fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_rejected() {
@@ -26,7 +23,6 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
         attribute_type: KeyAttributeType::S,
     });
     let index = GlobalSecondaryIndex {
-        capture_for_build: false,
         index_name: IndexName::new("by-group"),
         key_schema: vec![KeySchemaElement {
             attribute_name: "gsi_pk".into(),
@@ -38,19 +34,15 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
         },
     };
     info.global_secondary_indexes = Some(vec![index.clone()]);
-    let identity = KvTableIdentity {
-        table_id: 1,
-        revision: NonZeroU64::new(1).unwrap(),
-        table_name: table.table_name.clone(),
-        indexes: vec![KvIndexIdentity {
-            index_id: 1,
-            index_name: index.index_name.clone(),
-            index_kind: KvIndexKind::UserGsi,
-        }],
-        index_id_high_water: 1,
-        deleted: false,
-        external_cleanup_required: false,
-    };
+    table.binding = table
+        .binding
+        .with_added_gsi(
+            &index,
+            &table.attribute_definitions,
+            crate::gsi::index_incarnation(1, 1).into(),
+            storage_types::GsiPhase::Active,
+        )
+        .unwrap();
     let plan = RangeReadPlan::try_from_scan(ScanTableRequest {
         table_name: table.table_name.clone(),
         index_name: Some(index.index_name.clone()),
@@ -62,7 +54,7 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
     let bound = plan
         .bind(table.info.clone(), RangeReadiness::GsiPublished)
         .unwrap();
-    let page = bound.page(25, 1_048_576).unwrap();
+    let page = bound.page(25).unwrap();
     let input = RangeReadInput {
         table: &table,
         bound: &bound,
@@ -79,16 +71,15 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
     )
     .unwrap()
     .unwrap();
-    let physical = physical_item_key(&identity, &table, &bound, &key).unwrap();
+    let physical = physical_item_key(&table, &bound, &key).unwrap();
     let content = || {
         RangeContent::Projection(Box::new(crate::gsi::DecodedProjection {
             image: image.clone(),
-            revision: 1_u64.try_into().unwrap(),
         }))
     };
     assert!(
         input
-            .decode_entry::<PublicImage>(&identity, &physical, content())
+            .decode_entry::<PublicImage>(&physical, content())
             .is_ok()
     );
     for offset in [
@@ -101,7 +92,7 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
         let mut wrong = physical.clone();
         wrong[offset] ^= 1;
         let error = input
-            .decode_entry::<PublicImage>(&identity, &wrong, content())
+            .decode_entry::<PublicImage>(&wrong, content())
             .unwrap_err();
         use storage_types::context::WrappedError as _;
         assert!(

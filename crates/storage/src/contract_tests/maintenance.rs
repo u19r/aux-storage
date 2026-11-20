@@ -133,6 +133,7 @@ async fn given_ready_expiration_page_when_runtime_shuts_down_then_no_page_starts
 async fn given_remote_backend_when_local_maintenance_is_enabled_then_startup_rejects_before_io() {
     let result = DatabaseManager::new_with_config_and_runtime_options(
         StorageConfig {
+            initial_stream_lineages: None,
             backend_type: StorageBackend::Remote,
             connection_string: None,
             file_path: None,

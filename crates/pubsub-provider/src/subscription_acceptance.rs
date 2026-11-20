@@ -4,9 +4,10 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use storage_types::{StorageError, StorageResult, TimestampMillis};
 
 use crate::{
-    DeliveryRecord, DeliveryRecordId, DeliveryRecordKind, DeliveryStatus, DeliveryTarget,
-    PubsubAttempt, PubsubMessageId, SubscribeResponse, Subscription, SubscriptionIdentity,
-    SubscriptionRecord, delivery_operations::one_delivery, pubsub_port::read_topic,
+    DeliveryPayload, DeliveryRecordId, DeliveryRecordKind, DeliveryTarget, DestinationKey,
+    NewDelivery, PubsubAttempt, PubsubError, PubsubMessageId, PubsubResult, PubsubValidationKind,
+    SubscribeResponse, Subscription, SubscriptionIdentity, SubscriptionRecord,
+    pubsub_port::read_topic,
 };
 
 /// Captured subscription identity, token, time, and optional confirmation
@@ -87,17 +88,21 @@ impl SubscriptionSelection {
 pub struct PreparedSubscription<'native, A: PubsubAttempt> {
     attempt: &'native mut A,
     selection: SubscriptionSelection,
-    confirmation: Option<DeliveryRecord>,
+    confirmation: Option<NewDelivery>,
 }
 
 impl<'native, A: PubsubAttempt> PreparedSubscription<'native, A> {
+    /// A missing topic is `NotFound`; a subscription with the same identity
+    /// and other attributes is `InvalidParameter` (AWS probe A10).
     pub async fn prepare(
         attempt: &'native mut A,
         input: SubscriptionAcceptanceInput,
-    ) -> StorageResult<Option<Self>> {
+    ) -> StorageResult<PubsubResult<Self>> {
         let (subscription, message_id) = input.into_parts();
         let Some(topic) = read_topic(attempt, &subscription.topic_arn).await? else {
-            return Ok(None);
+            return Ok(Err(PubsubError::topic_not_found(
+                subscription.topic_arn.to_string(),
+            )));
         };
         let accepted_at = subscription.created_at;
         let identity = SubscriptionIdentity {
@@ -106,24 +111,29 @@ impl<'native, A: PubsubAttempt> PreparedSubscription<'native, A> {
             endpoint: &subscription.endpoint,
         };
         let selection = match attempt.find_subscription_by_identity(identity).await? {
+            Some(record) if !record.subscription.has_same_attributes(&subscription) => {
+                return Ok(Err(PubsubError::validation(
+                    PubsubValidationKind::SubscriptionExists,
+                )));
+            }
             Some(record) => SubscriptionSelection::Existing(record),
             None => SubscriptionSelection::Create(SubscriptionRecord {
                 subscription,
                 topic_incarnation: topic.incarnation,
             }),
         };
-        let confirmation = DeliveryRecord::pending_confirmation_at(
+        let confirmation = pending_confirmation_at(
             &selection.record().subscription,
             message_id.as_ref(),
             accepted_at,
         )?;
-        let confirmation = if let Some(record) = confirmation {
-            let existing = one_delivery(attempt.read_deliveries(vec![record.id.clone()]).await?)?;
-            existing.is_none().then_some(record)
+        let confirmation = if let Some(delivery) = confirmation {
+            let existing = attempt.load_delivery(&delivery.0.id).await?;
+            existing.is_none().then_some(delivery)
         } else {
             None
         };
-        Ok(Some(Self {
+        Ok(Ok(Self {
             attempt,
             selection,
             confirmation,
@@ -134,7 +144,7 @@ impl<'native, A: PubsubAttempt> PreparedSubscription<'native, A> {
         self.selection.record()
     }
 
-    pub fn confirmation(&self) -> Option<&DeliveryRecord> {
+    pub fn confirmation(&self) -> Option<&NewDelivery> {
         self.confirmation.as_ref()
     }
 
@@ -147,8 +157,8 @@ impl<'native, A: PubsubAttempt> PreparedSubscription<'native, A> {
                 subscription
             }
         };
-        if let Some(record) = self.confirmation {
-            self.attempt.write_delivery_records(vec![record]).await?;
+        if let Some(delivery) = self.confirmation {
+            self.attempt.store_new_deliveries(vec![delivery]).await?;
         }
         Ok(subscription)
     }
@@ -166,43 +176,38 @@ impl From<&Subscription> for SubscribeResponse {
     }
 }
 
-impl DeliveryRecord {
-    pub(crate) fn pending_confirmation_at(
-        subscription: &Subscription,
-        message_id: Option<&PubsubMessageId>,
-        accepted_at: TimestampMillis,
-    ) -> StorageResult<Option<Self>> {
-        let Some(token) = subscription.confirmation.token() else {
-            return Ok(None);
-        };
-        let message_id = message_id
-            .filter(|id| !id.as_str().is_empty())
-            .filter(|_| !token.is_empty())
-            .ok_or_else(|| StorageError::internal("subscription confirmation inputs differ"))?;
-        Ok(Some(Self {
-            id: DeliveryRecordId(format!(
-                "{}:{}:confirmation",
-                subscription.subscription_arn, message_id
-            )),
-            kind: DeliveryRecordKind::SubscriptionConfirmation {
-                token: token.to_string(),
-            },
-            message_id: message_id.clone(),
-            subscription_arn: subscription.subscription_arn.clone(),
-            subscription: None,
-            message_body: None,
-            subject: None,
-            message_attributes: std::collections::HashMap::new(),
-            target: DeliveryTarget::BuiltIn,
-            status: DeliveryStatus::Pending,
-            attempts: 0,
-            claim_generation: 0,
-            next_attempt_at: None,
-            lease_owner: None,
-            lease_expires_at: None,
-            last_error: None,
-            created_at: accepted_at,
-            updated_at: accepted_at,
-        }))
-    }
+/// The confirmation delivery of a pending subscription: an HTTP request
+/// with the token, under the HTTP retry policy, in its own partition.
+fn pending_confirmation_at(
+    subscription: &Subscription,
+    message_id: Option<&PubsubMessageId>,
+    accepted_at: TimestampMillis,
+) -> StorageResult<Option<NewDelivery>> {
+    let Some(token) = subscription.confirmation.token() else {
+        return Ok(None);
+    };
+    let message_id = message_id
+        .filter(|id| !id.as_str().is_empty())
+        .filter(|_| !token.is_empty())
+        .ok_or_else(|| StorageError::internal("subscription confirmation inputs differ"))?;
+    let payload = DeliveryPayload {
+        id: DeliveryRecordId(format!(
+            "{}:{}:confirmation",
+            subscription.subscription_arn, message_id
+        )),
+        kind: DeliveryRecordKind::SubscriptionConfirmation {
+            token: token.to_string(),
+        },
+        message_id: message_id.clone(),
+        destination: DestinationKey::of_confirmation(&subscription.subscription_arn),
+        subscription: None,
+        message_body: None,
+        subject: None,
+        message_attributes: std::collections::HashMap::new(),
+        target: DeliveryTarget::BuiltIn,
+        created_at: accepted_at,
+    };
+    let deadline = crate::DeliveryRetryPolicy::HTTP.deadline(accepted_at);
+    let state = payload.first_state(subscription.subscription_arn.clone(), deadline);
+    Ok(Some((payload, state)))
 }

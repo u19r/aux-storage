@@ -23,6 +23,17 @@ fn load_fixture(source: &str) -> Value {
     FIXTURES.case(include_str!("../fixtures/delete_item_cases.jsonl"), source)
 }
 
+/// The primary key attributes (`pk`, and `sk` when present) of a seeded item.
+fn item_key(item: &Value) -> Value {
+    let mut key = serde_json::Map::new();
+    for name in ["pk", "sk"] {
+        if let Some(value) = item.get(name) {
+            key.insert(name.to_owned(), value.clone());
+        }
+    }
+    Value::Object(key)
+}
+
 async fn assert_delete_case(store: &TestStore, case: &Value) {
     assert_eq!(case["operation"], "DeleteItem", "fixture operation");
     let table_kind = case["tables"][0].as_str().unwrap();
@@ -94,13 +105,10 @@ async fn assert_delete_case(store: &TestStore, case: &Value) {
     let original_item = preconditions
         .last()
         .map(|precondition| &precondition["request"]["Item"]);
-    let key = original_item.map_or_else(
-        || case["request"]["Key"].clone(),
-        |item| json!({"pk": item["pk"], "sk": item["sk"]}),
-    );
-    let invalid_key_case = case["source"]
-        .as_str()
-        .is_some_and(|source| source.starts_with("field-key/400"));
+    let key = original_item.map_or_else(|| case["request"]["Key"].clone(), item_key);
+    let invalid_key_case = case["source"].as_str().is_some_and(|source| {
+        source.starts_with("field-key/400") || source.contains("key_duplicate_set_member")
+    });
     let Ok(key) = serde_json::from_value::<KeyAttributes>(key) else {
         assert!(status == 400 && original_item.is_none() && invalid_key_case);
         return;
@@ -265,6 +273,62 @@ delete_case!(given_field_key_400_docs_limit_string_partition_key_empty_rejected_
 delete_case!(given_field_key_400_docs_limit_string_sort_key_1025_bytes_rejected_when_delete_item_runs_then_conformance_response_matches, "field-key/400/docs_limit_string_sort_key_1025_bytes_rejected.json");
 delete_case!(given_field_key_400_docs_limit_string_sort_key_empty_rejected_when_delete_item_runs_then_conformance_response_matches, "field-key/400/docs_limit_string_sort_key_empty_rejected.json");
 
+// DDB-PAR-4 (AWS probe P15): an expression attribute name is one attribute
+// name, so `#a` -> `a.b` reads the top-level `a.b`, never `a` -> `b`.
+delete_case!(
+    given_dotted_alias_condition_on_nested_value_when_delete_runs_then_condition_fails,
+    "local/ddb-par-4/dotted_alias_condition_nested_delete.json"
+);
+delete_case!(
+    given_dotted_alias_guard_matching_only_nested_member_when_delete_runs_then_item_is_kept,
+    "local/ddb-par-4/dotted_alias_guard_nested_delete.json"
+);
+delete_case!(
+    given_dotted_alias_condition_on_top_level_value_when_delete_runs_then_item_is_deleted,
+    "local/ddb-par-4/dotted_alias_condition_top_delete.json"
+);
+// AWS probe P1.
+delete_case!(
+    given_doubled_equals_condition_when_delete_runs_then_syntax_error,
+    "local/ddb-par-1/given_doubled_equals_condition_when_delete_runs_then_syntax_error.json"
+);
+// AWS probe P1.
+delete_case!(
+    given_trailing_and_condition_when_delete_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_trailing_and_condition_when_delete_runs_then_eof_syntax_error.json"
+);
+// AWS probe P2.
+delete_case!(
+    given_number_literal_condition_when_delete_runs_then_literal_is_rejected,
+    "local/ddb-par-1/given_number_literal_condition_when_delete_runs_then_literal_is_rejected.json"
+);
+// AWS probe P4.
+delete_case!(
+    given_empty_condition_when_delete_runs_then_empty_expression_error,
+    "local/ddb-par-1/given_empty_condition_when_delete_runs_then_empty_expression_error.json"
+);
+// AWS probe P4.
+delete_case!(
+    given_blank_condition_when_delete_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_blank_condition_when_delete_runs_then_eof_syntax_error.json"
+);
+// AWS probe P10.
+delete_case!(
+    given_attribute_exists_two_operands_when_delete_runs_then_operand_count_error,
+    "local/ddb-par-1/\
+     given_attribute_exists_two_operands_when_delete_runs_then_operand_count_error.json"
+);
+// AWS probe P1.
+delete_case!(
+    given_nested_size_condition_when_delete_runs_then_operand_type_error,
+    "local/ddb-par-1/given_nested_size_condition_when_delete_runs_then_operand_type_error.json"
+);
+delete_case!(
+    given_lowercase_and_condition_when_delete_runs_then_condition_is_accepted,
+    "local/ddb-par-1/given_lowercase_and_condition_when_delete_runs_then_condition_is_accepted.\
+     json"
+);
+
 /// Business rule from legacy KV DeleteItem and the DeleteItem Cucumber feature.
 #[tokio::test]
 async fn given_an_existing_item_when_delete_item_runs_twice_then_both_responses_are_empty_and_item_stays_absent()
@@ -310,3 +374,21 @@ async fn given_an_existing_item_when_delete_item_runs_twice_then_both_responses_
         resume_unwind(panic);
     }
 }
+
+// AWS behavioural suite
+delete_case!(given_check_delete_item_condition_between_bounds_validated_reversed_n_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_between_bounds_validated--reversed-n-refused.json");
+delete_case!(given_check_delete_item_condition_between_bounds_validated_reversed_s_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_between_bounds_validated--reversed-s-refused.json");
+delete_case!(given_check_delete_item_condition_between_bounds_validated_mixed_type_bounds_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_between_bounds_validated--mixed-type-bounds-refused.json");
+delete_case!(given_check_delete_item_condition_between_bounds_validated_equal_bounds_delete_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_between_bounds_validated--equal-bounds-delete.json");
+delete_case!(given_check_delete_item_condition_expression_attribute_not_exists_present_attribute_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_expression_attribute_not_exists--present-attribute-refused.json");
+delete_case!(given_check_delete_item_condition_expression_attribute_not_exists_absent_attribute_deletes_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_expression_attribute_not_exists--absent-attribute-deletes.json");
+delete_case!(given_check_delete_item_condition_expression_invalid_attribute_name_rejected_undeclared_name_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_expression_invalid_attribute_name_rejected--undeclared-name-refused.json");
+delete_case!(given_check_delete_item_condition_expression_invalid_attribute_name_rejected_declared_name_deletes_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_condition_expression_invalid_attribute_name_rejected--declared-name-deletes.json");
+delete_case!(given_check_delete_item_expected_and_conditionexpression_mutually_exclusive_rejected_mixed_parameters_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_expected_and_conditionexpression_mutually_exclusive_rejected--mixed-parameters-refused.json");
+delete_case!(given_check_delete_item_expected_and_conditionexpression_mutually_exclusive_rejected_condition_alone_deletes_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_expected_and_conditionexpression_mutually_exclusive_rejected--condition-alone-deletes.json");
+delete_case!(given_check_delete_item_key_duplicate_set_member_byte_order_rejected_bs_duplicate_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_key_duplicate_set_member_byte_order_rejected--bs-duplicate-refused.json");
+delete_case!(given_check_delete_item_key_duplicate_set_member_byte_order_rejected_ns_duplicate_refused_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_delete_item_key_duplicate_set_member_byte_order_rejected--ns-duplicate-refused.json");
+delete_case!(given_check_put_and_delete_item_reject_return_values_all_new_refuse_all_new_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_and_delete_item_reject_return_values_all_new--refuse-all-new.json");
+delete_case!(given_check_put_and_delete_item_reject_return_values_all_new_refuse_updated_old_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_and_delete_item_reject_return_values_all_new--refuse-updated-old.json");
+delete_case!(given_check_put_and_delete_item_reject_return_values_all_new_refuse_updated_new_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_and_delete_item_reject_return_values_all_new--refuse-updated-new.json");
+delete_case!(given_check_put_update_delete_item_return_consumed_capacity_invalid_enum_rejected_when_delete_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_update_delete_item_return_consumed_capacity_invalid_enum_rejected.json");

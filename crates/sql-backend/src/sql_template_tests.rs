@@ -126,11 +126,11 @@ fn given_catalog_lookups_when_fixed_sql_selected_then_preserve_full_text_and_bin
                 .unwrap()
                 .is_none()
             );
-            let queues = crate::queue_catalog::read_queues_by_url(
+            let queues = crate::queue_catalog::read_queues_by_name(
                 &mut attempt,
                 engine,
                 crate::ReadProtection::Snapshot,
-                vec!["url".to_owned()],
+                vec!["other".to_owned()],
             )
             .await
             .unwrap();
@@ -154,12 +154,12 @@ fn given_catalog_lookups_when_fixed_sql_selected_then_preserve_full_text_and_bin
             }
             let expected = [
                 format!(
-                    "SELECT queue_name, queue_url, incarnation, row_blob FROM sys_queue_catalog \
-                     WHERE queue_name = {prefix}1"
+                    "SELECT queue_name, incarnation, row_blob FROM sys_queue_catalog WHERE \
+                     queue_name = {prefix}1"
                 ),
                 format!(
-                    "SELECT queue_name, queue_url, incarnation, row_blob FROM sys_queue_catalog \
-                     WHERE queue_url = {prefix}1"
+                    "SELECT queue_name, incarnation, row_blob FROM sys_queue_catalog WHERE \
+                     queue_name = {prefix}1"
                 ),
                 format!("SELECT row_blob FROM sys_user_stream_catalog WHERE name = {prefix}1"),
                 format!(
@@ -177,7 +177,7 @@ fn given_catalog_lookups_when_fixed_sql_selected_then_preserve_full_text_and_bin
                         matches!(binds.as_slice(), [SqlValue::Text(value)] if value == "queue")
                     ),
                     1 => assert!(
-                        matches!(binds.as_slice(), [SqlValue::Text(value)] if value == "url")
+                        matches!(binds.as_slice(), [SqlValue::Text(value)] if value == "other")
                     ),
                     2 => assert!(
                         matches!(binds.as_slice(), [SqlValue::Text(value)] if value == "stream")

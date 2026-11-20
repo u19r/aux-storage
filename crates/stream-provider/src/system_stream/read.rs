@@ -1,8 +1,9 @@
 //! One logical SystemStream page and checkpoint decision on a native attempt.
 
-use storage_common::retry::retry_native_conflicts;
+use std::sync::Arc;
+
 use storage_types::{
-    AttemptMode, StorageEnum, StorageError, StorageResult, StreamRecord, SystemStreamCheckpoint,
+    StorageEnum, StorageError, StorageResult, StreamRecord, SystemStreamCheckpoint,
     SystemStreamCheckpointToken, SystemStreamContractError,
 };
 
@@ -12,7 +13,7 @@ use super::{
 };
 use crate::{
     StreamAttempt, StreamError, StreamPort, StreamResult,
-    constants::{STREAM_WRITE_RETRY, SYSTEM_STREAM_HISTORY_READ_BATCH},
+    constants::{SYSTEM_PAGE_READ, SYSTEM_STREAM_HISTORY_READ_BATCH},
 };
 
 #[tracing::instrument(
@@ -25,21 +26,24 @@ pub(crate) async fn get_system_stream_page<P: StreamPort>(
     request: SystemStreamPageRequest,
 ) -> StreamResult<SystemStreamPage> {
     let prepared = PreparedSystemStreamPage::new(request, port.now());
-    retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
-        let prepared = prepared.clone();
-        port.with_stream_attempt(AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(async move {
-                let mut settlement =
-                    infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(
-                        attempt,
-                    );
-                let result = read_page_in_attempt(settlement.as_mut(), prepared).await;
-                settlement.complete(result)
-            })
-        })
-    })
+    port.run(
+        SYSTEM_PAGE_READ,
+        Arc::new(prepared),
+        |attempt, prepared, _| Box::pin(system_page_in_attempt(attempt, prepared)),
+    )
     .await
     .map_err(StreamError::from_storage_error)
+}
+
+/// One try: the page under one protected history snapshot.
+async fn system_page_in_attempt<A: StreamAttempt>(
+    attempt: &mut A,
+    prepared: &PreparedSystemStreamPage,
+) -> StorageResult<SystemStreamPage> {
+    let mut settlement =
+        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
+    let result = read_page_in_attempt(settlement.as_mut(), prepared.clone()).await;
+    settlement.complete(result)
 }
 
 async fn read_page_in_attempt<A: StreamAttempt>(
@@ -62,9 +66,6 @@ async fn read_page_in_attempt<A: StreamAttempt>(
         None => {
             let origins = history.retirement_origins().map_err(contract_error)?;
             let retired = attempt.load_system_retired_frontiers(&origins).await?;
-            if retired.len() != origins.len() {
-                return Err(StorageError::internal("Source retirement count differs"));
-            }
             let checkpoint = history
                 .retained_checkpoint(&retired.into_iter().flatten().collect::<Vec<_>>())
                 .map_err(contract_error)?;
@@ -110,7 +111,7 @@ async fn read_verified_records<A: StreamAttempt>(
         super::snapshot_page::SystemSnapshotPage::new(plan, prepared, initial_visibility_cutoff);
     for reads in plan.as_ref().chunks(SYSTEM_STREAM_HISTORY_READ_BATCH) {
         let pages = attempt.read_system_history_pages(reads).await?;
-        if assembly.include_pages(attempt, reads, pages).await? {
+        if assembly.include_pages(reads, pages)? {
             break;
         }
     }

@@ -12,13 +12,15 @@ use crate::{
     normalize_key_attribute_value_for_write, verify_key_attributes,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct AttributeMapEntry {
     pub name: String,
     pub value: AttributeValue,
 }
 
-#[derive(Debug, Clone, Default, ToSchema)]
+#[derive(Clone, Default, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[schema(value_type = HashMap<String, AttributeValue>)]
 /// Equality treats attributes as a map; iteration and serialization retain
 /// insertion order.
@@ -33,10 +35,17 @@ impl PartialEq for AttributeMap {
     }
 }
 
+impl Eq for AttributeMap {}
+
 impl AttributeMap {
     pub fn from_dynamo_json(data: &[u8]) -> StorageResult<Self> {
         serde_json::from_slice(data).map_err(|error| {
-            crate::StorageError::internal(&format!("decode wire item attributes failed: {error}"))
+            crate::StorageError::internal(&format!(
+                "decode wire item attributes failed: {:?} at {}:{}",
+                error.classify(),
+                error.line(),
+                error.column()
+            ))
         })
     }
 
@@ -62,6 +71,43 @@ impl AttributeMap {
     pub fn remove(&mut self, name: &str) -> Option<AttributeValue> {
         let index = self.0.iter().position(|attribute| attribute.name == name)?;
         Some(self.0.remove(index).value)
+    }
+
+    /// Build from entries whose names are already distinct (keys of another
+    /// map). Skips the per-insert name scan of `insert`.
+    #[must_use]
+    pub fn from_distinct(entries: impl IntoIterator<Item = (String, AttributeValue)>) -> Self {
+        Self(
+            entries
+                .into_iter()
+                .map(|(name, value)| AttributeMapEntry { name, value })
+                .collect(),
+        )
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut AttributeValue> {
+        self.0
+            .iter_mut()
+            .find(|attribute| attribute.name == name)
+            .map(|attribute| &mut attribute.value)
+    }
+
+    pub fn get_or_insert_with(
+        &mut self,
+        name: &str,
+        default: impl FnOnce() -> AttributeValue,
+    ) -> &mut AttributeValue {
+        let index = match self.0.iter().position(|attribute| attribute.name == name) {
+            Some(index) => index,
+            None => {
+                self.0.push(AttributeMapEntry {
+                    name: name.to_owned(),
+                    value: default(),
+                });
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[index].value
     }
 
     pub fn normalize_numbers_for_write(&mut self) -> bool {

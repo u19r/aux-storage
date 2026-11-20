@@ -37,6 +37,28 @@ where F: FnOnce() -> String {
     Ok(())
 }
 
+/// AWS text for an item attribute name over the limit, without the
+/// validation-count prefix.
+pub(crate) const ATTRIBUTE_NAME_TOO_LARGE_MESSAGE: &str =
+    "Attribute name is too large, must be less than 65536 bytes";
+
+/// AWS text for an attribute value nested deeper than the limit, without the
+/// validation-count prefix.
+pub(crate) const NESTING_LEVELS_MESSAGE: &str = "Nesting Levels have exceeded supported limits: \
+                                                 Attributes in the item have nested levels beyond \
+                                                 supported limit";
+
+/// Validate the name of an item attribute or of a nested map member.
+pub(crate) fn validate_item_attribute_name(
+    name: &str,
+    field: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if name.len() > MAX_ATTRIBUTE_NAME_BYTES {
+        return Err(ATTRIBUTE_NAME_TOO_LARGE_MESSAGE.to_owned());
+    }
+    validate_attribute_name(name, field)
+}
+
 pub(crate) fn validate_attribute_name(
     name: &str,
     field: impl FnOnce() -> String,
@@ -90,7 +112,29 @@ pub fn normalize_dynamodb_number_for_write(value: &str) -> Cow<'_, str> {
 }
 
 fn number_needs_write_normalization(value: &str) -> bool {
-    value.len() > DYNAMODB_WRITE_NUMBER_BYTES || value.contains(['e', 'E'])
+    value.len() > DYNAMODB_WRITE_NUMBER_BYTES
+        || value.contains(['e', 'E'])
+        || !is_canonical_plain_number(value)
+}
+
+/// `-?(0|[1-9][0-9]*)(\.[0-9]*[1-9])?`, except negative zero. A number in
+/// this form is already stored as written.
+fn is_canonical_plain_number(value: &str) -> bool {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let (integer, fraction) = match unsigned.split_once('.') {
+        Some((integer, fraction)) => (integer, Some(fraction)),
+        None => (unsigned, None),
+    };
+    let integer_ok = match integer.as_bytes() {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    let fraction_ok = fraction.is_none_or(|fraction| {
+        fraction.ends_with(|ch: char| ch.is_ascii_digit() && ch != '0')
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    integer_ok && fraction_ok && value != "-0"
 }
 
 pub fn normalize_attribute_map_numbers_for_write(
@@ -227,7 +271,9 @@ pub fn validate_projected_attribute_limit(
     let total = gsi_count + lsi_count;
     if total > MAX_PROJECTED_ATTRIBUTES {
         return Err(format!(
-            "Projected attributes across all indexes cannot exceed {MAX_PROJECTED_ATTRIBUTES}"
+            "One or more parameter values were invalid: Number of projected attributes in all \
+             indexes exceeds limit of {MAX_PROJECTED_ATTRIBUTES}, number of projected \
+             attributes:{total}"
         ));
     }
     Ok(())
@@ -301,12 +347,18 @@ pub(crate) fn validate_attribute_value(
     depth: usize,
     field: &str,
 ) -> Result<(), String> {
-    if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
-        return Err(format!(
-            "{field} attribute nesting depth cannot exceed {MAX_ATTRIBUTE_NESTING_DEPTH}"
-        ));
+    // The attribute value itself is level one; the leaf counts as a level.
+    if depth >= MAX_ATTRIBUTE_NESTING_DEPTH {
+        return Err(NESTING_LEVELS_MESSAGE.to_owned());
     }
     match value {
+        AttributeValue::NULL(false) => {
+            return Err(
+                "One or more parameter values were invalid: Null attribute value types must have \
+                 the value of true"
+                    .to_owned(),
+            );
+        }
         AttributeValue::SS(values) => validate_string_set(values)?,
         AttributeValue::N(value) => validate_number(value)?,
         AttributeValue::NS(values) => validate_number_set(values)?,
@@ -318,8 +370,8 @@ pub(crate) fn validate_attribute_value(
             }
         }
         AttributeValue::M(values) => {
-            for (name, value) in values {
-                validate_attribute_name(name, || format!("{field} nested attribute name"))?;
+            for (name, value) in values.iter() {
+                validate_item_attribute_name(name, || format!("{field} nested attribute name"))?;
                 validate_attribute_value(value, depth + 1, field)?;
             }
         }
@@ -353,7 +405,8 @@ fn validate_number_set(values: &[String]) -> Result<(), String> {
     }
     let mut seen = HashSet::with_capacity(values.len());
     for value in values {
-        let key = crate::canonical_dynamodb_number(value).map_err(number_validation_error)?;
+        let key = crate::canonical_dynamodb_number(value)
+            .map_err(|error| number_validation_error(error, value))?;
         if !seen.insert(key) {
             return Err(
                 "One or more parameter values were invalid: Input collection contains duplicates."
@@ -365,11 +418,22 @@ fn validate_number_set(values: &[String]) -> Result<(), String> {
 }
 
 pub(crate) fn validate_number(value: &str) -> Result<(), String> {
-    crate::dynamodb_number::validate_dynamodb_number(value).map_err(number_validation_error)
+    crate::dynamodb_number::validate_dynamodb_number(value)
+        .map_err(|error| number_validation_error(error, value))
 }
 
-fn number_validation_error(error: crate::dynamodb_number::DynamodbNumberError) -> String {
-    error.validation_kind().message().to_string()
+/// A malformed number is echoed back in the message.
+fn number_validation_error(
+    error: crate::dynamodb_number::DynamodbNumberError,
+    value: &str,
+) -> String {
+    let kind = error.validation_kind();
+    // An empty number has no spelling to echo.
+    if matches!(kind, crate::StorageValidationKind::InvalidNumber) && !value.is_empty() {
+        format!("{}: {value}", kind.message())
+    } else {
+        kind.message().to_string()
+    }
 }
 
 pub(crate) fn normalize_attribute_value_numbers_for_write(value: &mut AttributeValue) -> bool {
@@ -394,7 +458,7 @@ pub(crate) fn normalize_attribute_value_numbers_for_write(value: &mut AttributeV
         AttributeValue::L(values) => values.iter_mut().fold(false, |changed, value| {
             normalize_attribute_value_numbers_for_write(value) | changed
         }),
-        AttributeValue::M(values) => normalize_attribute_map_numbers_for_write(values),
+        AttributeValue::M(values) => values.normalize_numbers_for_write(),
         _ => false,
     }
 }
@@ -408,7 +472,9 @@ fn attribute_value_numbers_need_write_normalization(value: &AttributeValue) -> b
         AttributeValue::L(values) => values
             .iter()
             .any(attribute_value_numbers_need_write_normalization),
-        AttributeValue::M(values) => attribute_map_numbers_need_write_normalization(values),
+        AttributeValue::M(values) => values
+            .values()
+            .any(attribute_value_numbers_need_write_normalization),
         _ => false,
     }
 }
@@ -427,6 +493,14 @@ fn expand_scientific_number(value: &str) -> Option<String> {
             .all(|byte| byte.is_ascii_digit())
     {
         return None;
+    }
+    if integer
+        .bytes()
+        .chain(fractional.bytes())
+        .all(|byte| byte == b'0')
+    {
+        // Zero is stored as `0` whatever its exponent.
+        return Some("0".to_owned());
     }
     let point = integer.len() as i64 + i64::from(exponent);
     let prefix_zeroes = point.min(0).unsigned_abs() as usize;
@@ -483,7 +557,7 @@ fn validate_binary_set(values: &[String]) -> Result<(), String> {
         return Err(format!(
             "One or more parameter values were invalid: Input collection {}of type BS contains \
              duplicates.",
-            format_quoted_collection(values, ",")
+            format_quoted_collection(&binary_duplicate_members(values), ",")
         ));
     }
     for value in values {
@@ -511,49 +585,67 @@ fn has_duplicate_members(values: &[String]) -> bool {
     values.iter().any(|value| !seen.insert(value.as_str()))
 }
 
-fn format_quoted_collection(values: &[String], separator: &str) -> String {
+/// AWS names the distinct members seen before the first repeat in ascending
+/// byte order, then the repeated member.
+fn binary_duplicate_members(values: &[String]) -> Vec<&String> {
+    let mut seen = Vec::with_capacity(values.len());
+    for value in values {
+        if seen.contains(&value) {
+            seen.sort_by_cached_key(|member| {
+                dynamodb_binary::decode_base64_string(member).unwrap_or_default()
+            });
+            seen.push(value);
+            break;
+        }
+        seen.push(value);
+    }
+    seen
+}
+
+fn format_quoted_collection<T: AsRef<str>>(values: &[T], separator: &str) -> String {
     let mut output = String::from("[");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             output.push_str(separator);
         }
         output.push('"');
-        output.push_str(value);
+        output.push_str(value.as_ref());
         output.push('"');
     }
     output.push(']');
     output
 }
 
+/// Item-size bytes of a number: one byte per base-100 digit pair aligned to
+/// the decimal point, a header byte and a sign byte; zero is one byte.
 pub(crate) fn dynamodb_number_size(value: &str) -> usize {
-    let mantissa = value.split_once(['e', 'E']).map_or(value, |(head, _)| head);
+    let (mantissa, exponent) = value
+        .split_once(['e', 'E'])
+        .map_or((value, 0), |(head, tail)| {
+            (head, tail.parse::<i64>().unwrap_or(0))
+        });
     let is_negative = mantissa.starts_with('-');
-    let mut significant_digits = 0usize;
-    let mut trailing_zero_digits = 0usize;
-    let mut seen_non_zero_digit = false;
+    let mantissa = mantissa.trim_start_matches(['+', '-']);
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
 
-    for byte in mantissa.trim_start_matches(['+', '-']).bytes() {
-        match byte {
-            b'0' if seen_non_zero_digit => {
-                significant_digits += 1;
-                trailing_zero_digits += 1;
+    let mut first_significant = None;
+    let mut last_significant = 0usize;
+    for (index, byte) in integer.bytes().chain(fraction.bytes()).enumerate() {
+        if byte != b'0' {
+            if first_significant.is_none() {
+                first_significant = Some(index);
             }
-            b'0' => {}
-            b'1'..=b'9' => {
-                seen_non_zero_digit = true;
-                significant_digits += 1;
-                trailing_zero_digits = 0;
-            }
-            _ => {}
+            last_significant = index;
         }
     }
-
-    let significant_digits = if seen_non_zero_digit {
-        significant_digits - trailing_zero_digits
-    } else {
-        1
+    let Some(first_significant) = first_significant else {
+        return 1;
     };
-    significant_digits.div_ceil(2) + 1 + usize::from(is_negative)
+
+    // Power of ten of the digit at `index`.
+    let power = |index: usize| integer.len() as i64 - 1 - index as i64 + exponent;
+    let pairs = power(first_significant).div_euclid(2) - power(last_significant).div_euclid(2) + 1;
+    pairs as usize + 1 + usize::from(is_negative)
 }
 
 fn projected_attribute_count(projection: &Projection) -> usize {

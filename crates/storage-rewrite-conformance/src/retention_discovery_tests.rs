@@ -16,7 +16,7 @@ async fn seed_equal_deadlines(
         fixture.operations.create_table(request).await?;
     }
     let markers = fixture
-        .stream_retention_repository
+        .maintenance
         .list_due_stream_trim_markers(due, 10)
         .await?;
     anyhow::ensure!(markers.len() == 3);
@@ -34,7 +34,7 @@ async fn verify_empty_page(
     expected: usize,
 ) -> anyhow::Result<()> {
     let stats = StreamDurationTrimWorker::new(
-        fixture.stream_retention_repository.as_ref(),
+        fixture.maintenance.as_ref(),
         StreamDurationTrimConfig {
             marker_page_size: StreamTrimPageLimit::try_from(2usize)?,
             stream_page_size: StreamTrimPageLimit::try_from(1usize)?,
@@ -57,7 +57,7 @@ async fn given_replaced_table_policies_when_reopened_then_only_current_schedule_
     let outcome = async {
         let request = hash_table_request(storage_types::TableName::new("one-table-schedule"));
         fixture.operations.create_table(request.clone()).await?;
-        let repository = &fixture.stream_retention_repository;
+        let repository = &fixture.maintenance;
         let horizon = TimestampMillis::from_timestamp(i64::MAX);
         let original = repository
             .list_due_stream_trim_markers(horizon, 100)
@@ -73,9 +73,11 @@ async fn given_replaced_table_policies_when_reopened_then_only_current_schedule_
             let markers = repository
                 .list_due_stream_trim_markers(horizon, 100)
                 .await?;
+            let expected_markers = usize::from(duration != -1);
             anyhow::ensure!(
-                markers.len() == 1,
-                "policy replacement accumulated schedules"
+                markers.len() == expected_markers,
+                "expected {expected_markers} cleanup markers for duration {duration}, got {}",
+                markers.len()
             );
             let state = repository
                 .load_stream_trim_states(&[original[0].scope.clone()])
@@ -96,12 +98,12 @@ async fn given_replaced_table_policies_when_reopened_then_only_current_schedule_
     let fixture = fixture.reopen().await;
     let outcome = async {
         let markers = fixture
-            .stream_retention_repository
+            .maintenance
             .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 100)
             .await?;
         anyhow::ensure!(markers.len() == 1, "reopen revived superseded schedules");
         let states = fixture
-            .stream_retention_repository
+            .maintenance
             .load_stream_trim_states(&[markers[0].scope.clone()])
             .await?;
         anyhow::ensure!(
@@ -136,7 +138,7 @@ async fn given_equal_deadlines_when_empty_work_page_continues_then_reopen_reache
         }
         fixture = fixture.reopen().await;
         let outcome = async {
-            let repository = &fixture.stream_retention_repository;
+            let repository = &fixture.maintenance;
             let remaining = repository.list_due_stream_trim_markers(due, 10).await?;
             anyhow::ensure!(
                 remaining == markers[consumed..],

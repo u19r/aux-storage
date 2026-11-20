@@ -1,12 +1,11 @@
 use storage_types::{SystemStreamPosition, SystemStreamScope, TimestampMillis};
 
-use super::{SystemStreamTrimPageRequest, SystemStreamTrimRecord};
+use super::{SystemStreamTrimPageRequest, SystemStreamTrimRecord, retired_frontiers};
 
 fn record(lane: &str, offset: u64, time: i64) -> SystemStreamTrimRecord {
     SystemStreamTrimRecord {
         position: SystemStreamPosition::try_new(lane, lane, offset.to_string()).unwrap(),
         created_at: TimestampMillis::from_timestamp(time),
-        table_history_id: Some(1_u32.into()),
     }
 }
 
@@ -96,4 +95,24 @@ fn given_unsettled_native_prefix_when_later_rows_exist_then_trim_preserves_them(
         .unwrap();
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].position, record("a", 1, 1000).position);
+}
+
+#[test]
+fn given_selected_records_of_two_lanes_out_of_order_then_one_frontier_per_lane_sorted() {
+    let at = |shard: &str, lineage: &str, offset: u64| SystemStreamTrimRecord {
+        position: SystemStreamPosition::try_new(shard, lineage, format!("{offset:020}")).unwrap(),
+        created_at: TimestampMillis::from_timestamp(0),
+    };
+    let records = [
+        at("s1", "l2", 3),
+        at("s1", "l2", 7),
+        at("s1", "l2", 5),
+        at("s1", "l1", 4),
+    ];
+    let expected = [("s1", "l1", 4), ("s1", "l2", 7)]
+        .map(|(shard, lineage, offset)| {
+            SystemStreamPosition::try_new(shard, lineage, format!("{offset:020}")).unwrap()
+        })
+        .to_vec();
+    assert_eq!(retired_frontiers(&records).unwrap(), expected);
 }

@@ -2,55 +2,35 @@
 
 use std::{future::Future, num::NonZeroU32};
 
-use storage_provider::{
-    TableReclaimAttempt, TableReclaimPhase, TableReclaimStep, TableReclaimTarget,
+use storage_backfill::GsiBuildTarget;
+use storage_provider::{ReclaimAttempt, TableReclaimPhase, TableReclaimStep, TableReclaimTarget};
+use storage_types::{
+    ReadProtection, StorageError, StorageResult, TableHistoryId, maintenance::TargetIncarnation,
+    storage_serde,
 };
-use storage_types::{ReadProtection, StorageError, StorageResult, TableHistoryId, storage_serde};
 
 use crate::{
     KvAttempt, KvMutation, KvRange,
-    catalog::{KvCatalogAttempt, metadata_key, table_id_from_history, verify_deleted_metadata},
-    constants::{
-        CATALOG_BYTES, GSI_BUILD_FAMILY, GSI_NAME_LOCK_FAMILY, GSI_PROJECTION_FAMILY,
-        GSI_RUNNABLE_FAMILY, GSI_TOMBSTONE_FAMILY, PRIMARY_ITEM_FAMILY, PRIMARY_TOMBSTONE_PREFIX,
-        TABLE_RECLAIM_PREFIX, TTL_INDEX_FAMILY,
+    catalog::{
+        KvCatalogAttempt, decode_index_incarnation, metadata_key, table_id_from_history,
+        verify_deleted_metadata,
     },
+    constants::{CATALOG_BYTES, GSI_RUNNABLE_FAMILY, TABLE_RECLAIM_PREFIX},
     range::prefix_upper_bound,
+    table_key_layout::{TableSubFamily, table_data_range, table_prefix, table_stream_range},
 };
 
 const RECLAIM_PAGE_ROWS: NonZeroU32 = NonZeroU32::MIN.saturating_add(64 - 1);
 
-impl<A: KvAttempt> TableReclaimAttempt for KvCatalogAttempt<'_, A> {
-    async fn load_table_system_rows(
-        &mut self,
-        history: TableHistoryId,
-        limit: NonZeroU32,
-    ) -> StorageResult<storage_provider::TableSystemHistoryPage> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        let result =
-            crate::table_history_reclaim::load_table_system_rows(catalog.attempt, history, limit)
-                .await;
-        operation.complete(result)
-    }
+/// How a reclaimed family stores values: a chunkable head is deleted with its
+/// chunk span; an unchunked key is deleted alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimValues {
+    Chunkable,
+    Unchunked,
+}
 
-    async fn store_table_system_removals(
-        &mut self,
-        history: TableHistoryId,
-        rows: &[storage_types::SystemHistoryRecord],
-    ) -> StorageResult<()> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        let result = crate::table_history_reclaim::store_table_system_removals(
-            catalog.attempt,
-            history,
-            rows,
-        );
-        operation.complete(result)
-    }
-
+impl<A: KvAttempt> ReclaimAttempt for KvCatalogAttempt<'_, A> {
     fn load_reclaim_target(
         &mut self,
     ) -> impl Future<Output = StorageResult<Option<TableReclaimTarget>>> + Send {
@@ -80,6 +60,16 @@ impl<A: KvAttempt> TableReclaimAttempt for KvCatalogAttempt<'_, A> {
                     value: storage_serde::to_bytes(&next_target)?,
                 }]
             }
+            None if clears_ranges(self.attempt) => {
+                // The whole table root leaves in this commit: the data range
+                // with the catalog record, and the stream part with every
+                // table-owned chunk.
+                let (begin, _) = table_data_range(table_id);
+                let (_, end) = table_stream_range(table_id);
+                self.attempt
+                    .native_stage(vec![KvMutation::DeleteRange { begin, end }])?;
+                vec![KvMutation::Delete { key }]
+            }
             None => vec![
                 KvMutation::Delete {
                     key: metadata_key(table_id),
@@ -88,6 +78,46 @@ impl<A: KvAttempt> TableReclaimAttempt for KvCatalogAttempt<'_, A> {
             ],
         };
         self.attempt.stage(changes)
+    }
+
+    async fn load_index_incarnation(
+        &mut self,
+        history: TableHistoryId,
+        target: &GsiBuildTarget,
+    ) -> StorageResult<Option<TargetIncarnation>> {
+        let bytes = self
+            .attempt
+            .get(
+                &metadata_key(table_id_from_history(history)?),
+                ReadProtection::Conflict,
+            )
+            .await?
+            .ok_or_else(|| {
+                StorageError::internal("KV active index binding has no table metadata")
+            })?;
+        decode_index_incarnation(&bytes, history, target)
+    }
+
+    async fn delete_index_page(
+        &mut self,
+        history: TableHistoryId,
+        target: &GsiBuildTarget,
+        _native: Option<storage_provider::NativeGsiRetirement>,
+    ) -> StorageResult<TableReclaimStep> {
+        let table_id = table_id_from_history(history)?;
+        let scope = target.incarnation.as_ref();
+        if scope.len() != 6 || scope[..4] != table_id.to_be_bytes() {
+            return Err(StorageError::internal(
+                "KV retired index scope differs from table history",
+            ));
+        }
+        let index_id = u16::from_be_bytes([scope[4], scope[5]]);
+        let prefix = crate::gsi::index_entry_prefix(table_id, index_id)?;
+        crate::table_reclaim::delete_family_pages(
+            self.attempt,
+            vec![(prefix, crate::table_reclaim::ReclaimValues::Chunkable)],
+        )
+        .await
     }
 }
 
@@ -130,15 +160,12 @@ async fn delete_page<A: KvAttempt>(
     attempt: &mut A,
     target: &TableReclaimTarget,
 ) -> StorageResult<TableReclaimStep> {
-    if matches!(
-        target.phase,
-        TableReclaimPhase::ExternalData | TableReclaimPhase::SystemHistory
-    ) {
+    if matches!(target.phase, TableReclaimPhase::ExternalData) {
         return Err(StorageError::internal(
             "Table reclaim phase requires its domain owner",
         ));
     }
-    if target.phase == TableReclaimPhase::TableHistory {
+    if target.phase == TableReclaimPhase::StreamEntries {
         return crate::table_history_reclaim::delete_table_history_rows(attempt, target.history_id)
             .await;
     }
@@ -148,9 +175,18 @@ async fn delete_page<A: KvAttempt>(
         return delete_family_pages(
             attempt,
             vec![
-                crate::stream_write::key_layout::item_row_prefix(&stream)?,
-                crate::stream_cursor::cursor_stream_prefix(&stream)?,
-                crate::stream_write::receipt_prefix(target.history_id),
+                (
+                    crate::stream_write::key_layout::item_row_prefix(&stream)?,
+                    ReclaimValues::Chunkable,
+                ),
+                (
+                    crate::stream_cursor::cursor_stream_prefix(&stream)?,
+                    ReclaimValues::Chunkable,
+                ),
+                (
+                    crate::stream_write::receipt_prefix(target.history_id)?,
+                    ReclaimValues::Unchunked,
+                ),
             ],
         )
         .await;
@@ -171,17 +207,22 @@ async fn delete_page<A: KvAttempt>(
         }])?;
         return Ok(TableReclaimStep::Complete);
     }
-    let prefixes = vec![family_prefix(target.phase, table_id, target.history_id)?];
-    delete_family_pages(attempt, prefixes).await
+    match target.phase {
+        // The final phase transition clears the whole data range natively.
+        TableReclaimPhase::PrimaryItems if !clears_ranges(attempt) => {
+            delete_table_data_page(attempt, table_id).await
+        }
+        _ => Ok(TableReclaimStep::Complete),
+    }
 }
 
 pub(crate) async fn delete_family_pages<A: KvAttempt>(
     attempt: &mut A,
-    prefixes: Vec<Vec<u8>>,
+    families: Vec<(Vec<u8>, ReclaimValues)>,
 ) -> StorageResult<TableReclaimStep> {
-    let ranges = prefixes
+    let ranges = families
         .iter()
-        .map(|prefix| {
+        .map(|(prefix, _)| {
             let end = prefix_upper_bound(prefix)
                 .ok_or_else(|| StorageError::internal("KV reclaim family has no upper bound"))?;
             Ok(KvRange {
@@ -195,14 +236,11 @@ pub(crate) async fn delete_family_pages<A: KvAttempt>(
         })
         .collect::<StorageResult<Vec<_>>>()?;
     let pages = attempt
-        .native_scan_batch(ranges, ReadProtection::Conflict)
+        .native_scan_batch_exact(ranges, ReadProtection::Conflict)
         .await?;
-    if pages.len() != prefixes.len() {
-        return Err(StorageError::internal("KV reclaim scan count differs"));
-    }
     let mut more = false;
     let mut changes = Vec::new();
-    for (prefix, page) in prefixes.into_iter().zip(pages) {
+    for ((prefix, values), page) in families.into_iter().zip(pages) {
         if page.entries.len() > RECLAIM_PAGE_ROWS.get() as usize
             || (page.more && page.entries.is_empty())
         {
@@ -215,7 +253,10 @@ pub(crate) async fn delete_family_pages<A: KvAttempt>(
                     "KV reclaim scan crossed its table family",
                 ));
             }
-            changes.push(delete_reclaimed_key(entry.key));
+            changes.push(match values {
+                ReclaimValues::Chunkable => KvMutation::Delete { key: entry.key },
+                ReclaimValues::Unchunked => KvMutation::DeleteUnchunked { key: entry.key },
+            });
         }
     }
     if !changes.is_empty() {
@@ -228,77 +269,96 @@ pub(crate) async fn delete_family_pages<A: KvAttempt>(
     })
 }
 
-fn delete_reclaimed_key(key: Vec<u8>) -> KvMutation {
-    if matches!(key.first(), Some(&GSI_TOMBSTONE_FAMILY)) {
-        KvMutation::DeleteUnchunked { key }
-    } else {
-        KvMutation::Delete { key }
+/// Engines whose attempt stages one native range clear.
+fn clears_ranges<A: KvAttempt>(attempt: &A) -> bool {
+    matches!(
+        attempt.backend_engine(),
+        storage_common::diagnostics::NativeEngine::FoundationDb
+    )
+}
+
+/// One page of the table's data range, around the catalog record that the
+/// final phase transition removes: one batched scan of the two halves.
+async fn delete_table_data_page<A: KvAttempt>(
+    attempt: &mut A,
+    table_id: u32,
+) -> StorageResult<TableReclaimStep> {
+    let (begin, end) = table_data_range(table_id);
+    let catalog = metadata_key(table_id);
+    let after_catalog = [catalog.as_slice(), &[0]].concat();
+    let ranges = [(begin, catalog), (after_catalog, end)]
+        .map(|(begin, end)| KvRange {
+            entry_bounds: None,
+            begin,
+            end,
+            reverse: false,
+            limit: RECLAIM_PAGE_ROWS,
+            max_bytes: CATALOG_BYTES,
+        })
+        .to_vec();
+    let pages = attempt
+        .native_scan_batch_exact(ranges, ReadProtection::Conflict)
+        .await?;
+    let mut more = false;
+    let mut changes = Vec::new();
+    for page in pages {
+        if page.entries.len() > RECLAIM_PAGE_ROWS.get() as usize
+            || (page.more && page.entries.is_empty())
+        {
+            return Err(StorageError::internal("KV reclaim page cannot advance"));
+        }
+        more |= page.more;
+        changes.extend(
+            page.entries
+                .into_iter()
+                .map(|entry| KvMutation::Delete { key: entry.key }),
+        );
     }
+    if !changes.is_empty() {
+        attempt.stage(changes)?;
+    }
+    Ok(if more {
+        TableReclaimStep::Advanced
+    } else {
+        TableReclaimStep::Complete
+    })
 }
 
 async fn verify_gsi_cleanup<A: KvAttempt>(
     attempt: &mut A,
     table_id: u32,
 ) -> StorageResult<TableReclaimStep> {
-    let ranges = [GSI_BUILD_FAMILY, GSI_RUNNABLE_FAMILY]
-        .map(|family| {
-            let mut begin = Vec::with_capacity(5);
-            begin.push(family);
-            begin.extend_from_slice(&table_id.to_be_bytes());
-            let end = prefix_upper_bound(&begin)
-                .ok_or_else(|| StorageError::internal("KV GSI family has no upper bound"))?;
-            Ok(KvRange {
-                entry_bounds: None,
-                begin,
-                end,
-                reverse: false,
-                limit: NonZeroU32::MIN,
-                max_bytes: CATALOG_BYTES,
-            })
+    let mut runnable = Vec::with_capacity(5);
+    runnable.push(GSI_RUNNABLE_FAMILY);
+    runnable.extend_from_slice(&table_id.to_be_bytes());
+    let ranges = [
+        table_prefix(table_id, TableSubFamily::GsiBuild).to_vec(),
+        runnable,
+    ]
+    .map(|begin| {
+        let end = prefix_upper_bound(&begin)
+            .ok_or_else(|| StorageError::internal("KV GSI family has no upper bound"))?;
+        Ok(KvRange {
+            entry_bounds: None,
+            begin,
+            end,
+            reverse: false,
+            limit: NonZeroU32::MIN,
+            max_bytes: CATALOG_BYTES,
         })
-        .into_iter()
-        .collect::<StorageResult<Vec<_>>>()?;
-    let pages = attempt.scan_batch(ranges, ReadProtection::Conflict).await?;
-    if pages.len() != 2
-        || pages
-            .iter()
-            .any(|page| page.more || !page.entries.is_empty())
+    })
+    .into_iter()
+    .collect::<StorageResult<Vec<_>>>()?;
+    let pages = attempt
+        .scan_batch_exact(ranges, ReadProtection::Conflict)
+        .await?;
+    if pages
+        .iter()
+        .any(|page| page.more || !page.entries.is_empty())
     {
         return Err(StorageError::internal(
             "KV deleted table still owns GSI builds",
         ));
     }
     Ok(TableReclaimStep::Complete)
-}
-
-fn family_prefix(
-    phase: TableReclaimPhase,
-    table_id: u32,
-    history_id: TableHistoryId,
-) -> StorageResult<Vec<u8>> {
-    let family = match phase {
-        TableReclaimPhase::PrimaryTombstones => {
-            let mut prefix = PRIMARY_TOMBSTONE_PREFIX.to_vec();
-            prefix.extend_from_slice(history_id.as_ref());
-            return Ok(prefix);
-        }
-        TableReclaimPhase::PrimaryItems => PRIMARY_ITEM_FAMILY,
-        TableReclaimPhase::GsiProjections => GSI_PROJECTION_FAMILY,
-        TableReclaimPhase::GsiTombstones => GSI_TOMBSTONE_FAMILY,
-        TableReclaimPhase::TtlIndex => TTL_INDEX_FAMILY,
-        TableReclaimPhase::GsiNameLocks => GSI_NAME_LOCK_FAMILY,
-        TableReclaimPhase::ExternalData
-        | TableReclaimPhase::MetadataCleanup
-        | TableReclaimPhase::ExplicitAppends
-        | TableReclaimPhase::SystemHistory
-        | TableReclaimPhase::TableHistory => {
-            return Err(StorageError::internal(
-                "KV reclaim phase has no single table family",
-            ));
-        }
-    };
-    let mut prefix = Vec::with_capacity(5);
-    prefix.push(family);
-    prefix.extend_from_slice(&table_id.to_be_bytes());
-    Ok(prefix)
 }

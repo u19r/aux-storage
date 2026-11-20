@@ -58,7 +58,7 @@ impl DatabaseManager {
         T: storage_types::single_table_entity::SingleTableEntity + TryIntoWireItem,
     {
         let entity = storage_types::single_table_entity::to_wire_entity(input.item)
-            .map_err(|err| StorageError::internal(&err.to_string()))?;
+            .map_err(|_| StorageError::internal("entity wire encode failed"))?;
         let (mut item, indexers) = entity.into_write_parts();
         crate::updated_at_apply::stamp_wire_item_now(&mut item)?;
         self.put_item(PutItemInput {

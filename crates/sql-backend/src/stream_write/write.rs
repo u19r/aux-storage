@@ -1,7 +1,7 @@
 //! Native-attempt staging for shared stream decisions on all three SQL engines.
 
 use storage_types::{StorageError, StorageResult, StreamItemId};
-use stream_provider::{DynamoStreamWritePlan, StreamItem, StreamRowValue};
+use stream_provider::{StreamItem, StreamRowValue};
 
 use super::{counter, sql_statements};
 use crate::{
@@ -17,19 +17,6 @@ pub(crate) async fn initialize_stream_rows<A: SqlAttempt>(
         attempt.execute(statement).await?;
     }
     Ok(())
-}
-
-pub(crate) fn dynamo_stream_statements(
-    engine: impl SqlLayout,
-    plan: DynamoStreamWritePlan,
-) -> StorageResult<Vec<crate::SqlStatement>> {
-    let DynamoStreamWritePlan { rows, record } = plan;
-    let mut statements = rows
-        .into_iter()
-        .map(|row| sql_statements::item(engine, row))
-        .collect::<StorageResult<Vec<_>>>()?;
-    statements.push(sql_statements::record(engine, record)?);
-    Ok(statements)
 }
 
 pub(crate) async fn append_attempt_allocated_user_item<A: SqlAttempt>(
@@ -103,12 +90,7 @@ pub(crate) async fn store_user_item<A: SqlAttempt>(
     engine: impl SqlLayout,
     row: StreamItem,
 ) -> StorageResult<()> {
-    let changed = attempt
-        .execute(sql_statements::item(
-            engine,
-            stream_provider::StreamWriteKind::User(row),
-        )?)
-        .await?;
+    let changed = attempt.execute(sql_statements::item(engine, row)?).await?;
     if changed != 1 {
         return Err(StorageError::internal("SQL stream append affected no row"));
     }

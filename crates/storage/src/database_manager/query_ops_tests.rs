@@ -79,12 +79,12 @@ async fn given_stored_entity_query_when_identity_is_corrupt_then_no_entity_is_ad
     let (database, table) = create_fixture().await;
     for (entity_type, legacy_type, id, is_valid) in [
         (Some("query-fixture"), None, "item", true),
-        (None, Some("query-fixture"), "item", true),
+        (None, Some("query-fixture"), "item", false),
         (Some("foreign-entity"), None, "item", false),
         (None, None, "item", false),
         (Some("query-fixture"), None, "foreign-id", false),
-        (Some("query-fixture"), Some("foreign-entity"), "item", false),
-        (Some("query-fixture"), Some("query-fixture"), "item", false),
+        (Some("query-fixture"), Some("foreign-entity"), "item", true),
+        (Some("query-fixture"), Some("query-fixture"), "item", true),
     ] {
         let mut item = AttributeMap::from_iter([
             ("pk".into(), AttributeValue::S("query-fixture".into())),

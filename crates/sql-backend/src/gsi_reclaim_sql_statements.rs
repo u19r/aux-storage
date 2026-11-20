@@ -4,6 +4,32 @@ use storage_backfill::GsiBuildTarget;
 
 use crate::{SqlLayout, SqlStatement, SqlValue};
 
+pub(crate) fn load_columns(
+    engine: impl SqlLayout,
+    history: storage_types::TableHistoryId,
+    columns: &[storage_types::KeyColumn],
+) -> SqlStatement {
+    let mut binds = vec![SqlValue::Text(engine.item_table_name(history))];
+    let placeholders = columns
+        .iter()
+        .map(|column| {
+            binds.push(SqlValue::Text(column.physical_name()));
+            engine.engine().placeholder(binds.len()).into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Another retired index can still reference a shared column. Its marker
+    // removes that index concurrently before the last marker removes columns.
+    SqlStatement::new(
+        format!(
+            "SELECT attname::text FROM pg_attribute AS a WHERE attrelid = to_regclass($1) AND NOT \
+             attisdropped AND attname IN ({placeholders}) AND NOT EXISTS (SELECT 1 FROM pg_index \
+             AS i WHERE i.indrelid = a.attrelid AND a.attnum = ANY(i.indkey))"
+        ),
+        binds,
+    )
+}
+
 pub(crate) fn load_incarnation(engine: impl SqlLayout, target: &GsiBuildTarget) -> SqlStatement {
     SqlStatement::new(
         format!(
@@ -17,9 +43,4 @@ pub(crate) fn load_incarnation(engine: impl SqlLayout, target: &GsiBuildTarget) 
             SqlValue::Text(target.index_name.to_string()),
         ],
     )
-}
-
-pub(crate) fn drop_relation(engine: impl SqlLayout, target: &GsiBuildTarget) -> SqlStatement {
-    let relation = engine.gsi_table_name(&target.incarnation);
-    SqlStatement::new(format!("DROP TABLE IF EXISTS \"{relation}\""), vec![])
 }

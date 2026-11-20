@@ -36,6 +36,7 @@ async fn create_queue(manager: &QueueManager, queue_name: &str) -> String {
         .create_queue(CreateQueueRequest {
             queue_name: queue_name.to_string(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .expect("create queue")
@@ -49,6 +50,7 @@ async fn send_message(manager: &QueueManager, queue_url: &str, body: String) -> 
             message_body: body,
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         })
         .await
         .expect("send message")
@@ -64,7 +66,7 @@ async fn receive_messages(
     manager
         .receive_message(ReceiveMessageRequest {
             queue_url: queue_url.to_string(),
-            max_number_of_messages: Some(max_messages),
+            max_number_of_messages: Some(max_messages.into()),
             visibility_timeout: Some(30),
             wait_time_seconds: Some(0),
             attribute_names: None,
@@ -153,7 +155,10 @@ async fn run_known_visible_found_quickly(case: &BackendCase, manager: &Arc<Queue
     assert_eq!(messages[0].message_id, sent_id);
 }
 
-async fn run_send_to_receive_under_500ms(case: &BackendCase, manager: &Arc<QueueManager>) {
+async fn run_send_to_receive_is_visible_to_first_receive(
+    case: &BackendCase,
+    manager: &Arc<QueueManager>,
+) {
     let queue_url = create_queue(
         manager,
         &format!("{}-send-to-receive", unique_suffix(case.name)),
@@ -161,22 +166,10 @@ async fn run_send_to_receive_under_500ms(case: &BackendCase, manager: &Arc<Queue
     .await;
     send_message(manager, &queue_url, "latency".to_string()).await;
 
-    let started_at = Instant::now();
-    let mut messages = Vec::new();
-    while started_at.elapsed() < Duration::from_millis(500) {
-        messages = receive_messages(manager, &queue_url, 1).await;
-        if !messages.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // A committed send must be visible to the first receive, with no waiting.
+    let messages = receive_messages(manager, &queue_url, 1).await;
 
     assert_eq!(messages.len(), 1, "{} did not receive message", case.name);
-    assert!(
-        started_at.elapsed() < Duration::from_millis(500),
-        "{} message was not receivable within 500ms after send response",
-        case.name
-    );
 }
 
 async fn run_stale_receipt_does_not_delete_current_claim(
@@ -379,7 +372,7 @@ async fn selected_single_node_backend_runs_sqs_delivery_invariants() {
     let manager = required_manager_for_case(&case).await;
     run_twelve_worker_no_drop_duplicate(&case, &manager).await;
     run_known_visible_found_quickly(&case, &manager).await;
-    run_send_to_receive_under_500ms(&case, &manager).await;
+    run_send_to_receive_is_visible_to_first_receive(&case, &manager).await;
 }
 
 #[tokio::test]
@@ -397,7 +390,7 @@ async fn selected_multi_node_delivery_invariants() {
     let manager = required_manager_for_case(&case).await;
     run_twelve_worker_no_drop_duplicate(&case, &manager).await;
     run_known_visible_found_quickly(&case, &manager).await;
-    run_send_to_receive_under_500ms(&case, &manager).await;
+    run_send_to_receive_is_visible_to_first_receive(&case, &manager).await;
 }
 
 #[cfg(any(feature = "foundationdb", feature = "postgres"))]

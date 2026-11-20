@@ -4,16 +4,13 @@
 use std::num::NonZeroU32;
 
 use storage_types::{
-    BoundTableInfo, ItemHistoryChange, ItemHistoryPointer, ItemHistoryPublication, StorageEnum,
-    StorageError, StorageResult, SystemStreamPosition, TableStreamCheckpoint, TableStreamFrontier,
-    TableStreamSequence,
+    BoundTableInfo, StorageEnum, StorageError, StorageResult, SystemStreamPosition,
+    TableStreamCheckpoint, TableStreamFrontier, TableStreamSequence,
 };
-use stream_provider::{
-    ItemHistoryImages, ReadDirection, ResolvedItemHistory, TableHistoryIndexRead,
-};
+use stream_provider::{PositionedStreamEntry, ReadDirection, TableHistoryIndexRead};
 
 use crate::{
-    DynamoTableStreamAttempt,
+    StreamRetentionPort,
     dynamo_table_stream::{
         DynamoTableStreamPage, TableStreamImageSelection, TableStreamReadOptions,
     },
@@ -30,13 +27,7 @@ pub(crate) struct TableHistoryPage<'a> {
     initial_visibility_cutoff: Option<storage_types::TimestampMillis>,
     options: TableStreamReadOptions<'a>,
     records: Vec<DynamoStreamRecord>,
-    encoded_bytes: usize,
-}
-
-struct PointerAdmission {
-    pointers: Vec<ItemHistoryPointer>,
-    observations: Vec<(SystemStreamPosition, bool)>,
-    is_truncated: bool,
+    response_bytes: usize,
 }
 
 impl<'a> TableHistoryPage<'a> {
@@ -67,7 +58,7 @@ impl<'a> TableHistoryPage<'a> {
             ),
             options,
             records: Vec::new(),
-            encoded_bytes: 0,
+            response_bytes: 0,
         })
     }
 
@@ -163,11 +154,13 @@ impl<'a> TableHistoryPage<'a> {
 
     pub(crate) async fn read(
         mut self,
-        attempt: &mut impl DynamoTableStreamAttempt,
+        attempt: &mut impl StreamRetentionPort,
         limit: NonZeroU32,
         frontier: TableStreamFrontier,
     ) -> StorageResult<DynamoTableStreamPage> {
-        self.encoded_bytes = serde_json::to_vec(&frontier)?.len();
+        if matches!(self.options.selection, TableStreamImageSelection::Snapshot) {
+            self.response_bytes = serde_json::to_vec(&frontier)?.len();
+        }
         let reads = (0..self.lanes.len())
             .map(|step| self.lane_read((self.next_lane + step) % self.lanes.len(), limit))
             .collect::<StorageResult<Vec<_>>>()?;
@@ -175,7 +168,7 @@ impl<'a> TableHistoryPage<'a> {
         let first_lane = self.next_lane;
         for (step, page) in pages.into_iter().enumerate() {
             let index = (first_lane + step) % self.lanes.len();
-            if self.include_page(attempt, index, page, limit).await? {
+            if self.include_page(index, page, limit)? {
                 break;
             }
         }
@@ -204,181 +197,141 @@ impl<'a> TableHistoryPage<'a> {
         })
     }
 
-    async fn include_page(
+    fn include_page(
         &mut self,
-        attempt: &mut impl DynamoTableStreamAttempt,
         index: usize,
         page: stream_provider::TableHistoryIndexPage,
         limit: NonZeroU32,
     ) -> StorageResult<bool> {
-        let admission = self.admit_pointers(page.pointers)?;
-        let images = match self.options.selection {
-            TableStreamImageSelection::Snapshot => ItemHistoryImages::Snapshot,
-            TableStreamImageSelection::DynamoDbImages => ItemHistoryImages::WithPredecessor,
-        };
-        let resolved = stream_provider::resolve_item_history(
-            attempt,
-            &admission.pointers,
-            images,
-            crate::constants::TABLE_HISTORY_READ_BYTES,
-        )
-        .await?;
-        if self.include_observations(index, admission.observations, resolved, limit)? {
-            return Ok(true);
-        }
-        if !page.more && !admission.is_truncated {
-            self.positions[index] = self.lanes[index].through.clone();
-        }
-        self.next_lane = (index + 1) % self.lanes.len();
-        Ok(self.records.len() == limit.get() as usize || admission.is_truncated)
-    }
-
-    fn include_observations(
-        &mut self,
-        index: usize,
-        observations: Vec<(SystemStreamPosition, bool)>,
-        resolved: Vec<Option<ResolvedItemHistory>>,
-        limit: NonZeroU32,
-    ) -> StorageResult<bool> {
-        let mut resolved = resolved.into_iter();
-        for (position, visible) in observations {
-            if !visible {
-                self.positions[index] = position;
+        for entry in page.entries {
+            if entry.history_id != self.table.history_id
+                || entry.source_table_name != self.table.table_name
+                || &entry.source_scope != self.state.source.as_ref().source_scope()
+            {
+                return Err(history_unavailable());
+            }
+            if !self.is_visible(&entry)? {
+                self.positions[index] = entry.position;
                 continue;
             }
-            let resolved = resolved.next().flatten().ok_or_else(history_unavailable)?;
+            if !entry.entry.is_public() {
+                self.positions[index] = entry.position;
+                continue;
+            }
             if self.records.len() == limit.get() as usize {
                 self.next_lane = index;
                 return Ok(true);
             }
             let previous = self.positions[index].clone();
-            self.positions[index] = position;
+            self.positions[index] = entry.position.clone();
             let cursor = self.checkpoint((index + 1) % self.lanes.len())?;
-            let record = decode_record(resolved, cursor)?;
-            if !self.include_record(record)? {
+            if !self.include_record(decode_record(entry, cursor)?)? {
                 self.positions[index] = previous;
                 self.next_lane = index;
                 return Ok(true);
             }
         }
-        Ok(false)
-    }
-
-    fn admit_pointers(&self, pointers: Vec<ItemHistoryPointer>) -> StorageResult<PointerAdmission> {
-        let mut admission = PointerAdmission {
-            pointers: Vec::new(),
-            observations: Vec::new(),
-            is_truncated: false,
-        };
-        let mut bytes = 0usize;
-        for pointer in pointers {
-            if pointer.metadata().address().history_id != self.table.history_id {
-                return Err(history_unavailable());
-            }
-            let position = event_position(&pointer)?.clone();
-            if !self.is_visible(&pointer)? {
-                admission.observations.push((position, false));
-                continue;
-            }
-            let bound = self.pointer_read_bytes(&pointer)?;
-            if bytes.saturating_add(bound) > crate::constants::TABLE_HISTORY_READ_BYTES.get() {
-                admission.is_truncated = true;
-                break;
-            }
-            bytes += bound;
-            admission.observations.push((position, true));
-            admission.pointers.push(pointer);
+        if !page.more {
+            self.positions[index] = self.lanes[index].through.clone();
         }
-        Ok(admission)
+        self.next_lane = (index + 1) % self.lanes.len();
+        Ok(self.records.len() == limit.get() as usize)
     }
 
-    fn pointer_read_bytes(&self, pointer: &ItemHistoryPointer) -> StorageResult<usize> {
-        let mut bound = pointer.record_bytes()
-            + stream_provider::StreamRowValue::history_envelope_bytes(
-                pointer.metadata().address(),
-            )?;
-        if matches!(
-            self.options.selection,
-            TableStreamImageSelection::DynamoDbImages
-        ) {
-            bound += pointer.predecessor_record_bytes_bound().unwrap_or(0)
-                + stream_provider::StreamRowValue::history_envelope_bytes(
-                    pointer.metadata().address(),
-                )?;
-        }
-        Ok(bound)
-    }
-
-    fn is_visible(&self, pointer: &ItemHistoryPointer) -> StorageResult<bool> {
-        let ItemHistoryPublication::Event { created_at, .. } = pointer.metadata().publication()
-        else {
-            return Err(history_unavailable());
-        };
-        let visible = !self
+    fn is_visible(&self, entry: &PositionedStreamEntry) -> StorageResult<bool> {
+        let retired = self
             .state
             .retention
             .frontier
-            .is_retired(pointer.metadata())?
+            .lineages
+            .iter()
+            .find(|lane| {
+                &lane.shard_id == entry.position.shard_id()
+                    && &lane.lineage_id == entry.position.lineage_id()
+            })
+            .and_then(|lane| lane.retired_through.as_ref())
+            .map(|through| {
+                entry
+                    .position
+                    .offset()
+                    .compare_order(through)
+                    .map(|order| !order.is_gt())
+                    .map_err(|_| history_unavailable())
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let created_at = entry.entry.created_at();
+        let visible = !retired
             && self
                 .state
                 .retention
                 .retention
                 .cutoff_at(self.options.now)
-                .is_none_or(|cutoff| *created_at > cutoff);
+                .is_none_or(|cutoff| created_at > cutoff);
         if !visible
             && !self
                 .initial_visibility_cutoff
-                .is_some_and(|cutoff| *created_at <= cutoff)
+                .is_some_and(|cutoff| created_at <= cutoff)
         {
             return Err(history_unavailable());
         }
         Ok(visible)
     }
 
-    fn record_bytes(&self, record: &DynamoStreamRecord) -> StorageResult<usize> {
-        let (old, new) = match self.options.selection {
-            TableStreamImageSelection::Snapshot => (None, record.new_image.as_ref()),
-            TableStreamImageSelection::DynamoDbImages => match self
-                .table
-                .info
-                .stream_specification
-                .as_ref()
-                .and_then(|spec| spec.stream_view_type.as_ref())
-            {
-                Some(storage_types::StreamViewType::KeysOnly) => (None, None),
-                Some(storage_types::StreamViewType::OldImage) => (record.old_image.as_ref(), None),
-                Some(storage_types::StreamViewType::NewImage) => (None, record.new_image.as_ref()),
-                _ => (record.old_image.as_ref(), record.new_image.as_ref()),
-            },
-        };
-        let bytes = serde_json::to_vec(&(
+    fn measure_snapshot_record_bytes(record: &DynamoStreamRecord) -> StorageResult<usize> {
+        Ok(serde_json::to_vec(&(
             &record.keys,
-            old,
-            new,
+            None::<&storage_types::AttributeMap>,
+            record.new_image.as_ref(),
             &record.source_table_name,
             &record.sequence_number,
         ))?
         .len()
-            + 1024;
-        Ok(bytes)
+            + 1024)
     }
 
-    fn include_record(&mut self, record: DynamoStreamRecord) -> StorageResult<bool> {
-        let bytes = self.record_bytes(&record)?;
-        let maximum_bytes = match self.options.selection {
-            TableStreamImageSelection::Snapshot => {
-                storage_types::STREAM_RECORDS_MAX_ENCODED_BYTES as usize
-            }
+    fn include_record(&mut self, mut record: DynamoStreamRecord) -> StorageResult<bool> {
+        let (bytes, maximum_bytes, overhead) = match self.options.selection {
+            TableStreamImageSelection::Snapshot => (
+                Self::measure_snapshot_record_bytes(&record)?,
+                storage_types::STREAM_RECORDS_MAX_ENCODED_BYTES as usize,
+                self.checkpoint(self.next_lane)?.len()
+                    + crate::constants::TABLE_STREAM_RESPONSE_RESERVE_BYTES,
+            ),
             TableStreamImageSelection::DynamoDbImages => {
-                crate::constants::DYNAMODB_STREAM_RESPONSE_BYTES
+                // Standard Streams limits logical data, including raw binary
+                // bytes. Snapshot framing and checkpoint reserves belong only
+                // to Aux TABLE responses.
+                match self
+                    .table
+                    .info
+                    .stream_specification
+                    .as_ref()
+                    .and_then(|spec| spec.stream_view_type.as_ref())
+                {
+                    Some(storage_types::StreamViewType::KeysOnly) => {
+                        record.old_image = None;
+                        record.new_image = None;
+                    }
+                    Some(storage_types::StreamViewType::OldImage) => record.new_image = None,
+                    Some(storage_types::StreamViewType::NewImage) => record.old_image = None,
+                    _ => {}
+                }
+                record.size_bytes = storage_types::LogicalItemSize::sum_attribute_bytes(
+                    record
+                        .keys
+                        .iter()
+                        .chain(record.old_image.iter().flat_map(|image| image.iter()))
+                        .chain(record.new_image.iter().flat_map(|image| image.iter())),
+                )?;
+                (
+                    record.size_bytes as usize,
+                    crate::constants::DYNAMODB_STREAM_RESPONSE_BYTES,
+                    0,
+                )
             }
         };
-        if self.encoded_bytes
-            + bytes
-            + self.checkpoint(self.next_lane)?.len()
-            + crate::constants::TABLE_STREAM_RESPONSE_RESERVE_BYTES
-            > maximum_bytes
-        {
+        if self.response_bytes + bytes + overhead > maximum_bytes {
             if self.records.is_empty() {
                 return Err(StorageError::raw_validation(
                     "The first table stream record exceeds the response byte limit",
@@ -386,58 +339,39 @@ impl<'a> TableHistoryPage<'a> {
             }
             return Ok(false);
         }
-        self.encoded_bytes += bytes + 1;
+        self.response_bytes += bytes
+            + usize::from(matches!(
+                self.options.selection,
+                TableStreamImageSelection::Snapshot
+            ));
         self.records.push(record);
         Ok(true)
     }
 }
 
-fn event_position(pointer: &ItemHistoryPointer) -> StorageResult<&SystemStreamPosition> {
-    match pointer.metadata().publication() {
-        ItemHistoryPublication::Event { table_position, .. } => Ok(table_position),
-        ItemHistoryPublication::PredecessorAnchor => Err(history_unavailable()),
-    }
-}
-
 fn decode_record(
-    resolved: ResolvedItemHistory,
+    record: PositionedStreamEntry,
     cursor: String,
 ) -> StorageResult<DynamoStreamRecord> {
-    let snapshot = storage_types::StreamRecord::try_from(&resolved)?;
-    let sequence_number = TableStreamSequence::try_from(
-        snapshot
-            .system_position
-            .as_ref()
-            .ok_or_else(history_unavailable)?
-            .offset(),
-    )?
-    .to_string();
-    let old_image = resolved
-        .predecessor
-        .as_ref()
-        .map(|entry| match entry.change() {
-            ItemHistoryChange::Image { item, .. } => item.to_attribute_map().map(Some),
-            ItemHistoryChange::Deleted { .. } => Ok(None),
-        })
-        .transpose()?
-        .flatten();
-    let (created_at, user_identity) = match resolved.current.metadata().publication() {
-        ItemHistoryPublication::Event {
-            created_at,
-            user_identity,
-            ..
-        } => (*created_at, user_identity.clone()),
-        ItemHistoryPublication::PredecessorAnchor => return Err(history_unavailable()),
-    };
     Ok(DynamoStreamRecord {
+        size_bytes: 0,
         cursor: Some(cursor),
-        source_table_name: snapshot.source_table_name,
-        keys: snapshot.keys,
-        sequence_number,
-        created_at,
-        user_identity,
-        old_image,
-        new_image: snapshot.item,
+        source_table_name: Some(record.source_table_name),
+        keys: record.entry.keys().clone(),
+        sequence_number: TableStreamSequence::try_from(record.position.offset())?.to_string(),
+        change: record.entry.change(),
+        created_at: record.entry.created_at(),
+        user_identity: record.entry.user_identity().cloned(),
+        old_image: record
+            .entry
+            .old_image()
+            .map(|image| image.item.to_attribute_map())
+            .transpose()?,
+        new_image: record
+            .entry
+            .new_image()
+            .map(|image| image.item.to_attribute_map())
+            .transpose()?,
     })
 }
 

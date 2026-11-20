@@ -3,6 +3,7 @@ use super::{
     collect_expression_attribute_placeholder_refs, split_top_level_args,
     update_expression_sections, validate_attribute_type_value_operands,
     validate_begins_with_value_operands, validate_between_bounds, validate_expression_shape,
+    validate_expression_syntax, validate_ordering_value_operands,
     validate_projection_expression_paths, validate_update_expression_paths,
 };
 
@@ -21,7 +22,34 @@ where
         .map(ExpressionValidationContext::new)
         .collect::<SmallVec<[_; 2]>>();
 
+    if expressions.is_empty() {
+        if names.is_some() {
+            return Err(validation_message(
+                "ExpressionAttributeNames can only be specified when using expressions".to_owned(),
+                prefixed,
+            ));
+        }
+        if values.is_some() {
+            return Err(validation_message(
+                "ExpressionAttributeValues can only be specified when using expressions".to_owned(),
+                prefixed,
+            ));
+        }
+    }
+
+    // AWS checks the operand payloads before it parses any expression. Read
+    // expressions report malformed operands through their own key rules.
+    if expressions.iter().any(|context| {
+        matches!(
+            context.kind,
+            ExpressionKind::Condition | ExpressionKind::Update
+        )
+    }) {
+        validate_expression_attribute_value_payloads(values, prefixed)?;
+    }
+
     for context in &expressions {
+        validate_expression_syntax(context.expression, context.kind, prefixed)?;
         validate_expression_shape(context, names, prefixed)?;
         validate_expression_names(context, names, prefixed)?;
         validate_projection_expression_paths(context.expression, context.kind, names, prefixed)?;
@@ -169,6 +197,13 @@ fn validate_expression_values(
 ) -> Result<(), String> {
     for &value in &context.used_values {
         if values.is_none_or(|values| !values.contains_key(value)) {
+            // The first error in written order wins: an operand error before
+            // the undefined placeholder is reported instead of it.
+            if let Some(written_before) = placeholder_offset(context.expression, value)
+                .and_then(|offset| context.expression.get(..offset))
+            {
+                validate_expression_value_operands(written_before, context.kind, values, prefixed)?;
+            }
             return Err(validation_message(
                 format!(
                     "Invalid {}: An expression attribute value used in expression is not defined; \
@@ -182,6 +217,17 @@ fn validate_expression_values(
     validate_expression_value_operands(context.expression, context.kind, values, prefixed)
 }
 
+/// Byte offset of the first whole-word occurrence of `placeholder`.
+fn placeholder_offset(expression: &str, placeholder: &str) -> Option<usize> {
+    expression
+        .match_indices(placeholder)
+        .find_map(|(offset, _)| {
+            let next = expression.as_bytes().get(offset + placeholder.len());
+            (!next.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_'))
+                .then_some(offset)
+        })
+}
+
 /// Input binding preserves expression structure but can change operand values.
 pub(crate) fn validate_expression_value_operands(
     expression: &str,
@@ -189,25 +235,33 @@ pub(crate) fn validate_expression_value_operands(
     values: Option<&crate::AttributeMap>,
     prefixed: bool,
 ) -> Result<(), String> {
-    validate_expression_attribute_value_payloads(kind, values, prefixed)?;
     validate_begins_with_value_operands(expression, kind, values, prefixed)?;
+    validate_ordering_value_operands(expression, kind, values, prefixed)?;
     validate_attribute_type_value_operands(expression, kind, values, prefixed)?;
     validate_between_bounds(expression, kind, values, prefixed)?;
     Ok(())
 }
 
 fn validate_expression_attribute_value_payloads(
-    kind: ExpressionKind,
     values: Option<&crate::AttributeMap>,
     prefixed: bool,
 ) -> Result<(), String> {
-    if kind != ExpressionKind::Update {
-        return Ok(());
-    }
     let Some(values) = values else {
         return Ok(());
     };
     for value in values.values() {
+        // A malformed number operand is echoed back in the message.
+        if let crate::AttributeValue::N(number) = value
+            && let Err(error) = crate::dynamodb_number::validate_dynamodb_number(number)
+        {
+            let kind = error.validation_kind();
+            let message = if matches!(kind, crate::StorageValidationKind::InvalidNumber) {
+                format!("{}: {number}", kind.message())
+            } else {
+                kind.message().to_owned()
+            };
+            return Err(validation_message(message, prefixed));
+        }
         crate::validate_attribute_value_for_write(value, "ExpressionAttributeValues")
             .map_err(|message| validation_message(message, prefixed))?;
     }
@@ -274,7 +328,7 @@ fn validate_unused_expression_values(
     ))
 }
 
-pub(super) fn validation_message(message: String, prefixed: bool) -> String {
+pub(crate) fn validation_message(message: String, prefixed: bool) -> String {
     if prefixed {
         format!("1 validation error detected: {message}")
     } else {

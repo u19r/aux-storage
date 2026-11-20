@@ -18,9 +18,7 @@ pub(super) async fn read<B: SqlBackend + 'static>(
         .checked_add(store.capabilities.max_value_bytes().get())
         .and_then(|bytes| bytes.checked_add(store.capabilities.max_key_bytes().get()))
         .ok_or_else(|| {
-            RawOrderedJobStoreError::Backend(
-                storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-            )
+            RawOrderedJobStoreError::Backend(storage_types::AttemptFailure::CAPACITY.into())
         })?;
     let max_bytes = NonZeroUsize::new(budget).ok_or_else(|| {
         RawOrderedJobStoreError::Backend(storage_types::StorageError::internal(

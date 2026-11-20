@@ -37,7 +37,6 @@ where
 pub fn decode_wire_serde_string<T>(raw: &str, field: &str) -> StorageResult<T>
 where T: DeserializeOwned {
     decode_quoted_scalar_json(raw, field)
-        .map_err(|err| StorageError::internal(&format!("invalid {field} field: {err}")))
 }
 
 fn encode_field_json(item: &WireItem, field: &str) -> StorageResult<Option<String>> {
@@ -73,7 +72,12 @@ fn parse_field_json<T: DeserializeOwned>(json: &str, field: &str) -> StorageResu
 #[cold]
 #[inline(never)]
 fn invalid_field_error(field: &str, err: &serde_json::Error) -> StorageError {
-    StorageError::internal(&format!("decode wire attribute {field} failed: {err}"))
+    StorageError::internal(&format!(
+        "decode wire attribute {field} failed: {:?} at {}:{}",
+        err.classify(),
+        err.line(),
+        err.column()
+    ))
 }
 
 #[cold]

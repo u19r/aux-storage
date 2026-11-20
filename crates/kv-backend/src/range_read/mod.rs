@@ -8,3 +8,5 @@ mod read;
 
 #[cfg(test)]
 mod read_tests;
+pub(crate) use projection::PublicImage;
+pub(crate) use read::RangeReadInput;

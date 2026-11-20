@@ -1,27 +1,27 @@
-#[cfg(any(
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres",
-    feature = "rocksdb",
-    feature = "foundationdb"
-))]
-mod assembly;
 mod construction;
-mod delivery;
-mod maintenance;
 mod models;
-pub(crate) use delivery::{DeliveryProviderSource, DeliveryProviders};
-pub(crate) use maintenance::MaintenanceProviderSource;
-#[cfg(feature = "regional")]
-mod regional;
-
+#[cfg(test)]
+mod models_test_support;
+mod native_store;
 #[cfg(feature = "remote")]
 pub use construction::connect_remote_scheduled_job_store;
-pub(crate) use construction::create_storage_provider_bundle;
-pub(crate) use models::MaintenanceRepositories;
+pub(crate) use construction::open_store;
+pub use models::InitializedStore;
 #[cfg(feature = "remote")]
 pub use models::RemoteScheduledJobStoreConfig;
-pub use models::StorageProviderBundle;
+pub(crate) use models::{MaintenanceRepositories, StoreKind};
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+pub(crate) use models_test_support::CallerMaintenance;
+pub(crate) use native_store::NativeStore;
 
 #[cfg(all(
     test,
@@ -35,5 +35,7 @@ pub use models::StorageProviderBundle;
 ))]
 mod construction_tests;
 
+#[cfg(all(test, feature = "rocksdb"))]
+mod maintenance_tests;
 #[cfg(all(test, feature = "rocksdb"))]
 mod partition_tests;

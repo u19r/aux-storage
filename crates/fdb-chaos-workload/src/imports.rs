@@ -6,8 +6,8 @@ pub(crate) use std::{
 };
 
 pub(crate) use fdb_chaos_model::{
-    Anomaly, AnomalyKind, AnomalyReport, GsiEntry, GsiIndexModel, HistoryEvent, OperationHistory,
-    OperationKind, OperationOutcome, PossibleTableModel, SharedKeyAudit, SharedKeyRead, TableModel,
+    Anomaly, AnomalyKind, AnomalyReport, HistoryEvent, OperationHistory, OperationKind,
+    OperationOutcome, PossibleTableModel, SharedKeyAudit, SharedKeyRead, TableModel,
     TrimProviderSnapshot, TrimScopeReport,
 };
 pub(crate) use foundationdb_simulation::{
@@ -15,18 +15,20 @@ pub(crate) use foundationdb_simulation::{
     WrappedWorkload, details, register_factory,
 };
 pub(crate) use pubsub::{
-    ClaimDeliveryRecordsRequest, ClaimDeliveryRecordsResponse, CreateTopicRequest,
-    DeliveryClaimLimit, DeliveryRecord, DeliveryRecordId, DeliveryRecordUpdate, DeliveryStatus,
-    PublishRequest, PubsubMessageId, PubsubProvider as _, SubscribeRequest, SubscriptionArn,
-    SubscriptionProtocol, TopicArn, TopicName,
+    AskMode, ClaimTerms, ClaimedDelivery, CreateTopicRequest, DeliveryAttemptResult,
+    DeliveryClaimRequest, DeliveryFailureCode, DeliveryPayload, DeliveryRecordId, DestinationAsk,
+    DestinationKey, LocalDelivery, LocalDeliveryItem, PublishRequest, PubsubMessageId,
+    PubsubProvider, RenderedQueueMessage, SettleInput, SettleOutcome, SubscribeRequest,
+    Subscription, SubscriptionArn, SubscriptionProtocol, Topic, TopicArn, TopicName,
 };
 pub(crate) use queue::{
     ChangeMessageVisibilityRequest, CreateQueueRequest, DeleteMessageRequest, GetQueueUrlRequest,
-    QueueManager, ReceiptHandle, ReceiveMessageRequest, SendMessageRequest,
+    MessageResponse, QueueError, QueueManager, ReceiptHandle, ReceiveMessageRequest,
+    SendMessageRequest,
 };
 pub(crate) use storage_provider::{
-    DynamoOperations as _, StreamDurationTrimConfig, StreamDurationTrimWorker,
-    StreamRetentionRepository,
+    DynamoOperations as _, MaintenanceOperations, StreamDurationTrimConfig,
+    StreamDurationTrimWorker,
 };
 pub(crate) use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, BillingMode,

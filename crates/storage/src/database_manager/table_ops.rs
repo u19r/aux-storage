@@ -8,8 +8,7 @@ use storage_types::{
     TableName, UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest,
     UpdateTimeToLiveResponse, context::WrappedError as _,
 };
-use stream::StreamError;
-use stream_provider::{SystemStreamPage, SystemStreamPageRequest};
+use stream_provider::{StreamError, SystemStreamPage, SystemStreamPageRequest};
 
 use crate::{
     admission::AdmissionClass,
@@ -21,18 +20,7 @@ use crate::{
 
 impl DatabaseManager {
     pub async fn create_table(&self, request: &CreateTableRequest) -> StorageResult<()> {
-        let owned_request = request.clone();
-        self.run_dynamo_admitted(
-            ROUTED_DEFAULT_CONNECTION_ID,
-            AdmissionClass::Write,
-            |dynamo| {
-                record_storage_operation("create_table", async move {
-                    dynamo.create_table(owned_request).await
-                })
-            },
-        )
-        .await?;
-        Ok(())
+        self.create_table_request(request.clone()).await.map(|_| ())
     }
 
     pub async fn create_table_on_connection(
@@ -59,12 +47,12 @@ impl DatabaseManager {
         table_name: &TableName,
         index_names: &[IndexName],
     ) -> StorageResult<Vec<(IndexName, GsiIndexReadiness)>> {
-        let repository = self.gsi_lifecycle_repository.clone().ok_or_else(|| {
-            StorageError::unsupported("GSI lifecycle reads are unavailable for this manager")
-        })?;
+        let connection = self.connection(ROUTED_DEFAULT_CONNECTION_ID)?;
+        let repository = Arc::clone(&connection.dynamo);
         let index_names = index_names.to_vec();
         let table_name = table_name.clone();
-        self.admission_controller_for_connection(ROUTED_DEFAULT_CONNECTION_ID)?
+        connection
+            .admission
             .settle_foreground(AdmissionClass::PointRead, || {
                 record_storage_operation("read_gsi_index_readiness", async move {
                     repository
@@ -205,18 +193,9 @@ impl DatabaseManager {
         &self,
         table_name: &TableName,
     ) -> StorageResult<DescribeTimeToLiveResponse> {
-        let request = DescribeTimeToLiveRequest {
+        self.describe_time_to_live_request(DescribeTimeToLiveRequest {
             table_name: table_name.clone(),
-        };
-        self.run_dynamo_admitted(
-            ROUTED_DEFAULT_CONNECTION_ID,
-            AdmissionClass::PointRead,
-            |dynamo| {
-                record_storage_operation("describe_time_to_live", async move {
-                    dynamo.describe_time_to_live(request).await
-                })
-            },
-        )
+        })
         .await
     }
 
@@ -260,34 +239,38 @@ impl DatabaseManager {
                 .await?;
             }
         }
-        let reclaim = self.table_reclaim_repository.as_ref().ok_or_else(|| {
-            StorageError::unsupported("test table cleanup requires local table reclaim")
-        })?;
+        let reclaim = self
+            .default_connection
+            .native
+            .as_ref()
+            .map(|native| Arc::clone(&native.maintenance))
+            .ok_or_else(|| {
+                StorageError::unsupported("test table cleanup requires local table reclaim")
+            })?;
         while reclaim.reclaim_table_page().await? == TableReclaimStep::Advanced {}
         Ok(())
     }
 
     pub async fn delete_table(&self, table_name: &TableName) -> StorageResult<()> {
-        let request = DeleteTableRequest {
+        self.delete_table_request(DeleteTableRequest {
             table_name: table_name.clone(),
-        };
-        self.run_dynamo_admitted(
-            ROUTED_DEFAULT_CONNECTION_ID,
-            AdmissionClass::Write,
-            |dynamo| {
-                record_storage_operation("delete_table", async move {
-                    dynamo.delete_table(request).await
-                })
-            },
-        )
-        .await?;
-        Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn update_table(
         &self,
         request: UpdateTableRequest,
     ) -> StorageResult<UpdateTableResponse> {
+        if request
+            .replica_updates
+            .as_ref()
+            .is_some_and(|updates| !updates.is_empty())
+        {
+            return record_storage_operation("update_table", self.update_table_replicas(request))
+                .await;
+        }
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::Write,

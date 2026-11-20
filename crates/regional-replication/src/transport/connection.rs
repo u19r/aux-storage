@@ -7,24 +7,30 @@ use tokio::{
 
 use super::error::{TransportError, TransportResult};
 
-pub(super) struct TransportConnection {
+pub struct TransportConnection {
     socket: TcpStream,
     deadline: Instant,
 }
 
 impl TransportConnection {
-    pub(super) fn new(socket: TcpStream, deadline: Instant) -> Self {
+    pub fn new(socket: TcpStream, deadline: Instant) -> Self {
         Self { socket, deadline }
     }
 
-    pub(super) fn require_live(&self) -> TransportResult<()> {
+    pub fn require_live(&self) -> TransportResult<()> {
         if Instant::now() >= self.deadline {
             return Err(TransportError::Timeout);
         }
         Ok(())
     }
 
-    pub(super) async fn read_exact(&mut self, bytes: &mut [u8]) -> TransportResult<()> {
+    /// A new allowance for the next stage (the server's response after a native
+    /// attempt).
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+
+    pub async fn read_exact(&mut self, bytes: &mut [u8]) -> TransportResult<()> {
         self.require_live()?;
         timeout_at(self.deadline, self.socket.read_exact(bytes))
             .await
@@ -32,7 +38,7 @@ impl TransportConnection {
         Ok(())
     }
 
-    pub(super) async fn write_all(&mut self, bytes: &[u8]) -> TransportResult<()> {
+    pub async fn write_all(&mut self, bytes: &[u8]) -> TransportResult<()> {
         self.require_live()?;
         timeout_at(self.deadline, self.socket.write_all(bytes))
             .await

@@ -7,7 +7,53 @@ struct RecordedMarkerWaves {
 }
 
 #[async_trait::async_trait]
-impl crate::StreamRetentionRepository for RecordedMarkerWaves {
+impl crate::MaintenanceOperations for RecordedMarkerWaves {
+    async fn advance_expiration(
+        &self,
+        _: crate::maintenance::ExpirationRequest,
+    ) -> storage_types::StorageResult<storage_types::maintenance::StepResult<()>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn trim_transact_receipts_page(
+        &self,
+        _: Option<String>,
+        _: std::num::NonZeroU32,
+    ) -> storage_types::StorageResult<Option<String>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn advance_gsi_build(
+        &self,
+        _: crate::maintenance::GsiBuildRequest,
+    ) -> storage_types::StorageResult<storage_types::maintenance::StepResult<()>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn trim_system_stream_page(
+        &self,
+        _: stream_provider::SystemStreamTrimPageRequest,
+    ) -> storage_types::StorageResult<stream_provider::SystemStreamTrimPageResult> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn reclaim_table_page(&self) -> storage_types::StorageResult<crate::TableReclaimStep> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn read_ttl_sweep_policy(
+        &self,
+        _: &storage_types::TableName,
+    ) -> storage_types::StorageResult<Option<storage_common::TtlSweepPolicy>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn execute_ttl_sweep_page(
+        &self,
+        _: storage_common::TtlSweepPageCommand,
+    ) -> storage_types::StorageResult<storage_common::TtlSweepPageResult> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn execute_ttl_sweep_request(
+        &self,
+        _: storage_common::TtlSweepRequest,
+    ) -> storage_types::StorageResult<storage_common::TtlSweepPageResult> {
+        unimplemented!("not used by this fixture")
+    }
     async fn trim_stream_marker_wave(
         &self,
         wave: crate::maintenance::StreamRetentionWave,

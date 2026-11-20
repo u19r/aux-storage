@@ -1,16 +1,15 @@
 use storage_types::{
     BoundTableInfo, DescribeStreamRequest, DescribeStreamResponse, SequenceNumberRange, Shard,
-    StorageError, StorageResult, StreamDescription, TableHistoryTarget, stream_identity,
+    StorageError, StorageResult, StreamDescription, TableName, stream_arn_table_name,
+    stream_identity,
 };
 
 use super::{DynamoStreamRead, iterator::validate_streams_page_limit, read::stream_not_found};
-use crate::{
-    dynamo_table_stream::DynamoTableStreamAttempt, table_history_read::TableHistoryReadState,
-};
+use crate::{maintenance::StreamRetentionPort, table_history_read::TableHistoryReadState};
 
 pub struct DescribeDynamoStream {
     request: DescribeStreamRequest,
-    target: TableHistoryTarget,
+    table_name: TableName,
 }
 
 impl TryFrom<DescribeStreamRequest> for DescribeDynamoStream {
@@ -26,21 +25,27 @@ impl TryFrom<DescribeStreamRequest> for DescribeDynamoStream {
                 "ShardFilter Type must be CHILD_SHARDS",
             ));
         }
-        let target = TableHistoryTarget::try_from(request.stream_arn.as_str())?;
-        Ok(Self { request, target })
+        let table_name = stream_arn_table_name(request.stream_arn.as_str())?;
+        Ok(Self {
+            request,
+            table_name,
+        })
     }
 }
 
 impl DynamoStreamRead for DescribeDynamoStream {
     type Response = DescribeStreamResponse;
-    fn target(&self) -> &TableHistoryTarget {
-        &self.target
+    fn table_name(&self) -> &TableName {
+        &self.table_name
     }
     fn stream_arn(&self) -> &str {
         &self.request.stream_arn
     }
-    async fn read<A: DynamoTableStreamAttempt>(
-        self,
+    fn stream_missing(&self) -> StorageError {
+        super::read::stream_arn_not_found(&self.request.stream_arn)
+    }
+    async fn read<A: StreamRetentionPort>(
+        &self,
         attempt: &mut A,
         table: &BoundTableInfo,
         _now: storage_types::TimestampMillis,
@@ -53,14 +58,15 @@ impl DynamoStreamRead for DescribeDynamoStream {
             .ok_or_else(stream_not_found)?;
         let state = TableHistoryReadState::load(attempt, table).await?;
         let (shards, last_evaluated_shard_id) = describe_shards(&self.request, &state)?;
-        let stream_label = stream_identity(&table.info.table_name, table.stream_identity()).1;
+        let identity = table.stream_identity().ok_or_else(stream_not_found)?;
+        let stream_label = stream_identity(&table.info.table_name, identity).1;
         Ok(DescribeStreamResponse {
             stream_description: StreamDescription {
-                stream_arn: self.request.stream_arn,
+                stream_arn: self.request.stream_arn.clone(),
                 stream_label,
                 stream_status: "ENABLED".into(),
                 stream_view_type: view,
-                creation_request_date_time: table.info.created_at.into(),
+                creation_request_date_time: identity.enabled_at.into(),
                 table_name: table.info.table_name.clone(),
                 key_schema: table.info.key_schema.clone(),
                 shards,

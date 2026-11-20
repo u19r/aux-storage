@@ -1,38 +1,62 @@
 //! Topic attribute counts use every visible subscription page in one snapshot.
 
-use async_trait::async_trait;
-use storage_types::{AttemptMode, StorageError, StorageResult};
+use std::sync::Arc;
+
+use storage_types::{StorageError, StorageResult};
 
 use crate::{
-    GetTopicAttributesRequest, GetTopicAttributesResponse, PubsubAttempt,
-    PubsubAttributeRepository, PubsubError, PubsubPort, PubsubResult, SubscriptionArn,
-    SubscriptionPage, SubscriptionPageRequest, TopicRecord, constants::PUBSUB_PAGE_LIMIT,
-    pubsub_port::read_topic, subscription_operations::validate_page,
+    GetSubscriptionAttributesRequest, GetSubscriptionAttributesResponse, GetTopicAttributesRequest,
+    GetTopicAttributesResponse, PubsubAttempt, PubsubError, PubsubPort, PubsubResult,
+    SubscriptionArn, SubscriptionPage, SubscriptionPageRequest, TopicArn, TopicRecord,
+    constants::{PUBSUB_PAGE_LIMIT, TOPIC_ATTRIBUTES_READ},
+    pubsub_port::read_topic,
+    subscription_operations::validate_page,
 };
 
-#[async_trait]
-impl<P: PubsubPort> PubsubAttributeRepository for P {
-    async fn get_topic_attributes(
-        &self,
-        request: GetTopicAttributesRequest,
-    ) -> PubsubResult<GetTopicAttributesResponse> {
-        let arn = request.topic_arn;
-        let requested = arn.clone();
-        let response = self
-            .with_pubsub_attempt(AttemptMode::ReadOnly, move |attempt| {
-                Box::pin(async move {
-                    let Some(topic) = read_topic(attempt, &requested).await? else {
-                        return Ok(None);
-                    };
-                    get_topic_attributes_from_topic(attempt, &topic)
-                        .await
-                        .map(Some)
-                })
-            })
-            .await
-            .map_err(PubsubError::from)?;
-        response.ok_or_else(|| PubsubError::topic_not_found(arn.to_string()))
-    }
+pub(crate) async fn get_topic_attributes<P: PubsubPort>(
+    port: &P,
+    request: GetTopicAttributesRequest,
+) -> PubsubResult<GetTopicAttributesResponse> {
+    let arn = Arc::new(request.topic_arn);
+    let response = port
+        .run(
+            TOPIC_ATTRIBUTES_READ,
+            Arc::clone(&arn),
+            |attempt, arn, _| Box::pin(topic_attributes_in_attempt(attempt, arn)),
+        )
+        .await
+        .map_err(PubsubError::from)?;
+    response.ok_or_else(|| PubsubError::topic_not_found(arn.to_string()))
+}
+
+/// One subscription point read (`CATALOG_POINT_READ`); the attributes are
+/// computed from the subscription it returns.
+pub(crate) async fn get_subscription_attributes<P: PubsubPort>(
+    port: &P,
+    request: GetSubscriptionAttributesRequest,
+) -> PubsubResult<GetSubscriptionAttributesResponse> {
+    let Some(subscription) =
+        crate::subscription_operations::get_subscription(port, &request.subscription_arn).await?
+    else {
+        return Err(PubsubError::subscription_not_found(
+            request.subscription_arn.to_string(),
+        ));
+    };
+    Ok(GetSubscriptionAttributesResponse {
+        attributes: subscription.attributes(),
+    })
+}
+
+async fn topic_attributes_in_attempt<A: PubsubAttempt>(
+    attempt: &mut A,
+    arn: &TopicArn,
+) -> StorageResult<Option<GetTopicAttributesResponse>> {
+    let Some(topic) = read_topic(attempt, arn).await? else {
+        return Ok(None);
+    };
+    get_topic_attributes_from_topic(attempt, &topic)
+        .await
+        .map(Some)
 }
 
 /// The caller binds this catalog incarnation in the same native snapshot.

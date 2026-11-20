@@ -1,11 +1,15 @@
 use axum::http::StatusCode;
 use serde_json::json;
 use storage_types::{
-    AttributeMap, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
-    DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE, StorageEnum, StorageError,
+    AttemptFailure, AttemptPhase, AttributeMap, CancellationReason,
+    DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+    DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE, DYNAMODB_TRANSACTION_CANCELED_MESSAGE,
+    DYNAMODB_TRANSACTION_CONFLICT_MESSAGE, ErrorClass, InfrastructureContext,
+    InfrastructureResultKind, NativeUnavailable, StorageEnum, StorageError, StorageValidationKind,
+    expired_in,
 };
 
-use super::{ErrorEnvelope, HttpApiError, IntoApiError};
+use super::HttpApiError;
 
 #[test]
 fn conditional_check_failed_http_message_contains_canonical_text() {
@@ -41,13 +45,13 @@ fn conditional_check_failed_response_can_include_all_old_item() {
 }
 
 #[test]
-fn transaction_conflict_passes_through_storage_message() {
-    let storage_err: StorageError = StorageEnum::TransactionConflict {
-        message: "custom conflict message".to_string(),
-    }
+fn transaction_conflict_uses_constant_wire_message() {
+    let storage_err: StorageError = StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(
+        storage_types::ConflictCause::Logical("custom conflict message"),
+    ))
     .into();
     let handler: HttpApiError = storage_err.into();
-    assert_eq!(handler.message, "custom conflict message");
+    assert_eq!(handler.message, DYNAMODB_TRANSACTION_CONFLICT_MESSAGE);
     assert_eq!(
         handler.error_type,
         "com.amazonaws.dynamodb.v20120810#TransactionConflictException"
@@ -58,9 +62,10 @@ fn transaction_conflict_passes_through_storage_message() {
 fn transaction_canceled_response_uses_dynamodb_cancellation_shape() {
     let storage_err: StorageError = StorageEnum::TransactionCanceled {
         reasons: vec![
-            "None".to_string(),
-            "ValidationError\tAn operand in the update expression has an incorrect data type"
-                .to_string(),
+            CancellationReason::none(),
+            CancellationReason::validation_error(
+                "An operand in the update expression has an incorrect data type",
+            ),
         ],
     }
     .into();
@@ -103,11 +108,8 @@ fn transaction_canceled_response_can_include_all_old_item_in_reason() {
         "note": {"S": "old"}
     }))
     .expect("attribute map");
-    let item_json = serde_json::to_string(&item).expect("serialize item");
     let storage_err: StorageError = StorageEnum::TransactionCanceled {
-        reasons: vec![format!(
-            "ConditionalCheckFailed\t{DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE}\t{item_json}"
-        )],
+        reasons: vec![CancellationReason::conditional_check_failed(Some(item))],
     }
     .into();
     let handler: HttpApiError = storage_err.into();
@@ -140,17 +142,6 @@ fn error_response_uses_aws_compatible_type_and_message_fields() {
     assert_eq!(response.error_type, "ValidationException");
     assert_eq!(response.message, "bad input");
     assert_eq!(response.request_id, None);
-}
-
-#[test]
-fn error_envelope_builder_preserves_optional_field_path() {
-    let envelope = ErrorEnvelope::new("invalid_request", "Invalid request")
-        .with_field_path(Some("queueName"), Some("body.queueName"));
-
-    assert_eq!(envelope.code, "invalid_request");
-    assert_eq!(envelope.message, "Invalid request");
-    assert_eq!(envelope.field.as_deref(), Some("queueName"));
-    assert_eq!(envelope.path.as_deref(), Some("body.queueName"));
 }
 
 #[test]
@@ -236,4 +227,286 @@ fn http_api_error_converts_unknown_status_to_internal_server_error_response() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body.error_type, "CustomException");
     assert_eq!(body.message, "custom");
+}
+
+#[test]
+fn abandoned_attempt_maps_to_503_with_retry_hint() {
+    let handler: HttpApiError = StorageError::attempt_abandoned().into();
+
+    assert_eq!(handler.status_code, 503);
+    assert_eq!(
+        handler
+            .response_headers
+            .iter()
+            .find(|(name, _)| name == "Retry-After")
+            .map(|(_, value)| value.as_str()),
+        Some("1")
+    );
+}
+
+#[test]
+fn native_unavailable_maps_to_503_with_retry_hint() {
+    let storage_err: StorageError = storage_types::AttemptFailure::Unavailable(
+        storage_types::NativeUnavailable::Deadline(storage_types::AttemptPhase::Statement),
+    )
+    .into();
+    let handler: HttpApiError = storage_err.into();
+
+    assert_eq!(handler.status_code, 503);
+    assert_eq!(
+        handler
+            .response_headers
+            .iter()
+            .find(|(name, _)| name == "Retry-After")
+            .map(|(_, value)| value.as_str()),
+        Some("1")
+    );
+}
+
+const DYNAMODB_INTERNAL_TYPE: &str = "com.amazonaws.dynamodb.v20120810#InternalServerError";
+
+fn retry_after(error: &HttpApiError) -> Option<&str> {
+    error
+        .response_headers
+        .iter()
+        .find(|(name, _)| name == "Retry-After")
+        .map(|(_, value)| value.as_str())
+}
+
+/// One value per `StorageEnum` variant (35) and the seven attempt kinds.
+fn every_storage_error() -> Vec<StorageError> {
+    let variants: Vec<StorageEnum> = vec![
+        StorageEnum::Database(std::fmt::Error),
+        StorageEnum::AwsSerialization("x".into()),
+        StorageEnum::Serialization(
+            serde_json::from_str::<u8>("x")
+                .expect_err("invalid json")
+                .into(),
+        ),
+        StorageEnum::InfrastructureResult(InfrastructureResultKind::Encoding {
+            context: InfrastructureContext::RecordEncoding,
+        }),
+        StorageEnum::Attempt(AttemptFailure::FRESH_VALIDATION),
+        StorageEnum::ResourceNotFound {
+            resource_type: "cursor",
+            resource_id: "x".into(),
+        },
+        StorageEnum::ResourceExists {
+            resource_type: "cursor",
+            resource_id: "x".into(),
+        },
+        StorageEnum::IndexNotFound {
+            index_name: "i".into(),
+            table_name: "t".into(),
+        },
+        StorageEnum::KeyValidation(
+            storage_types::TableKey::from_key_schema(
+                storage_types::TableName::new("t"),
+                &[],
+                &AttributeMap::new(),
+            )
+            .expect_err("missing hash key schema"),
+        ),
+        StorageEnum::InternalServerError {
+            message: "x".into(),
+        },
+        StorageEnum::HistoryUnavailable,
+        StorageEnum::HistoryExpired,
+        StorageEnum::TrimmedDataAccess,
+        StorageEnum::ConditionalCheckFailed,
+        StorageEnum::ConditionalCheckFailedWithItem {
+            item: AttributeMap::new(),
+        },
+        StorageEnum::GuardConflict {
+            message: "x".into(),
+        },
+        StorageEnum::Unsupported {
+            message: "x".into(),
+        },
+        StorageEnum::TableAlreadyExists { name: "t".into() },
+        StorageEnum::TableNotFound {
+            name: "t".into(),
+            message: "x".into(),
+        },
+        StorageEnum::Validation {
+            kind: StorageValidationKind::Message,
+            message: "x".into(),
+        },
+        StorageEnum::RawValidation {
+            message: "x".into(),
+        },
+        StorageEnum::DeletionProtectionEnabled {
+            table_name: "t".into(),
+            message: "x".into(),
+        },
+        StorageEnum::TransactionInProgress {
+            message: "x".into(),
+        },
+        StorageEnum::IdempotentParameterMismatch,
+        StorageEnum::IdempotencyReplay { response: vec![1] },
+        StorageEnum::TransactionCanceled {
+            reasons: vec![CancellationReason::none()],
+        },
+        StorageEnum::ProvisionedThroughputExceeded {
+            message: "x".into(),
+        },
+        StorageEnum::Throttled {
+            message: "x".into(),
+        },
+        StorageEnum::ServiceUnavailable {
+            message: "x".into(),
+            retry_after_seconds: 3,
+        },
+        StorageEnum::LimitExceeded {
+            message: "x".into(),
+        },
+        StorageEnum::Authentication {
+            message: "x".into(),
+        },
+        StorageEnum::AccessDenied {
+            message: "x".into(),
+        },
+        StorageEnum::RequestLimitExceeded,
+        StorageEnum::MissingAuthenticationToken,
+        StorageEnum::AwsService {
+            code: None,
+            message: "x".into(),
+        },
+    ];
+    let mut errors: Vec<StorageError> = variants.into_iter().map(StorageError::from).collect();
+    errors.extend([
+        StorageError::logical_conflict("test conflict"),
+        StorageError::from(AttemptFailure::CAPACITY),
+        StorageError::from(AttemptFailure::TRANSACTION_BYTES),
+        StorageError::from(AttemptFailure::Unavailable(
+            NativeUnavailable::ConnectionLost,
+        )),
+        expired_in(AttemptPhase::Statement),
+        StorageError::commit_unknown("lost"),
+    ]);
+    errors
+}
+
+#[test]
+fn given_every_storage_variant_when_mapped_to_dynamodb_then_status_follows_class() {
+    let errors = every_storage_error();
+    assert_eq!(
+        errors.len(),
+        35 + 6,
+        "one value per variant and attempt kind"
+    );
+    for error in errors {
+        let class = error.class();
+        let label = error.label();
+        let is_exception = matches!(
+            error.as_ref(),
+            StorageEnum::Unsupported { .. } | StorageEnum::AwsService { .. }
+        );
+        let http = HttpApiError::from(error);
+        match class {
+            ErrorClass::CommitUnknown | ErrorClass::Capacity => {
+                assert_eq!(http.status_code, 500, "{label}");
+                assert_eq!(http.error_type, DYNAMODB_INTERNAL_TYPE, "{label}");
+                assert_eq!(
+                    http.message, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+                    "{label}"
+                );
+            }
+            ErrorClass::Retryable => {
+                assert!(
+                    matches!(http.status_code, 400 | 429 | 503),
+                    "{label}: {}",
+                    http.status_code
+                );
+            }
+            ErrorClass::Client => {
+                assert!(
+                    (400..=499).contains(&http.status_code),
+                    "{label}: {}",
+                    http.status_code
+                );
+            }
+            ErrorClass::Internal => {
+                assert_eq!(http.status_code, 500, "{label}");
+                if !is_exception {
+                    assert_eq!(http.error_type, DYNAMODB_INTERNAL_TYPE, "{label}");
+                    assert_eq!(
+                        http.message, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn given_fresh_validation_when_mapped_to_dynamodb_then_503_retry_after_one() {
+    let http = HttpApiError::from(StorageError::from(AttemptFailure::FRESH_VALIDATION));
+
+    assert_eq!(http.status_code, 503);
+    assert_eq!(retry_after(&http), Some("1"));
+}
+
+#[test]
+fn given_serialization_or_guard_conflict_when_mapped_to_dynamodb_then_constant_internal_text() {
+    let errors: [StorageEnum; 4] = [
+        StorageEnum::GuardConflict {
+            message: "secret".into(),
+        },
+        StorageEnum::AwsSerialization("secret".into()),
+        StorageEnum::Database(std::fmt::Error),
+        StorageEnum::IdempotencyReplay { response: vec![1] },
+    ];
+    for error in errors {
+        let http = HttpApiError::from(StorageError::from(error));
+
+        assert_eq!(http.status_code, 500);
+        assert_eq!(http.error_type, DYNAMODB_INTERNAL_TYPE);
+        assert_eq!(http.message, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE);
+        assert!(!http.message.contains("secret"));
+    }
+}
+
+#[test]
+fn given_typed_reasons_when_serialized_then_aws_json_bytes() {
+    let storage_err: StorageError = StorageEnum::TransactionCanceled {
+        reasons: vec![
+            CancellationReason::none(),
+            CancellationReason::conditional_check_failed(None),
+        ],
+    }
+    .into();
+    let handler: HttpApiError = storage_err.into();
+
+    let (_, axum::response::Json(body)): (StatusCode, _) = handler.into();
+
+    assert_eq!(
+        serde_json::to_string(&body).expect("serialize body"),
+        concat!(
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","#,
+            r#""CancellationReasons":[{"Code":"None"},"#,
+            r#"{"Code":"ConditionalCheckFailed","Message":"The conditional request failed"}],"#,
+            r#""Message":"Transaction cancelled, please refer cancellation reasons for "#,
+            r#"specific reasons [None, ConditionalCheckFailed]"}"#
+        )
+    );
+}
+
+#[test]
+fn given_no_reasons_when_mapped_then_constant_message() {
+    let storage_err: StorageError = StorageEnum::TransactionCanceled { reasons: vec![] }.into();
+    let handler: HttpApiError = storage_err.into();
+
+    let (_, axum::response::Json(body)): (StatusCode, _) = handler.into();
+
+    assert_eq!(
+        body.transaction_message.as_deref(),
+        Some(DYNAMODB_TRANSACTION_CANCELED_MESSAGE)
+    );
+    assert!(
+        body.cancellation_reasons
+            .as_deref()
+            .is_some_and(<[_]>::is_empty)
+    );
 }

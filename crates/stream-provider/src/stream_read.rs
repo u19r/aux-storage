@@ -2,13 +2,11 @@
 
 use std::num::NonZeroU32;
 
-use storage_types::{AttemptMode, StorageError, StorageResult, StreamItemId, StreamName};
+use storage_types::{StorageError, StorageResult, StreamItemId, StreamName};
 
 use crate::{
-    ReadDirection, StreamAttempt, StreamError, StreamItem, StreamKind, StreamPage,
-    StreamPartitioningMode, StreamPort, StreamResult, StreamRowKind,
-    system_stream::{SystemStreamHistory, SystemStreamHistoryRecord},
-    validate_limit,
+    ReadDirection, StreamAddress, StreamAttempt, StreamError, StreamItem, StreamPage,
+    StreamPartitioningMode, StreamPort, StreamResult, validate_limit,
 };
 
 /// One bounded physical read. The family lowerer fetches one extra row so
@@ -26,20 +24,10 @@ pub struct StreamRowPage {
     pub more: bool,
 }
 
-pub type StreamReadKind<'a> = StreamKind<AddressedStreamRead<'a>, SystemStreamReadKind<'a>>;
-
-/// The stream kind supplies the physical address for either row operation.
-/// Page and point payloads therefore cannot name a different stream.
-pub struct AddressedStreamRead<'a> {
-    stream: &'a StreamRowKind,
-    read: StreamRowReadKind<'a>,
-}
-
-impl<'a> AddressedStreamRead<'a> {
-    #[must_use]
-    pub fn into_parts(self) -> (&'a StreamRowKind, StreamRowReadKind<'a>) {
-        (self.stream, self.read)
-    }
+/// One ordinary row read carries its physical address directly.
+pub struct StreamReadKind<'a> {
+    pub stream: &'a StreamName,
+    pub read: StreamRowReadKind<'a>,
 }
 
 pub enum StreamRowReadKind<'a> {
@@ -50,37 +38,18 @@ pub enum StreamRowReadKind<'a> {
     },
 }
 
-pub enum SystemStreamReadKind<'a> {
-    Rows(AddressedStreamRead<'a>),
-    Catalog,
-}
-
-impl StreamRowKind {
-    pub fn row_read<'a>(&'a self, request: StreamRowReadKind<'a>) -> StreamReadKind<'a> {
-        let addressed = AddressedStreamRead {
-            stream: self,
-            read: request,
-        };
-        match self {
-            Self::System(_) => StreamReadKind::System(SystemStreamReadKind::Rows(addressed)),
-            Self::Table(_) => StreamReadKind::Table(addressed),
-            Self::Item(_) => StreamReadKind::Item(addressed),
-            Self::User(_) => StreamReadKind::User(addressed),
-        }
-    }
-}
-
 pub enum StreamReadResult {
     Items(StreamRowPage),
     Item(Option<StreamItem>),
-    SystemCatalog(SystemStreamHistory),
 }
 
-/// One physical logical-history read, with its pointer rows in the same order.
+/// One physical logical-history page, with canonical entries in source order.
 pub struct SystemStreamHistoryReadPage {
     pub retired_through: Option<storage_types::SystemStreamPosition>,
-    pub records: Vec<storage_types::SystemHistoryRecord>,
-    pub observations: Vec<SystemStreamHistoryRecord>,
+    pub records: Vec<(
+        crate::PositionedStreamEntry,
+        Option<storage_types::TableHistoryState>,
+    )>,
     pub more: bool,
 }
 
@@ -97,15 +66,6 @@ impl StreamReadResult {
     pub(crate) fn into_item(self) -> StorageResult<Option<StreamItem>> {
         match self {
             Self::Item(item) => Ok(item),
-            _ => Err(StorageError::internal(
-                "stream backend returned another read kind",
-            )),
-        }
-    }
-
-    pub fn into_system_catalog(self) -> StorageResult<SystemStreamHistory> {
-        match self {
-            Self::SystemCatalog(history) => Ok(history),
             _ => Err(StorageError::internal(
                 "stream backend returned another read kind",
             )),
@@ -129,7 +89,7 @@ pub fn verify_stream_item_identity(
 
 pub(crate) async fn read<P: StreamPort>(
     port: &P,
-    kind: StreamRowKind,
+    address: StreamAddress,
     exclusive_start: Option<StreamItemId>,
     direction: ReadDirection,
     limit: u32,
@@ -142,24 +102,30 @@ pub(crate) async fn read<P: StreamPort>(
         limit: NonZeroU32::new(limit)
             .ok_or_else(|| StreamError::validation(crate::StreamValidationKind::InvalidLimit))?,
     };
-    let physical = port
-        .with_stream_attempt(AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(async move {
-                let mut request = request;
-                request.partitioning_mode =
-                    crate::stream_kind::resolve_stream_layout(attempt, &kind).await?;
-                let rows = attempt
-                    .read_stream(kind.row_read(StreamRowReadKind::Page(&request)))
-                    .await?
-                    .into_items()?;
-                Ok((rows, request, kind))
-            })
-        })
+    let (physical, request, stream) = port
+        .with_attempt(
+            crate::constants::STREAM_RANGE_READ.start(port.attempt_deadlines()),
+            move |attempt| {
+                Box::pin(async move {
+                    let mut request = request;
+                    let (stream, partitioning_mode) =
+                        crate::stream_kind::resolve_stream(attempt, &address).await?;
+                    request.partitioning_mode = partitioning_mode;
+                    let rows = attempt
+                        .read_stream(StreamReadKind {
+                            stream: &stream,
+                            read: StreamRowReadKind::Page(&request),
+                        })
+                        .await?
+                        .into_items()?;
+                    Ok((rows, request, stream))
+                })
+            },
+        )
         .await
         .map_err(StreamError::from_storage_error)?;
-    let (physical, request, kind) = physical;
     physical
-        .finish(&request, &kind)
+        .finish(&request, &stream)
         .map_err(StreamError::from_storage_error)
 }
 
@@ -167,7 +133,7 @@ impl StreamRowPage {
     pub fn finish(
         mut self,
         request: &StreamReadRequest,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
     ) -> StorageResult<StreamPage> {
         let max_rows = request.limit.get() as usize + 1;
         if self.rows.len() > max_rows || self.more && self.rows.is_empty() {
@@ -177,7 +143,7 @@ impl StreamRowPage {
         }
         let mut previous = request.exclusive_start;
         for row in &self.rows {
-            if row.stream_name.as_ref() != Some(stream.value())
+            if row.stream_name.as_ref() != Some(stream)
                 || !ordered_after(previous, row.id, request.direction)
             {
                 return Err(StorageError::internal(

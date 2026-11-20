@@ -37,14 +37,16 @@ impl HealthTracker {
     }
 
     pub fn record_failure(&self, reason: impl Into<String>) {
+        self.record_failure_at(Instant::now(), reason);
+    }
+
+    pub(crate) fn record_failure_at(&self, at: Instant, reason: impl Into<String>) {
         if let Ok(mut state) = self.inner.lock() {
             let reason_string = reason.into();
             if state.recent_failures.len() == 5 {
                 state.recent_failures.pop_front();
             }
-            state
-                .recent_failures
-                .push_back((Instant::now(), reason_string));
+            state.recent_failures.push_back((at, reason_string));
         }
     }
 

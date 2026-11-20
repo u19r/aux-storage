@@ -103,7 +103,7 @@ async fn given_missing_table_when_get_item_runs_then_resource_not_found_response
     assert!(!trace.contains("private-customer-key"));
     let expected = json!({
         "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
-        "message": format!("Requested resource not found: Table: {} not found", table.as_ref())
+        "message": "Requested resource not found"
     });
     assert_dynamo_error_response_exact(
         observed.result.unwrap_err(),

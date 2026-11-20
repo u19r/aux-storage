@@ -10,20 +10,32 @@ use crate::{SqlQueryPage, SqlStatement};
 
 pub(super) struct NativeStatements<'native> {
     connection: &'native rusqlite::Connection,
-    #[cfg(feature = "fault-injection")]
+    /// `false` in a ReadOnly attempt: a statement that SQLite does not classify
+    /// as read-only is refused before it runs.
+    writes: bool,
+    // A query that SQLite does not classify as read-only, such as
+    // `UPDATE ... RETURNING`, can change the database.
+    wrote: std::cell::Cell<bool>,
     fault_probe: Option<&'native dyn crate::SqlFaultProbe>,
 }
 
 impl<'native> NativeStatements<'native> {
     pub(super) fn new(
         connection: &'native rusqlite::Connection,
-        #[cfg(feature = "fault-injection")] fault_probe: Option<&'native dyn crate::SqlFaultProbe>,
+        writes: bool,
+        fault_probe: Option<&'native dyn crate::SqlFaultProbe>,
     ) -> Self {
         Self {
             connection,
-            #[cfg(feature = "fault-injection")]
+            writes,
+            wrote: std::cell::Cell::new(false),
             fault_probe,
         }
+    }
+
+    /// Whether a query prepared here was not read-only.
+    pub(super) fn wrote(&self) -> bool {
+        self.wrote.get()
     }
 
     pub(super) fn query(
@@ -44,7 +56,7 @@ impl<'native> NativeStatements<'native> {
         let mut pages = Vec::new();
         pages
             .try_reserve_exact(statements.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for (statement, _) in statements {
             pages.push(self.query_qualified(statement, max_bytes)?);
         }
@@ -61,7 +73,7 @@ impl<'native> NativeStatements<'native> {
         let mut counts = Vec::new();
         counts
             .try_reserve_exact(statements.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for statement in statements {
             counts.push(self.execute_qualified(statement)?);
         }
@@ -93,7 +105,6 @@ impl<'native> NativeStatements<'native> {
 
     fn execute_qualified(&self, statement: SqlStatement) -> StorageResult<u64> {
         let result = (|| {
-            #[cfg(feature = "fault-injection")]
             self.check_fault(crate::SqlFaultOperation::Execute, &statement)?;
             let (sql, values) = statement.into_native_parts::<rusqlite::types::Value>()?;
             let mut prepared = self
@@ -103,8 +114,14 @@ impl<'native> NativeStatements<'native> {
             let affected = prepared
                 .execute(rusqlite::params_from_iter(values.iter()))
                 .map_err(map_driver_error)?;
-            u64::try_from(affected)
-                .map_err(|_| StorageError::internal("SQLite affected count overflow"))
+            let affected = u64::try_from(affected)
+                .map_err(|_| StorageError::internal("SQLite affected count overflow"))?;
+            crate::fault_injection::observe_statement(
+                self.fault_probe,
+                crate::SqlFaultOperation::Execute,
+                affected,
+            );
+            Ok(affected)
         })();
         result.inspect_err(|error| {
             trace_native_failure(NativeEngine::Sqlite, NativeOperation::SqlExecute, error)
@@ -116,17 +133,18 @@ impl<'native> NativeStatements<'native> {
         statement: SqlStatement,
         max_bytes: NonZeroUsize,
     ) -> StorageResult<SqlQueryPage> {
-        #[cfg(feature = "fault-injection")]
         self.check_fault(crate::SqlFaultOperation::Query, &statement)?;
-        #[cfg(feature = "fault-injection")]
         let sql = self.fault_probe.map(|_| statement.sql().to_owned());
         let page = self.load_rows(statement, max_bytes)?;
-        #[cfg(feature = "fault-injection")]
-        if let (Some(probe), Some(sql)) = (self.fault_probe, sql.as_deref()) {
+        if let Some(probe) = self.fault_probe {
+            probe.observe(crate::SqlNativeEvent::Statement {
+                operation: crate::SqlFaultOperation::Query,
+                rows: u64::try_from(page.rows.len()).unwrap_or(u64::MAX),
+            });
             return Ok(probe.alter_query_page(
                 crate::SqlFaultCall {
                     operation: crate::SqlFaultOperation::Query,
-                    sql,
+                    sql: sql.as_deref().unwrap_or_default(),
                 },
                 page,
             ));
@@ -144,6 +162,14 @@ impl<'native> NativeStatements<'native> {
             .connection
             .prepare_cached(&sql)
             .map_err(map_driver_error)?;
+        if !prepared.readonly() {
+            if !self.writes {
+                return Err(StorageError::internal(
+                    "SQLite ReadOnly attempt refused a writing statement",
+                ));
+            }
+            self.wrote.set(true);
+        }
         let mut cursor = prepared
             .query(rusqlite::params_from_iter(values.iter()))
             .map_err(map_driver_error)?;
@@ -156,7 +182,6 @@ impl<'native> NativeStatements<'native> {
         Ok(page)
     }
 
-    #[cfg(feature = "fault-injection")]
     fn check_fault(
         &self,
         operation: crate::SqlFaultOperation,

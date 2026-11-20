@@ -1,5 +1,3 @@
-use std::time::{Duration, Instant};
-
 use alloc_counter::AllocationGuard;
 
 use crate::{
@@ -129,18 +127,6 @@ fn measure_legacy_validation_allocations() -> alloc_counter::AllocationReport<'s
     guard.finish()
 }
 
-fn measure_runtime(
-    validate: fn(&[KeySchemaElement; 3], &[(String, AttributeValue); 3]),
-) -> Duration {
-    let schemas = schemas();
-    let values = key_values();
-    let started = Instant::now();
-    for _ in 0..DYNAMODB_LIMITS_PERF_ITERATIONS {
-        validate(&schemas, &values);
-    }
-    started.elapsed()
-}
-
 #[test]
 fn direct_key_attribute_value_validation_allocation_profile_tests() {
     let legacy = measure_legacy_validation_allocations();
@@ -149,38 +135,6 @@ fn direct_key_attribute_value_validation_allocation_profile_tests() {
     let _ = alloc_counter::emit_report(&direct);
     assert!(direct.allocation_count < legacy.allocation_count);
     assert!(direct.allocated_bytes < legacy.allocated_bytes);
-}
-
-#[test]
-#[ignore = "manual runtime perf probe; run with --ignored --nocapture --test-threads=1"]
-fn direct_key_attribute_value_validation_runtime_perf_probe() {
-    let legacy = measure_runtime(|schemas, values| {
-        for (schema, (name, value)) in schemas.iter().zip(values.iter()) {
-            let mut key_attributes = KeyAttributes::with_capacity(1);
-            key_attributes.insert(name.clone(), value.clone());
-            validate_key_attributes_for_schema(std::slice::from_ref(schema), &key_attributes)
-                .expect("valid key value");
-        }
-    });
-    let direct = measure_runtime(|schemas, values| {
-        for (schema, (_, value)) in schemas.iter().zip(values.iter()) {
-            validate_key_attribute_value_for_schema(schema, value).expect("valid key value");
-        }
-    });
-
-    println!(
-        "legacy_key_attribute_validation iterations={DYNAMODB_LIMITS_PERF_ITERATIONS} \
-         elapsed_ms={:.3} ns_per_iter={:.2}",
-        legacy.as_secs_f64() * 1_000.0,
-        legacy.as_nanos() as f64 / DYNAMODB_LIMITS_PERF_ITERATIONS as f64
-    );
-    println!(
-        "direct_key_attribute_validation iterations={DYNAMODB_LIMITS_PERF_ITERATIONS} \
-         elapsed_ms={:.3} ns_per_iter={:.2}",
-        direct.as_secs_f64() * 1_000.0,
-        direct.as_nanos() as f64 / DYNAMODB_LIMITS_PERF_ITERATIONS as f64
-    );
-    assert!(direct.as_nanos() > 0);
 }
 
 #[test]

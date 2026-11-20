@@ -36,6 +36,6 @@ pub(crate) fn point_allowance(count: usize) -> StorageResult<crate::KvValueAllow
     let maximum = crate::constants::SCHEDULED_JOB_VALUE_BYTES;
     let total = maximum
         .checked_mul(count)
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     Ok(crate::KvValueAllowance::new(maximum, total))
 }

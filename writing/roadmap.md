@@ -19,7 +19,3 @@ Last updated: 2026-10-24
 
 - Bounded inverted indexes: opt-in set-membership indexes for DynamoDB set attributes.
 - Tunable limits: knobs to relax selected AWS DynamoDB constraints while preserving bounded work.
-
-## Planned
-
-- Accurate capacity consumption: consumed capacity remains best effort, not AWS billing-equivalent.

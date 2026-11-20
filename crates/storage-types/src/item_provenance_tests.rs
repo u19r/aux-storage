@@ -1,47 +1,53 @@
-use crate::ItemProvenance;
+use std::num::NonZeroU16;
 
-#[test]
-fn given_local_or_opaque_stored_metadata_when_read_and_serialized_then_exact_bytes_and_redaction_survive()
- {
-    for bytes in [
-        ItemProvenance::LOCAL_BYTES,
-        br#"{"kind":"replicated","winner":{"future":42}}"#,
-        r#"{ "future": [1e2, "葉\\\"", {"duplicate":1,"duplicate":2}] }"#.as_bytes(),
-        b"{}",
-    ] {
-        let value = ItemProvenance::decode(bytes).unwrap();
-        let read: ItemProvenance = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(value, read);
-        assert_eq!(value.as_bytes(), bytes);
-        assert_eq!(serde_json::to_vec(&value).unwrap(), bytes);
-        assert_eq!(serde_json::to_vec(&read).unwrap(), bytes);
-        assert_eq!(format!("{value:?}"), "ItemProvenance(<redacted>)");
-        assert_eq!(value.clone(), value);
-        let padded = [b" ".as_slice(), bytes, b"\n"].concat();
-        assert!(ItemProvenance::decode(&padded).is_err());
-        assert_eq!(
-            serde_json::from_slice::<ItemProvenance>(&padded).unwrap(),
-            value
-        );
-    }
-    assert_eq!(
-        serde_json::to_vec(&ItemProvenance::default()).unwrap(),
-        ItemProvenance::LOCAL_BYTES
-    );
+use crate::{ItemProvenance, RegionId, RegionalOrder};
+
+fn order() -> RegionalOrder {
+    RegionalOrder::from_parts(1_024_000, RegionId(NonZeroU16::new(2).unwrap()), false)
 }
 
 #[test]
-fn given_invalid_provenance_envelopes_when_read_then_both_boundaries_reject_them() {
-    for bytes in [
-        b"null".as_slice(),
-        b"[]",
-        b"42",
-        b"\"text\"",
-        b"{",
-        b"{} {}",
-        b"{\"x\":\xff}",
-    ] {
-        assert!(ItemProvenance::decode(bytes).is_err());
-        assert!(serde_json::from_slice::<ItemProvenance>(bytes).is_err());
+fn given_default_provenance_when_stored_then_empty_bytes_and_local() {
+    let value = ItemProvenance::default();
+    assert!(value.as_bytes().is_empty());
+    assert!(value.is_local());
+    assert_eq!(value.order(), None);
+    assert_eq!(ItemProvenance::decode(&[]).unwrap(), value);
+}
+
+#[test]
+fn given_regional_provenance_when_stored_then_eleven_bytes_and_round_trip() {
+    let value = ItemProvenance::regional(order());
+    assert_eq!(value.as_bytes().len(), RegionalOrder::ENCODED_BYTES);
+    assert_eq!(value.as_bytes(), order().encode());
+    assert!(!value.is_local());
+    let decoded = ItemProvenance::decode(value.as_bytes()).unwrap();
+    assert_eq!(decoded, value);
+    assert_eq!(decoded.order(), Some(order()));
+}
+
+#[test]
+fn given_other_lengths_when_decoded_then_error() {
+    for length in [1, 10, 12, 23] {
+        assert!(ItemProvenance::decode(&vec![0; length]).is_err());
     }
+}
+
+#[test]
+fn given_provenance_when_serialized_as_json_then_null_or_order_object_and_round_trip() {
+    let local = ItemProvenance::default();
+    assert_eq!(serde_json::to_vec(&local).unwrap(), b"null");
+    assert_eq!(
+        serde_json::from_slice::<ItemProvenance>(b"null").unwrap(),
+        local
+    );
+
+    let regional = ItemProvenance::regional(order());
+    let json = serde_json::to_value(regional).unwrap();
+    assert!(json.is_object());
+    assert_eq!(json, serde_json::to_value(order()).unwrap());
+    assert_eq!(
+        serde_json::from_value::<ItemProvenance>(json).unwrap(),
+        regional
+    );
 }

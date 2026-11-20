@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::{
     StorageError, StorageResult, WireAttributeDecode,
@@ -40,7 +39,8 @@ impl TableNamespace {
 
     #[must_use]
     pub fn new() -> Self {
-        let raw = Uuid::now_v7().as_u128() >> (u128::BITS as usize - CROCKFORD_114_BITS);
+        let raw =
+            crate::ambient::uuid_now_v7().as_u128() >> (u128::BITS as usize - CROCKFORD_114_BITS);
         let mut namespace = String::with_capacity(Self::LENGTH);
         namespace.push_str(Self::PREFIX);
         append_crockford_u128(&mut namespace, raw, CROCKFORD_114_LENGTH);

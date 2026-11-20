@@ -9,10 +9,10 @@ use std::{
 
 use http_request::reqwest::Client;
 use storage_common::WriteCostTally;
-use storage_provider::StorageProvider;
 use storage_types::{
-    AttributeValue, GlobalSecondaryIndexDescription, IndexName, IndexStatus, Projection,
-    StorageEnum, StorageError, TableName, context::WrappedError as _,
+    AttributeValue, CancellationCode, CancellationReason, GlobalSecondaryIndexDescription,
+    IndexName, IndexStatus, Projection, StorageEnum, StorageError, TableName,
+    context::WrappedError as _,
 };
 
 use crate::{
@@ -39,7 +39,6 @@ fn provider_with_urls(urls: &[&str]) -> RemoteStorageProvider {
         credential_source: "test",
         primary_endpoint: AtomicUsize::new(0),
         probation_endpoint: AtomicUsize::new(NO_ENDPOINT),
-        pressure_signals: AtomicUsize::new(0),
         retry_budget: RetryTokenBucket::new(),
         request_timeout: None,
         redirect_policy: super::provider_helpers::RemoteRedirectPolicy::Disabled,
@@ -171,26 +170,6 @@ fn given_retry_budget_refunds_when_full_or_concurrent_then_fast_path_preserves_c
         assert!(concurrent.try_take_at(now));
     }
     assert!(!concurrent.try_take_at(now));
-}
-
-#[test]
-fn admission_pressure_signal_is_empty_without_underflow() {
-    let provider = provider_with_urls(&["http://a.test"]);
-    assert!(!provider.take_admission_pressure_signal());
-
-    provider.pressure_signals.fetch_add(1, Ordering::Relaxed);
-    assert!(provider.take_admission_pressure_signal());
-    assert!(!provider.take_admission_pressure_signal());
-}
-
-#[test]
-fn admission_pressure_signal_drains_all_retry_markers_at_the_boundary() {
-    let provider = provider_with_urls(&["http://a.test"]);
-    provider.pressure_signals.store(5, Ordering::Relaxed);
-
-    assert!(provider.take_admission_pressure_signal());
-    assert_eq!(provider.pressure_signals.load(Ordering::Acquire), 0);
-    assert!(!provider.take_admission_pressure_signal());
 }
 
 #[test]
@@ -432,8 +411,12 @@ fn write_cost_tally_tracks_transact_item_kinds() {
 fn given_transaction_cancellation_when_logging_then_preserves_health_policy() {
     for reasons in [
         vec![],
-        vec!["ConditionalCheckFailed".into()],
-        vec!["TransactionConflict".into()],
+        vec![CancellationReason::conditional_check_failed(None)],
+        vec![CancellationReason::from_parts(
+            CancellationCode::TransactionConflict,
+            None,
+            None,
+        )],
     ] {
         let error = StorageError::from(StorageEnum::TransactionCanceled { reasons });
         assert!(RemoteStorageProvider::should_suppress_operation_warning(
@@ -450,112 +433,4 @@ fn given_transaction_cancellation_when_logging_then_preserves_health_policy() {
         "TransactWriteItems",
         &error
     ));
-}
-
-#[tokio::test]
-async fn given_remote_provider_when_snapshot_context_is_requested_then_returns_unsupported() {
-    let provider = provider_with_urls(&["http://127.0.0.1:1"]);
-    let error = provider
-        .begin_read_sequence_read_context(storage_types::ReadSequenceConsistency::Transactional)
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(error.to_enum(), StorageEnum::Unsupported { .. }));
-}
-
-#[tokio::test]
-async fn given_remote_provider_when_atomic_transform_is_requested_then_returns_unsupported() {
-    let provider = provider_with_urls(&["http://127.0.0.1:1"]);
-    let result = provider
-        .atomic_item_read_modify_write(storage_provider::AtomicItemReadModifyWriteRequest {
-            table_name: TableName::new("unsupported_table"),
-            key: Default::default(),
-            transform: Arc::new(|_| panic!("unsupported operation must not invoke the transform")),
-        })
-        .await;
-    assert_unsupported_default(result);
-}
-
-fn bind_guarded_write<R>(
-    request: R,
-) -> storage_provider::PhysicalWrite<R, storage_provider::TtlWriteContext> {
-    let table = TableName::new("unsupported_table");
-    storage_provider::PhysicalWrite::try_new(
-        0,
-        table.clone(),
-        request,
-        storage_provider::TtlWriteContext::direct(table).unwrap(),
-    )
-    .unwrap()
-}
-
-fn unsupported_guard() -> storage_types::DurablePointReadGuard {
-    storage_types::DurablePointReadGuard::Absent(storage_types::DurableAbsenceProof::new(vec![]))
-}
-
-fn assert_unsupported_default<T>(result: storage_types::StorageResult<T>) {
-    let error = result
-        .err()
-        .expect("unsupported provider operation must return an error");
-    assert!(matches!(error.to_enum(), StorageEnum::Unsupported { .. }));
-}
-
-#[tokio::test]
-async fn given_remote_provider_when_guarded_writes_are_requested_then_returns_unsupported() {
-    use storage_types::{
-        GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedTransactWriteItemsRequest,
-        GuardedUpdateItemRequest,
-    };
-    let provider = provider_with_urls(&["http://127.0.0.1:1"]);
-    let table_name = TableName::new("unsupported_table");
-    assert!(!provider.supports_guarded_writes());
-    assert!(!provider.supports_guarded_transaction_writes());
-    assert_unsupported_default(
-        provider
-            .guarded_put_item(bind_guarded_write(GuardedPutItemRequest {
-                table_name: table_name.clone(),
-                item: Default::default(),
-                indexers: vec![],
-                guard: unsupported_guard(),
-                condition_expression: None,
-                expression_attribute_names: None,
-                expression_attribute_values: None,
-                return_values: None,
-            }))
-            .await,
-    );
-    assert_unsupported_default(
-        provider
-            .guarded_delete_item(bind_guarded_write(GuardedDeleteItemRequest {
-                table_name: table_name.clone(),
-                key: Default::default(),
-                guard: unsupported_guard(),
-                condition_expression: None,
-                expression_attribute_names: None,
-                expression_attribute_values: None,
-            }))
-            .await,
-    );
-    assert_unsupported_default(
-        provider
-            .guarded_update_item(bind_guarded_write(GuardedUpdateItemRequest {
-                request: storage_types::UpdateItemRequest::builder()
-                    .table_name(table_name)
-                    .key(storage_types::KeyAttributes::default())
-                    .build(),
-                guard: unsupported_guard(),
-            }))
-            .await,
-    );
-    assert_unsupported_default(
-        provider
-            .guarded_transact_write_items(
-                GuardedTransactWriteItemsRequest {
-                    request: Default::default(),
-                    guards: vec![],
-                },
-                storage_provider::OrderedOperationContexts::try_new(vec![]).unwrap(),
-            )
-            .await,
-    );
 }

@@ -46,6 +46,7 @@ async fn given_manager_when_create_send_receive_delete_then_roundtrip() -> anyho
             .create_queue(queue_provider::CreateQueueRequest {
                 queue_name: "mgr-roundtrip".to_string(),
                 attributes: None,
+                ..Default::default()
             })
             .await
             .map_err(|err| anyhow::anyhow!("manager create failed: {err:?}"))?
@@ -56,6 +57,7 @@ async fn given_manager_when_create_send_receive_delete_then_roundtrip() -> anyho
                 message_body: "mgr-body".to_string(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             })
             .await
             .map_err(|err| anyhow::anyhow!("manager send failed: {err:?}"))?;
@@ -111,6 +113,7 @@ async fn given_manager_when_stale_receipt_then_current_preserved() -> anyhow::Re
             .create_queue(queue_provider::CreateQueueRequest {
                 queue_name: "mgr-stale".to_string(),
                 attributes: None,
+                ..Default::default()
             })
             .await
             .map_err(|err| anyhow::anyhow!("manager create failed: {err:?}"))?
@@ -121,6 +124,7 @@ async fn given_manager_when_stale_receipt_then_current_preserved() -> anyhow::Re
                 message_body: "stale".to_string(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             })
             .await
             .map_err(|err| anyhow::anyhow!("manager send failed: {err:?}"))?
@@ -335,13 +339,14 @@ async fn given_manager_when_queue_delivery_then_notification_persisted() -> anyh
         let queue_manager = Arc::new(queue::QueueManager::new(queue_provider));
         let manager = pubsub::PubsubManager::builder()
             .provider(pubsub_provider)
-            .queue_manager(queue_manager.clone())
+            .queue_wake(queue_manager.wake_handle())
             .build()
             .map_err(|err| anyhow::anyhow!("manager build failed: {err:?}"))?;
         let queue_url = queue_manager
             .create_queue(queue_provider::CreateQueueRequest {
                 queue_name: "mgr-notify".to_string(),
                 attributes: None,
+                ..Default::default()
             })
             .await
             .map_err(|err| anyhow::anyhow!("create queue failed: {err:?}"))?
@@ -354,7 +359,7 @@ async fn given_manager_when_queue_delivery_then_notification_persisted() -> anyh
             .subscribe(SubscribeRequest {
                 topic_arn: topic.topic_arn.clone(),
                 protocol: SubscriptionProtocol::Queue,
-                endpoint: queue_url.clone(),
+                endpoint: "arn:aws:sqs:us-east-1:000000000000:mgr-notify".to_owned(),
                 attributes: HashMap::new(),
                 extra_json: serde_json::Value::Null,
             })
@@ -419,6 +424,7 @@ async fn given_receive_attribute_prefix_when_projected_then_names_and_digest_mat
             .create_queue(queue_provider::CreateQueueRequest {
                 queue_name: "receive-projection".to_owned(),
                 attributes: None,
+                ..Default::default()
             })
             .await?
             .queue_url;
@@ -441,12 +447,14 @@ async fn given_receive_attribute_prefix_when_projected_then_names_and_digest_mat
                 message_body: "body".to_owned(),
                 delay_seconds: None,
                 message_attributes: Some(attributes),
+                ..Default::default()
             })
             .await?;
         let request: queue_provider::ReceiveMessageRequest =
             serde_json::from_value(serde_json::json!({
                 "QueueUrl": url, "MessageSystemAttributeNames": ["SentTimestamp"],
                 "MessageAttributeNames": ["bar.*"], "VisibilityTimeout": 0,
+                "WaitTimeSeconds": 1,
             }))?;
         let response = manager.receive_message(request).await?;
         let message = &response.messages[0];
@@ -461,6 +469,7 @@ async fn given_receive_attribute_prefix_when_projected_then_names_and_digest_mat
         let request: queue_provider::ReceiveMessageRequest =
             serde_json::from_value(serde_json::json!({
                 "QueueUrl": url, "MessageAttributeNames": [".*"], "VisibilityTimeout": 0,
+                "WaitTimeSeconds": 1,
             }))?;
         let response = manager.receive_message(request).await?;
         anyhow::ensure!(
@@ -492,6 +501,7 @@ async fn given_mixed_queue_size_batch_when_sent_then_valid_entry_succeeds_and_ov
                     "MaximumMessageSize".to_owned(),
                     "1024".to_owned(),
                 )])),
+                ..Default::default()
             })
             .await?
             .queue_url;
@@ -500,6 +510,7 @@ async fn given_mixed_queue_size_batch_when_sent_then_valid_entry_succeeds_and_ov
             message_body: body,
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         };
         let response = manager
             .send_message_batch(queue_provider::SendMessageBatchRequest {

@@ -1,58 +1,18 @@
-//! Native regional replication over the existing regional database boundary.
-pub mod bootstrap;
-mod canonical_original;
+//! Regional pair replication (design B): messages, region configuration, peer
+//! transport.
+pub mod client;
+pub mod config;
+#[cfg(test)]
+mod config_tests;
 mod constants;
-pub mod control;
-pub mod delivery;
-mod history_capacity;
-pub mod import;
-pub mod import_receipt;
-mod job_recovery;
-pub mod journal;
-mod native_read;
-mod native_record;
-pub(crate) mod origin;
-pub mod runtime;
-pub mod serving;
-pub mod source_frame;
+pub mod message;
+#[cfg(test)]
+mod message_tests;
+pub mod server;
+#[cfg(test)]
+mod server_tests;
 pub mod transport;
 
-#[cfg(test)]
-mod bootstrap_native_tests;
-#[cfg(test)]
-mod fragment_native_tests;
-#[cfg(test)]
-mod native_admission_test_support;
-#[cfg(test)]
-mod native_slice_tests;
-#[cfg(test)]
-mod source_frame_performance_tests;
-#[cfg(test)]
-mod test_support;
-
-pub mod enable;
-
-pub mod lifecycle;
-
-pub mod history_capture;
-
-pub mod history_collection;
-
-pub mod addition;
-pub mod streams;
-
-pub mod history;
-
-mod archive;
-
-pub mod trim;
-
-mod image_equality;
-mod json_projection;
-mod numeric_token;
-
-#[cfg(test)]
-mod table_stream_eligibility_tests;
-
-#[cfg(test)]
-mod job_recovery_tests;
+pub use client::RegionalPeerClient;
+pub use config::{RegionName, RegionalConfig};
+pub use server::{RegionalRequestHandler, spawn_server};

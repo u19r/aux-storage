@@ -36,14 +36,6 @@ impl NativeAttemptCapacity {
     }
 }
 
-/// The native owner has proved that this complete attempt did not commit.
-/// Only a conflict permits the shared retry owner to repeat fresh observations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeAttemptRejection {
-    Conflict,
-    Capacity,
-}
-
 impl crate::StorageError {
     /// Native owners use this after operation failure, without replacing an
     /// unknown outcome. The owner must still acknowledge abort before returning
@@ -54,50 +46,141 @@ impl crate::StorageError {
         }
         match settlement {
             Err(error)
-                if error.is_commit_unknown()
-                    || error.native_attempt_rejection()
-                        == Some(NativeAttemptRejection::Capacity) =>
+                if !matches!(
+                    error.attempt_kind(),
+                    Some(crate::AttemptKind::Conflict | crate::AttemptKind::FreshValidation)
+                ) && !error.is_attempt_abandoned() =>
             {
                 error
             }
             _ => self,
         }
     }
-
-    pub fn native_attempt_rejection(&self) -> Option<NativeAttemptRejection> {
-        match self.as_ref() {
-            crate::StorageEnum::TransactionConflict { .. } => {
-                Some(NativeAttemptRejection::Conflict)
-            }
-            crate::StorageEnum::InfrastructureResult(
-                crate::InfrastructureResultKind::NativeCapacityRejected,
-            ) => Some(NativeAttemptRejection::Capacity),
-            _ => None,
-        }
-    }
 }
 
 /// A workflow failure may follow native writes even when its caller catches it.
 /// Rejection is irreversible for this attempt; a retry needs a fresh attempt.
-#[derive(Default)]
 pub struct NativeAttemptSettlement {
-    state: std::sync::atomic::AtomicU8,
+    /// False once any verdict other than `Open` was merged: the lock-free
+    /// check of every native call.
+    open: std::sync::atomic::AtomicBool,
+    verdict: std::sync::Mutex<AttemptVerdict>,
     work: crate::native_work::NativeWorkBudget,
 }
 
-/// Discriminants order irreversible rejection strength for concurrent calls.
-#[repr(u8)]
-enum SettlementState {
+impl Default for NativeAttemptSettlement {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+/// What a rejected attempt reports. `strength` orders the verdicts; `merge`
+/// keeps the stronger one and, at equal strength, the first. Each verdict
+/// keeps the first error that set it, so its cause and phase survive.
+#[derive(Clone, Debug)]
+enum AttemptVerdict {
     Open,
-    Rejected,
-    CapacityRejected,
-    UnknownRejected,
+    /// A call failed without a classified error or was abandoned.
+    Abandoned,
+    /// A conflict or fresh-validation request: the retry owner decides.
+    Conflict(crate::StorageError),
+    /// A native deadline or lost service. `first_deadline` is the first
+    /// deadline error (it names its phase for the caller and the metric).
+    Unavailable {
+        first: crate::StorageError,
+        first_deadline: Option<crate::StorageError>,
+    },
+    Capacity(crate::StorageError),
+    TransactionBytes(crate::StorageError),
+    /// An error that is no attempt failure (validation, internal): the
+    /// caller sees it.
+    Permanent(crate::StorageError),
+    Unknown(crate::StorageError),
+}
+
+impl AttemptVerdict {
+    const fn strength(&self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Abandoned => 1,
+            Self::Conflict(_) => 2,
+            Self::Unavailable { .. } => 3,
+            Self::Capacity(_) => 4,
+            Self::TransactionBytes(_) => 5,
+            Self::Permanent(_) => 6,
+            Self::Unknown(_) => 7,
+        }
+    }
+
+    /// The verdict that one failed call contributes.
+    fn of_error(error: &crate::StorageError) -> Self {
+        if error.is_attempt_abandoned() {
+            return Self::Abandoned;
+        }
+        let Some(kind) = error.attempt_kind() else {
+            return Self::Permanent(error.clone());
+        };
+        match kind {
+            crate::AttemptKind::CommitUnknown => Self::Unknown(error.clone()),
+            crate::AttemptKind::TransactionBytes => Self::TransactionBytes(error.clone()),
+            crate::AttemptKind::Capacity => Self::Capacity(error.clone()),
+            crate::AttemptKind::Deadline => Self::Unavailable {
+                first: error.clone(),
+                first_deadline: Some(error.clone()),
+            },
+            crate::AttemptKind::Unavailable => Self::Unavailable {
+                first: error.clone(),
+                first_deadline: None,
+            },
+            crate::AttemptKind::Conflict | crate::AttemptKind::FreshValidation => {
+                Self::Conflict(error.clone())
+            }
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            // A deadline after another unavailability still names its phase.
+            (
+                Self::Unavailable {
+                    first,
+                    first_deadline: None,
+                },
+                Self::Unavailable {
+                    first_deadline: Some(deadline),
+                    ..
+                },
+            ) => Self::Unavailable {
+                first,
+                first_deadline: Some(deadline),
+            },
+            (current, other) if other.strength() > current.strength() => other,
+            (current, _) => current,
+        }
+    }
+
+    fn require_open(&self) -> crate::StorageResult<()> {
+        match self {
+            Self::Open => Ok(()),
+            Self::Abandoned => Err(crate::StorageError::attempt_abandoned()),
+            Self::Conflict(error)
+            | Self::Capacity(error)
+            | Self::TransactionBytes(error)
+            | Self::Permanent(error)
+            | Self::Unknown(error) => Err(error.clone()),
+            Self::Unavailable {
+                first,
+                first_deadline,
+            } => Err(first_deadline.as_ref().unwrap_or(first).clone()),
+        }
+    }
 }
 
 impl NativeAttemptSettlement {
     pub fn new(limits: Option<crate::NativeWorkLimits>) -> Self {
         Self {
-            state: Default::default(),
+            open: std::sync::atomic::AtomicBool::new(true),
+            verdict: std::sync::Mutex::new(AttemptVerdict::Open),
             work: crate::native_work::NativeWorkBudget::new(limits),
         }
     }
@@ -124,26 +207,23 @@ impl NativeAttemptSettlement {
     }
 
     pub fn reject(&self) {
-        self.state.fetch_max(
-            SettlementState::Rejected as u8,
-            std::sync::atomic::Ordering::AcqRel,
-        );
+        self.merge(AttemptVerdict::Abandoned);
     }
 
     /// Preserve a synchronous preparation failure before native dispatch.
     /// The owning attempt must still acknowledge abort before reporting
     /// nonacceptance.
     pub fn reject_error(&self, error: &crate::StorageError) {
-        let state = if error.is_commit_unknown() {
-            SettlementState::UnknownRejected
-        } else {
-            match error.native_attempt_rejection() {
-                Some(NativeAttemptRejection::Capacity) => SettlementState::CapacityRejected,
-                _ => SettlementState::Rejected,
-            }
-        };
-        self.state
-            .fetch_max(state as u8, std::sync::atomic::Ordering::AcqRel);
+        self.merge(AttemptVerdict::of_error(error));
+    }
+
+    fn merge(&self, verdict: AttemptVerdict) {
+        let mut current = self
+            .verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = std::mem::replace(&mut *current, AttemptVerdict::Open).merge(verdict);
+        self.open.store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Native calls may observe concurrently. Any failed or abandoned call
@@ -157,23 +237,13 @@ impl NativeAttemptSettlement {
     }
 
     pub fn require_open(&self) -> crate::StorageResult<()> {
-        let state = self.state.load(std::sync::atomic::Ordering::Acquire);
-        if state == SettlementState::Open as u8 {
+        if self.open.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        if state == SettlementState::UnknownRejected as u8 {
-            return Err(crate::StorageError::sync_submission_ambiguous(
-                None,
-                "Native attempt outcome is unknown",
-            ));
-        }
-        if state == SettlementState::CapacityRejected as u8 {
-            return Err(crate::InfrastructureResultKind::NativeCapacityRejected.into());
-        }
-        Err(crate::StorageEnum::TransactionConflict {
-            message: "Native attempt was rejected before settlement".into(),
-        }
-        .into())
+        self.verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .require_open()
     }
 }
 
@@ -203,7 +273,7 @@ impl Drop for NativeAttemptCall<'_> {
 }
 
 /// Native transaction capability shared by SQL and KV backends.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttemptMode {
     /// A coherent native snapshot. Providers currently serve both Dynamo
     /// read modes from this strong snapshot; an eventually consistent replica
@@ -211,8 +281,10 @@ pub enum AttemptMode {
     ReadOnly,
     ReadWrite,
     /// Write or check a bounded set of exact items. Providers may use statement
-    /// snapshots when they protect all targets, including absent items, before
-    /// observing them; other providers retain their native write isolation.
+    /// snapshots (Postgres `READ COMMITTED`) when every write targets a row
+    /// that an earlier protected read of the same attempt holds, or uses a
+    /// conditional insert whose miss is a conflict; other providers retain
+    /// their native write isolation.
     ReadWriteItems,
 }
 
@@ -243,6 +315,10 @@ pub enum ReadProtection {
     /// shared row lock; KV uses its ordinary conflict read.
     Shared,
     Conflict,
+    /// Protect for write as `Conflict` does, but omit a row that another
+    /// attempt protects now. Postgres renders `FOR UPDATE SKIP LOCKED`; other
+    /// providers treat it as `Conflict`.
+    Claim,
 }
 
 impl ReadProtection {
@@ -252,14 +328,14 @@ impl ReadProtection {
     pub const fn shared(self) -> Self {
         match self {
             Self::Snapshot => Self::Snapshot,
-            Self::Shared | Self::Conflict => Self::Shared,
+            Self::Shared | Self::Conflict | Self::Claim => Self::Shared,
         }
     }
 
     pub fn validate(self, mode: AttemptMode) -> crate::StorageResult<()> {
         match self {
             Self::Snapshot => Ok(()),
-            Self::Shared | Self::Conflict => mode.require_write(),
+            Self::Shared | Self::Conflict | Self::Claim => mode.require_write(),
         }
     }
 }

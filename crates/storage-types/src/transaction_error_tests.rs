@@ -1,13 +1,8 @@
-use std::hint::black_box;
-
-use alloc_counter::AllocationGuard;
-
 use crate::{
-    AttributeDefinition, AttributeValue, KeyAttributeType, KeyAttributes, KeySchemaElement,
-    KeyType, StorageEnum, StoredTableInfo, TableName, TableStatus, TimestampMillis,
-    TransactGetItem, TransactGetRequest, context::WrappedError as _,
+    AttributeDefinition, AttributeValue, CancellationCode, CancellationReason, KeyAttributeType,
+    KeyAttributes, KeySchemaElement, KeyType, StorageEnum, StoredTableInfo, TableName, TableStatus,
+    TimestampMillis, TransactGetItem, TransactGetRequest, context::WrappedError as _,
     preflight_transact_get_item_key_with_table_info, preflight_transact_write_key_with_table_info,
-    validate_key_attributes_for_schema,
 };
 
 fn key_cases() -> Vec<(&'static str, StoredTableInfo, KeyAttributes)> {
@@ -69,42 +64,6 @@ fn key_cases() -> Vec<(&'static str, StoredTableInfo, KeyAttributes)> {
 }
 
 #[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_key_validation_failures_when_classified_then_report_cpu_and_allocations() {
-    for (label, table, key) in key_cases() {
-        if let Err(error) = validate_key_attributes_for_schema(&table.key_schema, &key) {
-            report(&format!("classify_write_{label}"), || {
-                black_box(&error).is_transact_write_key_error_top_level()
-            });
-            report(&format!("classify_get_{label}"), || {
-                black_box(&error).is_transact_get_key_error_top_level()
-            });
-        }
-    }
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_transaction_key_shapes_when_preflighted_then_report_cpu_and_allocations() {
-    for (label, table, key) in key_cases() {
-        let get = TransactGetItem {
-            get: TransactGetRequest {
-                table_name: table.table_name.clone(),
-                key: key.clone(),
-                projection_expression: None,
-                expression_attribute_names: None,
-            },
-        };
-        report(&format!("preflight_write_{label}"), || {
-            preflight_transact_write_key_with_table_info(black_box(&table), black_box(&key))
-        });
-        report(&format!("preflight_get_{label}"), || {
-            preflight_transact_get_item_key_with_table_info(black_box(&get), black_box(&table))
-        });
-    }
-}
-
-#[test]
 fn given_transaction_key_failures_when_preflighted_then_preserve_top_level_and_member_errors() {
     for (label, table, key) in key_cases() {
         let get = TransactGetItem {
@@ -148,48 +107,6 @@ fn given_transaction_key_failures_when_preflighted_then_preserve_top_level_and_m
     }
 }
 
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_numeric_validation_shapes_when_validated_then_report_cpu_and_allocations() {
-    for (label, value) in [
-        ("valid", "123.45"),
-        ("empty", ""),
-        ("invalid", "x"),
-        ("precision", "123456789012345678901234567890123456789"),
-        ("underflow", "1e-131"),
-        ("overflow", "1e126"),
-        ("bad_exponent", "1e"),
-        ("exponent_range", "1e999999999999999999999"),
-    ] {
-        report(&format!("number_{label}"), || {
-            crate::dynamodb_limits::validate_number(black_box(value))
-        });
-    }
-}
-
-fn report<T>(label: &str, operation: impl Fn() -> T) {
-    for _ in 0..100 {
-        drop(black_box(operation()));
-    }
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "transaction_errors",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    let started = cpu_time::ProcessTime::now();
-    for _ in 0..100_000 {
-        drop(black_box(operation()));
-    }
-    let cpu = started.elapsed();
-    alloc_counter::emit_report(&guard.finish()).unwrap();
-    eprintln!(
-        "transaction_errors label={label} iterations=100000 cpu_ns={}",
-        cpu.as_nanos()
-    );
-}
-
 fn number_table_info() -> StoredTableInfo {
     StoredTableInfo {
         table_name: TableName::new("transaction_runtime_number_keys"),
@@ -220,6 +137,7 @@ fn number_table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
@@ -263,7 +181,7 @@ fn given_typed_and_untyped_failures_when_wrapped_and_bound_then_classification_u
         let mapped =
             transaction_write_binding_error_with_len(1, 3, StorageError::validation(message));
         assert!(
-            matches!(mapped.to_enum(), StorageEnum::TransactionCanceled { reasons } if reasons == &["None", &format!("ValidationError\t{message}"), "None"])
+            matches!(mapped.to_enum(), StorageEnum::TransactionCanceled { reasons } if reasons.as_slice() == [CancellationReason::none(), CancellationReason::validation_error(message), CancellationReason::none()])
         );
     }
     let overflow = transaction_write_binding_error_with_len(
@@ -272,7 +190,7 @@ fn given_typed_and_untyped_failures_when_wrapped_and_bound_then_classification_u
         StorageError::validation(StorageValidationKind::NumberOverflow),
     );
     assert!(
-        matches!(overflow.to_enum(), StorageEnum::TransactionCanceled { reasons } if reasons[1].starts_with("ValidationError\tNumber overflow."))
+        matches!(overflow.to_enum(), StorageEnum::TransactionCanceled { reasons } if reasons[1].code == CancellationCode::ValidationError && reasons[1].message.as_deref().is_some_and(|m| m.starts_with("Number overflow.")))
     );
     let non_validation = Result::<(), StorageError>::Err(StorageError::internal("failure"))
         .context("preserved")
@@ -289,7 +207,10 @@ fn given_typed_and_untyped_failures_when_wrapped_and_bound_then_classification_u
 
 #[test]
 fn given_indexer_failures_when_bound_then_preserve_top_level_message() {
-    use crate::{IndexedWireItem, StorageValidationKind, transaction_write_binding_error_with_len};
+    use crate::{
+        StorageValidationKind, transaction_write_binding_error_with_len,
+        validate_logical_item_names,
+    };
     for (value, kind) in [
         (
             AttributeValue::S(String::new()),
@@ -301,8 +222,7 @@ fn given_indexer_failures_when_bound_then_preserve_top_level_message() {
         ),
     ] {
         let item: crate::AttributeMap = [("indexed".to_string(), value)].into_iter().collect();
-        let error = IndexedWireItem::validate_logical_item_names(&item, &["indexed".to_string()])
-            .unwrap_err();
+        let error = validate_logical_item_names(&item, &["indexed".to_string()]).unwrap_err();
         assert_eq!(error.validation_kind(), kind);
         let error = transaction_write_binding_error_with_len(0, 1, error);
         assert!(
@@ -342,8 +262,8 @@ fn given_number_failures_when_parsed_then_preserve_codec_details_and_protocol_me
         ),
         (
             "1e9223372036854775807",
-            DynamodbNumberError::AdjustedExponentOutOfRange,
-            StorageValidationKind::InvalidNumber,
+            DynamodbNumberError::Overflow,
+            StorageValidationKind::NumberOverflow,
         ),
         (
             "123456789012345678901234567890123456789",
@@ -362,9 +282,15 @@ fn given_number_failures_when_parsed_then_preserve_codec_details_and_protocol_me
         ),
     ] {
         assert_eq!(canonical_dynamodb_number(raw).unwrap_err(), error);
+        // A malformed number is echoed back in the message unless empty.
+        let message = if matches!(kind, StorageValidationKind::InvalidNumber) && !raw.is_empty() {
+            format!("{}: {raw}", kind.message())
+        } else {
+            kind.message().to_owned()
+        };
         assert_eq!(
             crate::dynamodb_limits::validate_number(raw).unwrap_err(),
-            kind.message()
+            message
         );
         assert_eq!(
             crate::encode_dynamodb_number_key(raw).unwrap_err(),
@@ -374,49 +300,3 @@ fn given_number_failures_when_parsed_then_preserve_codec_details_and_protocol_me
 }
 
 crate::err_context!(UntypedStorageError, StorageEnum);
-
-fn original_context() -> UntypedStorageError {
-    UntypedStorageError::from(StorageEnum::Validation {
-        kind: crate::StorageValidationKind::Message,
-        message: "The parameter cannot be converted to a numeric value".to_string(),
-    })
-    .with_context("transaction key")
-}
-
-fn typed_context() -> crate::StorageError {
-    crate::StorageError::validation(crate::StorageValidationKind::InvalidNumber)
-        .with_context("transaction key")
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_contextual_validation_when_constructed_or_converted_then_report_cpu_and_allocations() {
-    eprintln!(
-        "error_layout original={} optimized={}",
-        std::mem::size_of::<UntypedStorageError>(),
-        std::mem::size_of::<crate::StorageError>()
-    );
-    let original = original_context();
-    let typed = typed_context();
-    assert_eq!(original.to_string(), typed.to_string());
-    assert_eq!(
-        original.recursive_context(Vec::new()).1,
-        typed.recursive_context(Vec::new()).1
-    );
-    assert_eq!(
-        original.into_enum().to_string(),
-        typed.into_enum().to_string()
-    );
-    report("context_original_make", original_context);
-    report("context_optimized_make", typed_context);
-    report("context_original_raw", || {
-        let error = original_context();
-        let StorageEnum::Validation { message, .. } = error.to_enum() else {
-            unreachable!()
-        };
-        crate::StorageError::raw_validation(message.clone())
-    });
-    report("context_optimized_raw", || {
-        typed_context().into_raw_validation()
-    });
-}

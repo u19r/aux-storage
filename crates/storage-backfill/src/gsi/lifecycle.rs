@@ -1,7 +1,5 @@
 use storage_common::TtlIndexWrite;
-use storage_types::{
-    BoundTableInfo, StorageEnum, StorageError, StorageResult, StoredTableInfo, WireItem,
-};
+use storage_types::{BoundTableInfo, StorageError, StorageResult, StoredTableInfo, WireItem};
 
 use super::{
     GsiActivationState, GsiBuild, GsiBuildStatus, GsiBuildTarget, GsiLifecycleError,
@@ -28,27 +26,8 @@ impl GsiBuildTarget {
 }
 
 impl GsiActivationState {
-    pub fn try_from_build<Cursor>(
-        build: GsiBuild<Cursor>,
-        target: &GsiBuildTarget,
-    ) -> StorageResult<Self> {
-        if &build.target != target {
-            return Err(Self::conflict_error());
-        }
-        let GsiState::CatchingUp(state) = build.state else {
-            return Err(Self::conflict_error());
-        };
-        Ok(Self {
-            target_incarnation: build.target.incarnation,
-            projected_through: state.cursor,
-        })
-    }
-
     pub fn conflict_error() -> StorageError {
-        StorageEnum::TransactionConflict {
-            message: "GSI build changed before activation".to_owned(),
-        }
-        .into()
+        StorageError::logical_conflict("GSI build changed before activation")
     }
 }
 
@@ -100,9 +79,7 @@ impl<Build: Into<GsiBuildStatus>> TryFrom<Vec<Build>> for GsiProjectionLifecycle
         GsiBuildStatus::require_distinct_targets(&builds)?;
         let mut writable_targets = Vec::with_capacity(builds.len());
         for build in builds {
-            if build.phase.permits_projection() {
-                writable_targets.push(build.target);
-            }
+            writable_targets.push(build.target);
         }
         Ok(Self { writable_targets })
     }
@@ -112,16 +89,90 @@ impl<Cursor> GsiBuild<Cursor> {
     pub fn validate_candidate(&self, observed: Option<&Self>) -> StorageResult<()>
     where Cursor: PartialEq {
         if observed != Some(self) {
-            return Err(StorageEnum::TransactionConflict {
-                message: "GSI build changed during candidate validation".to_owned(),
-            }
-            .into());
+            return Err(StorageError::logical_conflict(
+                "GSI build changed during candidate validation",
+            ));
         }
         Ok(())
     }
 }
 
+impl GsiBuild<()> {
+    /// Native indexes need a fill only for columns that no live index
+    /// maintains. TTL retains its projection build until its own layout
+    /// cutover.
+    pub fn prepare_native(
+        current: &BoundTableInfo,
+        next: &StoredTableInfo,
+        target: GsiBuildTarget,
+        low: storage_types::SystemStreamCheckpoint,
+    ) -> StorageResult<(storage_types::TableBinding, Self)> {
+        let index = next
+            .global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|index| index.index_name == target.index_name)
+            .ok_or_else(|| StorageError::internal("New GSI definition is absent"))?;
+        let binding = current.binding.with_added_gsi(
+            index,
+            &next.attribute_definitions,
+            target.incarnation.clone(),
+            storage_types::GsiPhase::Filling,
+        )?;
+        if target.index_name.is_ttl_index() {
+            let build = Self::new(target, low);
+            let phase = super::GsiBuildPhase::from(&build.state).into();
+            return Ok((
+                binding
+                    .with_gsi_phase(&index.index_name, phase)?
+                    .unwrap_or(binding),
+                build,
+            ));
+        }
+        let added = binding
+            .gsi(&index.index_name)
+            .ok_or_else(|| StorageError::internal("New GSI binding is absent"))?;
+        let maintained = added.columns.iter().all(|column| {
+            current
+                .binding
+                .gsis
+                .iter()
+                .any(|index| !index.name.is_ttl_index() && index.columns.contains(column))
+        });
+        let state = if maintained {
+            GsiState::Building(super::GsiNativeBuilding { low, retired: None })
+        } else {
+            GsiState::Filling(super::models::GsiScanning { low, after: None })
+        };
+        let phase = super::GsiBuildPhase::from(&state).into();
+        let binding = binding
+            .with_gsi_phase(&index.index_name, phase)?
+            .unwrap_or(binding);
+        Ok((binding, Self { target, state }))
+    }
+}
+
 impl GsiProjectionLifecycle {
+    /// The writable targets of the table's catalog binding. A phase change
+    /// changes the catalog stamp, so a confirmed binding needs no build read.
+    #[must_use]
+    pub fn from_binding(table: &BoundTableInfo) -> Self {
+        Self {
+            writable_targets: table
+                .binding
+                .gsis
+                .iter()
+                .map(|gsi| GsiBuildTarget {
+                    history_id: table.history_id,
+                    table_name: table.info.table_name.clone(),
+                    index_name: gsi.name.clone(),
+                    incarnation: gsi.build.clone(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn writable_targets(&self) -> &[GsiBuildTarget] {
         &self.writable_targets
     }
@@ -154,30 +205,20 @@ impl GsiProjectionLifecycle {
         old_item: Option<&storage_types::WireItem>,
         new_item: Option<&storage_types::WireItem>,
         indexers: &[String],
-        source_version: storage_types::ItemRevision,
     ) -> StorageResult<GsiProjectionWriteBatch> {
         if let Some(new_item) = new_item {
             let indexers =
                 storage_types::IndexerDeclaration::try_new(indexers.to_vec(), table.max_indexers)?;
-            return super::PreparedGsiPut::try_new(table, new_item, &indexers)?.finish(
-                self,
-                table,
-                old_item,
-                source_version,
-            );
+            return super::PreparedGsiPut::try_new(table, new_item, &indexers)?
+                .finish(self, table, old_item);
         }
-        Ok(GsiProjectionWriteBatch(self.plan_deletes(
-            table,
-            old_item,
-            source_version,
-        )?))
+        Ok(GsiProjectionWriteBatch(self.plan_deletes(table, old_item)?))
     }
 
     pub(super) fn plan_deletes(
         &self,
         table: &StoredTableInfo,
         old_item: Option<&storage_types::WireItem>,
-        source_version: storage_types::ItemRevision,
     ) -> StorageResult<Vec<GsiProjectionWrite>> {
         self.plan_write_actions(table, old_item, None)?
             .into_iter()
@@ -195,7 +236,6 @@ impl GsiProjectionLifecycle {
                 Ok(GsiProjectionWrite {
                     key: projection_key(index, gsi_key, table_key),
                     row: None,
-                    item_version: source_version,
                 })
             })
             .collect()

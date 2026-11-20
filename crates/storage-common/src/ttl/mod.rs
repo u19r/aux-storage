@@ -12,7 +12,5 @@ pub use models::{
 };
 pub use policy::TtlPolicyChange;
 
-pub use crate::constants::{TTL_INDEX_PREFIX, TTL_INDEX_WIDTH};
-
 #[cfg(test)]
 mod policy_tests;

@@ -1,28 +1,8 @@
 //! Native failure traces retain safe internal diagnostics without logging binds
 //! or keys.
 
+pub use storage_types::NativeEngine;
 use storage_types::{StorageEnum, StorageError, context::WrappedError as _};
-
-#[derive(Clone, Copy, Debug)]
-pub enum NativeEngine {
-    Sqlite,
-    Turso,
-    Postgres,
-    RocksDb,
-    FoundationDb,
-}
-
-impl NativeEngine {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sqlite => "sqlite",
-            Self::Turso => "turso",
-            Self::Postgres => "postgres",
-            Self::RocksDb => "rocksdb",
-            Self::FoundationDb => "foundationdb",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub enum NativeOperation {
@@ -61,12 +41,13 @@ pub fn trace_native_failure(
     error: &StorageError,
 ) {
     let (error_code, diagnostic) = storage_error_diagnostic(error);
-    if matches!(error.to_enum(), StorageEnum::TransactionConflict { .. }) {
+    if error.attempt_kind() == Some(storage_types::AttemptKind::Conflict) {
         tracing::debug!(
             backend = backend.as_str(),
             operation = operation.as_str(),
             error_code,
             diagnostic,
+            cause = error.attempt_failure().map(tracing::field::display),
             "native storage operation failed"
         );
     } else {
@@ -75,6 +56,7 @@ pub fn trace_native_failure(
             operation = operation.as_str(),
             error_code,
             diagnostic,
+            cause = error.attempt_failure().map(tracing::field::display),
             "native storage operation failed"
         );
     }
@@ -84,9 +66,7 @@ pub fn trace_native_failure(
 pub fn storage_error_diagnostic(error: &StorageError) -> (&'static str, &str) {
     match error.to_enum() {
         StorageEnum::InternalServerError { message } => ("InternalServerError", message.as_str()),
-        StorageEnum::TransactionConflict { message } => {
-            ("TransactionConflictException", message.as_str())
-        }
+        StorageEnum::Attempt(failure) => (attempt_error_code(failure.kind()), failure.reason()),
         StorageEnum::Database(_) => ("DatabaseError", "native database operation failed"),
         StorageEnum::AwsSerialization(_) => ("AwsSerializationError", "AWS serialization failed"),
         StorageEnum::Serialization(_) => ("SerializationError", "serialization failed"),
@@ -134,10 +114,6 @@ pub fn storage_error_diagnostic(error: &StorageError) -> (&'static str, &str) {
         ),
         StorageEnum::Throttled { .. } => ("ThrottlingException", "request throttled"),
         StorageEnum::ServiceUnavailable { .. } => ("ServiceUnavailable", "service unavailable"),
-        StorageEnum::SyncNotLeader { .. } => ("SyncNotLeader", "node is not the leader"),
-        StorageEnum::SyncSubmissionAmbiguous { .. } => {
-            ("SyncSubmissionAmbiguous", "submission outcome is ambiguous")
-        }
         StorageEnum::InfrastructureResult(_) => (
             "InternalServerError",
             "infrastructure storage operation failed",
@@ -154,30 +130,16 @@ pub fn storage_error_diagnostic(error: &StorageError) -> (&'static str, &str) {
     }
 }
 
-/// Count and time a native call, including failure and cancellation. Labels are
-/// closed.
-pub struct NativeCallTimer {
-    engine: NativeEngine,
-    operation: NativeOperation,
-    started: std::time::Instant,
-}
-
-impl NativeCallTimer {
-    pub fn start(engine: NativeEngine, operation: NativeOperation) -> Self {
-        Self {
-            engine,
-            operation,
-            started: std::time::Instant::now(),
+const fn attempt_error_code(kind: storage_types::AttemptKind) -> &'static str {
+    match kind {
+        storage_types::AttemptKind::Conflict => "TransactionConflictException",
+        storage_types::AttemptKind::FreshValidation => "FreshValidationRequired",
+        storage_types::AttemptKind::Capacity | storage_types::AttemptKind::TransactionBytes => {
+            "NativeCapacityRejected"
         }
-    }
-}
-
-impl Drop for NativeCallTimer {
-    fn drop(&mut self) {
-        crate::telemetry::record_provider_stage(
-            self.engine.as_str(),
-            self.operation.as_str(),
-            self.started.elapsed(),
-        );
+        storage_types::AttemptKind::Unavailable | storage_types::AttemptKind::Deadline => {
+            "NativeUnavailable"
+        }
+        storage_types::AttemptKind::CommitUnknown => "CommitUnknown",
     }
 }

@@ -8,9 +8,7 @@ use storage_types::{BoundTableInfo, StorageError, StorageResult, StreamRetention
 use super::{
     StreamDurationTrimStats, StreamRetentionFinish, StreamRetentionFinishReason,
     StreamRetentionObservation, StreamRetentionPort, StreamRetentionWave, StreamTrimDueMarker,
-    StreamTrimState, StreamTrimStateUpdate, StreamTrimStateWrite,
-    history_reclaim::{plan_history_reclaims, select_cleanup_deletes},
-    table_cleanup::TableCleanupWork,
+    StreamTrimState, StreamTrimStateUpdate, StreamTrimStateWrite, table_cleanup::TableCleanupWork,
 };
 
 pub(super) async fn execute_wave(
@@ -19,21 +17,34 @@ pub(super) async fn execute_wave(
 ) -> StorageResult<StreamDurationTrimStats> {
     let markers = wave.markers();
     let observations = attempt.load_stream_trim_observations(markers).await?;
-    if observations.len() != markers.len() {
-        return Err(invalid_wave());
-    }
     let SelectedStates {
         mut finishes,
         pending,
     } = select_states(markers, observations, wave)?;
     if !pending.is_empty() {
         let mut works = load_cleanup_works(attempt, pending, &mut finishes).await?;
-        observe_pointer_pages(attempt, &mut works, wave).await?;
-        let decisions = plan_history_reclaims(attempt, &works).await?;
-        let (deletes, last_lanes) = select_cleanup_deletes(&mut works, decisions)?;
-        attempt.delete_history_rows(&deletes).await?;
-        super::orphan_cleanup::advance_item_history_sweeps(attempt, &mut works, wave.observed_at)
-            .await?;
+        for work in &mut works {
+            if let Some(binding) = work.table.binding.regional.clone() {
+                let holds = attempt
+                    .list_regional_progress(
+                        &work.table,
+                        binding.pair,
+                        crate::ProgressDirection::Send,
+                    )
+                    .await?;
+                work.set_holds(holds);
+            }
+        }
+        observe_entry_pages(attempt, &mut works, wave).await?;
+        let mut deletes = Vec::new();
+        let mut last_lanes = Vec::new();
+        let work_count = works.len();
+        for (index, work) in works.iter_mut().enumerate() {
+            let (rows, last_lane) = work.select_deletes(divide_row_quota(index, work_count));
+            deletes.extend(rows);
+            last_lanes.push(last_lane);
+        }
+        attempt.delete_stream_entries(&deletes).await?;
         finishes.extend(
             works
                 .into_iter()
@@ -47,7 +58,7 @@ pub(super) async fn execute_wave(
         ..Default::default()
     };
     stats.record_finishes(&finishes);
-    attempt.finish_stream_trim_markers(finishes).await?;
+    super::finish_stream_trim_markers(attempt, finishes).await?;
     Ok(stats)
 }
 
@@ -72,8 +83,7 @@ async fn load_cleanup_works(
             });
         }
     }
-    // Image admission is a bounded prefix. Give tables skipped by an earlier
-    // byte limit priority over tables that already received a cleanup turn.
+    // Oldest cleanup turn receives priority within the bounded marker wave.
     works.sort_by_key(|work| work.state.updated_at);
     Ok(works)
 }
@@ -85,7 +95,7 @@ struct SelectedStates {
 
 fn select_states(
     markers: &[StreamTrimDueMarker],
-    observations: Vec<StreamRetentionObservation>,
+    observations: storage_types::Exact<StreamRetentionObservation>,
     wave: &StreamRetentionWave,
 ) -> StorageResult<SelectedStates> {
     let mut selected = SelectedStates {
@@ -133,7 +143,6 @@ impl SelectedStates {
             return Ok(());
         }
         if state.retention == StreamRetentionDuration::Forever
-            && state.frontier.item_history_sweep.is_none()
             && !state.frontier.has_pending_cleanup()?
         {
             self.finishes.push(finish_forever(marker, state));
@@ -173,18 +182,12 @@ async fn load_tables(
         .map(|(marker, _)| marker.scope.table_name.clone())
         .collect::<Vec<_>>();
     let stamps = attempt.read_catalog_stamps(&names).await?;
-    if stamps.len() != names.len() {
-        return Err(invalid_wave());
-    }
     let requests = names
         .into_iter()
         .zip(&stamps)
         .filter_map(|(name, stamp)| stamp.map(|stamp| (name, stamp)))
         .collect::<Vec<_>>();
     let tables = attempt.read_tables_at_stamps(&requests).await?;
-    if tables.len() != requests.len() {
-        return Err(invalid_wave());
-    }
     let mut tables = tables.into_iter();
     stamps
         .into_iter()
@@ -195,26 +198,31 @@ async fn load_tables(
         .collect()
 }
 
-async fn observe_pointer_pages(
+async fn observe_entry_pages(
     attempt: &mut impl StreamRetentionPort,
     works: &mut [TableCleanupWork],
     wave: &StreamRetentionWave,
 ) -> StorageResult<()> {
     let groups = works
         .iter()
-        .map(|work| work.reads(wave.page_limit))
+        .enumerate()
+        .map(|(index, work)| work.reads(wave.page_limit, divide_row_quota(index, works.len())))
         .collect::<StorageResult<Vec<_>>>()?;
-    let counts = groups.iter().map(Vec::len).collect::<Vec<_>>();
     let reads = groups.into_iter().flatten().collect::<Vec<_>>();
-    let mut pages = Vec::new();
+    let mut pages = Vec::with_capacity(reads.len());
     for reads in reads.chunks(crate::constants::TABLE_CLEANUP_PAGE_ROWS) {
-        pages.extend(stream_provider::read_table_history_indexes(attempt, reads).await?);
+        pages.extend(stream_provider::read_table_history_observations(attempt, reads).await?);
     }
     let mut pages = pages.into_iter();
-    for (work, count) in works.iter_mut().zip(counts) {
-        work.observe_pages(pages.by_ref().take(count).collect(), wave.observed_at)?;
+    for work in works.iter_mut() {
+        work.observe_pages(&mut pages, wave.observed_at)?;
     }
     Ok(())
+}
+
+fn divide_row_quota(index: usize, count: usize) -> usize {
+    let maximum = crate::constants::TABLE_CLEANUP_PAGE_ROWS;
+    maximum / count + usize::from(index < maximum % count)
 }
 
 fn invalid_wave() -> StorageError {

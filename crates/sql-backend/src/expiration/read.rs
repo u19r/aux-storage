@@ -29,16 +29,16 @@ pub(super) async fn read_expiration_index<A: SqlAttempt>(
     let more = page.more;
     let mut rows = Vec::new();
     rows.try_reserve_exact(page.rows.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for row in page.rows {
         let mut values = row.into_values().into_iter();
-        let (Some(SqlValue::Integer(seconds)), Some(SqlValue::Text(token))) =
-            (values.next(), values.next())
-        else {
+        let Some(SqlValue::Blob(key)) = values.next() else {
             return Err(StorageError::internal(
                 "SQL expiration index row has invalid types",
             ));
         };
+        let key = storage_common::TtlIndexKey::decode_ordered_bytes(key)?;
+        let (seconds, token): (i64, String) = key.into();
         if values.next().is_some() {
             return Err(StorageError::internal(
                 "SQL expiration index row has extra columns",

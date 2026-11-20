@@ -41,6 +41,34 @@ async fn given_initialized_owner_when_job_store_conformance_runs_then_ordered_tr
 }
 
 #[tokio::test]
+async fn given_initialized_owner_when_effect_receipt_clear_runs_then_only_its_group_is_removed() {
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        store.scheduled_job_store.bootstrap().await.unwrap();
+        let namespace = scheduled_bg_jobs::Namespace::try_new(format!(
+            "effect-receipt-clear/{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let report = scheduled_bg_jobs_conformance::run_effect_receipt_clear(
+            &store.scheduled_job_store,
+            &namespace,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("effect receipt clear conformance: {error:?}"));
+        assert_eq!(report.assertions, 9);
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(report.unknowns, 0);
+    })
+    .catch_unwind()
+    .await;
+    store.finish().await;
+    if let Err(panic) = outcome {
+        resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn given_initialized_owner_when_job_commit_outcome_is_unknown_then_reconciliation_holds() {
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
@@ -221,40 +249,54 @@ async fn given_accepted_enqueue_and_completion_when_the_producers_never_return_t
     }
 }
 
+/// Two equal batches prove bounded growth; a larger batch adds run time, not
+/// proof (owner rule: short tests). `AUX_JOB_STORE_GROWTH_BATCH` overrides it.
+const GROWTH_BATCH: u32 = 100;
+
 #[tokio::test]
-async fn given_repeated_completed_jobs_when_running_twenty_thousand_native_occurrences_then_rows_bytes_and_idle_mutations_are_bounded()
+async fn given_repeated_completed_jobs_when_running_native_occurrences_then_rows_bytes_and_idle_mutations_are_bounded()
  {
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         store.scheduled_job_store.bootstrap().await.unwrap();
-        for deduplication in [false, true] {
+        for workload in ["lifecycle", "deduplication", "effect receipts"] {
             let namespace = scheduled_bg_jobs::Namespace::try_new(format!(
                 "lifecycle-growth/{}",
                 uuid::Uuid::new_v4().simple()
             ))
             .unwrap();
-            let size = NonZeroU32::new(10_000).unwrap();
-            let report = if deduplication {
-                scheduled_bg_jobs_conformance::run_deduplication_growth(
+            let batch: u32 = std::env::var("AUX_JOB_STORE_GROWTH_BATCH")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(GROWTH_BATCH);
+            let size = NonZeroU32::new(batch).unwrap();
+            let report = match workload {
+                "lifecycle" => scheduled_bg_jobs_conformance::run_lifecycle_growth(
                     store.scheduled_job_store.clone(),
                     namespace,
                     size,
                 )
                 .await
-                .unwrap()
-            } else {
-                scheduled_bg_jobs_conformance::run_lifecycle_growth(
+                .unwrap(),
+                "deduplication" => scheduled_bg_jobs_conformance::run_deduplication_growth(
                     store.scheduled_job_store.clone(),
                     namespace,
                     size,
                 )
                 .await
-                .unwrap()
+                .unwrap(),
+                _ => scheduled_bg_jobs_conformance::run_effect_receipt_growth(
+                    store.scheduled_job_store.clone(),
+                    namespace,
+                    size,
+                )
+                .await
+                .unwrap(),
             };
-            assert_eq!(report.completed, 20_000);
+            assert_eq!(report.completed, batch * 2);
             assert_eq!(report.after_first_batch, report.after_second_batch);
             assert_eq!(report.idle_mutations, 0);
-            eprintln!("native completed-job growth (deduplication={deduplication}): {report:?}");
+            eprintln!("native completed-job growth ({workload}): {report:?}");
         }
     })
     .catch_unwind()

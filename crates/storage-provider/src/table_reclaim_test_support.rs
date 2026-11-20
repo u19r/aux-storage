@@ -4,20 +4,22 @@
 use std::num::NonZeroU32;
 
 use storage_types::{
-    AttemptMode, DeleteTableRequest, ItemHistoryReference, SystemHistoryRecord, TableHistoryId,
-    TableHistoryState, TableHistoryTarget,
+    AttemptMode, DeadlineClass, DeleteTableRequest, TableHistoryId, TableHistoryState,
+    TableHistoryTarget,
 };
-use stream_provider::{ItemHistoryReadAttempt, ItemHistoryReadBatch, SystemHistoryReadAttempt};
+use stream_provider::{PositionedStreamEntry, StreamAttempt};
 
 use crate::{
-    CatalogAttempt, DynamoOperations, DynamoPort, TableReclaimAttempt, TableReclaimRepository,
+    CatalogAttempt, DynamoOperations, DynamoPort, MaintenanceOperations, ReclaimAttempt,
     TableReclaimStep,
 };
 
-pub async fn qualify_table_history_reclaim<P: DynamoPort + DynamoOperations>(
+pub async fn qualify_table_history_reclaim<
+    P: DynamoPort + DynamoOperations + MaintenanceOperations,
+>(
     store: &P,
 ) -> TableHistoryId
-where for<'a> P::Attempt<'a>: TableReclaimAttempt + crate::maintenance::StreamRetentionPort {
+where for<'a> P::Attempt<'a>: ReclaimAttempt + crate::maintenance::StreamRetentionPort {
     let deleted = create_table(store, "history-reclaim-deleted").await;
     let peer = create_table(store, "history-reclaim-peer").await;
     store.update_time_to_live(serde_json::from_value(serde_json::json!({
@@ -32,7 +34,7 @@ where for<'a> P::Attempt<'a>: TableReclaimAttempt + crate::maintenance::StreamRe
     assert_eq!(before.len(), 67);
     let records = before
         .iter()
-        .filter(|record| record.table_history_id() == Some(deleted.history_id))
+        .filter(|record| record.history_id == deleted.history_id)
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 66);
@@ -66,9 +68,11 @@ where for<'a> P::Attempt<'a>: TableReclaimAttempt + crate::maintenance::StreamRe
         }
         pages += 1;
     }
+    // Two 64-entry pages, then one page per remaining phase; SQL drops the
+    // item family in one page, so 8 is the smallest provider count.
     assert!(
-        pages > 12,
-        "fixture must require several source and history pages"
+        pages >= 8,
+        "fixture must require bounded entry and table family pages"
     );
     assert_eq!(
         store.reclaim_table_page().await.unwrap(),
@@ -89,35 +93,46 @@ where for<'a> P::Attempt<'a>: TableReclaimAttempt + crate::maintenance::StreamRe
         "old-ID cleanup removed the replacement item"
     );
     let after = load_source_rows(store).await;
-    assert_eq!(after.len(), before.len());
-    for (before, after) in before.iter().zip(&after) {
-        assert_eq!(before.position(), after.position());
-        assert_eq!(before.created_at(), after.created_at());
-        if before.table_history_id() == Some(deleted.history_id) {
-            assert!(after.pointer().is_none());
-        } else {
-            assert_eq!(before, after);
-        }
+    let survivors = before
+        .into_iter()
+        .filter(|entry| entry.history_id != deleted.history_id)
+        .collect::<Vec<_>>();
+    assert_eq!(after.len(), 2);
+    for (before, after) in survivors.iter().zip(&after) {
+        assert_eq!(before.history_id, after.history_id);
+        assert_eq!(before.position, after.position);
+        assert_eq!(
+            before.encode_value().unwrap(),
+            after.encode_value().unwrap()
+        );
     }
     deleted.history_id
 }
 
 /// Native cleanup must wait for its external owner, including after ordinary
 /// metadata updates and immediate public-name reuse.
-pub async fn qualify_external_cleanup_fence<P: DynamoPort + DynamoOperations>(store: &P)
-where for<'a> P::Attempt<'a>: TableReclaimAttempt {
+pub async fn qualify_external_cleanup_fence<
+    P: DynamoPort + DynamoOperations + MaintenanceOperations,
+>(
+    store: &P,
+) where for<'a> P::Attempt<'a>: ReclaimAttempt {
     let deleted = create_table(store, "external-cleanup-fence").await;
     let name = deleted.table_name.clone();
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
                 let stamp = attempt.read_catalog_stamp(&name).await?.unwrap();
                 attempt.store_external_cleanup_barrier(&name, stamp).await?;
                 Ok(())
             })
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     store
         .update_table(
             serde_json::from_value(serde_json::json!({
@@ -155,6 +170,92 @@ where for<'a> P::Attempt<'a>: TableReclaimAttempt {
     assert!(current.item.is_some());
 }
 
+/// A cleanup barrier whose stamp no longer names the live catalog record is
+/// one conflict on every family, whatever the cause: absent, deleted or stale.
+/// Each barrier is one native attempt with no retry.
+pub async fn qualify_external_cleanup_barrier_misses<P: DynamoPort + DynamoOperations>(store: &P)
+where for<'a> P::Attempt<'a>: ReclaimAttempt {
+    let absent = create_table(store, "barrier-absent").await;
+    let mut stamp = read_stamp(store, &absent).await;
+    // A KV table id no table has; a UUID no SQL row has.
+    stamp.history_id = TableHistoryId::from(u32::MAX - 7);
+    assert_barrier_conflict(store_barrier(store, &absent, stamp).await);
+
+    let deleted = create_table(store, "barrier-deleted").await;
+    let stamp = read_stamp(store, &deleted).await;
+    store
+        .delete_table(DeleteTableRequest {
+            table_name: deleted.table_name.clone(),
+        })
+        .await
+        .unwrap();
+    assert_barrier_conflict(store_barrier(store, &deleted, stamp).await);
+
+    let stale = create_table(store, "barrier-stale").await;
+    let stamp = read_stamp(store, &stale).await;
+    store_barrier(store, &stale, stamp).await.unwrap();
+    assert_barrier_conflict(store_barrier(store, &stale, stamp).await);
+}
+
+async fn read_stamp<P: DynamoPort + DynamoOperations>(
+    store: &P,
+    table: &TableHistoryTarget,
+) -> crate::CatalogStamp
+where
+    for<'a> P::Attempt<'a>: ReclaimAttempt,
+{
+    let name = table.table_name.clone();
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
+            Box::pin(async move { Ok(attempt.read_catalog_stamp(&name).await?.unwrap()) })
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn store_barrier<P: DynamoPort + DynamoOperations>(
+    store: &P,
+    table: &TableHistoryTarget,
+    stamp: crate::CatalogStamp,
+) -> storage_types::StorageResult<()>
+where
+    for<'a> P::Attempt<'a>: ReclaimAttempt,
+{
+    let name = table.table_name.clone();
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
+            Box::pin(async move {
+                attempt.store_external_cleanup_barrier(&name, stamp).await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+}
+
+fn assert_barrier_conflict(result: storage_types::StorageResult<()>) {
+    let Err(error) = result else {
+        panic!("a cleanup barrier with an unmatched stamp must fail");
+    };
+    assert_eq!(
+        error.attempt_kind(),
+        Some(storage_types::AttemptKind::Conflict)
+    );
+    assert!(!matches!(
+        error.as_ref(),
+        storage_types::StorageEnum::ResourceNotFound { .. }
+    ));
+}
+
 async fn create_table<P: DynamoOperations>(store: &P, name: &str) -> TableHistoryTarget {
     let request = serde_json::from_value(serde_json::json!({
         "TableName": name, "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -178,9 +279,13 @@ async fn put_item<P: DynamoOperations>(store: &P, table: &TableHistoryTarget, ke
         .unwrap();
 }
 
-async fn load_source_rows<P: DynamoPort>(store: &P) -> Vec<SystemHistoryRecord> {
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+async fn load_source_rows<P: DynamoPort>(store: &P) -> Vec<PositionedStreamEntry> {
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
                 let source = attempt.read_system_page_start().await?;
                 let initial = source.initial_checkpoint().unwrap();
@@ -195,78 +300,88 @@ async fn load_source_rows<P: DynamoPort>(store: &P) -> Vec<SystemHistoryRecord> 
                             read,
                             retired_through: page.retired_through.clone(),
                             records: page
-                                .observations
+                                .records
                                 .iter()
-                                .map(|row| stream_provider::SystemStreamHistoryRecord {
-                                    position: row.position.clone(),
+                                .map(|(entry, _)| stream_provider::SystemStreamHistoryRecord {
+                                    position: entry.position.clone(),
                                 })
                                 .collect(),
                         },
                     )
                     .collect::<Vec<_>>();
                 plan.finish(&observations).unwrap();
-                Ok(pages.into_iter().flat_map(|page| page.records).collect())
+                Ok(pages
+                    .into_iter()
+                    .flat_map(|page| page.records)
+                    .map(|(entry, _)| entry)
+                    .collect())
             })
-        })
-        .await
-        .unwrap()
+        },
+    )
+    .await
+    .unwrap()
 }
 
 async fn assert_deleting<P: DynamoPort>(store: &P, history: TableHistoryId) {
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
-                let states = attempt.load_item_history_table_states(&[history]).await?;
+                let states = attempt.load_table_history_states(&[history]).await?;
                 assert!(matches!(
                     states.as_slice(),
                     [Some(TableHistoryState::Deleting)]
                 ));
                 Ok(())
             })
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
 }
 
 async fn assert_source_count<P: DynamoPort>(store: &P, history: TableHistoryId, count: usize)
-where for<'a> P::Attempt<'a>: TableReclaimAttempt {
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                let page = attempt
-                    .load_table_system_rows(history, NonZeroU32::new(100).unwrap())
-                    .await?;
-                assert_eq!(page.records.len(), count);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
+where for<'a> P::Attempt<'a>: ReclaimAttempt {
+    let entries = load_source_rows(store).await;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.history_id == history)
+            .count(),
+        count
+    );
 }
 
 async fn assert_reclaimed<P: DynamoPort>(
     store: &P,
     deleted: &TableHistoryTarget,
     survivors: &[TableHistoryTarget; 2],
-    records: Vec<SystemHistoryRecord>,
+    records: Vec<PositionedStreamEntry>,
 ) where
-    for<'a> P::Attempt<'a>: TableReclaimAttempt + crate::maintenance::StreamRetentionPort,
+    for<'a> P::Attempt<'a>: ReclaimAttempt + crate::maintenance::StreamRetentionPort,
 {
     let deleted = deleted.clone();
     let survivors = survivors.clone();
-    store
-        .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+    crate::DynamoPort::with_attempt(
+        store,
+        storage_types::AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+            storage_types::AttemptDeadlineSource::attempt_deadlines(store),
+        ),
+        move |attempt| {
             Box::pin(async move {
-                let references = records
-                    .iter()
-                    .map(|record| record.pointer().unwrap().metadata().reference().clone())
-                    .collect::<Vec<ItemHistoryReference>>();
                 let reads = table_history_reads(&records);
                 let pages = stream_provider::TableHistoryIndexAttempt::load_table_history_rows(
                     attempt, &reads,
                 )
                 .await?;
-                assert!(pages.iter().all(|page| page.rows.is_empty() && !page.more));
+                assert!(
+                    pages
+                        .iter()
+                        .all(|page| page.entries.is_empty() && !page.more)
+                );
                 let scopes = std::iter::once(&deleted)
                     .chain(survivors.iter())
                     .map(|target| {
@@ -282,7 +397,7 @@ async fn assert_reclaimed<P: DynamoPort>(
                 .await?;
                 assert!(policies[0].is_none() && policies[1].is_some() && policies[2].is_some());
                 let states = attempt
-                    .load_item_history_table_states(&[
+                    .load_table_history_states(&[
                         deleted.history_id,
                         survivors[0].history_id,
                         survivors[1].history_id,
@@ -296,52 +411,27 @@ async fn assert_reclaimed<P: DynamoPort>(
                         Some(TableHistoryState::Active(_))
                     ]
                 ));
-                let deleted_source = attempt
-                    .load_table_system_rows(deleted.history_id, NonZeroU32::new(100).unwrap())
-                    .await?;
-                assert!(deleted_source.records.is_empty() && !deleted_source.more);
-                for survivor in survivors {
-                    let source = attempt
-                        .load_table_system_rows(survivor.history_id, NonZeroU32::new(100).unwrap())
-                        .await?;
-                    assert_eq!(source.records.len(), 1);
-                }
-                let entries = attempt
-                    .load_item_history_entries(ItemHistoryReadBatch {
-                        references: &references,
-                        maximum_bytes: crate::constants::TABLE_HISTORY_READ_BYTES,
-                    })
-                    .await?;
-                assert!(entries.iter().all(Option::is_none));
                 Ok(())
             })
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
 }
 
 fn table_history_reads(
-    records: &[SystemHistoryRecord],
+    records: &[PositionedStreamEntry],
 ) -> Vec<stream_provider::TableHistoryIndexRead> {
     let mut reads = Vec::<stream_provider::TableHistoryIndexRead>::new();
     for record in records {
-        let pointer = record.pointer().unwrap();
-        let storage_types::ItemHistoryPublication::Event {
-            source_scope,
-            table_position,
-            ..
-        } = pointer.metadata().publication()
-        else {
-            panic!("source event");
-        };
         let lane = storage_types::TableHistoryLane::try_from((
-            pointer.metadata().address().history_id,
-            source_scope,
-            table_position,
+            record.history_id,
+            &record.source_scope,
+            &record.position,
         ))
         .unwrap();
         let through =
-            storage_types::TableStreamSequence::try_from(table_position.offset()).unwrap();
+            storage_types::TableStreamSequence::try_from(record.position.offset()).unwrap();
         if let Some(existing) = reads.iter_mut().find(|read| read.lane == lane) {
             existing.through = existing.through.max(through);
         } else {
@@ -355,4 +445,131 @@ fn table_history_reads(
         }
     }
     reads
+}
+
+/// SYSTEM retirement preserves the independent Forever table policy.
+pub async fn qualify_system_trim<
+    P: DynamoPort + DynamoOperations + MaintenanceOperations + stream_provider::StreamOperations,
+>(
+    store: &P,
+) where for<'a> P::Attempt<'a>: stream_provider::StreamAttempt {
+    use stream_provider::{SystemStreamPageRequest, SystemStreamTrimPageRequest};
+    let name = "system-trim-forever";
+    store
+        .create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": name, "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "KEYS_ONLY"},
+                "AuxStreamDurationHours": -1
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    for key in ["first", "second"] {
+        store
+            .put_item(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": name, "Item": {"pk": {"S": key}}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let scope = store.system_stream_scope().await.unwrap();
+    let before = store
+        .get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 1).unwrap())
+        .await
+        .unwrap();
+    let stale = before.issued_checkpoint().token().clone();
+    let request =
+        SystemStreamTrimPageRequest::try_new(scope.clone(), (i64::MAX - 1).into(), 1, None)
+            .unwrap();
+    let first = trim_page(store, request.clone()).await;
+    assert_eq!(first.reclaimed_records(), 1);
+    assert_eq!(trim_page(store, request).await, first);
+    let next = SystemStreamTrimPageRequest::try_new(
+        scope.clone(),
+        (i64::MAX - 1).into(),
+        1,
+        first.next_continuation().cloned(),
+    )
+    .unwrap();
+    let second = trim_page(store, next.clone()).await;
+    assert_eq!(second.reclaimed_records(), 1);
+    assert_eq!(trim_page(store, next).await, second);
+    assert!(second.next_continuation().is_none());
+    let repeated = trim_page(
+        store,
+        SystemStreamTrimPageRequest::try_new(scope.clone(), i64::MAX.into(), 1, None).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        repeated.scanned_records(),
+        0,
+        "retired canonical rows must not be rescanned"
+    );
+    assert!(
+        store
+            .get_system_stream_page(
+                SystemStreamPageRequest::try_new(scope.clone(), Some(stale), 10).unwrap()
+            )
+            .await
+            .is_err()
+    );
+    let empty = store
+        .get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap())
+        .await
+        .unwrap();
+    assert!(empty.records().is_empty());
+    let table = store
+        .get_stream_records(
+            serde_json::from_value(serde_json::json!({"TableName": name, "Limit": 10})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        table.records().len(),
+        2,
+        "SYSTEM trim deleted Forever table entries"
+    );
+    store
+        .put_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": name, "Item": {"pk": {"S": "later"}}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let later = store
+        .get_system_stream_page(
+            SystemStreamPageRequest::try_new(
+                scope,
+                Some(empty.issued_checkpoint().token().clone()),
+                10,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.records().len(), 1);
+    assert_eq!(
+        later.records()[0].keys.get("pk"),
+        Some(&storage_types::AttributeValue::S("later".to_owned()))
+    );
+}
+
+async fn trim_page<P: DynamoPort + MaintenanceOperations>(
+    store: &P,
+    request: stream_provider::SystemStreamTrimPageRequest,
+) -> stream_provider::SystemStreamTrimPageResult
+where
+    for<'a> P::Attempt<'a>: stream_provider::StreamAttempt,
+{
+    MaintenanceOperations::trim_system_stream_page(store, request)
+        .await
+        .unwrap()
 }

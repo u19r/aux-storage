@@ -20,8 +20,7 @@ pub(super) enum OperationFailure {
 impl OperationFailure {
     pub(super) fn from_storage(error: StorageError) -> Self {
         let message = storage_error_detail(&error);
-        if error.native_attempt_rejection() == Some(storage_types::NativeAttemptRejection::Conflict)
-        {
+        if error.attempt_kind() == Some(storage_types::AttemptKind::Conflict) {
             Self::RetryableStorage(message)
         } else {
             Self::Fatal(message)
@@ -128,8 +127,8 @@ impl ReadSequenceDagWorkload {
     fn validate_ordinary(&self, expectation: &OperationExpectation<'_>) -> Result<(), String> {
         if expectation.ordinary != expectation.expected {
             return Err(format!(
-                "ordinary result mismatch for {}: expected {:?}, got {:?}",
-                expectation.shape_id, expectation.expected, expectation.ordinary
+                "ordinary result mismatch for {}",
+                expectation.shape_id
             ));
         }
         self.trace_operation(
@@ -422,7 +421,7 @@ pub(super) fn first_normalized_difference(
                     if expected_value != mapped_value {
                         return Some(format!(
                             "{section:?}[{invocation_index}][{item_index}].{attribute_name:?}: \
-                             expected {expected_value:?}, mapped {mapped_value:?}"
+                             mapped value differs from the expected value"
                         ));
                     }
                 }

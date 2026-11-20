@@ -7,19 +7,29 @@ pub(crate) enum JobWriteAuthority {
 }
 
 impl JobWriteAuthority {
-    pub(crate) fn receipt_key(&self, token: &str) -> String {
+    /// The effect receipt key of this execution and caller token.
+    /// An effect is identified by its token inside the execution's group. A
+    /// terminal projection also binds its exact snapshot, so a later terminal
+    /// state of a reused execution cannot replay an older projection.
+    pub(crate) fn receipt_key(&self, token: &str) -> storage_types::StorageResult<StoreKey> {
         use sha2::{Digest, Sha256};
-        let mut identity = Vec::new();
-        self.bind_request_identity(&mut identity);
-        let mut digest = Sha256::new();
-        digest.update(crate::constants::JOB_EFFECT_RECEIPT_PREFIX);
-        digest.update(identity);
-        digest.update(token.as_bytes());
-        format!(
-            "{}{}",
-            crate::constants::JOB_EFFECT_RECEIPT_PREFIX,
-            hex::encode(digest.finalize())
-        )
+        let key = match self {
+            Self::Effect(authority) => {
+                let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+                authority.receipt_key(&digest)
+            }
+            Self::Terminal(authority) => {
+                let mut identity = Vec::new();
+                authority.bind_request_identity(&mut identity);
+                let mut hasher = Sha256::new();
+                hasher.update((identity.len() as u64).to_be_bytes());
+                hasher.update(&identity);
+                hasher.update(token.as_bytes());
+                let digest: [u8; 32] = hasher.finalize().into();
+                authority.receipt_key(&digest)
+            }
+        };
+        key.map_err(|_| storage_types::StorageError::internal("invalid scheduled-job receipt key"))
     }
 
     pub(crate) fn execution_identity(&self) -> [u8; 32] {

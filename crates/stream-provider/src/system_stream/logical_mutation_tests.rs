@@ -2,13 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 use storage_types::{
-    AttributeMap, AttributeValue, ItemStreamVersion, KeyAttributes, StoredTableInfo,
-    SystemStreamSourceTableName, TableName, TimestampMillis,
+    AttributeMap, AttributeValue, KeyAttributes, SystemStreamSourceTableName, TableName,
 };
 
-use super::logical_mutation::{
-    LogicalSystemStreamMutation, LogicalSystemStreamMutationInput, canonical_route_key,
-};
+use super::logical_mutation::canonical_route_key;
 
 #[derive(Serialize)]
 struct ExpectedRouteEvidence {
@@ -51,6 +48,7 @@ fn canonical_key_for_test(
 ) -> BTreeMap<String, AttributeValue> {
     key_schema
         .iter()
+        .filter(|key| key.key_type == storage_types::KeyType::Hash)
         .filter_map(|key| {
             attributes
                 .get(&key.attribute_name)
@@ -73,109 +71,67 @@ fn given_key_schema_when_canonical_route_then_borrowed_bytes_match_owned_encodin
     assert_eq!(actual_route, expected_route);
 }
 
-fn mutation_fixture() -> (StoredTableInfo, storage_types::WireItem, KeyAttributes) {
-    let table_name = TableName::new("orders");
-    let table_info = StoredTableInfo {
-        table_name: table_name.clone(),
-        table_status: storage_types::TableStatus::Active,
-        created_at: TimestampMillis::from_timestamp(0),
-        attribute_definitions: vec![storage_types::AttributeDefinition {
-            attribute_name: "pk".to_string(),
-            attribute_type: storage_types::KeyAttributeType::S,
-        }],
-        key_schema: vec![storage_types::KeySchemaElement {
-            attribute_name: "pk".to_string(),
-            key_type: storage_types::KeyType::Hash,
-        }],
-        max_indexers: storage_types::MaxIndexers::ZERO,
-        global_secondary_indexes: None,
-        table_size_bytes: 0,
-        item_count: 0,
-        stream_specification: None,
-        table_stream_duration:
-            storage_types::StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
-        deletion_protection_enabled: false,
-    };
-    let item: AttributeMap =
-        HashMap::from([("pk".to_string(), AttributeValue::S("tenant".to_string()))]).into();
-    let key_attributes =
-        KeyAttributes::from_iter([("pk".to_string(), AttributeValue::S("tenant".to_string()))]);
-    (
-        table_info,
-        storage_types::WireItem::try_from(item).unwrap(),
-        key_attributes,
-    )
-}
-
 #[test]
-fn given_protected_old_revision_when_mutation_is_prepared_then_exact_predecessor_is_required() {
-    let (table, item, key) = mutation_fixture();
-    let route = super::logical_mutation::DynamoMutationRoute::try_new(
-        &table.table_name,
-        &table.key_schema,
-        &key,
-    )
-    .unwrap();
-    let old = route.verify_item(item.clone()).unwrap();
-    for (has_old, previous, accepted) in [
-        (false, None, true),
-        (false, Some(4), false),
-        (true, None, false),
-        (true, Some(0), false),
-        (true, Some(5), false),
-        (true, Some(6), false),
-        (true, Some(4), true),
+fn given_partition_keys_when_routing_then_sort_key_is_ignored_and_table_is_retained() {
+    let (_, schema, _) = route_fixture();
+    for partition in [
+        AttributeValue::S("tenant".into()),
+        AttributeValue::N("123".into()),
+        AttributeValue::B("AAH/".into()),
     ] {
-        let result = LogicalSystemStreamMutation::try_from(LogicalSystemStreamMutationInput {
-            history_id: 1_u32.into(),
-            route: &route,
-            item: Some(route.verify_item(item.clone()).unwrap()),
-            old_item: has_old.then_some(&old),
-            previous_version: previous.map(ItemStreamVersion::new),
-            indexers: &[],
-            item_stream_version: ItemStreamVersion::new(5),
-            created_at: TimestampMillis::from_timestamp(0),
-            user_identity: None,
-        });
-        assert_eq!(result.is_ok(), accepted);
-        if let Ok(mutation) = result {
-            assert_eq!(
-                mutation.previous_version,
-                previous.map(ItemStreamVersion::new)
-            );
-            assert_eq!(
-                mutation.predecessor_payload_bytes,
-                has_old.then(|| old.dynamo_json_bytes().unwrap().len())
-            );
-            assert_eq!(
-                mutation.item.unwrap().dynamo_json_bytes().unwrap(),
-                item.dynamo_json_bytes().unwrap()
-            );
-        }
+        let route = |table: &str, sort: &str| {
+            super::logical_mutation::DynamoMutationRoute::try_new(
+                &TableName::new(table),
+                &schema,
+                &KeyAttributes::from_iter([
+                    ("pk".into(), partition.clone()),
+                    ("sk".into(), AttributeValue::S(sort.into())),
+                ]),
+            )
+            .unwrap()
+        };
+        let first = route("orders", "first");
+        let second = route("orders", "second");
+        assert_eq!(first.routing_key(), second.routing_key());
+        assert_ne!(first.routing_key(), route("other", "first").routing_key());
+        let item: AttributeMap = HashMap::from([
+            ("pk".into(), partition),
+            ("sk".into(), AttributeValue::S("second".into())),
+        ])
+        .into();
+        assert!(
+            first
+                .verify_item(storage_types::WireItem::try_from(item).unwrap())
+                .is_err()
+        );
     }
 }
 
 #[test]
-fn given_delete_without_a_live_predecessor_when_prepared_then_no_history_is_invented() {
-    let (table, _, key) = mutation_fixture();
-    let route = super::logical_mutation::DynamoMutationRoute::try_new(
-        &table.table_name,
-        &table.key_schema,
-        &key,
-    )
-    .unwrap();
-    assert!(
-        LogicalSystemStreamMutation::try_from(LogicalSystemStreamMutationInput {
-            history_id: 1_u32.into(),
-            route: &route,
-            item: None,
-            old_item: None,
-            previous_version: None,
-            indexers: &[],
-            item_stream_version: ItemStreamVersion::new(1),
-            created_at: TimestampMillis::from_timestamp(0),
-            user_identity: None,
-        })
-        .is_err()
-    );
+fn given_equivalent_numeric_partition_keys_when_routing_then_canonical_bytes_match() {
+    let (table, schema, _) = route_fixture();
+    let routes = ["123", "123.0", "1.23E2"].map(|number| {
+        canonical_route_key(
+            &table,
+            &schema,
+            &KeyAttributes::from_iter([("pk".into(), AttributeValue::N(number.into()))]),
+        )
+        .unwrap()
+    });
+    assert_eq!(routes[0], routes[1]);
+    assert_eq!(routes[0], routes[2]);
+}
+
+#[test]
+fn given_equivalent_binary_partition_keys_when_routing_then_canonical_bytes_match() {
+    let (table, schema, _) = route_fixture();
+    let routes = ["AQ==", "AQ"].map(|binary| {
+        canonical_route_key(
+            &table,
+            &schema,
+            &KeyAttributes::from_iter([("pk".into(), AttributeValue::B(binary.into()))]),
+        )
+        .unwrap()
+    });
+    assert_eq!(routes[0], routes[1]);
 }

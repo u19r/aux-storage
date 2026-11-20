@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::Visitor};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{ItemStreamVersion, constants::STREAM_ITEM_ID_LEN};
+use crate::constants::STREAM_ITEM_ID_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ToSchema)]
 #[schema(value_type = String, example = "000000000000000000000000")]
@@ -26,7 +26,7 @@ impl StreamItemId {
 
     #[must_use]
     pub fn random() -> Self {
-        Self::from_uuid(Uuid::now_v7())
+        Self::from_uuid(crate::ambient::uuid_now_v7())
     }
 
     #[must_use]
@@ -136,14 +136,6 @@ impl From<Uuid> for StreamItemId {
 impl From<[u8; STREAM_ITEM_ID_LEN]> for StreamItemId {
     fn from(value: [u8; STREAM_ITEM_ID_LEN]) -> Self {
         Self(value)
-    }
-}
-
-impl From<ItemStreamVersion> for StreamItemId {
-    fn from(value: ItemStreamVersion) -> Self {
-        let mut out = [0u8; STREAM_ITEM_ID_LEN];
-        out[4..].copy_from_slice(&value.to_be_bytes());
-        Self(out)
     }
 }
 

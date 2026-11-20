@@ -10,13 +10,15 @@ use utoipa::ToSchema;
 
 use crate::{AttributeValue, StorageError, StorageResult};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct KeyAttribute {
     pub name: String,
     pub value: AttributeValue,
 }
 
-#[derive(Debug, Clone, Default, ToSchema)]
+#[derive(Clone, Default, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[schema(value_type = HashMap<String, AttributeValue>)]
 /// Equality treats key attributes as a map; iteration and serialization retain
 /// insertion order.
@@ -31,19 +33,59 @@ impl PartialEq for KeyAttributes {
     }
 }
 
-impl KeyAttributes {
-    /// Select the complete primary key without cloning unrelated item values.
-    pub fn try_from_schema(
-        schema: &[crate::KeySchemaElement],
-        item: &impl AttributeValueLookup,
-    ) -> StorageResult<Self> {
-        let mut keys = Self::with_capacity(schema.len());
-        for element in schema {
-            let value = item
+/// The first key schema element that an item lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingKeyAttribute<'s> {
+    pub name: &'s str,
+}
+
+/// The one key extractor: each schema element with its item value, in schema
+/// order. The first absent element ends the walk with its name.
+pub struct SchemaKeyValues<'s, 'i, L: ?Sized> {
+    schema: std::slice::Iter<'s, crate::KeySchemaElement>,
+    item: &'i L,
+}
+
+impl<'s, 'i, L> Iterator for SchemaKeyValues<'s, 'i, L>
+where L: AttributeValueLookup + ?Sized
+{
+    type Item = Result<(&'s crate::KeySchemaElement, &'i AttributeValue), MissingKeyAttribute<'s>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let element = self.schema.next()?;
+        Some(
+            self.item
                 .get_attribute_value(&element.attribute_name)
-                .ok_or_else(|| {
-                    StorageError::internal("stream image lacks a table key attribute")
-                })?;
+                .map(|value| (element, value))
+                .ok_or(MissingKeyAttribute {
+                    name: &element.attribute_name,
+                }),
+        )
+    }
+}
+
+pub fn schema_key_values<'s, 'i, L>(
+    schema: &'s [crate::KeySchemaElement],
+    item: &'i L,
+) -> SchemaKeyValues<'s, 'i, L>
+where
+    L: AttributeValueLookup + ?Sized,
+{
+    SchemaKeyValues {
+        schema: schema.iter(),
+        item,
+    }
+}
+
+impl KeyAttributes {
+    /// Clone only the key components named by `schema`.
+    pub fn from_schema<'s>(
+        schema: &'s [crate::KeySchemaElement],
+        item: &(impl AttributeValueLookup + ?Sized),
+    ) -> Result<Self, MissingKeyAttribute<'s>> {
+        let mut keys = Self::with_capacity(schema.len());
+        for entry in schema_key_values(schema, item) {
+            let (element, value) = entry?;
             keys.insert(element.attribute_name.clone(), value.clone());
         }
         Ok(keys)

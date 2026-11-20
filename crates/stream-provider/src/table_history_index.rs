@@ -1,16 +1,11 @@
-//! Table indexes contain references ordered within one qualified lineage.
+//! Canonical entries ordered within one qualified table incarnation and
+//! lineage.
 
 use std::{future::Future, num::NonZeroU32};
 
-use storage_types::{
-    ItemHistoryPointer, ItemHistoryPublication, StorageError, StorageResult, TableHistoryLane,
-    TableStreamSequence, storage_serde,
-};
+use storage_types::{StorageError, StorageResult, TableHistoryLane, TableStreamSequence};
 
-use crate::{
-    ReadDirection, StreamDataType, StreamItem, StreamPartitioningMode, StreamReadRequest,
-    StreamRowKind, StreamRowPage,
-};
+use crate::{PositionedStreamEntry, ReadDirection};
 
 #[derive(Clone)]
 pub struct TableHistoryIndexRead {
@@ -21,65 +16,52 @@ pub struct TableHistoryIndexRead {
     pub limit: NonZeroU32,
 }
 
-impl TableHistoryIndexRead {
-    pub fn row_read(&self) -> StreamReadRequest {
-        StreamReadRequest {
-            partitioning_mode: StreamPartitioningMode::Single,
-            exclusive_start: self.exclusive_start.map(TableStreamSequence::native_key),
-            direction: self.direction,
-            limit: self.limit,
-        }
-    }
-
-    fn finish(&self, rows: StreamRowPage) -> StorageResult<TableHistoryIndexPage> {
-        let kind = StreamRowKind::Table(self.lane.physical_stream_name()?);
-        let page = rows.finish(&self.row_read(), &kind)?;
-        let pointers = page
-            .items
-            .into_iter()
-            .map(|row| self.decode_pointer(row))
-            .collect::<StorageResult<Vec<_>>>()?;
-        let last_position = pointers
-            .last()
-            .map(|pointer| pointer_event(pointer).map(|(_, position, _)| position.clone()))
-            .transpose()?;
-        Ok(TableHistoryIndexPage {
-            pointers,
-            more: page.has_more,
-            last_position,
-        })
-    }
-
-    fn decode_pointer(&self, row: StreamItem) -> StorageResult<ItemHistoryPointer> {
-        if row.data_type != StreamDataType::StreamPointer || row.id > self.through.native_key() {
-            return Err(invalid_index());
-        }
-        let pointer = decode_table_history_pointer(&row)?;
-        let (scope, position, _) = pointer_event(&pointer)?;
-        let lane =
-            TableHistoryLane::try_from((pointer.metadata().address().history_id, scope, position))?;
-        if lane != self.lane {
-            return Err(invalid_index());
-        }
-        Ok(pointer)
-    }
+/// One oldest or newest address within the captured publication bound.
+pub struct TableHistoryBoundaryRead {
+    pub lane: TableHistoryLane,
+    pub through: TableStreamSequence,
+    pub direction: ReadDirection,
 }
 
 pub struct TableHistoryIndexPage {
-    pub pointers: Vec<ItemHistoryPointer>,
+    pub entries: Vec<PositionedStreamEntry>,
     pub last_position: Option<storage_types::SystemStreamPosition>,
     pub more: bool,
 }
 
-/// Physical row reads join the caller's catalog/source-authority snapshot.
-/// They neither resolve payloads nor open another transaction.
+pub struct TableHistoryObservation {
+    pub history_id: storage_types::TableHistoryId,
+    pub position: storage_types::SystemStreamPosition,
+    pub created_at: storage_types::TimestampMillis,
+}
+
+pub struct TableHistoryObservationPage {
+    pub entries: Vec<TableHistoryObservation>,
+    pub last_position: Option<storage_types::SystemStreamPosition>,
+    pub more: bool,
+}
+
+/// Physical rows and boundary addresses join the caller's source-authority
+/// snapshot. Neither opens another transaction.
 pub trait TableHistoryIndexAttempt:
     infrastructure_provider::physical_attempt::PhysicalRecordAttempt
 {
+    fn load_table_history_boundaries(
+        &mut self,
+        reads: &[TableHistoryBoundaryRead],
+    ) -> impl Future<
+        Output = StorageResult<storage_types::Exact<Option<storage_types::SystemStreamPosition>>>,
+    > + Send;
+
+    fn load_table_history_observations(
+        &mut self,
+        reads: &[TableHistoryIndexRead],
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<TableHistoryObservationPage>>> + Send;
+
     fn load_table_history_rows(
         &mut self,
         reads: &[TableHistoryIndexRead],
-    ) -> impl Future<Output = StorageResult<Vec<StreamRowPage>>> + Send;
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<TableHistoryIndexPage>>> + Send;
 }
 
 pub async fn read_table_history_indexes(
@@ -90,76 +72,103 @@ pub async fn read_table_history_indexes(
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let result = async {
         let pages = operation.as_mut().load_table_history_rows(reads).await?;
-        if pages.len() != reads.len() {
-            return Err(invalid_index());
-        }
-        reads
-            .iter()
-            .zip(pages)
-            .map(|(read, rows)| read.finish(rows))
-            .collect()
+        pages
+            .try_zip_map(reads, |read, page| {
+                for entry in &page.entries {
+                    if &entry.source_scope != read.lane.source_scope() {
+                        return Err(StorageError::internal(
+                            "Table entry differs from qualified source",
+                        ));
+                    }
+                    require_qualified_position(read, entry.history_id, &entry.position)?;
+                }
+                Ok(page)
+            })
+            .map(storage_types::Exact::into_vec)
     }
     .await;
     operation.complete(result)
 }
 
-/// Canonical index values use the ordinary opaque envelope; they own no
-/// retained-image manifest. Native FDB keys bind a pending pointer at decode.
-impl TryFrom<&ItemHistoryPointer> for StreamItem {
-    type Error = StorageError;
-
-    fn try_from(pointer: &ItemHistoryPointer) -> StorageResult<Self> {
-        let (scope, position, created_at) = pointer_event(pointer)?;
-        let lane =
-            TableHistoryLane::try_from((pointer.metadata().address().history_id, scope, position))?;
-        Ok(Self {
-            id: TableStreamSequence::try_from(position.offset())?.native_key(),
-            stream_name: Some(lane.physical_stream_name()?),
-            data: storage_serde::to_bytes(pointer)?,
-            data_type: StreamDataType::StreamPointer,
-            created_at,
-        })
+pub async fn read_table_history_boundaries(
+    attempt: &mut impl TableHistoryIndexAttempt,
+    reads: &[TableHistoryBoundaryRead],
+) -> StorageResult<Vec<Option<storage_types::SystemStreamPosition>>> {
+    let mut operation =
+        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
+    let result = async {
+        let positions = operation
+            .as_mut()
+            .load_table_history_boundaries(reads)
+            .await?;
+        for (read, position) in reads.iter().zip(&positions) {
+            if let Some(position) = position {
+                let sequence = TableStreamSequence::try_from(position.offset())?;
+                if position.shard_id() != read.lane.shard_id()
+                    || position.lineage_id() != read.lane.lineage_id()
+                    || sequence > read.through
+                {
+                    return Err(StorageError::internal(
+                        "Table boundary differs from qualified source",
+                    ));
+                }
+            }
+        }
+        Ok(positions.into_vec())
     }
+    .await;
+    operation.complete(result)
 }
 
-pub(crate) fn decode_table_history_pointer(row: &StreamItem) -> StorageResult<ItemHistoryPointer> {
-    if row.data_type != StreamDataType::StreamPointer {
-        return Err(invalid_index());
+pub async fn read_table_history_observations(
+    attempt: &mut impl TableHistoryIndexAttempt,
+    reads: &[TableHistoryIndexRead],
+) -> StorageResult<storage_types::Exact<TableHistoryObservationPage>> {
+    let mut operation =
+        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
+    let result = async {
+        let pages = operation
+            .as_mut()
+            .load_table_history_observations(reads)
+            .await?;
+        for (read, page) in reads.iter().zip(&pages) {
+            if page.entries.len() > read.limit.get() as usize
+                || page.more && page.entries.is_empty()
+                || page.last_position.as_ref() != page.entries.last().map(|entry| &entry.position)
+            {
+                return Err(StorageError::internal("Invalid table observation page"));
+            }
+            for entry in &page.entries {
+                require_qualified_position(read, entry.history_id, &entry.position)?;
+            }
+        }
+        Ok(pages)
     }
-    let mut pointer: ItemHistoryPointer = storage_serde::from_bytes(&row.data)?;
-    if pointer_event(&pointer)?.1.offset().versionstamp().is_some() {
-        pointer = pointer.with_versionstamp(*row.id.as_bytes())?;
-    }
-    let (scope, position, created_at) = pointer_event(&pointer)?;
-    let lane =
-        TableHistoryLane::try_from((pointer.metadata().address().history_id, scope, position))?;
-    if row.stream_name.as_ref() != Some(&lane.physical_stream_name()?)
-        || created_at != row.created_at
-        || TableStreamSequence::try_from(position.offset())?.native_key() != row.id
+    .await;
+    operation.complete(result)
+}
+
+fn require_qualified_position(
+    read: &TableHistoryIndexRead,
+    history_id: storage_types::TableHistoryId,
+    position: &storage_types::SystemStreamPosition,
+) -> StorageResult<()> {
+    let sequence = TableStreamSequence::try_from(position.offset())?;
+    let outside_start = read
+        .exclusive_start
+        .is_some_and(|start| match read.direction {
+            ReadDirection::Forward => sequence <= start,
+            ReadDirection::Backward => sequence >= start,
+        });
+    if history_id != read.lane.history_id()
+        || position.shard_id() != read.lane.shard_id()
+        || position.lineage_id() != read.lane.lineage_id()
+        || sequence > read.through
+        || outside_start
     {
-        return Err(invalid_index());
+        return Err(StorageError::internal(
+            "Table entry differs from qualified source",
+        ));
     }
-    Ok(pointer)
-}
-
-fn pointer_event(
-    pointer: &ItemHistoryPointer,
-) -> StorageResult<(
-    &storage_types::SystemStreamScope,
-    &storage_types::SystemStreamPosition,
-    storage_types::TimestampMillis,
-)> {
-    match pointer.metadata().publication() {
-        ItemHistoryPublication::Event {
-            source_scope,
-            table_position,
-            created_at,
-            ..
-        } => Ok((source_scope, table_position, *created_at)),
-        ItemHistoryPublication::PredecessorAnchor => Err(invalid_index()),
-    }
-}
-
-fn invalid_index() -> StorageError {
-    StorageError::internal("Table history index differs from its qualified source")
+    Ok(())
 }

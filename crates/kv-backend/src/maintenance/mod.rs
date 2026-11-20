@@ -7,4 +7,4 @@ mod progress;
 
 pub(crate) use admission::read_admission;
 pub(crate) use identity::initialize_maintenance;
-pub(crate) use progress::{ProgressFence, write_progress};
+pub(crate) use progress::store_progress;

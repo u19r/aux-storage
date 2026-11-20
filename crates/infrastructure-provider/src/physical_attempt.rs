@@ -69,18 +69,6 @@ pub trait PhysicalRecordAttempt: Send {
     ) -> impl Future<Output = StorageResult<ConditionalWriteResult>> + Send;
 }
 
-/// Error owners expose native causes without consuming or rewriting their
-/// error.
-pub trait PhysicalRecordFailure {
-    fn native_error(&self) -> Option<&storage_types::StorageError>;
-}
-
-impl PhysicalRecordFailure for storage_types::StorageError {
-    fn native_error(&self) -> Option<&storage_types::StorageError> {
-        Some(self)
-    }
-}
-
 /// Own nonacceptance until a complete protected-record operation returns
 /// success. Native effects and external I/O remain inside the caller's existing
 /// attempt.
@@ -97,12 +85,9 @@ impl<'attempt, A: PhysicalRecordAttempt + ?Sized> PhysicalRecordOperation<'attem
         }
     }
 
-    pub fn complete<R, E: PhysicalRecordFailure>(mut self, result: Result<R, E>) -> Result<R, E> {
+    pub fn complete<R>(mut self, result: StorageResult<R>) -> StorageResult<R> {
         if let Err(error) = &result {
-            match error.native_error() {
-                Some(error) => self.attempt.reject_settlement_error(error),
-                None => self.attempt.reject_settlement(),
-            }
+            self.attempt.reject_settlement_error(error);
         }
         self.completed = true;
         result

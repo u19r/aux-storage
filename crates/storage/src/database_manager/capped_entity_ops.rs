@@ -221,14 +221,14 @@ impl DatabaseManager {
             return Ok(None);
         };
         match value {
-            AttributeValue::N(raw) => raw.parse::<u64>().map(Some).map_err(|err| {
+            AttributeValue::N(raw) => raw.parse::<u64>().map(Some).map_err(|_| {
                 StorageError::internal(&format!(
-                    "invalid capped entity counter value for {counted_entity_type}: {err}"
+                    "invalid capped entity counter value for {counted_entity_type}"
                 ))
             }),
             other => Err(StorageError::internal(&format!(
-                "capped entity counter value for {counted_entity_type} must be numeric, got \
-                 {other:?}"
+                "capped entity counter value for {counted_entity_type} must be numeric, got {}",
+                other.variant_name()
             ))),
         }
     }

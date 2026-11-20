@@ -1,9 +1,10 @@
 use storage_provider::{StorageBackend, StorageConfig};
 
-use super::create_storage_provider_bundle;
+use super::open_store;
 
 fn config(backend_type: StorageBackend) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type,
         connection_string: None,
         file_path: None,
@@ -31,7 +32,7 @@ async fn given_local_bundles_when_constructed_then_initialized_capabilities_are_
     ] {
         let mut config = config(backend);
         config.connection_string = Some(directory.join(name).to_string_lossy().into_owned());
-        let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+        let bundle = open_store(config, &Default::default(), "default")
             .await
             .expect("construct bundle");
         assert_initialized_capabilities(bundle);
@@ -39,19 +40,23 @@ async fn given_local_bundles_when_constructed_then_initialized_capabilities_are_
     std::fs::remove_dir_all(directory).expect("remove owned local fixture");
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(all(feature = "postgres", feature = "test-support"))]
 #[tokio::test]
 #[ignore = "requires a configured PostgreSQL service"]
 async fn given_postgres_bundle_when_constructed_then_initialized_capabilities_are_present() {
+    let base = std::env::var("TEST_POSTGRES_DSN").expect("TEST_POSTGRES_DSN required");
+    let (dsn, schema) =
+        sql_backend::postgres::test_schema::isolated_test_dsn(&base, "storage_bundle");
+    sql_backend::postgres::test_schema::create_test_schema(&dsn, &schema)
+        .await
+        .unwrap();
     let mut config = config(StorageBackend::Postgres);
     config.postgres = Some(storage_provider::PostgresSettings {
-        dsn: std::env::var("TEST_POSTGRES_DSN")
-            .or_else(|_| std::env::var("CUCUMBER_POSTGRES_DSN"))
-            .expect("TEST_POSTGRES_DSN or CUCUMBER_POSTGRES_DSN required"),
+        dsn,
         tls: false,
         ..Default::default()
     });
-    let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+    let bundle = open_store(config, &Default::default(), "default")
         .await
         .expect("construct PostgreSQL bundle");
     assert_initialized_capabilities(bundle);
@@ -64,14 +69,12 @@ async fn given_foundationdb_bundle_when_constructed_then_initialized_capabilitie
     let mut config = config(StorageBackend::FoundationDb);
     config.foundationdb = Some(storage_provider::FoundationDbSettings {
         cluster_file: Some(
-            std::env::var("TEST_FDB_CLUSTER_FILE")
-                .or_else(|_| std::env::var("FDB_CLUSTER_FILE"))
-                .expect("TEST_FDB_CLUSTER_FILE or FDB_CLUSTER_FILE required"),
+            std::env::var("TEST_FDB_CLUSTER_FILE").expect("TEST_FDB_CLUSTER_FILE required"),
         ),
         subspace_prefix: Some(fixture_scope()),
         ..Default::default()
     });
-    let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+    let bundle = open_store(config, &Default::default(), "default")
         .await
         .expect("construct FDB bundle");
     assert_initialized_capabilities(bundle);
@@ -91,16 +94,8 @@ fn fixture_scope() -> String {
     format!("partition-capability-{}-{time}", std::process::id())
 }
 
-fn assert_initialized_capabilities(bundle: super::StorageProviderBundle) {
-    assert!(bundle.stream.is_some());
-    assert!(bundle.queue.is_some());
-    assert!(bundle.pubsub.is_some());
-    assert!(bundle.native_attempt_capacity.is_some());
-    assert!(bundle.ttl_sweep_repository.is_some());
-    assert!(bundle.system_stream_trim_repository.is_some());
-    assert!(bundle.table_reclaim_repository.is_some());
-    let maintenance = bundle
-        .maintenance
-        .expect("initialized maintenance capabilities");
-    assert!(maintenance.queue_message_cleanup_repository.is_some());
+fn assert_initialized_capabilities(store: super::InitializedStore) {
+    let native = store.native_store().expect("a native store");
+    assert!(native.attempt_capacity().is_ok());
+    assert!(native.scheduled_job_store(Default::default()).is_ok());
 }

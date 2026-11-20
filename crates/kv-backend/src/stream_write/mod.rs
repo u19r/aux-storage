@@ -1,7 +1,11 @@
 mod append_receipt;
 #[cfg(all(test, feature = "rocksdb"))]
+mod append_receipt_tests;
+#[cfg(all(test, feature = "rocksdb"))]
 mod append_reclaim_tests;
-mod history_delete;
+mod entry_delete;
+#[cfg(test)]
+pub(crate) use append_receipt::APPEND_RECEIPT_VALUE_BYTES;
 pub(crate) use append_receipt::{load_append_receipt, receipt_prefix, store_append_receipt};
 pub(crate) mod counter;
 pub mod key_layout;

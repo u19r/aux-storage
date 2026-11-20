@@ -8,7 +8,7 @@ pub(super) fn disallowed_function_error(
 ) -> Option<String> {
     function_names
         .iter()
-        .find(|function_name| !function_calls(expression, function_name).is_empty())
+        .find(|function_name| function_calls(expression, function_name).next().is_some())
         .map(|function_name| {
             format!(
                 "Invalid {kind}: The function is not allowed in {expression_context} expression; \
@@ -21,8 +21,7 @@ pub(super) fn nested_update_function_error(
     kind: ExpressionKind,
 ) -> Option<String> {
     for call in function_calls(expression, "if_not_exists") {
-        let args = split_nonempty_top_level_args(call.args);
-        if let Some(first_arg) = args.first()
+        if let Some(first_arg) = nonempty_top_level_args(call.args).next()
             && nested_update_function_name(first_arg).is_some()
         {
             return Some(format!(
@@ -33,9 +32,7 @@ pub(super) fn nested_update_function_error(
     }
 
     for call in function_calls(expression, "list_append") {
-        let args = split_nonempty_top_level_args(call.args);
-        if args
-            .iter()
+        if nonempty_top_level_args(call.args)
             .any(|arg| nested_update_function_name(arg) == Some("list_append"))
         {
             return Some(format!(
@@ -63,25 +60,44 @@ pub(super) fn function_syntax_or_arity_error(
     expression: &str,
     kind: ExpressionKind,
 ) -> Option<String> {
-    for function_name in ["contains", "begins_with", "attribute_type", "size"] {
+    for (function_name, expected) in [
+        ("contains", 2),
+        ("begins_with", 2),
+        ("attribute_type", 2),
+        ("size", 1),
+        ("attribute_exists", 1),
+        ("attribute_not_exists", 1),
+        ("if_not_exists", 2),
+        ("list_append", 2),
+    ] {
         for call in function_calls(expression, function_name) {
-            let args = split_nonempty_top_level_args(call.args);
-            if args.is_empty() {
+            let mut args = nonempty_top_level_args(call.args);
+            let argument_count = args.clone().count();
+            let first_argument = args.next();
+            if argument_count == 0 {
                 return Some(format!(
                     "Invalid {kind}: Syntax error; token: \")\", near: \"{}\"",
                     empty_function_near(expression, call.open_paren, call.close_paren)
                 ));
             }
-            let expected = if function_name == "size" { 1 } else { 2 };
-            if args.len() != expected {
+            if argument_count != expected {
                 return Some(format!(
                     "Invalid {kind}: Incorrect number of operands for operator or function; \
                      operator or function: {function_name}, number of operands: {}",
-                    args.len()
+                    argument_count
                 ));
             }
             if function_name == "size" {
-                if let Some(nested_function) = nested_function_name(args[0]) {
+                // `size` returns a number, so AWS reports the operand type
+                // (probe P1 `size(size(a)) > :v`).
+                let first_argument = first_argument.unwrap_or_default();
+                if nested_function_name(first_argument) == Some("size") {
+                    return Some(format!(
+                        "Invalid {kind}: Incorrect operand type for operator or function; \
+                         operator or function: size, operand type: N"
+                    ));
+                }
+                if let Some(nested_function) = nested_function_name(first_argument) {
                     return Some(format!(
                         "Invalid {kind}: The function is not allowed to be used this way in an \
                          expression; function: {nested_function}"
@@ -106,49 +122,47 @@ struct FunctionCall<'a> {
     close_paren: usize,
 }
 
-fn function_calls<'a>(expression: &'a str, function_name: &str) -> Vec<FunctionCall<'a>> {
-    let mut calls = Vec::new();
+/// Calls of `function_name` (ASCII case-insensitive, matched anywhere in the
+/// text) with their parenthesized arguments. Allocates nothing.
+fn function_calls<'a>(
+    expression: &'a str,
+    function_name: &'a str,
+) -> impl Iterator<Item = FunctionCall<'a>> {
+    let bytes = expression.as_bytes();
+    let name = function_name.as_bytes();
     let mut offset = 0usize;
-    let needle = format!("{function_name}(");
-    let lower_expression = expression.to_ascii_lowercase();
-    while let Some(relative_start) = lower_expression
-        .get(offset..)
-        .and_then(|tail| tail.find(&needle))
-    {
-        let open_paren = offset + relative_start + function_name.len();
+    std::iter::from_fn(move || {
+        let needle_len = name.len() + 1;
+        let open_paren = (offset..)
+            .take_while(|&start| start + needle_len <= bytes.len())
+            .find(|&start| {
+                bytes[start + name.len()] == b'('
+                    && bytes[start..start + name.len()].eq_ignore_ascii_case(name)
+            })?
+            + name.len();
         let args_start = open_paren + 1;
         let mut depth = 1usize;
-        let mut found_close = false;
-        let Some(args_tail) = expression.get(args_start..) else {
-            break;
-        };
-        for (relative_index, ch) in args_tail.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
+        for (relative_index, &byte) in bytes[args_start..].iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
                     depth -= 1;
                     if depth == 0 {
                         let close_paren = args_start + relative_index;
-                        if let Some(args) = expression.get(args_start..close_paren) {
-                            calls.push(FunctionCall {
-                                args,
-                                open_paren,
-                                close_paren,
-                            });
-                        }
                         offset = close_paren + 1;
-                        found_close = true;
-                        break;
+                        return Some(FunctionCall {
+                            args: expression.get(args_start..close_paren)?,
+                            open_paren,
+                            close_paren,
+                        });
                     }
                 }
                 _ => {}
             }
         }
-        if !found_close {
-            break;
-        }
-    }
-    calls
+        offset = bytes.len();
+        None
+    })
 }
 
 fn empty_function_near(expression: &str, open_paren: usize, close_paren: usize) -> String {
@@ -167,12 +181,10 @@ fn empty_function_near(expression: &str, open_paren: usize, close_paren: usize) 
     near
 }
 
-pub(super) fn split_nonempty_top_level_args(args: &str) -> Vec<&str> {
-    split_top_level_args(args)
-        .into_iter()
+pub(super) fn nonempty_top_level_args(args: &str) -> impl Iterator<Item = &str> + Clone {
+    top_level_args(args)
         .map(str::trim)
         .filter(|arg| !arg.is_empty())
-        .collect()
 }
 
 fn nested_function_name(argument: &str) -> Option<&str> {
@@ -190,7 +202,7 @@ fn size_function_has_comparison(expression: &str, close_paren: usize) -> bool {
     let tail = expression
         .get(close_paren + 1..)
         .unwrap_or_default()
-        .trim_start();
+        .trim_start_matches(|ch: char| ch == ')' || ch.is_whitespace());
     tail.starts_with('=')
         || tail.starts_with("<>")
         || tail.starts_with("<=")
@@ -208,9 +220,11 @@ pub(super) fn contains_same_operand_error(
     names: Option<&crate::VecMap<String, String>>,
 ) -> Option<String> {
     for args in function_argument_lists(expression, "contains") {
-        let parts = split_top_level_args(args);
-        if parts.len() == 2 && parts[0].trim() == parts[1].trim() {
-            let operand = resolve_expression_path_for_message(parts[0].trim(), names);
+        let mut parts = top_level_args(args);
+        if let (Some(first), Some(second), None) = (parts.next(), parts.next(), parts.next())
+            && first.trim() == second.trim()
+        {
+            let operand = resolve_expression_path_for_message(first.trim(), names);
             return Some(format!(
                 "Invalid {kind}: The first operand must be distinct from the remaining operands \
                  for this operator or function; operator: contains, first operand: [{operand}]"
@@ -235,8 +249,7 @@ pub(super) fn attribute_type_literal_operand_error(
     kind: ExpressionKind,
 ) -> Option<String> {
     for args in function_argument_lists(expression, "attribute_type") {
-        let parts = split_top_level_args(args);
-        let Some(attribute_type_operand) = parts.get(1).map(|part| part.trim()) else {
+        let Some(attribute_type_operand) = top_level_args(args).nth(1).map(str::trim) else {
             continue;
         };
         if !attribute_type_operand.starts_with(':') {
@@ -256,8 +269,7 @@ pub(super) fn validate_attribute_type_value_operands(
         return Ok(());
     };
     for args in function_argument_lists(expression, "attribute_type") {
-        let parts = split_top_level_args(args);
-        let Some(attribute_type_operand) = parts.get(1).map(|part| part.trim()) else {
+        let Some(attribute_type_operand) = top_level_args(args).nth(1).map(str::trim) else {
             continue;
         };
         if !attribute_type_operand.starts_with(':') {
@@ -312,8 +324,7 @@ pub(super) fn validate_begins_with_value_operands(
         return Ok(());
     };
     for args in function_argument_lists(expression, "begins_with") {
-        let parts = split_top_level_args(args);
-        let Some(prefix_operand) = parts.get(1).map(|part| part.trim()) else {
+        let Some(prefix_operand) = top_level_args(args).nth(1).map(str::trim) else {
             continue;
         };
         if !prefix_operand.starts_with(':') {
@@ -337,6 +348,97 @@ pub(super) fn validate_begins_with_value_operands(
         }
     }
     Ok(())
+}
+
+/// `<`, `<=`, `>` and `>=` order only strings, numbers and binaries. A
+/// placeholder directly beside the operator that holds another type is refused
+/// with the operator's text. Operands of `size()` comparisons are not checked:
+/// a type mismatch there evaluates false (probes P15, P16).
+pub(super) fn validate_ordering_value_operands(
+    expression: &str,
+    kind: ExpressionKind,
+    values: Option<&crate::AttributeMap>,
+    prefixed: bool,
+) -> Result<(), String> {
+    if matches!(kind, ExpressionKind::Update | ExpressionKind::Projection) {
+        return Ok(());
+    }
+    let Some(values) = values else {
+        return Ok(());
+    };
+    let bytes = expression.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte != b'<' && byte != b'>' {
+            index += 1;
+            continue;
+        }
+        let operator_start = index;
+        index += 1;
+        if byte == b'<' && bytes.get(index) == Some(&b'>') {
+            index += 1;
+            continue;
+        }
+        if bytes.get(index) == Some(&b'=') {
+            index += 1;
+        }
+        let Some(operator) = expression.get(operator_start..index) else {
+            continue;
+        };
+        let left_end = expression
+            .get(..operator_start)
+            .map_or(0, |left| left.trim_end().len());
+        let left = &bytes[..left_end];
+        if left.last() == Some(&b')') {
+            continue;
+        }
+        let left_start = left
+            .iter()
+            .rposition(|byte| !is_placeholder_byte(*byte))
+            .map_or(0, |position| position + 1);
+        let right_start = index
+            + bytes[index..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+        let right_end = right_start
+            + bytes[right_start..]
+                .iter()
+                .take_while(|byte| is_placeholder_byte(**byte))
+                .count();
+        for key in [
+            expression.get(left_start..left_end),
+            expression.get(right_start..right_end),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|key| key.starts_with(':'))
+        {
+            if let Some(value) = values.get(key)
+                && !matches!(
+                    value,
+                    crate::AttributeValue::S(_)
+                        | crate::AttributeValue::N(_)
+                        | crate::AttributeValue::B(_)
+                )
+            {
+                return Err(validation_message(
+                    format!(
+                        "Invalid {kind}: Incorrect operand type for operator or function; \
+                         operator or function: {operator}, operand type: {}",
+                        value.variant_name()
+                    ),
+                    prefixed,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_placeholder_byte(byte: u8) -> bool {
+    byte == b':' || byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
 pub(super) fn function_argument_lists<'a>(
@@ -381,27 +483,39 @@ fn find_argument_end(arguments: &str) -> Option<usize> {
 }
 
 pub(super) fn split_top_level_args(args: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
+    top_level_args(args).collect()
+}
+
+/// Parts of `args` split at commas outside parentheses and brackets; always
+/// yields at least one (possibly empty) part. Allocates nothing.
+fn top_level_args(args: &str) -> impl Iterator<Item = &str> + Clone {
+    let bytes = args.as_bytes();
     let mut start = 0usize;
+    let mut index = 0usize;
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
-    for (index, ch) in args.char_indices() {
-        match ch {
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            ',' if paren_depth == 0 && bracket_depth == 0 => {
-                if let Some(part) = args.get(start..index) {
-                    parts.push(part);
-                }
-                start = index + 1;
-            }
-            _ => {}
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
         }
-    }
-    if let Some(part) = args.get(start..) {
-        parts.push(part);
-    }
-    parts
+        while index < bytes.len() {
+            let current = index;
+            index += 1;
+            match bytes[current] {
+                b'(' => paren_depth += 1,
+                b')' => paren_depth = paren_depth.saturating_sub(1),
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                b',' if paren_depth == 0 && bracket_depth == 0 => {
+                    let part = args.get(start..current)?;
+                    start = current + 1;
+                    return Some(part);
+                }
+                _ => {}
+            }
+        }
+        done = true;
+        args.get(start..)
+    })
 }

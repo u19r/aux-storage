@@ -88,7 +88,7 @@ impl RecordingRaw {
 impl RawOrderedJobStore for RecordingRaw {
     fn bind_native_admission(
         &self,
-        _: Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        _: Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> storage_types::StorageResult<()> {
         // This adapter fixture has no native provider or settlement lifecycle.
         Err(StorageError::internal(
@@ -159,14 +159,6 @@ fn nonzero_usize(value: usize) -> NonZeroUsize {
 
 fn nonzero_u32(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("non-zero test limit")
-}
-
-#[test]
-fn given_raw_backend_when_constructing_provider_job_store_then_it_is_object_safe() {
-    let raw = Arc::new(RecordingRaw::new());
-    let _: Arc<dyn RawOrderedJobStore> = raw.clone();
-    let store = ScheduledJobStore::new(raw.clone());
-    assert_eq!(store.capabilities().level(), StoreLevel::Local);
 }
 
 #[tokio::test]
@@ -413,7 +405,7 @@ struct FailingRaw;
 impl RawOrderedJobStore for FailingRaw {
     fn bind_native_admission(
         &self,
-        _: Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        _: Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> storage_types::StorageResult<()> {
         // This adapter fixture has no native provider or settlement lifecycle.
         Err(StorageError::internal(
@@ -466,7 +458,7 @@ struct OutOfBoundsRangeRaw;
 impl RawOrderedJobStore for OutOfBoundsRangeRaw {
     fn bind_native_admission(
         &self,
-        _: Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        _: Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> storage_types::StorageResult<()> {
         // This adapter fixture has no native provider or settlement lifecycle.
         Err(StorageError::internal(

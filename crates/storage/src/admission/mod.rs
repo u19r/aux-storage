@@ -20,6 +20,7 @@ mod state;
 mod waiters;
 
 pub(crate) use admission_types::is_admission_pressure;
+pub(crate) use registry::fixed_ingress_limit;
 
 #[cfg(test)]
 pub(crate) use crate::admission::{
@@ -40,6 +41,8 @@ pub use crate::admission::{
 
 #[cfg(test)]
 mod admission_conformance_tests;
+#[cfg(test)]
+mod admission_overload_tests;
 #[cfg(test)]
 mod admission_tests;
 #[cfg(test)]

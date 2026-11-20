@@ -2,6 +2,8 @@
 
 mod format;
 pub(crate) mod key_layout;
+#[cfg(test)]
+mod key_layout_tests;
 mod read;
 mod transaction;
 

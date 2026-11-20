@@ -20,6 +20,10 @@ pub(crate) fn into_json_bytes(response: GetItemResponse) -> serde_json::Result<V
         write_field_name(&mut out, &mut first, "Item")?;
         write_wire_item(&mut out, item)?;
     }
+    if let Some(consumed_capacity) = &response.consumed_capacity {
+        write_field_name(&mut out, &mut first, "ConsumedCapacity")?;
+        serde_json::to_writer(&mut out, consumed_capacity)?;
+    }
     out.push(b'}');
     Ok(out)
 }

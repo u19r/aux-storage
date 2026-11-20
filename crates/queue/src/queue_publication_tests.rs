@@ -8,7 +8,8 @@ use queue_provider::{
 use storage_types::TimestampMillis;
 
 use crate::{
-    QueueManager, create_queue_provider, queue_test_support_tests::selected_native_backend_case,
+    QueueManager,
+    queue_test_support_tests::{open_test_store, selected_native_backend_case},
 };
 
 struct PublicationFixture {
@@ -21,8 +22,7 @@ struct PublicationFixture {
 impl PublicationFixture {
     async fn new() -> Self {
         let case = selected_native_backend_case("queue-publication");
-        let provider: Arc<dyn QueueOperations> =
-            Arc::from(create_queue_provider(case.config).await.unwrap());
+        let provider: Arc<dyn QueueOperations> = open_test_store(case.store).await;
         let manager = Arc::new(QueueManager::new(provider.clone()));
         let queue_url = manager
             .create_queue(CreateQueueRequest {
@@ -31,6 +31,7 @@ impl PublicationFixture {
                     "MessageRetentionPeriod".into(),
                     "60".into(),
                 )])),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -39,7 +40,7 @@ impl PublicationFixture {
             provider,
             manager,
             queue_url,
-            id: MessageId::from_bytes([7; queue_provider::MESSAGE_ID_VERSIONSTAMP_LEN]),
+            id: MessageId::from_bytes([7; queue_provider::MESSAGE_ID_LEN]),
         }
     }
     fn request(&self, body: &str) -> PublishMessageRequest {
@@ -50,6 +51,7 @@ impl PublicationFixture {
                 message_body: body.into(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             },
         }
     }
@@ -244,20 +246,29 @@ async fn read_publication_record(
     use queue_provider::{QueueAttempt, QueuePort};
     store
         // Protected point reads require a write-capable native attempt.
-        .with_queue_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                let incarnation = queue_provider::QueueOperation::load(attempt, &queue_url)
-                    .await?
-                    .unwrap()
-                    .incarnation();
-                Ok(attempt
-                    .read_messages_by_id(incarnation, vec![id])
-                    .await?
-                    .pop()
-                    .flatten()
-                    .unwrap())
-            })
-        })
+        .with_attempt(
+            storage_types::AttemptPlan::new(
+                storage_types::AttemptMode::ReadWrite,
+                storage_types::DeadlineClass::Write,
+            )
+            .start(storage_types::AttemptDeadlineSource::attempt_deadlines(
+                store,
+            )),
+            move |attempt| {
+                Box::pin(async move {
+                    let incarnation = queue_provider::QueueOperation::load(attempt, &queue_url)
+                        .await?
+                        .unwrap()
+                        .incarnation();
+                    Ok(attempt
+                        .read_messages_by_id(incarnation, vec![id])
+                        .await?
+                        .into_single()
+                        .flatten()
+                        .unwrap())
+                })
+            },
+        )
         .await
         .unwrap()
 }
@@ -266,24 +277,32 @@ async fn read_publication_record(
 #[tokio::test]
 async fn given_pending_message_with_checkpoint_when_published_again_then_native_receipt_expiry_timestamp_and_checkpoint_are_unchanged()
  {
-    let backend = sql_backend::sqlite::SqliteBackend::initialize(":memory:")
-        .await
-        .unwrap();
+    let backend = sql_backend::sqlite::SqliteBackend::initialize(
+        ":memory:",
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .unwrap();
     let store = Arc::new(
-        sql_backend::SqlStore::initialize_schema(backend)
-            .await
-            .unwrap(),
+        sql_backend::SqlStore::initialize_schema(
+            backend,
+            storage_types::InitialStreamLineages::ONE,
+            true,
+        )
+        .await
+        .unwrap(),
     );
     let manager = QueueManager::new(store.clone());
     let queue_url = manager
         .create_queue(CreateQueueRequest {
             queue_name: "checkpoint-publication".into(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap()
         .queue_url;
-    let id = MessageId::from_bytes([8; queue_provider::MESSAGE_ID_VERSIONSTAMP_LEN]);
+    let id = MessageId::from_bytes([8; queue_provider::MESSAGE_ID_LEN]);
     let request = || PublishMessageRequest {
         message_id: id,
         message: SendMessageRequest {
@@ -291,6 +310,7 @@ async fn given_pending_message_with_checkpoint_when_published_again_then_native_
             message_body: "checkpoint work".into(),
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         },
     };
     manager.publish_message(request()).await.unwrap();
@@ -365,7 +385,7 @@ async fn given_equal_repeated_source_work_when_stable_publication_replaces_rando
                 .await
                 .unwrap();
             let mut request = candidate.request(&body);
-            let mut identity = [7; queue_provider::MESSAGE_ID_VERSIONSTAMP_LEN];
+            let mut identity = [7; queue_provider::MESSAGE_ID_LEN];
             identity[0] = index;
             request.message_id = MessageId::from_bytes(identity);
             candidate.manager.publish_message(request).await.unwrap();

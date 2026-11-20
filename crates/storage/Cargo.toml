@@ -5,74 +5,59 @@ license.workspace = true
 name = "storage"
 version = "0.1.0"
 
+[package.metadata.cargo-machete]
+# The Quint switch! macro expands to a reference to anyhow in unit tests.
+ignored = ["anyhow"]
+
 [lib]
 doctest = false
 
 [features]
 default = ["sqlite"]
-sqlite = [
-    "dep:sql-backend",
-    "sql-backend/sqlite",
-    "storage-types/sqlite",
-    "stream/sqlite",
-]
-turso = ["dep:sql-backend", "sql-backend/turso", "storage-types/turso", "stream/turso"]
-postgres = [
-    "dep:sql-backend",
-    "sql-backend/postgres",
-    "storage-types/postgres",
-    "stream/postgres",
-]
-rocksdb = [
-    "dep:kv-backend",
-    "kv-backend/rocksdb",
-    "storage-types/rocksdb",
-    "stream/rocksdb",
-]
-foundationdb = ["dep:kv-backend", "kv-backend/foundationdb", "stream/foundationdb"]
+sqlite = ["dep:sql-backend", "sql-backend/sqlite", "storage-types/sqlite"]
+turso = ["dep:sql-backend", "sql-backend/turso", "storage-types/turso"]
+postgres = ["dep:sql-backend", "sql-backend/postgres", "storage-types/postgres"]
+rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "storage-types/rocksdb"]
+foundationdb = ["dep:kv-backend", "kv-backend/foundationdb"]
 remote = ["dep:storage-remote"]
-regional = [
-    "storage-types/regional",
-    "dep:replication-types",
-    "dep:regional-replication",
-    "dep:infrastructure-provider",
-]
 opt-loop-profiling = ["dep:opt-loop-probe"]
 test-support = [
-    "dep:anyhow",
-    "dep:replication-provider",
-    "dep:reqwest",
     "dep:tempfile",
     "dep:tokio-postgres",
     "dep:tracing-subscriber",
-    "dep:bytes",
-    "dep:uuid",
     "scheduled-bg-jobs/test-support",
     "kv-backend?/test-support",
+    "pubsub/test-support",
+    "pubsub-provider/test-support",
+    "queue-provider/test-support",
+    "regional-replication/test-support",
+    "storage-provider/test-support",
+    "sql-backend?/test-support",
+    "storage-remote?/test-support",
+    "storage-types/test-support",
+    "stream-provider/test-support",
 ]
 
 [dependencies]
-anyhow = { workspace = true, optional = true }
 async-trait = { workspace = true }
 bg-job-store = { path = "../bg-job-store" }
 bg-jobs-tokio = { workspace = true }
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true }
 config = { path = "../config" }
 futures = { workspace = true }
 hex = { workspace = true }
-infrastructure-provider = { workspace = true, optional = true }
+infrastructure-provider = { workspace = true }
 kv-backend = { path = "../kv-backend", optional = true, default-features = false }
 lru-ttl-cache = { workspace = true }
 md5 = { workspace = true }
 metrics = { workspace = true }
 metrics-facade = { workspace = true }
 opt-loop-probe = { workspace = true, optional = true }
+pubsub = { path = "../pubsub", default-features = false }
 pubsub-provider = { path = "../pubsub-provider" }
+queue = { path = "../queue", default-features = false }
 queue-provider = { path = "../queue-provider" }
-regional-replication = { path = "../regional-replication", optional = true }
-replication-provider = { workspace = true, optional = true }
-replication-types = { path = "../replication-types", optional = true }
-reqwest = { workspace = true, optional = true }
+regional-replication = { path = "../regional-replication" }
 scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
@@ -80,12 +65,10 @@ sha2 = { workspace = true }
 sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-backfill = { path = "../storage-backfill" }
 storage-common = { path = "../storage-common" }
-storage-condition = { path = "../storage-condition" }
 storage-derive = { path = "../storage-derive" }
 storage-provider = { path = "../storage-provider", features = ["runtime-integration"] }
 storage-remote = { path = "../storage-remote", optional = true }
 storage-types = { path = "../storage-types" }
-stream = { path = "../stream", default-features = false }
 stream-provider = { path = "../stream-provider" }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true }
@@ -94,20 +77,24 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 typed-builder = { workspace = true }
 url = { workspace = true }
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
 bg-jobs-tokio = { workspace = true, features = ["test-support"] }
 bytes = { workspace = true }
-cpu-time = { workspace = true }
-infrastructure-provider = { workspace = true }
+pubsub = { path = "../pubsub", default-features = false, features = ["test-support"] }
+pubsub-provider = { path = "../pubsub-provider", features = ["test-support"] }
+queue-provider = { path = "../queue-provider", features = ["test-support"] }
 quint-connect = { workspace = true }
-replication-provider = { workspace = true }
-reqwest = { workspace = true }
+regional-replication = { path = "../regional-replication", features = ["test-support"] }
 rusqlite = { workspace = true }
 scheduled-bg-jobs = { workspace = true, features = ["test-support"] }
+storage-observability-test-support = { path = "../storage-observability-test-support" }
+storage-provider = { path = "../storage-provider", features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
+stream-provider = { path = "../stream-provider", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing-subscriber = { workspace = true }

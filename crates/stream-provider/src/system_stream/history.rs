@@ -7,45 +7,38 @@
 use std::{borrow::Cow, num::NonZeroU64};
 
 use storage_types::{
-    StorageError, StorageResult, SystemStreamCheckpoint, SystemStreamContractError,
+    StorageEnum, StorageError, StorageResult, SystemStreamCheckpoint, SystemStreamContractError,
     SystemStreamLineageId, SystemStreamOffset, SystemStreamPosition,
 };
 
 use super::{
-    SystemStreamLineageCatalog, SystemStreamSplitReceipt, SystemStreamSplitRequest,
-    SystemStreamSplitResult,
+    SystemStreamLineageCatalog, SystemStreamSplitPlan, SystemStreamSplitReceipt,
+    SystemStreamSplitRequest, SystemStreamSplitResult,
 };
 
-/// Logical source observations remain in the caller's native attempt.
-pub trait SystemHistoryReadAttempt:
-    infrastructure_provider::physical_attempt::PhysicalRecordAttempt
-{
-    fn read_system_page_start(
-        &mut self,
-    ) -> impl Future<Output = StorageResult<SystemStreamHistory>> + Send;
-
-    /// Read the history snapshot for one page without adding the hot sequence
-    /// rows to the native write conflict range.
-    ///
-    /// A page read writes nothing; its resume token carries the frontier. The
-    /// sequence rows advance on every ordinary write, so protecting them would
-    /// make every concurrent write abort the page read. A snapshot read
-    /// observes a consistent frontier and the next page advances from it.
-    fn read_system_page_start_snapshot(
-        &mut self,
-    ) -> impl Future<Output = StorageResult<SystemStreamHistory>> + Send {
-        self.read_system_page_start()
+/// The highest stable position of one lineage in a history snapshot.
+/// `visible_upper` is the first position the snapshot cannot yet see (KV:
+/// `next`; Postgres: the snapshot's xmin position). A live lineage is stable
+/// up to `visible_upper - 1`, clamped to its own range; a sealed lineage ends
+/// at its stored end, which must lie in `[initial, next]`.
+pub fn lineage_frontier_high(
+    initial_sequence: NonZeroU64,
+    next_sequence: NonZeroU64,
+    sealed_after: Option<u64>,
+    visible_upper: u64,
+) -> StorageResult<u64> {
+    let (initial, next) = (initial_sequence.get(), next_sequence.get());
+    if initial > next {
+        return Err(StorageEnum::HistoryUnavailable.into());
     }
-
-    fn load_system_retired_frontiers(
-        &mut self,
-        origins: &[SystemStreamPosition],
-    ) -> impl Future<Output = StorageResult<Vec<Option<SystemStreamPosition>>>> + Send;
-
-    fn read_system_history_pages(
-        &mut self,
-        reads: &[SystemStreamHistoryRead],
-    ) -> impl Future<Output = StorageResult<Vec<crate::SystemStreamHistoryReadPage>>> + Send;
+    let end = match sealed_after {
+        Some(end) if end > next || end < initial => {
+            return Err(StorageEnum::HistoryUnavailable.into());
+        }
+        Some(end) => end,
+        None => visible_upper.clamp(initial, next),
+    };
+    Ok(end - 1)
 }
 
 /// Immutable allocation baseline and committed upper bound for one lineage.
@@ -72,6 +65,7 @@ pub struct SystemStreamHistory {
     bounds: Vec<SystemStreamHistoryBounds>,
     ordering: SystemStreamHistoryOrdering,
     commit_frontiers: Vec<SystemStreamPosition>,
+    minimum_new_position: Option<NonZeroU64>,
 }
 
 impl AsRef<SystemStreamLineageCatalog> for SystemStreamHistory {
@@ -84,7 +78,6 @@ impl AsRef<SystemStreamLineageCatalog> for SystemStreamHistory {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SystemStreamHistoryOrdering {
     #[default]
-    Contiguous,
     SparseNumeric,
     Versionstamped,
 }
@@ -125,38 +118,31 @@ impl SystemStreamHistory {
         self.ordering == SystemStreamHistoryOrdering::Versionstamped
     }
 
-    pub fn with_commit_ordering(mut self, frontiers: Vec<SystemStreamPosition>) -> Self {
+    pub fn with_commit_ordering(
+        mut self,
+        frontiers: Vec<SystemStreamPosition>,
+        minimum_new_position: NonZeroU64,
+    ) -> Self {
         self.ordering = SystemStreamHistoryOrdering::Versionstamped;
         self.commit_frontiers = frontiers;
+        self.minimum_new_position = Some(minimum_new_position);
         self
     }
 
-    pub fn with_sparse_numeric_ordering(mut self, frontiers: Vec<SystemStreamPosition>) -> Self {
+    pub fn with_sparse_numeric_ordering(
+        mut self,
+        frontiers: Vec<SystemStreamPosition>,
+        minimum_new_position: NonZeroU64,
+    ) -> Self {
         self.ordering = SystemStreamHistoryOrdering::SparseNumeric;
         self.commit_frontiers = frontiers;
+        self.minimum_new_position = Some(minimum_new_position);
         self
     }
 
-    pub fn native_numeric_position(
-        &self,
-        routing_key: &[u8],
-        offset: u64,
-    ) -> StorageResult<SystemStreamPosition> {
-        self.catalog
-            .writer_lineage(routing_key)?
-            .position(format!("{offset:020}-ns"))
-            .map_err(|_| StorageError::internal("Invalid native numeric stream position"))
-    }
-
-    pub fn pending_commit_position(
-        &self,
-        routing_key: &[u8],
-        ordinal: u16,
-    ) -> StorageResult<SystemStreamPosition> {
-        let lineage = self.catalog.writer_lineage(routing_key)?;
-        lineage
-            .position(format!("{:020}-vsffff{ordinal:04x}", u64::MAX))
-            .map_err(|_| StorageError::internal("Invalid pending native stream position"))
+    /// Lowest position a native event can receive after this history snapshot.
+    pub fn minimum_new_position(&self) -> Option<NonZeroU64> {
+        self.minimum_new_position
     }
 
     fn frontier_position(
@@ -177,10 +163,46 @@ impl SystemStreamHistory {
     pub fn plan_split(
         &self,
         request: &SystemStreamSplitRequest,
-    ) -> Result<SystemStreamSplitReceipt, SystemStreamContractError> {
+    ) -> Result<SystemStreamSplitPlan, SystemStreamContractError> {
         request.validate_against(&self.catalog)?;
+        if self.minimum_new_position.is_some_and(|minimum| {
+            request
+                .children()
+                .iter()
+                .any(|child| child.initial_sequence() > minimum)
+        }) {
+            return Err(SystemStreamContractError::InvalidChildStart);
+        }
         let parent = self.find_bounds(request.parent().lineage_id())?;
-        SystemStreamSplitReceipt::try_new(request, parent.next_sequence.get())
+        if self.uses_commit_versionstamps() {
+            let parent = request.parent();
+            let sealed_parent = super::SystemStreamLineage::try_new(
+                parent.shard_id().as_str(),
+                parent.lineage_id().as_str(),
+                parent.parent_lineage_id().map(|id| id.as_str().to_owned()),
+                true,
+            )?;
+            Ok(SystemStreamSplitPlan::EndAtCommit(
+                SystemStreamSplitResult::try_new(
+                    request,
+                    sealed_parent,
+                    super::SystemStreamSplitDisposition::Applied,
+                )?,
+            ))
+        } else {
+            Ok(SystemStreamSplitPlan::KnownEnd(
+                SystemStreamSplitReceipt::try_new(request, parent.next_sequence.get())?,
+            ))
+        }
+    }
+
+    pub fn sealed_end(
+        &self,
+        lineage: &SystemStreamLineageId,
+    ) -> Result<NonZeroU64, SystemStreamContractError> {
+        self.find_bounds(lineage)?
+            .sealed_after
+            .ok_or(SystemStreamContractError::BackendContract)
     }
 
     /// A receipt can replay after its children have accepted writes or have
@@ -287,11 +309,30 @@ impl SystemStreamHistory {
                 return Err(SystemStreamContractError::BackendContract);
             }
         }
+        // Counter publication and entries commit atomically. Its closed high
+        // remains authoritative after retention or table deletion leaves gaps.
+        let commit_frontiers = catalog
+            .entries()
+            .iter()
+            .map(|lineage| {
+                let bound = bounds
+                    .iter()
+                    .find(|bound| &bound.lineage_id == lineage.lineage_id())
+                    .ok_or(SystemStreamContractError::UnknownLineage)?;
+                let high = bound.sealed_after.unwrap_or(bound.next_sequence).get() - 1;
+                SystemStreamPosition::try_new(
+                    lineage.shard_id().as_str(),
+                    lineage.lineage_id().as_str(),
+                    format!("{high:020}"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             catalog,
             bounds,
-            ordering: SystemStreamHistoryOrdering::Contiguous,
-            commit_frontiers: Vec::new(),
+            ordering: SystemStreamHistoryOrdering::SparseNumeric,
+            commit_frontiers,
+            minimum_new_position: None,
         })
     }
 
@@ -366,18 +407,34 @@ impl SystemStreamHistory {
         let current = self.expand_frontier(current, high)?;
         let mut reads = Vec::new();
         let mut remaining = limit.min(storage_types::SYSTEM_STREAM_RECORDS_LIMIT_MAX);
-        for (index, position) in current.frontier().iter().enumerate() {
+        let mut positions = current
+            .frontier()
+            .iter()
+            .map(|position| {
+                let mut order = [0; 12];
+                if self.minimum_new_position.is_some() {
+                    if let Some(versionstamp) = position.offset().versionstamp() {
+                        order = versionstamp;
+                    } else {
+                        order[..8].copy_from_slice(&position.offset().order()?.to_be_bytes());
+                    }
+                }
+                Ok((position, order))
+            })
+            .collect::<Result<Vec<_>, SystemStreamContractError>>()?;
+        if self.minimum_new_position.is_some() {
+            // Native clocks advance empty lineages too. Read the least advanced
+            // checkpoint first so unrelated writes cannot starve later
+            // lineages.
+            positions.sort_by_key(|(_, order)| *order);
+        }
+        for (index, (position, _)) in positions.into_iter().enumerate() {
             let boundary = self.read_boundary(position, high)?;
             let through = boundary.order()?;
-            let offset = Self::parse_offset(position)?;
             let count = if position.offset().compare_order(&boundary)?.is_eq() {
                 0
-            } else if self.ordering != SystemStreamHistoryOrdering::Contiguous {
-                remaining.div_ceil((current.frontier().len() - index) as u32)
             } else {
-                u32::try_from(through - offset)
-                    .unwrap_or(u32::MAX)
-                    .min(remaining)
+                remaining.div_ceil((current.frontier().len() - index) as u32)
             };
             if count != 0 {
                 reads.push(SystemStreamHistoryRead {
@@ -696,8 +753,7 @@ impl SystemStreamHistoryPage {
             let consumed = Self::validate_observation(read, observation, provider_more)?;
             if consumed < read.limit
                 && index + 1 != observations.len()
-                && (read.ordering == SystemStreamHistoryOrdering::Contiguous
-                    || provider_more == Some(true))
+                && provider_more == Some(true)
             {
                 return Err(SystemStreamContractError::BackendContract);
             }
@@ -707,10 +763,7 @@ impl SystemStreamHistoryPage {
                 .ok_or(SystemStreamContractError::UnknownLineage)?;
             // Private progress records the consumed sequence. Public record
             // suffixes must not prevent equality with a captured numeric high.
-            let after = SystemStreamHistory::parse_offset(&read.after)?;
-            *position = if read.ordering == SystemStreamHistoryOrdering::Contiguous {
-                Self::sequence_position(position, after + u64::from(consumed))?
-            } else if provider_more == Some(true) {
+            *position = if provider_more == Some(true) {
                 observation
                     .records
                     .last()
@@ -752,21 +805,16 @@ impl SystemStreamHistoryPage {
         let rows = &observation.records;
         let count =
             u32::try_from(rows.len()).map_err(|_| SystemStreamContractError::BackendContract)?;
-        let is_commit_ordered = read.ordering != SystemStreamHistoryOrdering::Contiguous;
-        if observation.read != read
-            || count > read.limit
-            || !is_commit_ordered && count < read.limit && (more != Some(true) || count == 0)
-            || is_commit_ordered && more == Some(true) && count == 0
-        {
+        if observation.read != read || count > read.limit || more == Some(true) && count == 0 {
             return Err(SystemStreamContractError::BackendContract);
         }
         let after = SystemStreamHistory::parse_offset(&read.after)?;
         let mut previous = read.after.offset().as_str();
         let mut previous_order = after;
-        for (ordinal, row) in rows.iter().enumerate() {
+        for row in rows {
             if row.position.shard_id() != read.after.shard_id()
                 || row.position.lineage_id() != read.after.lineage_id()
-                || if is_commit_ordered {
+                || {
                     (read.ordering == SystemStreamHistoryOrdering::Versionstamped
                         && row.position.offset().versionstamp().is_none())
                         || (read.ordering == SystemStreamHistoryOrdering::Versionstamped
@@ -774,8 +822,6 @@ impl SystemStreamHistoryPage {
                         || (read.ordering == SystemStreamHistoryOrdering::SparseNumeric
                             && SystemStreamHistory::parse_offset(&row.position)? <= previous_order)
                         || SystemStreamHistory::parse_offset(&row.position)? > read.through
-                } else {
-                    SystemStreamHistory::parse_offset(&row.position)? != after + ordinal as u64 + 1
                 }
             {
                 return Err(SystemStreamContractError::BackendContract);

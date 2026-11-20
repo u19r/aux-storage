@@ -653,3 +653,6 @@ transact_get_case!(
     given_docs_limit_sort_key_empty_rejected_when_transact_get_items_runs_then_error_matches_aws,
     "field-transact_items/400/docs_limit_sort_key_empty_rejected.json"
 );
+
+// AWS behavioural suite
+transact_get_case!(given_check_transact_get_items_over_the_item_cap_rejected_when_transact_get_items_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_transact_get_items_over_the_item_cap_rejected.json");

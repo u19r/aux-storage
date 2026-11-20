@@ -1514,8 +1514,9 @@ async fn dynamodb_streams_get_records_rejects_invalid_iterator() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             error.0.error_type,
-            "com.amazonaws.dynamodb.v20120810#TrimmedDataAccessException"
+            "com.amazon.coral.validate#ValidationException"
         );
+        assert_eq!(error.0.message, "Invalid ShardIterator");
     }
 }
 

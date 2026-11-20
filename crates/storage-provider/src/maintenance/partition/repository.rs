@@ -6,17 +6,16 @@ use scheduled_bg_jobs::{JobId, Namespace};
 use storage_common::{
     PARTITION_SAMPLE_MAX_AGE_MS, PARTITION_SAMPLE_PAGE_LIMIT,
     partition::{PartitionLoadObservation, PartitionLoadSampleRecord},
-    retry::retry_native_conflicts,
 };
 use storage_types::{
-    AttemptMode, BoundedVec, Revision, StorageError, StorageResult, StreamName, TimestampMillis,
+    BoundedVec, Revision, StorageError, StorageResult, StreamName, TimestampMillis,
     maintenance::{
         MaintenanceKind, StepResult, TaskAdmission, TaskAuthority, TaskProgress, TaskScope,
     },
 };
 
 use super::PartitionPort;
-use crate::{DYNAMO_WRITE_RETRY, DynamoPort};
+use crate::{DynamoPort, constants::BACKGROUND_PAGE};
 
 #[derive(Clone)]
 pub struct PartitionReconciliationRequest {
@@ -39,6 +38,12 @@ pub trait PartitionReconciliationRepository: Send + Sync {
     ) -> StorageResult<()>;
 }
 
+/// The load samples of one stream for one publish.
+struct SamplesInput {
+    stream: StreamName,
+    records: BoundedVec<PartitionLoadSampleRecord, 0, { PARTITION_SAMPLE_PAGE_LIMIT as usize }>,
+}
+
 #[async_trait]
 impl<P: DynamoPort + 'static> PartitionReconciliationRepository for P
 where for<'a> P::Attempt<'a>: PartitionPort
@@ -47,12 +52,12 @@ where for<'a> P::Attempt<'a>: PartitionPort
         &self,
         request: PartitionReconciliationRequest,
     ) -> StorageResult<StepResult<()>> {
-        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
-            let request = request.clone();
-            self.with_dynamo_attempt(AttemptMode::ReadWrite, move |port| {
-                Box::pin(async move { advance(port, request).await })
-            })
-        })
+        DynamoPort::run(
+            self,
+            BACKGROUND_PAGE,
+            Arc::new(request),
+            |attempt, request, _| Box::pin(advance(attempt, request.clone())),
+        )
         .await
     }
 
@@ -64,13 +69,13 @@ where for<'a> P::Attempt<'a>: PartitionPort
         if records.is_empty() {
             return Ok(());
         }
-        let records = Arc::new(records);
-        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
-            let stream = stream.clone();
-            let records = Arc::clone(&records);
-            self.with_dynamo_attempt(AttemptMode::ReadWrite, move |port| {
-                Box::pin(async move { publish_samples(port, &stream, records.as_slice()).await })
-            })
+        let input = Arc::new(SamplesInput { stream, records });
+        DynamoPort::run(self, BACKGROUND_PAGE, input, |attempt, input, _| {
+            Box::pin(publish_samples(
+                attempt,
+                &input.stream,
+                input.records.as_slice(),
+            ))
         })
         .await
     }
@@ -213,73 +218,4 @@ async fn publish_samples(
         record.validate_for(&family)?;
     }
     port.store_partition_samples(stream, records).await
-}
-
-/// Native admission wraps each attempt, while the shared decisions remain above
-/// it.
-pub struct AdmittedPartitionRepository<P> {
-    port: Arc<P>,
-    binding: Arc<crate::native_admission::NativeAdmissionBinding>,
-}
-
-impl<P> AdmittedPartitionRepository<P> {
-    pub fn new(
-        port: Arc<P>,
-        binding: Arc<crate::native_admission::NativeAdmissionBinding>,
-    ) -> Self {
-        Self { port, binding }
-    }
-}
-
-#[async_trait]
-impl<P: DynamoPort> PartitionReconciliationRepository for AdmittedPartitionRepository<P>
-where for<'native> P::Attempt<'native>: PartitionPort
-{
-    async fn advance_partition_reconciliation(
-        &self,
-        request: PartitionReconciliationRequest,
-    ) -> StorageResult<StepResult<()>> {
-        retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
-            let port = Arc::clone(&self.port);
-            let request = request.clone();
-            self.binding.settle(
-                crate::native_admission::NativeWork::Background,
-                move || async move {
-                    port.with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
-                        Box::pin(advance(attempt, request))
-                    })
-                    .await
-                },
-            )
-        })
-        .await
-    }
-
-    async fn publish_partition_samples(
-        &self,
-        stream: StreamName,
-        records: BoundedVec<PartitionLoadSampleRecord, 0, { PARTITION_SAMPLE_PAGE_LIMIT as usize }>,
-    ) -> StorageResult<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let records = Arc::new(records);
-        retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
-            let port = Arc::clone(&self.port);
-            let stream = stream.clone();
-            let records = Arc::clone(&records);
-            self.binding.settle(
-                crate::native_admission::NativeWork::Background,
-                move || async move {
-                    port.with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
-                        Box::pin(async move {
-                            publish_samples(attempt, &stream, records.as_slice()).await
-                        })
-                    })
-                    .await
-                },
-            )
-        })
-        .await
-    }
 }

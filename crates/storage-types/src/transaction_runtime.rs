@@ -1,16 +1,16 @@
 use std::{collections::HashSet, fmt::Write as _};
 
 use crate::{
-    AttributeValue, AttributeValueLookup, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
-    KeyAttributeType, KeyAttributes, StorageEnum, StorageError, StorageResult, StoredTableInfo,
-    TableName, TransactEncodeItem, TransactGetItem, TransactWriteItem, canonical_dynamodb_number,
+    AttributeValue, AttributeValueLookup, CancellationCode, CancellationReason, KeyAttributeType,
+    KeyAttributes, StorageEnum, StorageError, StorageResult, StoredTableInfo, TableName,
+    TransactEncodeItem, TransactGetItem, TransactWriteItem, canonical_dynamodb_number,
     context::WrappedError as _, validate_item_key_attributes_for_schema,
     validate_key_attribute_value_for_schema, validate_key_attributes_for_schema,
 };
 
 #[derive(Debug, Clone, Default)]
 pub struct TransactionKeyPreflight {
-    pub validation_reason: Option<String>,
+    pub validation_reason: Option<CancellationReason>,
     pub key_fingerprint: Option<String>,
 }
 
@@ -48,17 +48,17 @@ pub fn transaction_write_binding_error_with_len(
     }
 }
 
-pub fn transaction_canceled_for_reason(index: usize, reason: String) -> StorageError {
+pub fn transaction_canceled_for_reason(index: usize, reason: CancellationReason) -> StorageError {
     transaction_canceled_for_reason_with_len(index, index + 1, reason)
 }
 
 pub fn transaction_canceled_for_reason_with_len(
     index: usize,
     total_len: usize,
-    reason: String,
+    reason: CancellationReason,
 ) -> StorageError {
     let len = total_len.max(index + 1);
-    let mut reasons = vec!["None".to_string(); len];
+    let mut reasons = vec![CancellationReason::none(); len];
     reasons[index] = reason;
     StorageEnum::TransactionCanceled { reasons }.into()
 }
@@ -74,18 +74,18 @@ fn pad_transaction_canceled_reasons(error: StorageError, total_len: usize) -> St
         .into();
     }
     let mut reasons = reasons.clone();
-    reasons.resize(total_len, "None".to_string());
+    reasons.resize(total_len, CancellationReason::none());
     StorageEnum::TransactionCanceled { reasons }.into()
 }
 
 pub fn transaction_canceled_for_indexed_reasons(
-    reasons: Vec<Option<String>>,
+    reasons: Vec<Option<CancellationReason>>,
 ) -> Option<StorageError> {
     reasons.iter().any(Option::is_some).then(|| {
         StorageEnum::TransactionCanceled {
             reasons: reasons
                 .into_iter()
-                .map(|reason| reason.unwrap_or_else(|| "None".to_string()))
+                .map(|reason| reason.unwrap_or_else(CancellationReason::none))
                 .collect(),
         }
         .into()
@@ -98,7 +98,7 @@ pub fn transaction_canceled_for_preflights(
     let first_index = preflights
         .iter()
         .position(|preflight| preflight.validation_reason.is_some())?;
-    let mut reasons = vec!["None".to_string(); preflights.len()];
+    let mut reasons = vec![CancellationReason::none(); preflights.len()];
     for (index, preflight) in preflights.iter().enumerate().skip(first_index) {
         if let Some(reason) = preflight.validation_reason.as_ref() {
             reasons[index] = reason.clone();
@@ -108,22 +108,31 @@ pub fn transaction_canceled_for_preflights(
 }
 
 // TODO: consolidate transaction-reason accessors on StorageError.
-pub fn transaction_cancellation_reason_at(error: &StorageError, index: usize) -> Option<String> {
+pub fn transaction_cancellation_reason_at(
+    error: &StorageError,
+    index: usize,
+) -> Option<CancellationReason> {
     match error.to_enum() {
         StorageEnum::TransactionCanceled { reasons } => reasons
             .get(index)
-            .filter(|reason| reason.as_str() != "None")
+            .filter(|reason| reason.code != CancellationCode::None)
             .cloned(),
-        StorageEnum::ConditionalCheckFailed => Some("ConditionalCheckFailed".to_string()),
-        StorageEnum::Validation { message, .. } => Some(format!("ValidationError\t{message}")),
+        StorageEnum::ConditionalCheckFailed => {
+            Some(CancellationReason::conditional_check_failed(None))
+        }
+        StorageEnum::Validation { message, .. } => {
+            Some(CancellationReason::validation_error(message.clone()))
+        }
         _ => None,
     }
 }
 
 // TODO: consolidate transaction-reason accessors on StorageError.
-pub fn transaction_validation_reason(error: &StorageError) -> Option<String> {
+pub fn transaction_validation_reason(error: &StorageError) -> Option<CancellationReason> {
     match error.to_enum() {
-        StorageEnum::Validation { message, .. } => Some(format!("ValidationError\t{message}")),
+        StorageEnum::Validation { message, .. } => {
+            Some(CancellationReason::validation_error(message.clone()))
+        }
         _ => None,
     }
 }
@@ -282,19 +291,6 @@ pub fn validate_no_duplicate_transact_item_keys(
     Ok(())
 }
 
-pub fn conditional_check_failed_reason<T: serde::Serialize>(
-    old_item: Option<&T>,
-) -> StorageResult<String> {
-    if let Some(old_item) = old_item {
-        return Ok(format!(
-            "ConditionalCheckFailed\t{}\t{}",
-            DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
-            serde_json::to_string(old_item)?
-        ));
-    }
-    Ok("ConditionalCheckFailed".to_string())
-}
-
 #[must_use]
 pub fn return_values_on_condition_check_failure_all_old(value: Option<&String>) -> bool {
     value.is_some_and(|value| value == "ALL_OLD")
@@ -446,7 +442,7 @@ fn append_fingerprint_part(fingerprint: &mut String, tag: &str, value: impl AsRe
     fingerprint.push(';');
 }
 
-fn transaction_cancellation_reason(error: &StorageError) -> Option<String> {
+fn transaction_cancellation_reason(error: &StorageError) -> Option<CancellationReason> {
     transaction_cancellation_reason_at(error, 0)
 }
 

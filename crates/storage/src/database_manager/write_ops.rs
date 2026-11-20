@@ -1,24 +1,14 @@
-use futures::TryFutureExt;
 use storage_types::{
     AttributeMap, DeleteItemRequest, ExprNameRef, ExprValueRef, KeyRef, PutItemRequest,
     PutItemResponse, ReturnValuesOldNewUpdated, StorageResult, TableName, UpdateItemRequest,
     UpdateItemResponse, WireItem, expr_names_to_map, expr_values_to_map,
 };
 
-use crate::{
-    admission::AdmissionClass,
-    database_manager::{
-        DatabaseManager, DeleteItemInput, PutItemInput, UpdateItemInput, record_storage_operation,
-    },
-    updated_at_apply::{inject_updated_at_into_update_expression, stamp_wire_item_now},
-};
+use crate::database_manager::{DatabaseManager, DeleteItemInput, PutItemInput, UpdateItemInput};
 
 impl DatabaseManager {
     pub async fn put_item(&self, input: PutItemInput) -> StorageResult<PutItemResponse> {
-        let mut item = WireItem::try_from(input.item)?;
-        if self.single_table_mode_enabled() {
-            stamp_wire_item_now(&mut item)?;
-        }
+        let item = WireItem::try_from(input.item)?;
         let mut request = PutItemRequest::new(input.table_name, item);
         request.indexers = input.indexers;
         request.condition_expression = input.condition_expression;
@@ -28,10 +18,7 @@ impl DatabaseManager {
         request.return_values_on_condition_check_failure = input
             .return_old_on_condition_failure
             .then(|| "ALL_OLD".to_string());
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
-            record_storage_operation("put_item", async move { dynamo.put_item(request).await })
-        })
-        .await
+        self.put_item_request(request).await
     }
 
     pub async fn delete_item(&self, input: DeleteItemInput) -> StorageResult<Option<AttributeMap>> {
@@ -50,27 +37,12 @@ impl DatabaseManager {
                 .return_old_on_condition_failure
                 .then(|| "ALL_OLD".to_string()),
         };
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
-            record_storage_operation(
-                "delete_item",
-                async move { dynamo.delete_item(request).await },
-            )
-            .map_ok(|response| response.attributes)
-        })
-        .await
+        self.delete_item_request(request)
+            .await
+            .map(|response| response.attributes)
     }
 
-    pub async fn update_item(
-        &self,
-        mut input: UpdateItemInput,
-    ) -> StorageResult<UpdateItemResponse> {
-        if self.single_table_mode_enabled() && !input.update_expression.trim().is_empty() {
-            inject_updated_at_into_update_expression(
-                &mut input.update_expression,
-                &mut input.expression_attribute_names,
-                &mut input.expression_attribute_values,
-            )?;
-        }
+    pub async fn update_item(&self, input: UpdateItemInput) -> StorageResult<UpdateItemResponse> {
         let mut request = UpdateItemRequest::builder()
             .table_name(input.table_name)
             .key(input.key)
@@ -87,13 +59,7 @@ impl DatabaseManager {
             .build();
         request.update_expression =
             (!input.update_expression.trim().is_empty()).then_some(input.update_expression);
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
-            record_storage_operation(
-                "update_item",
-                async move { dynamo.update_item(request).await },
-            )
-        })
-        .await
+        self.update_item_request(request).await
     }
 
     #[expect(

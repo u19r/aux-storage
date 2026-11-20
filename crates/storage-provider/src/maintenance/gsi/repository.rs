@@ -1,24 +1,18 @@
 use std::future::Future;
 
-use async_trait::async_trait;
 use storage_backfill::{
-    GsiActivationObservation, GsiActivationState, GsiBuild, GsiBuildCandidates,
-    GsiBuildProjectionObservation, GsiBuildTarget, GsiPageLimit, GsiProjection, GsiProjectionKey,
-    GsiProjectionStateRead, GsiProjectionStateReadBatch, GsiScanObservation, GsiScanSourcePage,
-    GsiSourceProjection, GsiStreamObservation, GsiStreamSourcePage,
+    GsiBuild, GsiBuildCandidates, GsiBuildTarget, GsiPageLimit, GsiScanObservation,
+    GsiScanSourcePage,
 };
-use storage_common::{TtlConfigRecord, retry::retry_native_conflicts};
+use storage_common::TtlConfigRecord;
 use storage_types::{
-    IndexName, StorageResult, SystemStreamCheckpoint, TableName,
-    maintenance::{StepResult, TargetIncarnation, TaskProgress},
+    StorageResult, TableName,
+    maintenance::{TargetIncarnation, TaskProgress},
 };
 
 use super::{
     GsiBuildAdvance, GsiBuildRequest, GsiPort, GsiTransition, models::GsiBuildStart,
     transaction::GsiAttempt,
-};
-use crate::{
-    DYNAMO_WRITE_RETRY, DynamoPort, GsiIndexReadiness, GsiReadinessRecord, GsiReadinessSnapshot,
 };
 
 /// The scheduler's wraparound decision is shared. Physical stores issue the
@@ -72,6 +66,14 @@ pub trait GsiCandidateRead<Cursor> {
 /// those shared operations.
 pub trait GsiBuildTransaction {
     type Cursor: PartialEq + Send + Sync;
+
+    fn advance_native_gsi(
+        &mut self,
+        _build: &GsiBuild<Self::Cursor>,
+        _progress: super::NativeGsiProgress,
+    ) -> impl Future<Output = StorageResult<Option<GsiBuildAdvance>>> {
+        async { Ok(None) }
+    }
 
     fn advance_gsi_build(
         &mut self,
@@ -143,92 +145,15 @@ pub trait GsiBuildTransaction {
     {
         async move {
             let page = self.read_gsi_scan_source_page(target, after, limit).await?;
-            let sources = GsiSourceProjection::project_scanned_items(
+            let projections = storage_backfill::GsiProjectedRow::project_scanned_items(
                 &page.table,
                 &target.index_name,
                 page.items,
             )?;
-            let reads = GsiProjectionStateRead::plan(&sources);
-            let current = self
-                .read_gsi_projected_states(GsiProjectionStateReadBatch {
-                    table: &page.table,
-                    target,
-                    sources: &sources,
-                    reads: &reads,
-                })
-                .await?;
             Ok(GsiScanObservation {
                 expected_after: page.expected_after,
                 end: page.end,
-                projections: GsiBuildProjectionObservation::attach_all(sources, current)?,
-            })
-        }
-    }
-
-    fn read_gsi_catch_up(
-        &mut self,
-        target: &GsiBuildTarget,
-        after: SystemStreamCheckpoint,
-        through: SystemStreamCheckpoint,
-        limit: GsiPageLimit,
-    ) -> impl Future<Output = StorageResult<GsiStreamObservation>>
-    where
-        Self: Sized,
-    {
-        self.read_gsi_stream_observation(target, after, through, limit)
-    }
-
-    fn read_gsi_activation(
-        &mut self,
-        target: &GsiBuildTarget,
-        required_from: SystemStreamCheckpoint,
-        through: SystemStreamCheckpoint,
-    ) -> impl Future<Output = StorageResult<GsiActivationObservation>>
-    where
-        Self: Sized,
-    {
-        async move {
-            self.validate_gsi_frontier(&required_from, &through).await?;
-            let state = self.read_gsi_activation_state(target, through).await?;
-            Ok(GsiActivationObservation {
-                target_incarnation: state.target_incarnation,
-                projected_through: state.projected_through,
-            })
-        }
-    }
-
-    fn read_gsi_stream_observation(
-        &mut self,
-        target: &GsiBuildTarget,
-        after: SystemStreamCheckpoint,
-        through: SystemStreamCheckpoint,
-        limit: GsiPageLimit,
-    ) -> impl Future<Output = StorageResult<GsiStreamObservation>>
-    where
-        Self: Sized,
-    {
-        async move {
-            let page = self
-                .read_gsi_stream_source_page(target, &after, &through, limit)
-                .await?;
-            let mut sources = Vec::new();
-            for candidate in page.candidates {
-                sources.extend(candidate.into_projections(&page.table, &target.index_name)?);
-            }
-            let reads = GsiProjectionStateRead::plan(&sources);
-            let current = self
-                .read_gsi_projected_states(GsiProjectionStateReadBatch {
-                    table: &page.table,
-                    target,
-                    sources: &sources,
-                    reads: &reads,
-                })
-                .await?;
-            Ok(GsiStreamObservation {
-                expected_cursor: after,
-                through,
-                end: page.end,
-                projections: GsiBuildProjectionObservation::attach_all(sources, current)?,
+                projections,
             })
         }
     }
@@ -239,47 +164,6 @@ pub trait GsiBuildTransaction {
         after: Option<&Self::Cursor>,
         limit: GsiPageLimit,
     ) -> impl Future<Output = StorageResult<GsiScanSourcePage<Self::Cursor>>>;
-
-    fn read_gsi_stream_source_page(
-        &mut self,
-        target: &GsiBuildTarget,
-        after: &SystemStreamCheckpoint,
-        through: &SystemStreamCheckpoint,
-        limit: GsiPageLimit,
-    ) -> impl Future<Output = StorageResult<GsiStreamSourcePage>>;
-
-    fn read_gsi_projection_states(
-        &mut self,
-        batch: GsiProjectionStateReadBatch<'_>,
-    ) -> impl Future<Output = StorageResult<Vec<Option<GsiProjection<GsiProjectionKey>>>>>;
-
-    fn read_gsi_projected_states(
-        &mut self,
-        batch: GsiProjectionStateReadBatch<'_>,
-    ) -> impl Future<Output = StorageResult<Vec<Option<GsiProjection<GsiProjectionKey>>>>>
-    where
-        Self: Sized,
-    {
-        async move {
-            if batch.reads.is_empty() {
-                Ok((0..batch.sources.len()).map(|_| None).collect())
-            } else {
-                self.read_gsi_projection_states(batch).await
-            }
-        }
-    }
-
-    fn validate_gsi_frontier(
-        &mut self,
-        current: &SystemStreamCheckpoint,
-        through: &SystemStreamCheckpoint,
-    ) -> impl Future<Output = StorageResult<()>>;
-
-    fn read_gsi_activation_state(
-        &mut self,
-        target: &GsiBuildTarget,
-        through: SystemStreamCheckpoint,
-    ) -> impl Future<Output = StorageResult<GsiActivationState>>;
 
     fn read_gsi_ttl_config(
         &mut self,
@@ -298,47 +182,15 @@ pub trait GsiBuildTransaction {
     ) -> impl Future<Output = StorageResult<()>>;
 }
 
-#[async_trait]
-pub trait GsiBuildRepository: Send + Sync {
-    async fn advance_gsi_build(&self, request: GsiBuildRequest) -> StorageResult<StepResult<()>>;
-}
-
-#[async_trait]
-impl<P: DynamoPort> GsiBuildRepository for P
-where for<'native> P::Attempt<'native>: GsiPort
-{
-    async fn advance_gsi_build(&self, request: GsiBuildRequest) -> StorageResult<StepResult<()>> {
-        let advance = retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
-            let request = request.clone();
-            self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(async move { GsiAttempt::advance(attempt, &request).await })
-            })
-        })
-        .await?;
-        if let Some(name) = advance.ttl_activation.map(|policy| policy.table_name) {
-            self.metadata_cache().invalidate(&name);
-        }
-        Ok(advance.result)
+/// One try. Each try after the first halves the page of the try before it.
+pub(crate) async fn gsi_build_in_attempt<P: GsiPort>(
+    attempt: &mut P,
+    request: &GsiBuildRequest,
+    attempt_try: storage_types::AttemptTry,
+) -> StorageResult<GsiBuildAdvance> {
+    let mut request = request.clone();
+    for _ in 1..attempt_try.number {
+        request.page_limit = request.page_limit.halved();
     }
-}
-
-#[async_trait]
-pub trait GsiLifecycleRepository: Send + Sync {
-    async fn read_gsi_readiness_records(
-        &self,
-        table_name: &TableName,
-        index_names: &[IndexName],
-    ) -> StorageResult<Vec<GsiReadinessRecord>>;
-
-    async fn read_gsi_index_readiness(
-        &self,
-        table_name: &TableName,
-        index_names: &[IndexName],
-    ) -> StorageResult<Vec<(IndexName, GsiIndexReadiness)>> {
-        GsiReadinessSnapshot::from(
-            self.read_gsi_readiness_records(table_name, index_names)
-                .await?,
-        )
-        .select(index_names)
-    }
+    GsiAttempt::advance(attempt, &request).await
 }

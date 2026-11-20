@@ -19,6 +19,11 @@ pub struct StoredTableInfo {
     pub table_size_bytes: u64,
     pub item_count: u64,
     pub stream_specification: Option<StreamSpecification>,
+    /// The store-clock stamp of the latest stream enable: it names the stream
+    /// (label and ARN). Disable keeps it; each enable issues a later one.
+    /// `None` until the first enable.
+    #[schema(value_type = Option<i64>)]
+    pub stream_enabled_at: Option<TimestampMillis>,
     #[serde(default = "default_table_stream_duration")]
     pub table_stream_duration: StreamRetentionDuration,
     #[serde(default)]
@@ -50,7 +55,7 @@ impl StoredTableInfo {
     /// A public stream or a temporary internal GSI build requires history.
     #[must_use]
     pub fn requires_stream_entry(&self) -> bool {
-        self.has_public_stream_request() || self.has_internal_stream_capture()
+        self.has_public_stream_request()
     }
 
     #[must_use]
@@ -58,15 +63,6 @@ impl StoredTableInfo {
         self.stream_specification
             .as_ref()
             .is_some_and(|spec| spec.stream_enabled)
-    }
-
-    #[must_use]
-    pub fn has_internal_stream_capture(&self) -> bool {
-        self.global_secondary_indexes
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|index| index.capture_for_build)
     }
 
     #[must_use]
@@ -90,11 +86,6 @@ pub struct AttributeDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GlobalSecondaryIndex {
-    /// Temporary ownership of mutation history, hidden from public index
-    /// descriptions.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[schema(ignore)]
-    pub capture_for_build: bool,
     #[serde(rename = "IndexName")]
     pub index_name: IndexName,
 

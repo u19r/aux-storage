@@ -12,7 +12,7 @@ use scheduled_bg_jobs::store::{
 };
 use storage_common::point_results::PointPlacement;
 use storage_provider::{RawOrderedJobStore, RawOrderedJobStoreError};
-use storage_types::{StorageError, StorageResult};
+use storage_types::{AttemptPlan, DeadlineClass, StorageError, StorageResult};
 
 use super::{commit, limits, range, sql_statements};
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
     constants::SCHEDULED_JOB_POINT_READ_BYTES as POINT_READ_BYTES,
 };
 
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
 pub(crate) async fn initialize<A: SqlAttempt>(
     attempt: &mut A,
     engine: SqlEngine,
@@ -34,7 +35,7 @@ pub(crate) struct SqlRawOrderedJobStore<B> {
     pub(super) backend: Arc<B>,
     pub(super) capabilities: StoreCapabilities,
     pub(super) admission:
-        std::sync::OnceLock<Arc<dyn storage_provider::native_admission::NativeAdmission>>,
+        std::sync::OnceLock<Arc<dyn storage_common::native_admission::NativeAdmission>>,
     pub(super) engine: SqlEngine,
 }
 
@@ -66,7 +67,15 @@ impl<B: SqlBackend + 'static> SqlRawOrderedJobStore<B> {
         storage_provider::job_store::run_native_job_read(
             self.capabilities.max_transaction_duration(),
             self.admission.get().cloned(),
-            move || async move { backend.with_attempt(AttemptMode::ReadOnly, operation).await },
+            move || async move {
+                backend
+                    .with_attempt(
+                        AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::BackgroundPage)
+                            .start(backend.attempt_deadlines()),
+                        operation,
+                    )
+                    .await
+            },
         )
         .await
     }
@@ -76,7 +85,7 @@ impl<B: SqlBackend + 'static> SqlRawOrderedJobStore<B> {
 impl<B: SqlBackend + 'static> RawOrderedJobStore for SqlRawOrderedJobStore<B> {
     fn bind_native_admission(
         &self,
-        admission: Arc<dyn storage_provider::native_admission::NativeAdmission>,
+        admission: Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> StorageResult<()> {
         self.admission.set(admission).map_err(|_| {
             storage_types::StorageError::internal("scheduled-job native admission is already bound")
@@ -151,9 +160,7 @@ pub(crate) fn decode_many<Value: From<Vec<u8>>>(
     }
     let mut values = Vec::new();
     values.try_reserve_exact(keys.len()).map_err(|_| {
-        RawOrderedJobStoreError::Backend(
-            storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-        )
+        RawOrderedJobStoreError::Backend(storage_types::AttemptFailure::CAPACITY.into())
     })?;
     values.resize_with(keys.len(), || None);
     for row in page.rows {
@@ -169,9 +176,13 @@ pub(crate) fn decode_many<Value: From<Vec<u8>>>(
         })
         .place(Value::from(value), &copy)
         .map_err(|error| {
-            if error.native_attempt_rejection()
-                == Some(storage_types::NativeAttemptRejection::Capacity)
-            {
+            if matches!(
+                error.attempt_kind(),
+                Some(
+                    storage_types::AttemptKind::Capacity
+                        | storage_types::AttemptKind::TransactionBytes
+                )
+            ) {
                 RawOrderedJobStoreError::Backend(error)
             } else {
                 RawOrderedJobStoreError::Corrupt("scheduled job batch association")

@@ -1,8 +1,8 @@
 //! Atomic KV GSI build effects on the caller's native write attempt.
 
 use storage_backfill::GsiBuild;
-use storage_provider::{GsiWriteSource, UpdateTimeToLiveAttempt, maintenance::GsiTransition};
-use storage_types::{BoundTableInfo, StorageResult, maintenance::MaintenanceKind};
+use storage_provider::{TtlPolicyAttempt, maintenance::GsiTransition};
+use storage_types::{BoundTableInfo, StorageResult};
 
 use super::{GsiWriteInput, catalog::build_mutations, prepare_gsi_writes, read::target_index};
 use crate::{
@@ -13,15 +13,19 @@ pub(crate) async fn apply_gsi_transition<A: KvAttempt>(
     catalog: &mut KvCatalogAttempt<'_, A>,
     table: &BoundTableInfo,
     transition: GsiTransition<'_, Vec<u8>>,
-    observed_progress: &maintenance::ProgressFence,
+    progress: storage_provider::maintenance::ProgressWrite,
 ) -> StorageResult<()> {
-    let identity = catalog.identity_for(&table.info.table_name)?.clone();
+    let identity = catalog.load_table_identity(table).await?;
     let index_id = target_index(&identity, &transition.expected.target)?;
+    // Only a phase change that writers see changes the binding and the
+    // stamp; a build page stores job state only.
+    let binding = transition.next_binding(&catalog.current_binding(table))?;
     let GsiTransition {
-        expected_revision,
-        next_progress,
+        expected_revision: _,
+        next_progress: _,
         expected,
         projections,
+        primary_ttl_metadata: _,
         next_state,
         ttl_activation,
     } = transition;
@@ -31,9 +35,7 @@ pub(crate) async fn apply_gsi_transition<A: KvAttempt>(
     prepare_gsi_writes(
         catalog,
         GsiWriteInput {
-            identity: &identity,
             table,
-            source: GsiWriteSource::Backfill,
             writes: projections,
             prepared: &mut Vec::new(),
         },
@@ -49,16 +51,15 @@ pub(crate) async fn apply_gsi_transition<A: KvAttempt>(
     catalog
         .attempt
         .stage(build_mutations(identity.table_id, index_id, &next)?.into())?;
+    if let Some(binding) = binding {
+        catalog
+            .replace_table_layout(table, identity, table.info.as_ref().clone(), binding)
+            .await?;
+    }
     if let Some(activation) = ttl_activation {
         catalog
             .write_ttl_config(table, activation.activated.clone())
             .await?;
     }
-    maintenance::write_progress(
-        catalog.attempt,
-        MaintenanceKind::GsiBackfill,
-        observed_progress,
-        expected_revision,
-        next_progress,
-    )
+    maintenance::store_progress(catalog.attempt, progress)
 }

@@ -61,7 +61,7 @@ pub trait RawOrderedJobStore: Send + Sync {
 
     fn bind_native_admission(
         &self,
-        admission: std::sync::Arc<dyn crate::native_admission::NativeAdmission>,
+        admission: std::sync::Arc<dyn storage_common::native_admission::NativeAdmission>,
     ) -> storage_types::StorageResult<()>;
 
     async fn bootstrap(&self) -> Result<(), RawOrderedJobStoreError>;

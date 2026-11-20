@@ -96,7 +96,7 @@ async fn given_hash_only_query_at_consumed_key_when_resumed_then_page_is_empty()
                 let page = result.items.unwrap_or_default();
                 let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
                 anyhow::ensure!(
-                    page.len() == usize::from(should_return) && next.is_none(),
+                    page.len() == usize::from(should_return) && next.is_some() == should_return,
                     "hash cursor forward={forward} index={index}: page={page:?} next={next:?}"
                 );
             }
@@ -190,7 +190,7 @@ async fn given_partition_only_query_with_other_partition_cursor_when_resumed_the
                 let page = result.items.unwrap_or_default();
                 let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
                 anyhow::ensure!(
-                    page.len() == usize::from(should_return) && next.is_none(),
+                    page.len() == usize::from(should_return) && next.is_some() == should_return,
                     "composite cursor forward={forward} index={index}: page={page:?} next={next:?}"
                 );
             }
@@ -268,6 +268,15 @@ async fn given_numeric_partition_and_binary_sort_keys_when_query_pages_then_curs
                     .await?;
                 let page = result.items.unwrap_or_default();
                 let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
+                // A Query that evaluated exactly its Limit keeps a cursor, so
+                // the walk ends on one empty page.
+                if page.is_empty() {
+                    anyhow::ensure!(
+                        next.is_none() && !seen.is_empty(),
+                        "binary key page missing"
+                    );
+                    break;
+                }
                 anyhow::ensure!(page.len() == 1, "binary key page missing");
                 let attrs = page[0].to_attribute_map()?;
                 let Some(AttributeValue::B(binary)) = attrs.get("sk") else {
@@ -356,6 +365,13 @@ async fn given_numeric_sort_keys_when_query_pages_then_equivalent_bound_preserve
                     .await?;
                 let page = result.items.unwrap_or_default();
                 let next = result.last_evaluated_key.map(ExclusiveStartKey::Key);
+                if page.is_empty() {
+                    anyhow::ensure!(
+                        next.is_none() && !seen.is_empty(),
+                        "numeric page missing forward={forward} seen={seen:?} next={next:?}"
+                    );
+                    break;
+                }
                 anyhow::ensure!(
                     page.len() == 1,
                     "numeric page missing forward={forward} seen={seen:?} next={next:?}"

@@ -19,7 +19,6 @@ pub(crate) struct PubsubDeliveryWorkload {
     pub(crate) observed_publish_acceptances: BTreeSet<String>,
     pub(crate) claim_count: u64,
     pub(crate) unknown_claim_count: u64,
-    pub(crate) claim_audit_count: u64,
     pub(crate) duplicate_claim_reject_count: u64,
     pub(crate) delivered_count: u64,
     pub(crate) failed_count: u64,
@@ -28,6 +27,8 @@ pub(crate) struct PubsubDeliveryWorkload {
     pub(crate) direct_scan_count: u64,
     pub(crate) terminal_duplicate_reject_count: u64,
     pub(crate) orphan_check_count: u64,
+    pub(crate) unknown_delivery_count: u64,
+    pub(crate) terminal_effect_audit_count: u64,
     pub(crate) error_count: u64,
     pub(crate) topic_arn: Option<TopicArn>,
     pub(crate) subscription_arns: Vec<SubscriptionArn>,
@@ -67,7 +68,6 @@ impl PubsubDeliveryWorkload {
             observed_publish_acceptances: BTreeSet::new(),
             claim_count: 0,
             unknown_claim_count: 0,
-            claim_audit_count: 0,
             duplicate_claim_reject_count: 0,
             delivered_count: 0,
             failed_count: 0,
@@ -76,6 +76,8 @@ impl PubsubDeliveryWorkload {
             direct_scan_count: 0,
             terminal_duplicate_reject_count: 0,
             orphan_check_count: 0,
+            unknown_delivery_count: 0,
+            terminal_effect_audit_count: 0,
             error_count: 0,
             topic_arn: None,
             subscription_arns: Vec::new(),
@@ -86,11 +88,18 @@ impl PubsubDeliveryWorkload {
         }
     }
 
-    pub(crate) fn driver(&self, db: SimDatabase) -> kv_backend::foundationdb::FoundationDbBackend {
-        kv_backend::foundationdb::FoundationDbBackend::from_simulation(
-            db,
-            Some(b"aux-storage/fdb-chaos/pubsub-delivery/"),
-            None,
+    pub(crate) fn driver(
+        &self,
+        db: SimDatabase,
+    ) -> Result<kv_backend::foundationdb::FoundationDbBackend, String> {
+        Ok(
+            kv_backend::foundationdb::FoundationDbBackend::from_simulation(
+                db,
+                Some(b"aux-storage/fdb-chaos/pubsub-delivery/"),
+                None,
+                storage_types::ReadVersionPolicy::Fresh,
+                crate::simulation_clock::phase_clock(self.clock.as_ref())?,
+            ),
         )
     }
 
@@ -103,10 +112,14 @@ impl PubsubDeliveryWorkload {
             .clock
             .as_ref()
             .ok_or("simulation phase clock is absent")?;
-        let store =
-            kv_backend::KvStore::initialize_format_with_clock(self.driver(db), clock.clone())
-                .await
-                .map_err(|error| storage_error_detail(&error))?;
+        let store = kv_backend::KvStore::initialize_format_with_clock(
+            self.driver(db)?,
+            storage_types::InitialStreamLineages::ONE,
+            clock.clone(),
+        )
+        .await
+        .map_err(|error| storage_error_detail(&error))?
+        .with_metadata_cache_ttl(SIMULATION_METADATA_CACHE_TTL);
         Ok(Arc::new(store))
     }
 
@@ -118,8 +131,15 @@ impl PubsubDeliveryWorkload {
         "FdbChaosPubsubDelivery".to_string()
     }
 
+    pub(crate) fn queue_name(&self, index: u64) -> String {
+        format!("FdbChaosPubsubDeliveryQueue{index}")
+    }
+
     pub(crate) fn endpoint_for(&self, index: u64) -> String {
-        format!("arn:aws:sqs:us-east-1:000000000000:FdbChaosPubsubDeliveryQueue{index}")
+        format!(
+            "arn:aws:sqs:us-east-1:000000000000:{}",
+            self.queue_name(index)
+        )
     }
 
     pub(crate) fn message_body(&self, sequence: u64) -> String {
@@ -265,6 +285,14 @@ impl RustWorkload for PubsubDeliveryWorkload {
             metric_val_u64(
                 "aux_storage_pubsub_delivery_orphan_check_count",
                 self.orphan_check_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_delivery_count",
+                self.unknown_delivery_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_terminal_effect_audit_count",
+                self.terminal_effect_audit_count,
             ),
             metric_val_u64("aux_storage_pubsub_delivery_error_count", self.error_count),
         ]);

@@ -9,15 +9,3 @@ pub struct PrimaryStateRow {
     pub key: KeyAttributes,
     pub state: ItemWriteObservation,
 }
-
-impl From<crate::ItemTombstone> for PrimaryStateRow {
-    fn from(row: crate::ItemTombstone) -> Self {
-        Self {
-            key: row.key,
-            state: ItemWriteObservation::Deleted {
-                revision: row.revision,
-                provenance: row.provenance,
-            },
-        }
-    }
-}

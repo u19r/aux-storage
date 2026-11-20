@@ -215,19 +215,6 @@ fn checkpoint_decode_checks_canonical_order_without_reencoding() {
     assert!(candidate.allocated_bytes < legacy.allocated_bytes);
 }
 
-fn legacy_frontier_catalog_valid(
-    checkpoint: &SystemStreamCheckpoint,
-    catalog: &[SystemStreamPosition],
-) -> bool {
-    let catalog: Vec<_> = catalog.iter().collect();
-    checkpoint.frontier().iter().all(|position| {
-        catalog.iter().any(|candidate| {
-            candidate.shard_id() == position.shard_id()
-                && candidate.lineage_id() == position.lineage_id()
-        })
-    })
-}
-
 fn frontier_catalog_fixture() -> (SystemStreamCheckpoint, Vec<SystemStreamPosition>) {
     let frontier = (0..128)
         .map(|index| position(&format!("shard-{index:03}"), "lineage", "offset"))
@@ -248,29 +235,6 @@ fn frontier_catalog_index_preserves_large_catalog_miss_error() {
         checkpoint.validate_frontier_catalog(catalog.iter()),
         Err(SystemStreamContractError::UnknownLineage)
     );
-}
-
-#[test]
-#[ignore = "isolated CPU probe; run explicitly for the paired workload"]
-fn frontier_catalog_index_cpu_profile() {
-    let (checkpoint, catalog) = frontier_catalog_fixture();
-    let legacy_start = std::time::Instant::now();
-    for _ in 0..16 {
-        std::hint::black_box(legacy_frontier_catalog_valid(&checkpoint, &catalog));
-    }
-    let legacy = legacy_start.elapsed();
-
-    let candidate_start = std::time::Instant::now();
-    for _ in 0..16 {
-        let _ = std::hint::black_box(checkpoint.validate_frontier_catalog(catalog.iter()));
-    }
-    let candidate = candidate_start.elapsed();
-    eprintln!(
-        "frontier_catalog_cpu_profile frontier=128 catalog=8192 legacy_ns={} candidate_ns={}",
-        legacy.as_nanos(),
-        candidate.as_nanos()
-    );
-    assert!(candidate < legacy);
 }
 
 #[test]

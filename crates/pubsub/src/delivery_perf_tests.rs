@@ -2,11 +2,9 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use alloc_counter::AllocationGuard;
 use pubsub_provider::{
-    DeliveryRecordId, DeliveryStatus, PublishRequest, PubsubProvider, SubscribeRequest,
-    SubscriptionProtocol,
+    DeliveryRecordId, PublishRequest, PubsubProvider, SubscribeRequest, SubscriptionProtocol,
 };
 use queue::{CreateQueueRequest, QueueManager, ReceiveMessageRequest};
-use queue_provider::QueueProvider;
 use serde_json::Value;
 use sql_backend::{SqlStore, sqlite::SqliteBackend};
 
@@ -34,21 +32,28 @@ async fn given_sqlite_deliveries_when_job_runs_then_payloads_claims_and_allocati
         ("sqlite_signed_64k", 65536, true, false),
         ("sqlite_raw_64k", 65536, false, true),
     ] {
-        let driver = SqliteBackend::initialize(":memory:").await.unwrap();
-        let provider = Arc::new(SqlStore::initialize_schema(driver).await.unwrap());
+        let driver =
+            SqliteBackend::initialize(":memory:", storage_types::AttemptDeadlines::default())
+                .await
+                .unwrap();
+        let provider = Arc::new(
+            SqlStore::initialize_schema(driver, storage_types::InitialStreamLineages::ONE, true)
+                .await
+                .unwrap(),
+        );
         PubsubProvider::initialize(provider.as_ref()).await.unwrap();
-        QueueProvider::initialize(provider.as_ref()).await.unwrap();
         let queue = Arc::new(QueueManager::new(provider.clone()));
         queue
             .create_queue(CreateQueueRequest {
                 queue_name: "orders".to_string(),
                 attributes: None,
+                ..Default::default()
             })
             .await
             .unwrap();
         let mut builder = PubsubManager::builder()
             .provider(provider.clone())
-            .queue_manager(queue.clone());
+            .queue_wake(queue.wake_handle());
         if signed {
             builder = builder.notification_signer(Arc::new(FixedSigner));
         }
@@ -58,7 +63,7 @@ async fn given_sqlite_deliveries_when_job_runs_then_payloads_claims_and_allocati
             .subscribe(SubscribeRequest {
                 topic_arn: topic.topic_arn.clone(),
                 protocol: SubscriptionProtocol::Queue,
-                endpoint: "orders".to_string(),
+                endpoint: "arn:aws:sqs:us-east-1:000000000000:orders".to_string(),
                 attributes: HashMap::from([("RawMessageDelivery".to_string(), raw.to_string())]),
                 extra_json: Value::Null,
             })
@@ -103,12 +108,7 @@ async fn given_sqlite_deliveries_when_job_runs_then_payloads_claims_and_allocati
         assert_eq!(processed, 10);
         assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 0);
         for id in ids {
-            let record = provider.get_delivery_record(&id).await.unwrap().unwrap();
-            assert_eq!(record.status, DeliveryStatus::Delivered);
-            assert_eq!(record.attempts, 1);
-            assert_eq!(record.claim_generation, 1);
-            assert!(record.lease_owner.is_none());
-            assert_eq!(record.message_body.as_deref(), Some(body.as_str()));
+            assert_eq!(provider.get_delivery(&id).await.unwrap(), None);
         }
         let messages = queue
             .receive_message(ReceiveMessageRequest {

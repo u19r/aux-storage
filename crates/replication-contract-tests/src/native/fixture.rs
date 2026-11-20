@@ -12,7 +12,7 @@ use infrastructure_provider::{
 #[cfg(any(feature = "native-sqlite", feature = "native-postgres"))]
 use sql_backend::SqlStore;
 use storage_provider::DynamoPort;
-use storage_types::{AttemptMode, StorageError, StorageResult};
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass, StorageError, StorageResult};
 
 #[cfg(any(feature = "native-sqlite", feature = "native-postgres"))]
 use crate::HarnessResult;
@@ -49,13 +49,32 @@ where
         + Send
         + 'static,
 {
-    store.with_dynamo_attempt(mode, operation).await
+    storage_provider::DynamoPort::with_attempt(
+        store,
+        AttemptPlan::new(
+            mode,
+            if mode == AttemptMode::ReadOnly {
+                DeadlineClass::PointRead
+            } else {
+                DeadlineClass::Write
+            },
+        )
+        .start(store.attempt_deadlines()),
+        operation,
+    )
+    .await
 }
 
 #[cfg(feature = "native-sqlite")]
 pub async fn memory_sqlite() -> HarnessResult<SqlStore<sql_backend::sqlite::SqliteBackend>> {
-    let backend = sql_backend::sqlite::SqliteBackend::initialize(":memory:").await?;
-    let store = SqlStore::initialize_schema(backend).await?;
+    let backend = sql_backend::sqlite::SqliteBackend::initialize(
+        ":memory:",
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await?;
+    let store =
+        SqlStore::initialize_schema(backend, storage_types::InitialStreamLineages::ONE, true)
+            .await?;
     store.initialize_records(limits()?).await?;
     Ok(store)
 }
@@ -97,13 +116,19 @@ impl FileSqlite {
         path: &std::path::Path,
         probe: Option<Arc<dyn sql_backend::SqlFaultProbe>>,
     ) -> HarnessResult<SqlStore<sql_backend::sqlite::SqliteBackend>> {
-        let backend = sql_backend::sqlite::SqliteBackend::initialize(path).await?;
+        let backend = sql_backend::sqlite::SqliteBackend::initialize(
+            path,
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await?;
         let backend = if let Some(probe) = probe {
             backend.with_fault_probe(probe)
         } else {
             backend
         };
-        let store = SqlStore::initialize_schema(backend).await?;
+        let store =
+            SqlStore::initialize_schema(backend, storage_types::InitialStreamLineages::ONE, true)
+                .await?;
         store.initialize_records(limits()?).await?;
         Ok(store)
     }
@@ -173,13 +198,24 @@ impl Postgres {
         if policy != "on" {
             return Err("selected Postgres contracts require synchronous_commit=on".into());
         }
-        let backend = sql_backend::postgres::PostgresBackend::initialize(dsn, 4, false).await?;
+        let backend = sql_backend::postgres::PostgresBackend::initialize(
+            dsn,
+            4,
+            false,
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await?;
         let backend = if let Some(probe) = probe {
             backend.with_fault_probe(probe)
         } else {
             backend
         };
-        let store = sql_backend::SqlStore::initialize_schema(backend).await?;
+        let store = sql_backend::SqlStore::initialize_schema(
+            backend,
+            storage_types::InitialStreamLineages::ONE,
+            true,
+        )
+        .await?;
         store.initialize_records(limits()?).await?;
         Ok(store)
     }
@@ -221,7 +257,7 @@ async fn connect_postgres(dsn: &str) -> HarnessResult<tokio_postgres::Client> {
 }
 
 /// Execute the existing shared PutItem stages on the caller's borrowed catalog.
-pub async fn put_item_in_catalog<A: storage_provider::UpsertAttempt>(
+pub async fn put_item_in_catalog<A: storage_provider::ItemWriteAttempt>(
     catalog: &mut A,
     cache: &storage_provider::TableMetadataCache,
     request: storage_types::PutItemRequest,
@@ -229,25 +265,21 @@ pub async fn put_item_in_catalog<A: storage_provider::UpsertAttempt>(
 ) -> storage_types::StorageResult<()> {
     use storage_provider::{PutItemShape, prepare_accepted_upsert, resolve_table_in_attempt};
 
-    let shape = PutItemShape::try_from_request(request)?;
+    let shape = std::sync::Arc::new(PutItemShape::try_from_request(request)?);
     let (table, _) = resolve_table_in_attempt(catalog, cache, &shape.table_name).await?;
-    let ttl = catalog.read_ttl_config(&table).await?;
-    let bound = shape.bind_table(table, ttl.as_ref())?;
+    if table.info.requires_stream_entry() {
+        storage_provider::prepare_writer_routes_in_attempt(catalog, None).await?;
+    }
+    let bound = shape.bind_table(table)?;
     let (observed, lifecycle) = catalog.observe_for_write(&bound.table, &bound.key).await?;
     let (accepted, _) = bound.accept_old(observed, lifecycle)?.into_result()?;
-    prepare_accepted_upsert(
-        catalog,
-        accepted,
-        captured_at,
-        storage_types::ItemProvenance::default(),
-    )
-    .await?;
+    prepare_accepted_upsert(catalog, accepted, captured_at).await?;
     catalog.flush_dynamo_write().await
 }
 
 /// Execute the existing shared UpdateItem stages on the caller's borrowed
 /// catalog.
-pub async fn update_item_in_catalog<A: storage_provider::UpsertAttempt>(
+pub async fn update_item_in_catalog<A: storage_provider::ItemWriteAttempt>(
     catalog: &mut A,
     cache: &storage_provider::TableMetadataCache,
     request: storage_types::UpdateItemRequest,
@@ -255,18 +287,15 @@ pub async fn update_item_in_catalog<A: storage_provider::UpsertAttempt>(
 ) -> StorageResult<storage_types::WireItem> {
     use storage_provider::{UpdateItemShape, prepare_accepted_upsert, resolve_table_in_attempt};
 
-    let shape = UpdateItemShape::try_from_request(request)?;
+    let shape = std::sync::Arc::new(UpdateItemShape::try_from_request(request)?);
     let (table, _) = resolve_table_in_attempt(catalog, cache, &shape.table_name).await?;
+    if table.info.requires_stream_entry() {
+        storage_provider::prepare_writer_routes_in_attempt(catalog, None).await?;
+    }
     let bound = shape.bind_table(table)?;
     let (observed, lifecycle) = catalog.observe_for_write(&bound.table, &bound.key).await?;
     let (accepted, _) = bound.accept_old(observed, lifecycle)?.into_result()?;
-    let images = prepare_accepted_upsert(
-        catalog,
-        accepted,
-        captured_at,
-        storage_types::ItemProvenance::default(),
-    )
-    .await?;
+    let images = prepare_accepted_upsert(catalog, accepted, captured_at).await?;
     catalog.flush_dynamo_write().await?;
-    Ok(images.new_item)
+    Ok((*images.new_item).clone())
 }

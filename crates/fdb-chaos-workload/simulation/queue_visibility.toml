@@ -9,6 +9,6 @@ testTitle = "AuxStorageFdbChaosQueueVisibility"
   useCAPI = true
   profile = "smoke"
   operationCount = 1
-  activeClientCount = 1
+  activeClientCount = 2
   historySampleLimit = 0
   artifactRoot = "run-artifacts/fdb-chaos"

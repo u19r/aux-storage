@@ -1,88 +1,63 @@
-//! Physical revision metadata. Replication policy belongs above this value.
-
-use std::{fmt, sync::Arc};
+//! The regional order stored with a live item; absent for an item of an
+//! unpaired table and for an item stored before its table was paired.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::value::RawValue;
 
-use crate::{StorageError, StorageResult};
+use crate::{RegionalOrder, StorageError, StorageResult};
 
-/// Keeps existing stored metadata intact without interpreting a legacy winner.
-/// Ordinary writes use the allocation-free local representation.
-#[derive(Clone, Default)]
-pub struct ItemProvenance(Option<Arc<RawValue>>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItemProvenance {
+    order: Option<RegionalOrder>,
+    encoded: [u8; RegionalOrder::ENCODED_BYTES],
+}
 
 impl ItemProvenance {
-    pub const LOCAL_BYTES: &'static [u8] = br#"{"kind":"unreplicated"}"#;
-
-    pub fn decode(bytes: &[u8]) -> StorageResult<Self> {
-        if bytes == Self::LOCAL_BYTES {
-            return Ok(Self::default());
+    #[must_use]
+    pub fn regional(order: RegionalOrder) -> Self {
+        Self {
+            order: Some(order),
+            encoded: order.encode(),
         }
-        let raw: Box<RawValue> = serde_json::from_slice(bytes)
-            .map_err(|_| StorageError::internal("invalid stored item provenance"))?;
-        if raw.get().as_bytes() != bytes {
-            return Err(StorageError::internal(
-                "invalid stored item provenance envelope",
-            ));
-        }
-        Self::parse_envelope(raw)
     }
 
     #[must_use]
+    pub fn order(&self) -> Option<RegionalOrder> {
+        self.order
+    }
+
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.order.is_none()
+    }
+
+    /// Stored bytes: empty, or the 11-byte order.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.0
-            .as_ref()
-            .map_or(Self::LOCAL_BYTES, |value| value.get().as_bytes())
-    }
-
-    fn parse_envelope(raw: Box<RawValue>) -> StorageResult<Self> {
-        if !raw.get().starts_with('{') || u32::try_from(raw.get().len()).is_err() {
-            return Err(StorageError::internal(
-                "invalid stored item provenance envelope",
-            ));
+        if self.order.is_some() {
+            &self.encoded
+        } else {
+            &[]
         }
-        if raw.get().as_bytes() == Self::LOCAL_BYTES {
-            return Ok(Self::default());
+    }
+
+    pub fn decode(bytes: &[u8]) -> StorageResult<Self> {
+        match bytes.len() {
+            0 => Ok(Self::default()),
+            RegionalOrder::ENCODED_BYTES => Ok(Self::regional(RegionalOrder::decode(bytes)?)),
+            _ => Err(StorageError::internal("invalid stored item provenance")),
         }
-        Ok(Self(Some(Arc::from(raw))))
     }
 }
-
-impl fmt::Debug for ItemProvenance {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ItemProvenance(<redacted>)")
-    }
-}
-
-impl PartialEq for ItemProvenance {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_bytes() == other.as_bytes()
-    }
-}
-
-impl Eq for ItemProvenance {}
 
 impl Serialize for ItemProvenance {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if let Some(raw) = &self.0 {
-            raw.serialize(serializer)
-        } else {
-            #[derive(Serialize)]
-            struct Local {
-                kind: &'static str,
-            }
-            Local {
-                kind: "unreplicated",
-            }
-            .serialize(serializer)
-        }
+        self.order.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for ItemProvenance {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Box::<RawValue>::deserialize(deserializer)?;
-        Self::parse_envelope(raw).map_err(serde::de::Error::custom)
+        Ok(Option::<RegionalOrder>::deserialize(deserializer)?
+            .map_or_else(Self::default, Self::regional))
     }
 }

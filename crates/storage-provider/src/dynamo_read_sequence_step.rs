@@ -73,7 +73,7 @@ pub trait ReadSequenceStepReader: Send {
                     observe_provider_read("read_sequence.query_table", self.query(*request))
                         .await?;
                 Ok(DynamoReadSequenceStep {
-                    payload: ReadSequenceInvocationPayload::Query(response),
+                    payload: ReadSequenceInvocationPayload::Query(Box::new(response)),
                     item_cursors,
                     publications: publication.into_iter().collect(),
                 })
@@ -90,11 +90,14 @@ async fn observe_provider_read<T>(
     let result = read.await;
     drop(database_call);
     if let Err(error) = &result {
-        let error_kind = match error.to_enum() {
-            StorageEnum::TransactionConflict { .. } => "transaction_conflict",
-            StorageEnum::Throttled { .. } => "throttled",
-            StorageEnum::InternalServerError { .. } => "internal_server_error",
-            _ => "other",
+        let error_kind = if error.attempt_kind() == Some(storage_types::AttemptKind::Conflict) {
+            "transaction_conflict"
+        } else {
+            match error.to_enum() {
+                StorageEnum::Throttled { .. } => "throttled",
+                StorageEnum::InternalServerError { .. } => "internal_server_error",
+                _ => "other",
+            }
         };
         tracing::warn!(operation, error_kind, "read sequence provider read failed");
     }

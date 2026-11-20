@@ -1,5 +1,5 @@
 //! Own complete native addresses before issuing any request from an inventory.
-use storage_types::{InfrastructureResultKind, StorageError, StorageResult};
+use storage_types::{StorageError, StorageResult};
 
 use super::input_limits::NativeInputLimits;
 use crate::{KvRange, constants::KV_VERSIONSTAMP_PLACEHOLDER};
@@ -14,7 +14,7 @@ impl NativeInputLimits {
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(keys.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for key in keys {
             physical.push(self.copy_key(key)?);
         }
@@ -44,7 +44,7 @@ impl NativeInputLimits {
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(ranges.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for range in ranges {
             physical.push(self.prepare_range(range)?);
         }
@@ -57,9 +57,9 @@ impl NativeInputLimits {
             .prefix
             .len()
             .checked_add(logical_bytes)
-            .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         key.try_reserve_exact(self.prefix.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         key.resize(bytes, 0);
         key.copy_within(..logical_bytes, self.prefix.len());
         key[..self.prefix.len()].copy_from_slice(&self.prefix);
@@ -77,11 +77,11 @@ impl NativeInputLimits {
             .prefix
             .len()
             .checked_add(key.len())
-            .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(bytes)
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         physical.extend_from_slice(&self.prefix);
         physical.extend_from_slice(key);
         Ok(physical)
@@ -97,15 +97,15 @@ impl NativeInputLimits {
             .len()
             .checked_add(change.prefix.len())
             .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         let bytes = self
             .prefix
             .len()
             .checked_add(Self::versionstamped_key_bytes(&change)?)
-            .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         let mut key = change.prefix;
         key.try_reserve_exact(bytes - key.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         key = self.prefix_key(key)?;
         key.extend_from_slice(&KV_VERSIONSTAMP_PLACEHOLDER);
         key.extend_from_slice(&change.user_bytes);

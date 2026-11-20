@@ -38,11 +38,16 @@ pub async fn delete_table_in_attempt<A: DeleteTableAttempt>(
                 StorageError::deletion_protection_enabled(&table.info.table_name),
             ));
         }
+        if table.binding.regional.is_some() {
+            return Ok(SemanticDecision::Rejected(StorageError::raw_validation(
+                "Table has a replica; remove the replica before deleting the table",
+            )));
+        }
         let description =
             TableDescription::from_bound_table_info(table.clone(), TableStatus::Deleting);
         retire_table_in_attempt(attempt, table).await?;
         Ok(SemanticDecision::Accepted(DeleteTableResponse {
-            table_description: description,
+            table_description: description.into(),
         }))
     }
     .await;

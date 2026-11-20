@@ -2,7 +2,7 @@
 //! messages.
 
 use crate::{
-    DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+    CancellationReason, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
     DYNAMODB_MISSING_AUTH_TOKEN_MESSAGE, DYNAMODB_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
     DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE, DYNAMODB_THROTTLING_MESSAGE,
     DYNAMODB_TRANSACTION_CANCELED_MESSAGE, StorageEnum, StorageError, StorageValidationKind,
@@ -32,21 +32,18 @@ fn table_already_exists_message() {
 }
 
 #[test]
-fn internal_server_error_message_canonical() {
+fn internal_server_error_display_shows_cause() {
     let err = StorageError::internal("some internal detail");
-    assert_eq!(display(err), DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(display(err), "internal error: some internal detail");
 }
 
 #[test]
 fn transaction_conflict_message() {
-    let err: StorageError = StorageEnum::TransactionConflict {
-        message: "details".into(),
-    }
+    let err: StorageError = StorageEnum::Attempt(crate::AttemptFailure::Conflict(
+        crate::ConflictCause::Logical("details"),
+    ))
     .into();
-    assert_eq!(
-        display(err),
-        "Operation was rejected because there is an ongoing transaction for the item."
-    );
+    assert_eq!(display(err), "logical conflict: details");
 }
 
 #[test]
@@ -64,7 +61,7 @@ fn transaction_in_progress_message() {
 #[test]
 fn transaction_canceled_message() {
     let err: StorageError = StorageEnum::TransactionCanceled {
-        reasons: vec!["ConditionalCheckFailed".into()],
+        reasons: vec![CancellationReason::conditional_check_failed(None)],
     }
     .into();
     assert_eq!(display(err), DYNAMODB_TRANSACTION_CANCELED_MESSAGE);

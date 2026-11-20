@@ -6,7 +6,8 @@ use crate::{
     WireItem,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct BatchWriteItemRequest {
     #[schema(value_type = HashMap<TableName, Vec<WriteRequest>>)]
@@ -19,7 +20,8 @@ pub struct BatchWriteItemRequest {
     pub return_item_collection_metrics: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct WriteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29,7 +31,8 @@ pub struct WriteRequest {
     pub delete_request: Option<DeleteRequest>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct PutRequest {
     #[serde(with = "crate::wire_item::dynamo_json")]
@@ -42,7 +45,8 @@ pub struct PutRequest {
     pub indexers: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct TransactPutRequest {
     pub table_name: TableName,
@@ -71,13 +75,15 @@ pub struct TransactPutRequest {
     pub return_values_on_condition_check_failure: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct DeleteRequest {
     pub key: KeyAttributes,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct TransactDeleteRequest {
     pub table_name: TableName,
@@ -99,7 +105,8 @@ pub struct TransactDeleteRequest {
     pub return_values_on_condition_check_failure: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct BatchWriteItemResponse {
     #[serde(rename = "UnprocessedItems", skip_serializing_if = "Option::is_none")]
     #[schema(value_type = HashMap<TableName, Vec<WriteRequest>>)]
@@ -112,10 +119,11 @@ pub struct BatchWriteItemResponse {
     pub item_collection_metrics: Option<serde_json::Value>,
 
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
-    pub consumed_capacity: Option<serde_json::Value>,
+    pub consumed_capacity: Option<Vec<crate::ConsumedCapacity>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct BatchGetItemRequest {
     #[schema(value_type = HashMap<TableName, KeysAndAttributes>)]
@@ -125,7 +133,8 @@ pub struct BatchGetItemRequest {
     pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct KeysAndAttributes {
     #[schema(value_type = Vec<HashMap<String, AttributeValue>>)]
@@ -145,7 +154,8 @@ pub struct KeysAndAttributes {
     pub consistent_read: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct BatchGetItemResponse {
     #[serde(
         rename = "Responses",
@@ -161,10 +171,11 @@ pub struct BatchGetItemResponse {
     pub unprocessed_keys: Option<VecMap<TableName, KeysAndAttributes>>,
 
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
-    pub consumed_capacity: Option<serde_json::Value>,
+    pub consumed_capacity: Option<Vec<crate::ConsumedCapacity>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct TransactGetItemsRequest {
     pub transact_items: Vec<TransactGetItem>,
@@ -173,13 +184,15 @@ pub struct TransactGetItemsRequest {
     pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct TransactGetItem {
     pub get: TransactGetRequest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct TransactGetRequest {
     pub table_name: TableName,
@@ -194,16 +207,18 @@ pub struct TransactGetRequest {
     pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct TransactGetItemsResponse {
     #[serde(rename = "Responses")]
     pub responses: Vec<ItemResponse>,
 
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
-    pub consumed_capacity: Option<serde_json::Value>,
+    pub consumed_capacity: Option<Vec<crate::ConsumedCapacity>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ItemResponse {
     #[serde(
         rename = "Item",

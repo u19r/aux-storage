@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use config::{Config, runtime::MutableConfigManager};
+use config::{Config, runtime::SharedConfigManager};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
 };
@@ -28,7 +28,7 @@ impl Drop for ConfigWatchGuard {
 pub(crate) fn spawn(
     path: PathBuf,
     initial: Arc<Config>,
-    config_manager: Arc<dyn MutableConfigManager>,
+    config_manager: Arc<SharedConfigManager>,
 ) -> NotifyResult<ConfigWatchGuard> {
     let (tx, _rx) = watch::channel(initial);
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(16);

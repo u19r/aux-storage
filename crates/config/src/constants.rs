@@ -1,6 +1,4 @@
-pub const DEFAULT_CONFIG_VERSION: &str = "1.0";
 pub const DEFAULT_HTTP_BIND_ADDR: &str = "0.0.0.0:8080";
-pub const DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS: u64 = 500;
 
 pub const DEFAULT_STORAGE_SQLITE_DB_PATH: &str = "/var/lib/aux-storage/db/sqlite/main.db";
 pub const DEFAULT_STORAGE_TURSO_DB_PATH: &str = "main.turso.db";
@@ -8,14 +6,9 @@ pub const DEFAULT_STORAGE_ROCKS_DB_PATH: &str = "/var/lib/aux-storage/db/rocksdb
 pub const DEFAULT_REMOTE_REGION: &str = "us-east-1";
 
 pub const DEFAULT_TRACING_LOG_LEVEL: &str = "warn";
-pub const DEFAULT_LOG_DESTINATION: &str = "stdout";
+pub const DEFAULT_RUNTIME_SHUTDOWN_GRACE_SECONDS: u64 = 5;
 
-pub const DEFAULT_JOBS_MAX_IMMEDIATE_WORKERS: usize = 8;
-pub const DEFAULT_JOBS_JITTER_PERCENT: u8 = 10;
 pub const DEFAULT_JOBS_GSI_BACKFILL_INTERVAL_MS: u64 = 30_000;
-
-pub const DEFAULT_QUEUE_VISIBILITY_TIMEOUT_SECONDS: u32 = 30;
-pub const DEFAULT_QUEUE_MESSAGE_RETENTION_SECONDS: u32 = 345_600;
 
 pub(crate) const MAX_INTERPOLATION_DEPTH: usize = 16;
 pub(crate) const AUTO_GENERATED_SCHEMA_COMMENT: &str =
@@ -67,6 +60,46 @@ pub(crate) const VARIABLES: &[(&str, &str, bool)] = &[
     (
         "AUX_STORAGE_ADMISSION_MAX_QUEUE_WAIT_MS",
         "features.storage_admission.max_queue_wait_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_POINT_READ_MS",
+        "features.storage_deadlines.point_read_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_RANGE_READ_MS",
+        "features.storage_deadlines.range_read_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_WRITE_MS",
+        "features.storage_deadlines.write_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_TRANSACTION_MS",
+        "features.storage_deadlines.transaction_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_SCHEMA_CHANGE_MS",
+        "features.storage_deadlines.schema_change_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_BACKGROUND_PAGE_MS",
+        "features.storage_deadlines.background_page_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_LONG_POLL_PROBE_MS",
+        "features.storage_deadlines.long_poll_probe_ms",
+        false,
+    ),
+    (
+        "AUX_STORAGE_DEADLINES_COMMIT_GRACE_MS",
+        "features.storage_deadlines.commit_grace_ms",
         false,
     ),
 ];

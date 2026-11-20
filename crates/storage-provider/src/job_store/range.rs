@@ -13,9 +13,7 @@ pub fn finish_range_page(
     entries
         .try_reserve_exact(request.item_limit().get() as usize)
         .map_err(|_| {
-            RawOrderedJobStoreError::Backend(
-                storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-            )
+            RawOrderedJobStoreError::Backend(storage_types::AttemptFailure::CAPACITY.into())
         })?;
     let mut used_bytes = 0usize;
     for row in rows {

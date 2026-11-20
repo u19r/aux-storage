@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use httpmock::prelude::*;
 use queue_provider::{
-    MessageId, Queue, QueueError, QueueMessage, QueueProvider, ReceiptHandle,
-    RemoteCredentialStrategy, RemoteQueueSettings, RemoteSigv4Settings,
+    MessageId, Queue, QueueError, QueueMessage, QueueOperations, QueueValidationKind, ReceiptHandle,
 };
 
 use super::{
     RemoteQueueProvider,
     implementation::{classify_remote_error, queue_attribute_updates},
 };
+use crate::{RemoteCredentialStrategy, RemoteQueueSettings, RemoteSigv4Settings};
 
 fn settings(endpoint: String) -> RemoteQueueSettings {
     RemoteQueueSettings {
@@ -32,7 +32,7 @@ async fn remote_send_batch_maps_ten_results_in_request_order_with_one_call() {
         .map(|index| {
             serde_json::json!({
                 "Id": index.to_string(),
-                "MessageId": format!("{index:024x}"),
+                "MessageId": format!("00000000-0000-0000-0000-{index:012x}"),
                 "MD5OfMessageBody": "body"
             })
         })
@@ -63,6 +63,7 @@ async fn remote_send_batch_maps_ten_results_in_request_order_with_one_call() {
             receipt_handle: None,
             created_at: storage_types::TimestampMillis::now(),
             visibility_timestamp: None,
+            ..Default::default()
         })
         .collect();
 
@@ -86,7 +87,7 @@ async fn remote_send_batch_maps_ten_results_in_request_order_with_one_call() {
         } else {
             assert_eq!(
                 result.as_ref().expect("successful message").to_string(),
-                format!("{index:024x}")
+                format!("00000000-0000-0000-0000-{index:012x}")
             );
         }
     }
@@ -237,6 +238,7 @@ async fn create_queue_updates_existing_queue_attributes() {
                 ("DelaySeconds".to_string(), "0".to_string()),
             ]),
             created_at: storage_types::TimestampMillis::now(),
+            ..Default::default()
         })
         .await
         .expect("ensure queue exists");
@@ -291,6 +293,7 @@ async fn create_queue_skips_attribute_update_when_queue_matches() {
             queue_url: queue_url.clone(),
             attributes: HashMap::from([("VisibilityTimeout".to_string(), "45".to_string())]),
             created_at: storage_types::TimestampMillis::now(),
+            ..Default::default()
         })
         .await
         .expect("ensure queue exists");
@@ -469,7 +472,7 @@ async fn remote_send_message_clamps_expired_visibility_to_zero_delay() {
                 "DelaySeconds": 0,
             }));
         then.status(200).json_body_obj(&serde_json::json!({
-            "MessageId": "018f1f612a6f7ac3b9b67f65",
+            "MessageId": "018f1f61-2a6f-7ac3-b9b6-7f65bb2d91fd",
             "MD5OfMessageBody": "841a2d689ad86bd1611447453c22c6fc",
         }));
     });
@@ -487,11 +490,15 @@ async fn remote_send_message_clamps_expired_visibility_to_zero_delay() {
             receipt_handle: None,
             created_at: storage_types::TimestampMillis::now(),
             visibility_timestamp: Some(storage_types::TimestampMillis::now() - 1),
+            ..Default::default()
         })
         .await
         .expect("send message");
 
-    assert_eq!(message_id.to_string(), "018f1f612a6f7ac3b9b67f65");
+    assert_eq!(
+        message_id.to_string(),
+        "018f1f61-2a6f-7ac3-b9b6-7f65bb2d91fd"
+    );
     send.assert();
 }
 
@@ -509,15 +516,16 @@ async fn given_sqs_delivery_when_receiving_then_durable_attempt_and_original_age
     let provider = RemoteQueueProvider::new(settings(server.base_url()))
         .await
         .unwrap();
-    let messages = queue_provider::QueueProvider::receive_messages(
+    let messages = QueueOperations::receive_messages(
         &provider,
         "queue",
         1,
-        30u32.into(),
-        0u32.into(),
+        Some(30u32.into()),
+        Some(0u32.into()),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .messages;
     assert_eq!(
         messages[0].attributes.as_ref().unwrap()["ApproximateReceiveCount"],
         "180"
@@ -527,4 +535,100 @@ async fn given_sqs_delivery_when_receiving_then_durable_attempt_and_original_age
         "1000"
     );
     receive.assert_calls(1);
+}
+
+#[tokio::test]
+async fn given_missing_queue_when_get_queue_by_name_then_none_after_one_request() {
+    let server = MockServer::start();
+    let get_queue_url = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueUrl");
+        then.status(400).json_body_obj(&serde_json::json!({
+            "__type": "AWS.SimpleQueueService.NonExistentQueue",
+            "message": "missing"
+        }));
+    });
+    let get_queue_attributes = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueAttributes");
+        then.status(200)
+            .json_body_obj(&serde_json::json!({"Attributes": {}}));
+    });
+    let provider = RemoteQueueProvider::new(settings(server.base_url()))
+        .await
+        .expect("provider");
+
+    let queue = provider.get_queue_by_name("missing").await;
+
+    assert!(matches!(queue, Ok(None)), "{queue:?}");
+    assert_eq!(get_queue_url.calls(), 1);
+    assert_eq!(get_queue_attributes.calls(), 0);
+}
+
+#[tokio::test]
+async fn given_two_queue_urls_when_sending_a_batch_then_rejected_before_any_request() {
+    let server = MockServer::start();
+    let send = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.SendMessageBatch");
+        then.status(200)
+            .json_body_obj(&serde_json::json!({"Successful": [], "Failed": []}));
+    });
+    let provider = RemoteQueueProvider::new(settings(server.base_url()))
+        .await
+        .expect("provider");
+    let message = |url: &str| QueueMessage {
+        receive_count: 0,
+        message_id: MessageId::default(),
+        queue_url: url.into(),
+        body: "body".to_string(),
+        message_attributes: None,
+        receipt_handle: None,
+        created_at: storage_types::TimestampMillis::now(),
+        visibility_timestamp: None,
+        ..Default::default()
+    };
+
+    let result = provider
+        .send_messages(vec![message("a"), message("b")])
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(QueueError::Validation {
+                kind: QueueValidationKind::InvalidParameterValue,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(send.calls(), 0);
+}
+
+#[tokio::test]
+async fn given_receive_when_remote_answers_then_reply_is_drained_without_wake_or_due_time() {
+    let server = MockServer::start();
+    let receive = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.ReceiveMessage");
+        then.status(200).json_body_obj(&serde_json::json!({"Messages": [{
+            "MessageId": "message", "ReceiptHandle": "receipt", "MD5OfBody": "digest", "Body": "work",
+            "Attributes": {"SentTimestamp": "1000", "ApproximateReceiveCount": "1"}
+        }]}));
+    });
+    let provider = RemoteQueueProvider::new(settings(server.base_url()))
+        .await
+        .unwrap();
+
+    let received = QueueOperations::receive_messages(&provider, "queue", 1, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(received.messages.len(), 1);
+    assert_eq!(received.wait_time_seconds, 0);
+    assert!(received.drained);
+    assert!(received.next_due_in.is_none());
+    assert!(received.moved_to.is_none());
+    assert_eq!(receive.calls(), 1);
 }

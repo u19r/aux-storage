@@ -21,12 +21,7 @@ use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_
 
 async fn complete_gsi_build(store: &TestStore, request: &GsiBuildRequest) {
     for _ in 0..32 {
-        let step = observe(
-            store
-                .gsi_build_repository
-                .advance_gsi_build(request.clone()),
-        )
-        .await;
+        let step = observe(store.maintenance.advance_gsi_build(request.clone())).await;
         step.assert_no_warning_or_error();
         match step
             .result
@@ -37,6 +32,17 @@ async fn complete_gsi_build(store: &TestStore, request: &GsiBuildRequest) {
         }
     }
     panic!("GSI build must complete within 32 bounded steps");
+}
+
+async fn finish_gsi_build(store: &TestStore) {
+    let request = GsiBuildRequest {
+        destination: Namespace::try_new("rewrite-conformance-gsi").unwrap(),
+        job: JobId::from([7; 16]),
+        fence: NonZeroU64::new(1).unwrap(),
+        page_limit: GsiPageLimit::try_from(64usize).unwrap(),
+        captured_at: TimestampMillis::now(),
+    };
+    complete_gsi_build(store, &request).await;
 }
 
 // Validation and negative rules: a malformed GSI action blocks the entire
@@ -182,9 +188,9 @@ async fn given_indexer_capacity_when_increased_then_decrease_is_rejected_without
         let describe_request = DescribeTableRequest::try_from(json!({"TableName": table.as_ref()})).unwrap();
         let before = store.operations.describe_table(describe_request.clone()).await.unwrap();
         let due_at = store.now() + 96 * 60 * 60 * 1000;
-        let markers = store.stream_retention_repository.list_due_stream_trim_markers(due_at, 100).await.unwrap();
+        let markers = store.maintenance.list_due_stream_trim_markers(due_at, 100).await.unwrap();
         let scopes = markers.iter().map(|marker| marker.scope.clone()).collect::<Vec<_>>();
-        let states = store.stream_retention_repository.load_stream_trim_states(&scopes).await.unwrap();
+        let states = store.maintenance.load_stream_trim_states(&scopes).await.unwrap();
         let decrease = UpdateTableRequest::try_from(json!({
             "TableName": table.as_ref(),
             "MaxIndexers": 1, "DeletionProtectionEnabled": true, "AuxStreamDurationHours": 48,
@@ -209,8 +215,8 @@ async fn given_indexer_capacity_when_increased_then_decrease_is_rejected_without
         let described = store.operations.describe_table(describe)
             .await.expect("describe capacity after rejection");
         assert_eq!(serde_json::to_value(described).unwrap(), serde_json::to_value(before).unwrap());
-        assert!(store.stream_retention_repository.load_stream_trim_states(&scopes).await.unwrap() == states, "rejected update changed retention states");
-        assert!(store.stream_retention_repository.list_due_stream_trim_markers(due_at, 100).await.unwrap() == markers, "rejected update changed due markers");
+        assert!(store.maintenance.load_stream_trim_states(&scopes).await.unwrap() == states, "rejected update changed retention states");
+        assert!(store.maintenance.list_due_stream_trim_markers(due_at, 100).await.unwrap() == markers, "rejected update changed due markers");
     }).catch_unwind().await;
     store.finish().await;
     if let Err(panic) = outcome {
@@ -226,7 +232,6 @@ async fn given_existing_table_when_gsi_is_added_then_describe_preserves_creating
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
         super::table_stream_eligibility_tests::set_stream(&store, &table, true).await.unwrap();
-        super::table_stream_eligibility_tests::finish_initialization(&store, &table).await.unwrap();
 
         let request = UpdateTableRequest::try_from(json!({
             "TableName": table.as_ref(),
@@ -240,18 +245,21 @@ async fn given_existing_table_when_gsi_is_added_then_describe_preserves_creating
         let updated = observe(store.operations.update_table(request)).await;
         updated.assert_no_warning_or_error();
         let updated = updated.result.expect("add GSI").table_description;
+        // AWS P13: the UpdateTable response is UPDATING and the new index is
+        // CREATING before its backfill starts.
+        assert_eq!(serde_json::to_value(&updated.table_status).unwrap(), "UPDATING");
         let index = &updated.global_secondary_indexes.as_ref().expect("GSI in update response")[0];
         assert_eq!(serde_json::to_value(index).unwrap()["IndexStatus"], "CREATING");
-        assert_eq!(index.backfilling, Some(true));
+        assert_eq!(index.backfilling, Some(false));
 
+        // DescribeTable keeps the table UPDATING while the index builds.
         let described = store.operations.describe_table(DescribeTableRequest {
             table_name: table.clone(),
         }).await.expect("describe building GSI");
-        assert_eq!(
-            serde_json::to_value(described.table.global_secondary_indexes).unwrap(),
-            serde_json::to_value(updated.global_secondary_indexes).unwrap(),
-            "DescribeTable must report the same durable GSI readiness as UpdateTable",
-        );
+        assert_eq!(serde_json::to_value(&described.table.table_status).unwrap(), "UPDATING");
+        let index = &described.table.global_secondary_indexes.as_ref().expect("GSI in describe")[0];
+        assert_eq!(serde_json::to_value(index).unwrap()["IndexStatus"], "CREATING");
+        assert_eq!(index.backfilling, Some(true));
 
         let query = QueryRequest::try_from(json!({
             "TableName": table.as_ref(),
@@ -264,7 +272,8 @@ async fn given_existing_table_when_gsi_is_added_then_describe_preserves_creating
         assert_dynamo_error_response_exact(
             rejected.result.expect_err("building GSI must reject queries"),
             axum::http::StatusCode::BAD_REQUEST,
-            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Global secondary index ByGroup is not ready for queries"}"#,
+            // AWS P13 answer for a Query on a CREATING GSI.
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The table does not have the specified index: ByGroup"}"#,
         );
     }).catch_unwind().await;
     store.finish().await;
@@ -273,15 +282,15 @@ async fn given_existing_table_when_gsi_is_added_then_describe_preserves_creating
     }
 }
 
-// Business and negative rules: deleting a building GSI removes access without
-// deleting base items.
+// A build rejects a second GSI change; deleting the active index preserves base
+// items.
 #[tokio::test]
-async fn given_building_gsi_when_index_is_deleted_then_base_items_remain_and_index_is_rejected() {
+async fn given_building_gsi_when_index_is_deleted_then_rejected_until_active_and_base_items_remain()
+{
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
         super::table_stream_eligibility_tests::set_stream(&store, &table, true).await.unwrap();
-        super::table_stream_eligibility_tests::finish_initialization(&store, &table).await.unwrap();
         let put = PutItemRequest::try_from(json!({
             "TableName": table.as_ref(),
             "Item": {"pk": {"S": "customer-1"}, "gpk": {"S": "group-1"}}
@@ -301,16 +310,23 @@ async fn given_building_gsi_when_index_is_deleted_then_base_items_remain_and_ind
         created.assert_no_warning_or_error();
         let indexes = created.result.expect("start GSI build").table_description
             .global_secondary_indexes.expect("building GSI in update response");
-        assert_eq!(indexes[0].backfilling, Some(true));
+        assert_eq!(indexes[0].backfilling, Some(false));
 
         let delete = UpdateTableRequest::try_from(json!({
             "TableName": table.as_ref(),
             "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "ByGroup"}}]
         })).expect("valid GSI deletion request");
+        let error = store.operations.update_table(delete.clone()).await.expect_err("building index rejects deletion");
+        assert!(matches!(error.as_ref(), storage_types::StorageEnum::LimitExceeded { .. }));
+        finish_gsi_build(&store).await;
         let deleted = observe(store.operations.update_table(delete)).await;
         deleted.assert_no_warning_or_error();
         let updated = deleted.result.expect("delete GSI").table_description;
-        assert!(updated.global_secondary_indexes.as_deref().unwrap_or_default().is_empty());
+        // AWS P13: the response shows the deleted index as DELETING.
+        let shown = updated.global_secondary_indexes.as_deref().unwrap_or_default();
+        assert_eq!(shown.len(), 1);
+        assert!(matches!(shown[0].index_status, Some(storage_types::IndexStatus::Deleting)));
+        assert!(matches!(updated.table_status, storage_types::TableStatus::Updating));
 
         let described = store.operations.describe_table(DescribeTableRequest {
             table_name: table.clone(),
@@ -358,7 +374,6 @@ async fn given_deleted_gsi_when_same_name_is_recreated_then_new_index_queries_on
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
         super::table_stream_eligibility_tests::set_stream(&store, &table, true).await.unwrap();
-        super::table_stream_eligibility_tests::finish_initialization(&store, &table).await.unwrap();
         for attribute in ["old_key", "new_key"] {
             let create = UpdateTableRequest::try_from(json!({
                 "TableName": table.as_ref(),
@@ -371,6 +386,7 @@ async fn given_deleted_gsi_when_same_name_is_recreated_then_new_index_queries_on
             })).expect("valid GSI creation");
             if attribute == "old_key" {
                 store.operations.update_table(create).await.expect("create first GSI incarnation");
+                finish_gsi_build(&store).await;
                 let delete = UpdateTableRequest::try_from(json!({
                     "TableName": table.as_ref(),
                     "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "ByGroup"}}]
@@ -443,9 +459,6 @@ async fn given_writes_around_gsi_registration_when_build_completes_then_only_ind
         super::table_stream_eligibility_tests::set_stream(&store, &table, true)
             .await
             .unwrap();
-        super::table_stream_eligibility_tests::finish_initialization(&store, &table)
-            .await
-            .unwrap();
         let put = PutItemRequest::try_from(json!({
             "TableName": table.as_ref(),
             "Item": {
@@ -486,7 +499,7 @@ async fn given_writes_around_gsi_registration_when_build_completes_then_only_ind
             .table_description
             .global_secondary_indexes
             .expect("GSI in update response");
-        assert_eq!(indexes[0].backfilling, Some(true));
+        assert_eq!(indexes[0].backfilling, Some(false));
 
         let during_build = PutItemRequest::try_from(json!({
             "TableName": table.as_ref(),
@@ -537,7 +550,12 @@ async fn given_writes_around_gsi_registration_when_build_completes_then_only_ind
             serde_json::to_value(&indexes[0]).unwrap()["IndexStatus"],
             "ACTIVE"
         );
-        assert_eq!(indexes[0].backfilling, Some(false));
+        // AWS P13: an ACTIVE index has no `Backfilling` field.
+        assert_eq!(indexes[0].backfilling, None);
+        assert_eq!(
+            serde_json::to_value(&described.table.table_status).unwrap(),
+            "ACTIVE"
+        );
 
         let query = QueryRequest::try_from(json!({
             "TableName": table.as_ref(),
@@ -741,20 +759,20 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
         (4, 72, false, json!({"Delete": {"IndexName": "new-index"}})),
     ] {
         let store = TestStore::open_sqlite_file(&path).await;
-        let mut specification = json!({"StreamEnabled": enabled});
-        if enabled {
-            specification["StreamViewType"] = json!("NEW_AND_OLD_IMAGES");
+        if gsi.get("Delete").is_some() {
+            finish_gsi_build(&store).await;
+        }
+        let mut request = json!({
+            "TableName": table, "MaxIndexers": capacity, "AuxStreamDurationHours": duration,
+            "DeletionProtectionEnabled": enabled, "GlobalSecondaryIndexUpdates": [gsi]
+        });
+        // The stream is created enabled; AWS rejects enabling it again (P13).
+        if !enabled {
+            request["StreamSpecification"] = json!({"StreamEnabled": false});
         }
         let response = store
             .operations
-            .update_table(
-                UpdateTableRequest::try_from(json!({
-                    "TableName": table, "MaxIndexers": capacity, "AuxStreamDurationHours": duration,
-                    "DeletionProtectionEnabled": enabled, "StreamSpecification": specification,
-                    "GlobalSecondaryIndexUpdates": [gsi]
-                }))
-                .unwrap(),
-            )
+            .update_table(UpdateTableRequest::try_from(request).unwrap())
             .await
             .unwrap();
         assert_eq!(response.table_description.max_indexers.get(), capacity);
@@ -770,7 +788,7 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
             .unwrap();
         let due_at = store.now() + 96 * 60 * 60 * 1000;
         let markers = store
-            .stream_retention_repository
+            .maintenance
             .list_due_stream_trim_markers(due_at, 100)
             .await
             .unwrap();
@@ -783,7 +801,7 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
             .map(|marker| marker.scope.clone())
             .collect::<Vec<_>>();
         let states = store
-            .stream_retention_repository
+            .maintenance
             .load_stream_trim_states(&scopes)
             .await
             .unwrap();
@@ -796,7 +814,7 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
         );
         assert!(
             reopened
-                .stream_retention_repository
+                .maintenance
                 .load_stream_trim_states(&scopes)
                 .await
                 .unwrap()
@@ -804,7 +822,7 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
         );
         assert!(
             reopened
-                .stream_retention_repository
+                .maintenance
                 .list_due_stream_trim_markers(due_at, 100)
                 .await
                 .unwrap()

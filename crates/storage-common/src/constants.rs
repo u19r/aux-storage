@@ -1,39 +1,15 @@
 //! Shared storage-common constants.
 
-pub const DEFAULT_GENERIC_LIMIT: u32 = 100;
-pub const MAX_GENERIC_LIMIT: u32 = 10_000;
-
-// Scan/query pagination shared by sql backends (formerly sql-only).
-// Query max matches DynamoDB parity (10k); scan max stays conservative
-// (1k) until full 1MB fetch support lands.
-pub const DEFAULT_SCAN_LIMIT: u32 = 100;
-pub const MAX_SCAN_LIMIT: u32 = 1_000;
-pub const DEFAULT_QUERY_LIMIT: u32 = 100;
+// Item limits of one Query or Scan page; a request without `Limit` uses
+// them, and the 1 MB evaluated-bytes budget usually ends the page first.
 pub const MAX_QUERY_LIMIT: u32 = 10_000;
+pub const MAX_SCAN_LIMIT: u32 = MAX_QUERY_LIMIT;
 
-pub const TTL_INDEX_PREFIX: &str = "__ttl-index/";
-pub const TTL_INDEX_WIDTH: usize = 20;
 pub const MAX_TTL_SWEEP_PAGE_LIMIT: usize = 500;
-
-// Stream trim tuning shared by kv and sql backends (formerly duplicated in
-// kv::constants and sql::constants). Retention horizon and paging shape the
-// trim worker on every backend.
-pub const STREAM_TRIM_RETENTION_HOURS: i64 = 72;
-pub const MILLIS_PER_HOUR: i64 = 60 * 60 * 1000;
-pub const STREAM_TRIM_READ_LIMIT: u32 = 1_000;
-pub const STREAM_TRIM_DELETE_BATCH_SIZE: usize = 25;
-
-pub const GSI_LAG_TARGET_MS: u64 = 200;
-pub const GSI_LAG_SOFT_LIMIT_MS: u64 = 400;
-pub const GSI_LAG_HARD_LIMIT_MS: u64 = 1_000;
-pub const GSI_LAG_CRITICAL_LIMIT_MS: u64 = 3_000;
-pub(crate) const MAX_SOFT_DELAY_MS: u64 = 25;
-pub(crate) const HARD_DELAY_MS: u64 = 50;
 
 pub(crate) const PARTITION_AUTOSCALE_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
 pub const DEFAULT_ORDERED_LOG_PARTITION_COUNT: std::num::NonZeroU16 =
     std::num::NonZeroU16::MIN.saturating_add(16 - 1);
-pub const DEFAULT_STANDARD_QUEUE_PARTITION_COUNT: u16 = 64;
 pub const DEFAULT_PARTITION_TARGET_WRITES_PER_SECOND: u64 = 500;
 pub const DEFAULT_PARTITION_TARGET_BYTES_PER_SECOND: u64 = 256 * 1024;
 pub const DEFAULT_PARTITION_TARGET_CONFLICTS_PER_WINDOW: u64 = 8;
@@ -57,8 +33,12 @@ pub const PARTITION_SAMPLE_MAX_AGE_MS: i64 = 60_000;
 
 pub(crate) const PARTITION_SAMPLE_WINDOW_MS: i64 = 1_000;
 
+/// Longest extra wait before a sync while other write attempts are between
+/// their first write and their commit.
 pub(crate) const DURABILITY_BATCH_WINDOW_MS: u64 = 2;
-pub(crate) const DURABILITY_BATCH_CAPACITY: usize = 1024;
+
+/// Pause before a barrier is tried again after it returned no sync result.
+pub(crate) const DURABILITY_BARRIER_RETRY_MS: u64 = 10;
 
 /// Default storage maintenance cadences in milliseconds.
 pub(crate) const DEFAULT_JOB_INTERVALS: crate::jobs::DatabaseJobIntervals =
@@ -69,6 +49,9 @@ pub(crate) const DEFAULT_JOB_INTERVALS: crate::jobs::DatabaseJobIntervals =
         stream_trim_interval_ms: crate::JobIntervalMillis(3_600_000),
         table_reclaim_interval_ms: crate::JobIntervalMillis(30_000),
         queue_message_cleanup_interval_ms: crate::JobIntervalMillis(60_000),
+        // Pending subscriptions are deleted 48 hours after Subscribe; an
+        // hourly turn keeps the overrun under an hour.
+        pubsub_stale_subscription_sweep_interval_ms: crate::JobIntervalMillis(3_600_000),
         // Matches the ten-minute transact-write idempotency window.
         transact_receipt_trim_interval_ms: crate::JobIntervalMillis(600_000),
     };

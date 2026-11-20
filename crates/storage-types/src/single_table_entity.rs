@@ -6,7 +6,7 @@ use serde::Serialize;
 
 pub use crate::constants::{
     CREATED_AT_ALIAS_ATTR, CREATED_AT_ATTR, ENTITY_TYPE_ATTR, EXPIRES_AT_ALIAS_ATTR,
-    EXPIRES_AT_ATTR, LEGACY_ENTITY_TYPE_ATTR, UPDATED_AT_ALIAS_ATTR, UPDATED_AT_ATTR,
+    EXPIRES_AT_ATTR, UPDATED_AT_ALIAS_ATTR, UPDATED_AT_ATTR,
 };
 
 /// Keys returned are logical (no tenant id prefix because each tenant has its
@@ -56,21 +56,16 @@ pub trait SingleTableEntity {
     }
 
     /// Bind a decoded entity to its addressed row before its identity selects
-    /// a destination. Split physical keys and residual keys must agree; the
-    /// canonical wire reader retains the existing entity-type alias format.
+    /// a destination. Split physical keys and residual keys must agree.
     fn validate_stored_identity(&self, source: &crate::WireItem) -> crate::StorageResult<()> {
         let key = crate::KeyAttributes::from_iter([
             ("pk".into(), crate::AttributeValue::S(self.pk())),
             ("sk".into(), crate::AttributeValue::S(self.sk())),
         ]);
-        let entity_types = source.select_attribute_values(&[
-            ENTITY_TYPE_ATTR,
-            crate::constants::LEGACY_ENTITY_TYPE_ATTR,
-        ])?;
+        let entity_types = source.select_attribute_values(&[ENTITY_TYPE_ATTR])?;
         if !source.has_verified_keys(&key)?
             || !matches!(entity_types.as_slice(),
-                [Some(crate::AttributeValue::S(value)), None]
-                | [None, Some(crate::AttributeValue::S(value))]
+                [Some(crate::AttributeValue::S(value))]
                     if value == Self::STORAGE_ENTITY_TYPE)
         {
             return Err(crate::StorageError::internal(
@@ -199,7 +194,8 @@ impl EntityIndexer {
 }
 
 /// Encoded single-table entity with its generated ordered indexer declaration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct WireEntity {
     item: WireItem,
     indexers: WireEntityIndexers,
@@ -435,10 +431,7 @@ pub fn matches_entity_type<T: SingleTableEntity>(map: &impl crate::AttributeValu
 pub fn storage_entity_type_from_item(
     map: &impl crate::AttributeValueLookup,
 ) -> Option<crate::StorageEntityType> {
-    match map
-        .get_attribute_value(ENTITY_TYPE_ATTR)
-        .or_else(|| map.get_attribute_value(LEGACY_ENTITY_TYPE_ATTR))
-    {
+    match map.get_attribute_value(ENTITY_TYPE_ATTR) {
         Some(AttributeValue::S(value)) => crate::StorageEntityType::parse_db(value),
         _ => None,
     }
@@ -446,10 +439,7 @@ pub fn storage_entity_type_from_item(
 
 #[must_use]
 pub fn entity_type_from_item(map: &impl crate::AttributeValueLookup) -> Option<&str> {
-    match map
-        .get_attribute_value(ENTITY_TYPE_ATTR)
-        .or_else(|| map.get_attribute_value(LEGACY_ENTITY_TYPE_ATTR))
-    {
+    match map.get_attribute_value(ENTITY_TYPE_ATTR) {
         Some(AttributeValue::S(value)) => Some(value.as_str()),
         _ => None,
     }

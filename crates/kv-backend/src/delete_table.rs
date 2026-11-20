@@ -13,7 +13,8 @@ impl<A: KvAttempt> DeleteTableAttempt for KvCatalogAttempt<'_, A> {
         table: &BoundTableInfo,
     ) -> StorageResult<bool> {
         Ok(self
-            .identity_for(&table.info.table_name)?
+            .load_table_identity(table)
+            .await?
             .external_cleanup_required)
     }
 

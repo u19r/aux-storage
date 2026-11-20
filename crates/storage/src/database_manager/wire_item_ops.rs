@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use storage_types::{AttributeMap, AttributeValue, StorageResult, WireItem};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum PutItemPayload {
     AttributeMap(AttributeMap),
     WireItem(Box<WireItem>),

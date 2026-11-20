@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use storage_types::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateTableRequest, KeyAttributeType,
-    KeySchemaElement, KeyType, StorageEnum, TableName, context::WrappedError as _,
+    AttemptRequest, AttributeDefinition, AttributeValue, BillingMode, CreateTableRequest,
+    KeyAttributeType, KeySchemaElement, KeyType, StorageEnum, TableName,
+    context::WrappedError as _,
 };
 
 use crate::DatabaseManager;
@@ -28,13 +29,17 @@ impl sql_backend::SqlBackend for CountedBackend {
         self.backend.record_capacity(limits)
     }
 
+    fn attempt_deadlines(&self) -> storage_types::AttemptDeadlines {
+        self.backend.attempt_deadlines()
+    }
+
     fn engine(&self) -> sql_backend::SqlEngine {
         self.backend.engine()
     }
 
     fn with_attempt<R, F>(
         &self,
-        mode: sql_backend::AttemptMode,
+        request: AttemptRequest,
         operation: F,
     ) -> impl std::future::Future<Output = storage_types::StorageResult<R>> + Send
     where
@@ -48,7 +53,7 @@ impl sql_backend::SqlBackend for CountedBackend {
     {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.backend.with_attempt(mode, operation)
+        self.backend.with_attempt(request, operation)
     }
 }
 
@@ -59,7 +64,7 @@ async fn given_manager_point_reads_when_cache_cold_and_warm_then_one_attempt_sup
     let table = TableName::new("manager_get_scope");
     let seed = DatabaseManager::new_for_test_with_config(storage_provider::StorageConfig {
         connection_string: Some(path.to_string_lossy().into_owned()),
-        ..super::super::construction::immediate_sqlite_test_config()
+        ..super::super::test_database::immediate_sqlite_test_config()
     })
     .await
     .expect("seed manager");
@@ -92,23 +97,27 @@ async fn given_manager_point_reads_when_cache_cold_and_warm_then_one_attempt_sup
 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let backend = CountedBackend {
-        backend: sql_backend::sqlite::SqliteBackend::initialize(&path)
-            .await
-            .expect("open SQLite"),
+        backend: sql_backend::sqlite::SqliteBackend::initialize(
+            &path,
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .expect("open SQLite"),
         attempts: attempts.clone(),
     };
     let store = Arc::new(
-        sql_backend::SqlStore::initialize_schema(backend)
-            .await
-            .expect("initialize store"),
-    );
-    let manager = super::super::construction_tests::database_manager_from_bundle(
-        crate::provider_bundle::StorageProviderBundle::try_from_initialized_store(
-            store,
-            Default::default(),
+        sql_backend::SqlStore::initialize_schema(
+            backend,
+            storage_types::InitialStreamLineages::ONE,
+            true,
         )
-        .expect("initialized bundle"),
+        .await
+        .expect("initialize store"),
+    );
+    let manager = super::super::construction_tests::database_manager_from_store(
+        crate::InitializedStore::native(store),
     )
+    .await
     .expect("manager over one initialized store");
     for temperature in ["cold", "warm"] {
         attempts.store(0, std::sync::atomic::Ordering::SeqCst);

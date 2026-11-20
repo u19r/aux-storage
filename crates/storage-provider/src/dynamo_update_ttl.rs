@@ -1,48 +1,38 @@
 //! One TTL policy transition under the caller's protected table attempt.
 
-use std::future::Future;
-
 use storage_common::ttl::{TtlConfigRecord, TtlPolicyChange};
 use storage_types::{
     BoundTableInfo, StorageResult, TimeToLiveSpecification, TimestampMillis,
     UpdateTimeToLiveResponse,
 };
 
-use crate::{DescribeTimeToLiveAttempt, SemanticDecision};
+use crate::{SemanticDecision, TtlPolicyAttempt};
 
-pub trait UpdateTimeToLiveAttempt:
-    DescribeTimeToLiveAttempt + crate::TableUpdateTransaction
-{
-    fn write_ttl_config(
-        &mut self,
-        table: &BoundTableInfo,
-        config: TtlConfigRecord,
-    ) -> impl Future<Output = StorageResult<()>> + Send;
+/// Previous protected checkpoint and its replacement; the policy stays
+/// unchanged.
+pub struct TtlCheckpointChange {
+    pub previous: storage_common::ttl::TtlMaintenanceCheckpoint,
+    pub next: TtlConfigRecord,
+}
 
-    fn install_ttl_policy(
-        &mut self,
-        table: &BoundTableInfo,
-        change: TtlPolicyChange,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        async move {
-            let Some(layout) = crate::TableUpdateChange::for_ttl_policy(&table.info, &change)
-            else {
-                return Ok(());
-            };
-            let updated = self.persist_table_update(table.clone(), layout).await?;
-            match change {
-                TtlPolicyChange::Enable(config) | TtlPolicyChange::Disable(config) => {
-                    self.write_ttl_config(&updated, config).await
-                }
-                TtlPolicyChange::Unchanged => unreachable!("unchanged policy has no layout effect"),
-            }
-        }
+impl TtlCheckpointChange {
+    pub fn try_new(
+        mut observed: TtlConfigRecord,
+        next_cursor: Option<storage_common::TtlMaintenanceCursor>,
+    ) -> StorageResult<Self> {
+        let previous = observed.checkpoint.clone();
+        observed.checkpoint.revision = previous.revision.checked_next()?;
+        observed.checkpoint.cursor = next_cursor;
+        Ok(Self {
+            previous,
+            next: observed,
+        })
     }
 }
 
 /// Keep the response tied to the request; the persisted policy may remain
 /// `Enabling` until the bounded maintenance job finishes its existing items.
-pub async fn update_time_to_live_in_attempt<A: UpdateTimeToLiveAttempt>(
+pub async fn update_time_to_live_in_attempt<A: TtlPolicyAttempt>(
     attempt: &mut A,
     table: &BoundTableInfo,
     specification: &TimeToLiveSpecification,

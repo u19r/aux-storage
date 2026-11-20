@@ -1,122 +1,14 @@
 use crate::{
-    AttributeValue, IndexKey, IndexKeyPrefix, IndexName, ItemKey, KeyAttributeType,
-    KeySchemaElement, SerializesToKey, StorageError, StorageResult, StoredTableInfo, StreamItemId,
-    StreamKey, StreamName, TableKey, TableName,
-    item_key::ItemKeyError,
-    item_key_ordered::{
-        serialize_attribute_value, serialize_index_key_part_values, serialize_key_part_values,
-    },
+    AttributeValue, IndexName, ItemKey, KeyAttributeType, KeySchemaElement, StorageError,
+    StorageResult, StoredTableInfo, TableKey, item_key::ItemKeyError,
+    item_key_ordered::serialize_attribute_value,
 };
 
 impl ItemKey {
-    #[must_use]
-    pub fn all_table_prefix(table_name: &TableName) -> Vec<u8> {
-        table_name.sanitized_name().as_bytes().to_vec()
-    }
-    #[must_use]
-    pub fn table_data_prefix(&self) -> Vec<u8> {
-        if let Some(index_name) = self.index_id() {
-            Self::index_prefix_from_name(self.table_name(), index_name)
-        } else {
-            Self::table_prefix_from_name(self.table_name())
-        }
-    }
-
-    #[must_use]
-    pub fn table_prefix_from_name(table_name: &TableName) -> Vec<u8> {
-        let mut prefix = Self::all_table_prefix(table_name);
-        prefix.extend(b"/data/");
-        prefix
-    }
-
-    #[must_use]
-    pub fn index_prefix_from_name(table_name: &TableName, index_id: &IndexName) -> Vec<u8> {
-        let mut prefix = Self::all_table_prefix(table_name);
-        prefix.extend(b"/index/");
-        prefix.extend(index_id.as_ref().as_bytes());
-        prefix.extend(b"/data/");
-        prefix
-    }
-
-    #[must_use]
-    pub fn split_item_id_from_key(key: &[u8]) -> Option<Vec<u8>> {
-        let index = key
-            .windows(6)
-            .enumerate()
-            .find_map(|(i, window)| if window == b"/data/" { Some(i) } else { None })?;
-
-        Some(key[(index + 6)..].to_vec())
-    }
-
     pub fn serialize_attribute_value_to_bytes(
         attribute_value: &AttributeValue,
     ) -> Result<Vec<u8>, ItemKeyError> {
         serialize_attribute_value(attribute_value)
-    }
-
-    pub fn serialize_key_part(&self) -> Result<Vec<u8>, ItemKeyError> {
-        serialize_key_part_values(self.hash_key(), self.range_key())
-    }
-
-    pub fn item_stream_name(&self) -> Result<StreamName, ItemKeyError> {
-        StreamName::table_item_stream(self.table_name(), self)
-    }
-
-    pub fn item_stream_key(
-        &self,
-        stream_item_id: &StreamItemId,
-    ) -> Result<StreamKey, ItemKeyError> {
-        let stream_name = self.item_stream_name()?;
-        let stream_item_key: StreamKey = &stream_name + stream_item_id;
-        Ok(stream_item_key)
-    }
-}
-
-impl SerializesToKey for ItemKey {
-    fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
-        match self {
-            ItemKey::Table(key) => key.serialize_to_bytes(),
-            ItemKey::Index(key) => key.serialize_to_bytes(),
-            ItemKey::IndexPrefix(key) => key.serialize_to_bytes(),
-        }
-    }
-}
-
-impl SerializesToKey for TableKey {
-    fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
-        let mut key_parts: Vec<u8> = ItemKey::table_prefix_from_name(&self.table_name);
-        key_parts.extend(serialize_key_part_values(
-            &self.hash_key,
-            self.range_key.as_ref(),
-        )?);
-        Ok(key_parts)
-    }
-}
-
-impl SerializesToKey for IndexKeyPrefix {
-    fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
-        let mut key_parts: Vec<u8> =
-            ItemKey::index_prefix_from_name(&self.table_name, &self.index_id);
-        key_parts.extend(serialize_index_key_part_values(
-            &self.hash_key,
-            self.range_key.as_ref(),
-        )?);
-        Ok(key_parts)
-    }
-}
-
-impl SerializesToKey for IndexKey {
-    fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
-        let mut key_parts: Vec<u8> =
-            ItemKey::index_prefix_from_name(&self.table_name, &self.index_id);
-        key_parts.extend(serialize_index_key_part_values(
-            &self.hash_key,
-            self.range_key.as_ref(),
-        )?);
-        let table_key_bytes =
-            serialize_key_part_values(&self.table_key.hash_key, self.table_key.range_key.as_ref())?;
-        ItemKey::append_length_prefixed_key(&mut key_parts, &table_key_bytes)?;
-        Ok(key_parts)
     }
 }
 

@@ -14,7 +14,7 @@ use serde_json::json;
 use storage_types::{GetItemRequest, PutItemRequest, TableName};
 
 use super::{
-    table_stream_eligibility_tests::{finish_initialization, set_stream},
+    table_stream_eligibility_tests::set_stream,
     test_support::{TestStore, hash_table_request, unique_table_name},
 };
 
@@ -73,7 +73,10 @@ async fn put_phase(store: &TestStore, table: &TableName, value: &str) -> anyhow:
 #[ignore = "child process for the FoundationDB transition test"]
 async fn given_process_scope_when_parent_changes_catalog_then_child_refreshes_stale_preparation()
 -> anyhow::Result<()> {
-    let cluster = std::env::var("STREAM_TEST_CLUSTER")?;
+    let Ok(cluster) = std::env::var("STREAM_TEST_CLUSTER") else {
+        // Child half of a two-process test; nothing to do when run alone.
+        return Ok(());
+    };
     let prefix = std::env::var("STREAM_TEST_PREFIX")?;
     let table = TableName::new(&std::env::var("STREAM_TEST_TABLE")?);
     let signal = std::path::PathBuf::from(std::env::var("STREAM_TEST_SIGNAL")?);
@@ -133,9 +136,6 @@ async fn qualify_transition(internal_gsi: bool) -> anyhow::Result<()> {
     }
     std::fs::write(signals.path().join("enable"), [])?;
     await_signal(signals.path(), "enabled-done").await?;
-    if !internal_gsi {
-        finish_initialization(&store, &table).await?;
-    }
     await_signal(signals.path(), "disable-prepared").await?;
     if internal_gsi {
         super::gsi_lifecycle_tests::finish_backfill(&store, 1).await?;
@@ -145,7 +145,7 @@ async fn qualify_transition(internal_gsi: bool) -> anyhow::Result<()> {
                 .get_table_info(table.clone())
                 .await?
                 .requires_stream_entry(),
-            "internal GSI completion did not stop capture"
+            "internal GSI unexpectedly requires stream capture"
         );
     } else {
         set_stream(&store, &table, false).await?;
@@ -159,8 +159,9 @@ async fn qualify_transition(internal_gsi: bool) -> anyhow::Result<()> {
     );
     let records = super::cdc_stream_tests::system_records(&store, 100).await?;
     anyhow::ensure!(
-        records.len() == 1,
-        "configuration transition emitted the wrong history count"
+        records.len() == usize::from(!internal_gsi),
+        "configuration transition emitted {} history records (internal_gsi={internal_gsi})",
+        records.len()
     );
     let current = store
         .operations
@@ -172,6 +173,26 @@ async fn qualify_transition(internal_gsi: bool) -> anyhow::Result<()> {
         .item
         .unwrap();
     anyhow::ensure!(current.required_string_attribute("value")? == "disabled-after");
+    if internal_gsi {
+        let indexed = store
+            .operations
+            .query(
+                storage_types::QueryRequest::try_from(json!({
+                    "TableName": table, "IndexName": "by_pk",
+                    "KeyConditionExpression": "pk = :pk",
+                    "ExpressionAttributeValues": {":pk": {"S": "racer"}}
+                }))
+                .map_err(anyhow::Error::msg)?,
+            )
+            .await?
+            .items
+            .unwrap_or_default();
+        anyhow::ensure!(
+            indexed.len() == 1
+                && indexed[0].required_string_attribute("value")? == "disabled-after",
+            "cached writer missed committing GSI configuration"
+        );
+    }
     store.finish().await;
     Ok(())
 }

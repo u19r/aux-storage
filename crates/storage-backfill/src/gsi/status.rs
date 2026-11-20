@@ -15,28 +15,25 @@ pub struct GsiBuildStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(from = "StoredPhase")]
 pub enum GsiBuildPhase {
-    Scanning,
-    CatchingUp,
+    Filling,
+    Building,
     Active,
-    Blocked,
 }
 
 /// Read the existing KV enum tag without materializing its state payload.
 #[derive(Deserialize)]
 enum StoredPhase {
-    Scanning(IgnoredAny),
-    CatchingUp(IgnoredAny),
+    Filling(IgnoredAny),
+    Building(IgnoredAny),
     Active(IgnoredAny),
-    Blocked(IgnoredAny),
 }
 
 impl From<StoredPhase> for GsiBuildPhase {
     fn from(phase: StoredPhase) -> Self {
         match phase {
-            StoredPhase::Scanning(_) => Self::Scanning,
-            StoredPhase::CatchingUp(_) => Self::CatchingUp,
+            StoredPhase::Filling(_) => Self::Filling,
+            StoredPhase::Building(_) => Self::Building,
             StoredPhase::Active(_) => Self::Active,
-            StoredPhase::Blocked(_) => Self::Blocked,
         }
     }
 }
@@ -46,10 +43,9 @@ impl TryFrom<&str> for GsiBuildPhase {
 
     fn try_from(phase: &str) -> Result<Self, Self::Error> {
         match phase {
-            "scanning" => Ok(Self::Scanning),
-            "catching-up" => Ok(Self::CatchingUp),
+            "filling" => Ok(Self::Filling),
+            "building" => Ok(Self::Building),
             "active" => Ok(Self::Active),
-            "blocked" => Ok(Self::Blocked),
             _ => Err(GsiRecordError::Phase),
         }
     }
@@ -58,10 +54,20 @@ impl TryFrom<&str> for GsiBuildPhase {
 impl<Cursor> From<&GsiState<Cursor>> for GsiBuildPhase {
     fn from(state: &GsiState<Cursor>) -> Self {
         match state {
-            GsiState::Scanning(_) => Self::Scanning,
-            GsiState::CatchingUp(_) => Self::CatchingUp,
+            GsiState::Filling(_) => Self::Filling,
+            GsiState::Building(_) => Self::Building,
             GsiState::Active(_) => Self::Active,
-            GsiState::Blocked(_) => Self::Blocked,
+        }
+    }
+}
+
+/// All build phases maintain projections; only Active serves queries.
+impl From<GsiBuildPhase> for storage_types::GsiPhase {
+    fn from(phase: GsiBuildPhase) -> Self {
+        match phase {
+            GsiBuildPhase::Filling => Self::Filling,
+            GsiBuildPhase::Building => Self::Building,
+            GsiBuildPhase::Active => Self::Active,
         }
     }
 }
@@ -77,7 +83,7 @@ impl<Cursor> From<GsiBuild<Cursor>> for GsiBuildStatus {
 
 impl GsiBuildPhase {
     pub const fn permits_projection(self) -> bool {
-        !matches!(self, Self::Blocked)
+        true
     }
 
     pub const fn permits_queries(self) -> bool {

@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use storage_backfill::GsiProjectionLifecycle;
 use storage_common::{TtlIndexKey, TtlIndexWrite, ttl::TtlIndexKeyToken};
-use storage_types::{BoundTableInfo, ItemProvenance, StorageResult, TimestampMillis};
+use storage_types::{BoundTableInfo, StorageResult, TimestampMillis};
 
 use super::{ExpirationDelete, ExpirationIndexLocator};
 use crate::{
-    AcceptedDeleteItem, BoundDeleteItem, DeleteItemAttempt, ItemWriteObservation,
-    ItemWriteObservationRead, prepare_accepted_delete,
+    AcceptedDeleteItem, ItemWriteAttempt, ItemWriteObservation, ItemWriteObservationRead,
+    prepare_accepted_delete,
 };
 
 pub fn expiration_index_deletes(
@@ -24,7 +24,7 @@ pub fn expiration_index_deletes(
     })
 }
 
-pub async fn prepare_expiration_item_deletes<A: DeleteItemAttempt>(
+pub async fn prepare_expiration_item_deletes<A: ItemWriteAttempt + crate::CatalogAttempt>(
     attempt: &mut A,
     table: Arc<BoundTableInfo>,
     items: Vec<ExpirationDelete>,
@@ -34,11 +34,15 @@ pub async fn prepare_expiration_item_deletes<A: DeleteItemAttempt>(
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
     let result = async {
+        let mut routes_ready = false;
         for accepted in accept_expiration_item_deletes(attempt, table, items).await? {
             let mut accepted = accepted?;
+            if !routes_ready && accepted.old_item.is_some() && accepted.history_route.is_some() {
+                crate::prepare_writer_routes_in_attempt(attempt, None).await?;
+                routes_ready = true;
+            }
             accepted.user_identity = Some(storage_types::StreamUserIdentity::service_ttl());
-            prepare_accepted_delete(attempt, &accepted, captured_at, ItemProvenance::default())
-                .await?;
+            prepare_accepted_delete(attempt, &mut accepted, captured_at).await?;
         }
         attempt.flush_dynamo_write().await
     }
@@ -46,41 +50,40 @@ pub async fn prepare_expiration_item_deletes<A: DeleteItemAttempt>(
     settlement.complete(result)
 }
 
-pub async fn accept_expiration_item_deletes<A: DeleteItemAttempt>(
+pub async fn accept_expiration_item_deletes<A: ItemWriteAttempt>(
     attempt: &mut A,
     table: Arc<BoundTableInfo>,
     items: Vec<ExpirationDelete>,
 ) -> StorageResult<impl Iterator<Item = StorageResult<AcceptedDeleteItem>> + Send + use<A>> {
-    let (bound, observations) = observe_expiration_item_deletes(attempt, table, items).await?;
-    Ok(bound
+    let (items, observations) =
+        observe_expiration_item_deletes(attempt, Arc::clone(&table), items).await?;
+    Ok(items
         .into_iter()
         .zip(observations)
-        .map(|(item, (observed, lifecycle))| item.accept_old(observed, lifecycle)?.into_result()))
+        .map(move |(item, (observed, lifecycle))| {
+            let old = crate::dynamo_put_item::ObservedWrite::try_new(observed, &item.key)?;
+            AcceptedDeleteItem::try_from_observed(Arc::clone(&table), item.key, old, lifecycle)
+        }))
 }
 
-pub(super) async fn observe_expiration_item_deletes<A: DeleteItemAttempt>(
+pub(super) async fn observe_expiration_item_deletes<A: ItemWriteAttempt>(
     attempt: &mut A,
     table: Arc<BoundTableInfo>,
-    items: Vec<ExpirationDelete>,
+    mut items: Vec<ExpirationDelete>,
 ) -> StorageResult<(
-    Vec<BoundDeleteItem>,
+    Vec<ExpirationDelete>,
     Vec<(ItemWriteObservation, GsiProjectionLifecycle)>,
 )> {
-    let bound = items
-        .into_iter()
-        .map(|item| BoundDeleteItem::for_maintenance(Arc::clone(&table), item.key))
-        .collect::<StorageResult<Vec<_>>>()?;
-    let reads = bound
+    for item in &mut items {
+        storage_types::validate_transact_key(&table.info, &item.key)?;
+        item.key.normalize_numbers_for_write();
+    }
+    let reads = items
         .iter()
-        .map(|item| ItemWriteObservationRead::Write(&item.table, &item.key))
+        .map(|item| ItemWriteObservationRead::Write(&table, &item.key))
         .collect::<Vec<_>>();
     let observations = attempt.observe_for_writes(&reads).await?;
-    if observations.len() != bound.len() {
-        return Err(storage_types::StorageError::internal(
-            "expiration observation count differs",
-        ));
-    }
-    Ok((bound, observations))
+    Ok((items, observations.into_vec()))
 }
 
 impl super::ExpirationDeletionBatch {

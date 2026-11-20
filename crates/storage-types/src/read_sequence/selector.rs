@@ -56,11 +56,11 @@ impl ParsedReadSequenceSelector {
         mut visit: impl FnMut(AttributeValue),
     ) -> Result<(), ReadSequenceValidationError> {
         let Some((first, remaining)) = self.segments.split_first() else {
-            visit(AttributeValue::M(item.clone().into()));
+            visit(AttributeValue::M(item.clone()));
             return Ok(());
         };
         let ReadSequenceSelectorSegment::Attribute(name) = first else {
-            for value in self.evaluate_values(&AttributeValue::M(item.clone().into()))? {
+            for value in self.evaluate_values(&AttributeValue::M(item.clone()))? {
                 visit(value);
             }
             return Ok(());

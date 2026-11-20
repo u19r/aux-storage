@@ -22,6 +22,7 @@ impl KvFaultProbe for InitializationFault {
     fn at_commit_boundary(
         &self,
         boundary: KvCommitBoundary,
+        _mode: storage_types::AttemptMode,
     ) -> futures::future::BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             if boundary == KvCommitBoundary::BeforeCommit
@@ -61,13 +62,21 @@ impl Clock for SelectedClock {
 async fn given_selected_clock_when_format_commits_abort_then_initialization_and_published_store_keep_that_clock()
  {
     let root = tempfile::tempdir().unwrap();
-    let backend = RocksDbBackend::initialize(root.path().join("store"))
-        .unwrap()
-        .with_fault_probe(Arc::new(InitializationFault(AtomicUsize::new(2))));
+    let backend = RocksDbBackend::initialize(
+        root.path().join("store"),
+        storage_types::AttemptDeadlines::default(),
+        256,
+    )
+    .unwrap()
+    .with_fault_probe(Arc::new(InitializationFault(AtomicUsize::new(2))));
     let clock = Arc::new(SelectedClock::default());
-    let store = KvStore::initialize_format_with_clock(backend, clock.clone())
-        .await
-        .unwrap();
+    let store = KvStore::initialize_format_with_clock(
+        backend,
+        storage_types::InitialStreamLineages::ONE,
+        clock.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         clock.0.load(Ordering::SeqCst),
         2,

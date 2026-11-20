@@ -1,7 +1,7 @@
 //! One host connection owns foreground and scheduled native admission.
 use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc};
 
-use storage_provider::native_admission::{NativeAdmission, NativeAdmissionPermit, NativeWork};
+use storage_common::native_admission::{NativeAdmission, NativeAdmissionPermit, NativeWork};
 use storage_types::{StorageError, StorageResult};
 
 use super::{AdmissionConfig, AdmissionController};

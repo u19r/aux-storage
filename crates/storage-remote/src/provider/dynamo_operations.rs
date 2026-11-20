@@ -12,10 +12,10 @@ use storage_types::{
     CreateTableRequest, CreateTableResponse, DeleteItemRequest, DeleteItemResponse,
     DeleteTableRequest, DeleteTableResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, GetItemRequest, GetItemResponse,
-    GetStreamRecordsRequest, GetStreamRecordsResponse, ListStreamsRequest, ListStreamsResponse,
-    ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse, QueryRequest,
-    QueryResponse, ReadSequenceRequest, ReadSequenceResponse, ScanRequest, ScanResponse,
-    StorageError, StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest,
+    GetStreamRecordsRequest, GetStreamRecordsResponse, IndexName, ListStreamsRequest,
+    ListStreamsResponse, ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse,
+    QueryRequest, QueryResponse, ReadSequenceRequest, ReadSequenceResponse, ScanRequest,
+    ScanResponse, StorageError, StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest,
     TransactGetItemsResponse, TransactWriteItemsRequest, TransactWriteItemsResponse,
     UpdateItemRequest, UpdateItemResponse, UpdateTableRequest, UpdateTableResponse,
     UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
@@ -25,20 +25,8 @@ use super::RemoteStorageProvider;
 
 #[async_trait]
 impl DynamoOperations for RemoteStorageProvider {
-    async fn list_change_index_markers(
-        &self,
-        request: storage_provider::ListChangeIndexMarkersRequest,
-    ) -> StorageResult<Vec<storage_provider::ChangeIndexMarker>> {
-        let response: storage_provider::ListChangeIndexMarkersResponse = self
-            .invoke("DynamoDB_20120810.ListChangeIndexMarkers", &request)
-            .await?;
-        Ok(response.markers)
-    }
-
     async fn get_table_info(&self, table_name: TableName) -> StorageResult<Arc<StoredTableInfo>> {
-        storage_provider::StorageProvider::get_table_info(self, &table_name)
-            .await
-            .map(Arc::new)
+        self.get_table_info_inner(&table_name).await.map(Arc::new)
     }
 
     async fn list_streams(
@@ -150,7 +138,7 @@ impl DynamoOperations for RemoteStorageProvider {
         &self,
         request: storage_types::QueryTableRequest,
     ) -> StorageResult<storage_provider::RangeReadPage<WireItem>> {
-        self.query_table_with_metadata(&request, None).await
+        self.query_table_page(&request).await
     }
 
     async fn query_source_page(
@@ -221,5 +209,33 @@ impl DynamoOperations for RemoteStorageProvider {
     ) -> StorageResult<DescribeTimeToLiveResponse> {
         self.invoke("DynamoDB_20120810.DescribeTimeToLive", &request)
             .await
+    }
+
+    async fn read_gsi_readiness_records(
+        &self,
+        table_name: &TableName,
+        index_names: &[IndexName],
+    ) -> StorageResult<Vec<storage_provider::GsiReadinessRecord>> {
+        let response: DescribeTableResponse = self
+            .invoke(
+                "DynamoDB_20120810.DescribeTable",
+                &DescribeTableRequest {
+                    table_name: table_name.clone(),
+                },
+            )
+            .await?;
+        let indexes = response.table.global_secondary_indexes.unwrap_or_default();
+        Ok(
+            super::provider_helpers::gsi_index_readiness(&indexes, index_names)?
+                .into_iter()
+                .map(
+                    |(index_name, readiness)| storage_provider::GsiReadinessRecord {
+                        table_name: table_name.clone(),
+                        index_name,
+                        readiness,
+                    },
+                )
+                .collect(),
+        )
     }
 }

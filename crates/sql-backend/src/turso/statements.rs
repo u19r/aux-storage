@@ -12,23 +12,14 @@ pub(super) async fn query_batch(
     connection: &turso::Connection,
     queries: Vec<(SqlStatement, crate::ReadProtection)>,
     max_bytes: NonZeroUsize,
-    #[cfg(feature = "fault-injection")] fault_probe: Option<&dyn crate::SqlFaultProbe>,
+    fault_probe: Option<&dyn crate::SqlFaultProbe>,
 ) -> StorageResult<Vec<SqlQueryPage>> {
     let mut pages = Vec::new();
     pages
         .try_reserve_exact(queries.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for (statement, _) in queries {
-        pages.push(
-            query(
-                connection,
-                statement,
-                max_bytes,
-                #[cfg(feature = "fault-injection")]
-                fault_probe,
-            )
-            .await?,
-        );
+        pages.push(query(connection, statement, max_bytes, fault_probe).await?);
     }
     Ok(pages)
 }
@@ -36,22 +27,14 @@ pub(super) async fn query_batch(
 pub(super) async fn execute_batch(
     connection: &turso::Connection,
     writes: Vec<SqlStatement>,
-    #[cfg(feature = "fault-injection")] fault_probe: Option<&dyn crate::SqlFaultProbe>,
+    fault_probe: Option<&dyn crate::SqlFaultProbe>,
 ) -> StorageResult<Vec<u64>> {
     let mut counts = Vec::new();
     counts
         .try_reserve_exact(writes.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for statement in writes {
-        counts.push(
-            execute(
-                connection,
-                statement,
-                #[cfg(feature = "fault-injection")]
-                fault_probe,
-            )
-            .await?,
-        );
+        counts.push(execute(connection, statement, fault_probe).await?);
     }
     Ok(counts)
 }
@@ -59,9 +42,8 @@ pub(super) async fn execute_batch(
 pub(super) async fn execute(
     connection: &turso::Connection,
     statement: SqlStatement,
-    #[cfg(feature = "fault-injection")] fault_probe: Option<&dyn crate::SqlFaultProbe>,
+    fault_probe: Option<&dyn crate::SqlFaultProbe>,
 ) -> StorageResult<u64> {
-    #[cfg(feature = "fault-injection")]
     if let Some(probe) = fault_probe
         && let Some(error) = probe.fail(crate::SqlFaultCall {
             operation: crate::SqlFaultOperation::Execute,
@@ -71,27 +53,34 @@ pub(super) async fn execute(
         trace_native_failure(NativeEngine::Turso, NativeOperation::SqlExecute, &error);
         return Err(error);
     }
+    let wave =
+        crate::fault_injection::SqlWave::start_plain(fault_probe, &[statement.sql()]).await?;
     let (sql, values) = statement.into_native_parts::<turso::Value>()?;
     let mut prepared = connection.prepare(&sql).await.map_err(map_driver_error)?;
-    prepared
+    let changed = prepared
         .execute(values)
         .await
         .map_err(map_driver_error)
         .inspect_err(|error| {
             trace_native_failure(NativeEngine::Turso, NativeOperation::SqlExecute, error)
-        })
+        })?;
+    crate::fault_injection::end_wave(wave);
+    crate::fault_injection::observe_statement(
+        fault_probe,
+        crate::SqlFaultOperation::Execute,
+        changed,
+    );
+    Ok(changed)
 }
 
 pub(super) async fn query(
     connection: &turso::Connection,
     statement: SqlStatement,
     max_bytes: NonZeroUsize,
-    #[cfg(feature = "fault-injection")] fault_probe: Option<&dyn crate::SqlFaultProbe>,
+    fault_probe: Option<&dyn crate::SqlFaultProbe>,
 ) -> StorageResult<SqlQueryPage> {
     let result = async {
-        #[cfg(feature = "fault-injection")]
         let sql_for_probe = fault_probe.map(|_| statement.sql().to_owned());
-        #[cfg(feature = "fault-injection")]
         if let (Some(probe), Some(sql)) = (fault_probe, sql_for_probe.as_deref())
             && let Some(error) = probe.fail(crate::SqlFaultCall {
                 operation: crate::SqlFaultOperation::Query,
@@ -100,6 +89,8 @@ pub(super) async fn query(
         {
             return Err(error);
         }
+        let wave =
+            crate::fault_injection::SqlWave::start_plain(fault_probe, &[statement.sql()]).await?;
         let (sql, values) = statement.into_native_parts::<turso::Value>()?;
         let mut prepared = connection.prepare(&sql).await.map_err(map_driver_error)?;
         let mut cursor = prepared.query(values).await.map_err(map_driver_error)?;
@@ -110,8 +101,12 @@ pub(super) async fn query(
                 break;
             }
         }
-        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::end_wave(wave);
         if let (Some(probe), Some(sql)) = (fault_probe, sql_for_probe.as_deref()) {
+            probe.observe(crate::SqlNativeEvent::Statement {
+                operation: crate::SqlFaultOperation::Query,
+                rows: u64::try_from(page.rows.len()).unwrap_or(u64::MAX),
+            });
             return Ok(probe.alter_query_page(
                 crate::SqlFaultCall {
                     operation: crate::SqlFaultOperation::Query,

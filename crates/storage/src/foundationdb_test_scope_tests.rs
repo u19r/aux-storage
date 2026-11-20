@@ -55,7 +55,7 @@ async fn assert_neighbor_row(db: &DatabaseManager, table: &TableName) {
 #[ignore = "requires a reachable FoundationDB cluster compatible with the pinned storage client"]
 async fn given_two_owned_native_scopes_when_success_panic_or_cancellation_closes_one_then_all_its_keys_are_removed_and_neighbor_data_survives()
  {
-    let cluster_file = std::env::var("FDB_CLUSTER_FILE").expect("FDB_CLUSTER_FILE");
+    let cluster_file = std::env::var("TEST_FDB_CLUSTER_FILE").expect("TEST_FDB_CLUSTER_FILE");
     let first = FoundationDbTestScope::try_new(cluster_file.clone())
         .await
         .expect("first owned scope");
@@ -162,7 +162,7 @@ impl Drop for NativeWriterProcess {
 #[ignore = "requires a reachable FoundationDB cluster compatible with the pinned storage client"]
 async fn given_owned_native_writer_process_when_killed_and_reaped_then_parent_removes_all_its_keys_and_preserves_neighbor_data()
  {
-    let cluster_file = std::env::var("FDB_CLUSTER_FILE").expect("FDB_CLUSTER_FILE");
+    let cluster_file = std::env::var("TEST_FDB_CLUSTER_FILE").expect("TEST_FDB_CLUSTER_FILE");
     let table = TableName::new("owned_scope_process_data");
     if let Ok(prefix) = std::env::var("FDB_OWNED_CHILD_NAMESPACE_PREFIX") {
         let db = FoundationDbTestScope::open_database(storage_provider::FoundationDbSettings {
@@ -199,7 +199,7 @@ async fn given_owned_native_writer_process_when_killed_and_reaped_then_parent_re
             let stderr = std::fs::File::create(&stderr_path).expect("owned child diagnostics");
             let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
                 .args(["--exact", "foundationdb_test_scope_tests::given_owned_native_writer_process_when_killed_and_reaped_then_parent_removes_all_its_keys_and_preserves_neighbor_data", "--ignored", "--nocapture"])
-                .env("FDB_CLUSTER_FILE", &cluster_file)
+                .env("TEST_FDB_CLUSTER_FILE", &cluster_file)
                 .env("FDB_OWNED_CHILD_NAMESPACE_PREFIX", first.settings().subspace_prefix.as_ref().expect("owned namespace"))
                 .env("FDB_OWNED_CHILD_READY_PATH", &ready_path)
                 .stdin(std::process::Stdio::null())

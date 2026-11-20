@@ -51,19 +51,16 @@ impl From<RawOrderedJobStoreError> for ScheduledJobStoreError {
     }
 }
 
+/// Projects a storage failure onto the job library's categories by its class:
+/// known not committed and repeatable → `Unavailable`; an unknown commit
+/// outcome, a capacity limit, a client or an internal failure → `Permanent`.
 fn map_storage_error(error: &StorageError) -> StoreFailure {
     match error.to_enum() {
         StorageEnum::Unsupported { .. } => StoreFailure::Unsupported,
-        StorageEnum::ServiceUnavailable { .. }
-        | StorageEnum::TransactionConflict { .. }
-        | StorageEnum::TransactionInProgress { .. }
-        | StorageEnum::ProvisionedThroughputExceeded { .. }
-        | StorageEnum::Throttled { .. }
-        | StorageEnum::LimitExceeded { .. }
-        | StorageEnum::RequestLimitExceeded => StoreFailure::Unavailable,
         StorageEnum::Serialization(_) | StorageEnum::AwsSerialization(_) => {
             StoreFailure::Corrupt(StoreDataError::Malformed("serialized value"))
         }
+        _ if error.class().is_retryable() => StoreFailure::Unavailable,
         _ => StoreFailure::Permanent,
     }
 }

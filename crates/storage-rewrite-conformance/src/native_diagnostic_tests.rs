@@ -54,9 +54,11 @@ async fn given_validation_and_conflict_when_native_logging_runs_then_codes_and_l
             Level::WARN,
         ),
         (
-            StorageError::from(StorageEnum::TransactionConflict {
-                message: "native lock contention".to_owned(),
-            }),
+            StorageError::from(StorageEnum::Attempt(
+                storage_types::AttemptFailure::Conflict(storage_types::ConflictCause::Logical(
+                    "native lock contention",
+                )),
+            )),
             "TransactionConflictException",
             Level::DEBUG,
         ),

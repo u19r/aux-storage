@@ -21,12 +21,12 @@ async fn given_one_table_duration_when_all_write_forms_commit_then_only_one_tabl
             stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
         });
         fixture.operations.create_table(request).await?;
-        let initial_markers = fixture.stream_retention_repository.list_due_stream_trim_markers(
+        let initial_markers = fixture.maintenance.list_due_stream_trim_markers(
             TimestampMillis::from_timestamp(i64::MAX), 100,
         ).await?;
         let initial_scope = initial_markers.iter().find(|marker| marker.scope.table_name == name)
             .expect("new table schedule").scope.clone();
-        let initial_states = fixture.stream_retention_repository.load_stream_trim_states(
+        let initial_states = fixture.maintenance.load_stream_trim_states(
             std::slice::from_ref(&initial_scope),
         ).await?;
         let initial = initial_states[0].as_ref().expect("new table state");
@@ -58,15 +58,16 @@ async fn given_one_table_duration_when_all_write_forms_commit_then_only_one_tabl
         fixture.operations.delete_item(DeleteItemRequest::new(name.clone(), storage_types::KeyAttributes::from([
             ("pk".to_owned(), storage_types::AttributeValue::S("c".to_owned()))
         ]))).await?;
-        let markers = fixture.stream_retention_repository.list_due_stream_trim_markers(
+        let markers = fixture.maintenance.list_due_stream_trim_markers(
             TimestampMillis::from_timestamp(i64::MAX), 100,
         ).await?;
         let markers = markers.iter().filter(|marker| marker.scope.table_name == name).collect::<Vec<_>>();
         anyhow::ensure!(markers.len() == 1, "writes created item-specific retention schedules");
-        let states = fixture.stream_retention_repository.load_stream_trim_states(
+        let states = fixture.maintenance.load_stream_trim_states(
             std::slice::from_ref(&initial_scope),
         ).await?;
         anyhow::ensure!(states[0].as_ref() == Some(initial), "ordinary writes changed table policy or frontier");
+        fixture.wait_until_changes_are_readable().await;
         let page = fixture.operations.get_stream_records(GetStreamRecordsRequest::table(name, None, Some(100))).await?;
         anyhow::ensure!(page.records().len() == 7, "a committed write lost its table history");
         Ok(())
@@ -93,7 +94,7 @@ async fn given_empty_trim_when_later_write_arrives_then_table_schedule_reclaims_
         });
         fixture.operations.create_table(request).await?;
         let worker = StreamDurationTrimWorker::new(
-            fixture.stream_retention_repository.as_ref(),
+            fixture.maintenance.as_ref(),
             StreamDurationTrimConfig::default(),
         );
         fixture.advance_time(Duration::from_secs(24 * 3600));
@@ -106,6 +107,7 @@ async fn given_empty_trim_when_later_write_arrives_then_table_schedule_reclaims_
                 "TableName": name, "Item": {"pk": {"S": "later"}}
             }))?)
             .await?;
+        fixture.wait_until_changes_are_readable().await;
         fixture.advance_time(Duration::from_secs(24 * 3600 - 60));
         let before_expiry = worker.run_due_page(fixture.now(), fixture.now()).await?;
         anyhow::ensure!(
@@ -119,7 +121,7 @@ async fn given_empty_trim_when_later_write_arrives_then_table_schedule_reclaims_
             "later event was never rediscovered after idle trim"
         );
         let markers = fixture
-            .stream_retention_repository
+            .maintenance
             .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 100)
             .await?;
         anyhow::ensure!(markers.len() == 1 && markers[0].due_at > fixture.now());

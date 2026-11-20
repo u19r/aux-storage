@@ -82,30 +82,69 @@ pub struct SystemStreamLineageCatalog {
 }
 
 impl SystemStreamLineageCatalog {
-    /// Route one write to an active lineage using the same canonical route
-    /// bytes for SQL and KV. A split changes only the active catalog, not
-    /// this selection rule.
+    /// Build the sole initial provider topology; root zero retains its
+    /// established identifiers.
+    pub fn initial_roots(
+        source_scope: SystemStreamScope,
+        count: storage_types::InitialStreamLineages,
+    ) -> Result<Self, SystemStreamContractError> {
+        let entries = (0..count.get())
+            .map(|index| {
+                let (shard, lineage) = if index == 0 {
+                    (
+                        crate::DYNAMO_SYSTEM_SHARD_ID.to_owned(),
+                        crate::DYNAMO_SYSTEM_LINEAGE_ID.to_owned(),
+                    )
+                } else {
+                    (
+                        format!("initial-shard-{index:03}"),
+                        format!("initial-lineage-{index:03}"),
+                    )
+                };
+                SystemStreamLineage::try_new(shard, lineage, None, false)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new(source_scope, entries)
+    }
+
+    /// Route through the validated topology so splitting one leaf cannot move
+    /// keys assigned to another root or branch. Catalog order is not authority.
     pub fn writer_lineage(&self, routing_key: &[u8]) -> StorageResult<&SystemStreamLineage> {
-        let mut active = self
-            .entries
-            .iter()
-            .filter(|entry| !entry.sealed())
-            .collect::<Vec<_>>();
-        active.sort_unstable_by(|left, right| {
-            left.shard_id()
-                .cmp(right.shard_id())
-                .then_with(|| left.lineage_id().cmp(right.lineage_id()))
-        });
-        if active.is_empty() {
-            return Err(StorageError::internal(
-                "SystemStream has no active writer lineage",
-            ));
+        let mut candidates = Vec::with_capacity(self.entries.len());
+        let mut parent = None;
+        let mut digest = Sha256::digest(routing_key);
+        loop {
+            candidates.clear();
+            candidates.extend(
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.parent_lineage_id() == parent),
+            );
+            candidates.sort_unstable_by(|left, right| {
+                left.shard_id()
+                    .cmp(right.shard_id())
+                    .then_with(|| left.lineage_id().cmp(right.lineage_id()))
+            });
+            if candidates.is_empty() {
+                return Err(StorageError::internal(
+                    "SystemStream has no active writer lineage",
+                ));
+            }
+            let mut prefix = [0; 8];
+            prefix.copy_from_slice(&digest[..8]);
+            let index = (u64::from_be_bytes(prefix) % candidates.len() as u64) as usize;
+            let selected = candidates[index];
+            if !selected.sealed() {
+                return Ok(selected);
+            }
+            parent = Some(selected.lineage_id());
+            // A parent-specific choice distributes each split independently of
+            // the root choice without allocating another routing-key buffer.
+            let mut hasher = Sha256::new();
+            hasher.update(selected.lineage_id().as_str().as_bytes());
+            hasher.update(routing_key);
+            digest = hasher.finalize();
         }
-        let digest = Sha256::digest(routing_key);
-        let mut prefix = [0; 8];
-        prefix.copy_from_slice(&digest[..8]);
-        let index = (u64::from_be_bytes(prefix) % active.len() as u64) as usize;
-        Ok(active[index])
     }
 
     /// Validate a provider catalog for one logical source scope.

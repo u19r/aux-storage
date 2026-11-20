@@ -165,7 +165,7 @@ async fn given_paged_parent_when_read_sequence_resumes_then_each_page_runs_its_c
     let mut token: Option<String> = None;
     let mut child_invocations = 0;
     let mut independent_items = 0;
-    for page_index in 0..5 {
+    for page_index in 0..10 {
         let mut page = request.clone();
         if let Some(previous) = token.take() {
             page["NextSequenceToken"] = json!(previous);

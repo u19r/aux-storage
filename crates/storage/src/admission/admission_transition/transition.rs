@@ -69,9 +69,14 @@ fn evaluate_window_inner(
     let saturated = state.window.peak_in_flight
         >= saturated_in_flight_threshold(state.desired_limit)
         || state.window.queue_waits > 0
+        || state.window.queue_timeout
         || state.window.queue_nonempty_for.as_nanos()
             >= duration_percent_threshold(elapsed, QUEUE_SATURATION_PERCENT);
-    let pressure = state.window.explicit_pressure || state.window.queue_timeout;
+    // A queue timeout means demand exceeds the current local limit. It is
+    // saturation, not provider pressure: treating it as pressure halves the
+    // limit, which causes more timeouts and pins the controller in emergency
+    // at its floor. Latency still turns saturation into congestion.
+    let pressure = state.window.explicit_pressure;
     let enough_samples =
         state.window.completed.iter().copied().sum::<usize>() >= BASELINE_SAMPLE_MINIMUM;
     let percentiles = std::array::from_fn(|index| Window::p90(&state.window.samples[index]));
@@ -82,7 +87,13 @@ fn evaluate_window_inner(
             if state.window.completed[index] < BASELINE_SAMPLE_MINIMUM {
                 return None;
             }
-            percentiles[index].map(|p90| (state.baselines_ms[index] * LATENCY_BUFFER) / p90)
+            // The low-load baseline only ratchets down, to sub-millisecond
+            // values on fast providers. Never judge congestion against less
+            // than the configured latency estimate, or normal latency growth
+            // under concurrency reads as degradation.
+            let reference =
+                state.baselines_ms[index].max(config.initial_latency_estimate_ms as f64);
+            percentiles[index].map(|p90| (reference * LATENCY_BUFFER) / p90)
         })
         .reduce(f64::min)
         .unwrap_or(f64::INFINITY);
@@ -272,28 +283,34 @@ pub(crate) fn transition_window(
             }
         }
         AdmissionState::Recovering => {
+            state.saturated_healthy_windows = 0;
             if sustained_congestion {
                 normal_backoff(config, state, signals.gradient);
-                state.saturated_healthy_windows = 0;
-            } else if signals.congested {
-                state.saturated_healthy_windows = 0;
-            } else if signals.saturated && signals.enough_samples && signals.gradient >= 1.0 {
-                state.saturated_healthy_windows = state.saturated_healthy_windows.saturating_add(1);
-                if state.saturated_healthy_windows >= 3 && signals.now >= state.probe_due {
-                    state.probe_previous_limit = Some(state.desired_limit);
-                    state.previous_saturated_goodput = Some(signals.goodput);
-                    let delta = percent_threshold(state.desired_limit, PROBE_PERCENT).max(1);
+            } else if !signals.congested && signals.gradient >= 1.0 {
+                // Healthy latency (or no samples) without pressure: regain the
+                // starting limit quickly, saturated or not. Probes continue
+                // from Stable once the starting limit is restored.
+                let target = recovery_limit(config);
+                if state.desired_limit < target {
                     state.desired_limit = state
                         .desired_limit
-                        .saturating_add(delta)
-                        .min(config.effective_maximum());
-                    state.state = AdmissionState::Probe;
+                        .saturating_mul(2)
+                        .max(state.desired_limit.saturating_add(1))
+                        .min(target);
                 }
-            } else if !signals.saturated {
-                state.saturated_healthy_windows = 0;
+                if state.desired_limit >= target {
+                    state.state = AdmissionState::Stable;
+                }
             }
         }
     }
+}
+
+/// The limit recovery climbs back to: the configured starting limit.
+fn recovery_limit(config: &AdmissionConfig) -> usize {
+    config
+        .bootstrap_limit()
+        .unwrap_or_else(|_| config.effective_maximum())
 }
 
 fn normal_backoff(config: &AdmissionConfig, state: &mut ControllerState, gradient: f64) {

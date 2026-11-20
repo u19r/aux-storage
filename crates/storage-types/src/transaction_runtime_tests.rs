@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
 
 use alloc_counter::AllocationGuard;
 
@@ -156,29 +153,6 @@ fn transaction_put_key_fingerprint_avoids_temporary_key_map_and_json_allocations
     );
 }
 
-#[test]
-#[ignore = "manual runtime perf probe; run with --ignored --nocapture before/after transaction \
-            fingerprint changes"]
-fn transaction_key_fingerprint_runtime_perf_probe() {
-    let table_info = number_table_info();
-    let item = fingerprint_item();
-    for measurement in 1..=3 {
-        let legacy = measure_fingerprint_runtime(|| {
-            legacy_transact_put_item_key_fingerprint(&table_info, &item)
-        });
-        let optimized =
-            measure_fingerprint_runtime(|| transact_put_item_key_fingerprint(&table_info, &item));
-        println!(
-            "transaction_key_fingerprint measurement={measurement} legacy_ms={:.3} \
-             optimized_ms={:.3} legacy_ns_per_iter={:.2} optimized_ns_per_iter={:.2}",
-            legacy.as_secs_f64() * 1_000.0,
-            optimized.as_secs_f64() * 1_000.0,
-            legacy.as_nanos() as f64 / TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS as f64,
-            optimized.as_nanos() as f64 / TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS as f64
-        );
-    }
-}
-
 fn measure_fingerprint_allocations(
     test_name: &'static str,
     label: &'static str,
@@ -189,14 +163,6 @@ fn measure_fingerprint_allocations(
         std::hint::black_box(fingerprint().expect("fingerprint key"));
     }
     guard.finish()
-}
-
-fn measure_fingerprint_runtime(mut fingerprint: impl FnMut() -> StorageResult<String>) -> Duration {
-    let started = Instant::now();
-    for _ in 0..TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS {
-        std::hint::black_box(fingerprint().expect("fingerprint key"));
-    }
-    started.elapsed()
 }
 
 fn legacy_transact_put_item_key_fingerprint(
@@ -262,6 +228,7 @@ fn number_table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }

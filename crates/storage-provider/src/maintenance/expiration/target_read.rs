@@ -8,7 +8,7 @@ use storage_types::{
 };
 
 use super::{ExpirationTarget, ExpirationTargetAdmission, ExpirationTargetRead};
-use crate::{CatalogAttempt, DescribeTimeToLiveAttempt, ListTablesAttempt};
+use crate::{CatalogAttempt, ListingAttempt, TtlPolicyAttempt};
 
 const TARGET_PAGE_SIZE: u32 = 64;
 
@@ -19,7 +19,7 @@ pub async fn read_expiration_target_in_attempt<A, S>(
     bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(ExpirationTarget, Arc<BoundTableInfo>)>>
 where
-    A: CatalogAttempt + DescribeTimeToLiveAttempt + ListTablesAttempt,
+    A: CatalogAttempt + TtlPolicyAttempt + ListingAttempt,
     S: ExpirationTargetAdmission<A>,
 {
     match read {
@@ -44,7 +44,7 @@ async fn scan_targets<A, S>(
     bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(ExpirationTarget, Arc<BoundTableInfo>)>>
 where
-    A: CatalogAttempt + DescribeTimeToLiveAttempt + ListTablesAttempt,
+    A: CatalogAttempt + TtlPolicyAttempt + ListingAttempt,
     S: ExpirationTargetAdmission<A>,
 {
     let mut cursor = after.cloned();
@@ -91,7 +91,7 @@ async fn configured_target<A, S>(
     bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(ExpirationTarget, Arc<BoundTableInfo>)>>
 where
-    A: CatalogAttempt + DescribeTimeToLiveAttempt,
+    A: CatalogAttempt + TtlPolicyAttempt,
     S: ExpirationTargetAdmission<A>,
 {
     let Some(stamp) = attempt.read_catalog_stamp(name).await? else {
@@ -99,6 +99,14 @@ where
     };
     bindings.observe(name, stamp.history_id)?;
     let table = attempt.read_table_at_stamp(name, stamp).await?;
+    if table
+        .binding
+        .regional
+        .as_deref()
+        .is_some_and(|binding| !binding.admits_local_writes())
+    {
+        return Ok(None);
+    }
     if !admission.admits_target(attempt, &table).await? {
         return Ok(None);
     }

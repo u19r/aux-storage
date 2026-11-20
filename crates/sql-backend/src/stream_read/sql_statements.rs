@@ -1,14 +1,15 @@
 //! SQL text and bindings for ordered stream pages and point reads.
 
 use storage_types::{StorageEnum, StorageResult, StreamItemId, StreamName};
-use stream_provider::{ReadDirection, StreamReadRequest, StreamRowKind, SystemStreamHistoryRead};
+use stream_provider::{ReadDirection, StreamReadRequest, SystemStreamHistoryRead};
 
 use crate::{SqlEngine, SqlLayout, SqlStatement, SqlValue};
 
 // A cursor may pass only transactions known complete in its read snapshot.
 const POSTGRES_VISIBLE_USER_ROW: &str =
     " AND item_id < (decode('58494431', 'hex') || \
-     int8send(pg_snapshot_xmin(pg_current_snapshot())::text::bigint))";
+     int8send(pg_snapshot_xmin(pg_current_snapshot())::text::bigint + (SELECT transaction_offset \
+     FROM sys_system_stream_scope WHERE scope_key = 'system')))";
 
 pub(super) fn read_history_table_states(
     engine: impl SqlLayout,
@@ -47,18 +48,12 @@ pub(super) fn read_history_table_states(
 
 pub(super) fn read_rows(
     engine: impl SqlLayout,
-    stream: &StreamRowKind,
+    stream: &storage_types::StreamName,
     request: &StreamReadRequest,
 ) -> SqlStatement {
-    let (mut predicates, binds) = row_predicates(engine, stream.value(), request);
-    if engine.engine() == SqlEngine::Postgres && matches!(stream, StreamRowKind::User(_)) {
+    let (mut predicates, binds) = row_predicates(engine, stream, request);
+    if engine.engine() == SqlEngine::Postgres {
         predicates.push_str(POSTGRES_VISIBLE_USER_ROW);
-    }
-    if engine.engine() == SqlEngine::Postgres && !matches!(stream, StreamRowKind::User(_)) {
-        predicates.push_str(
-            " AND item_id < (decode('ffffffff', 'hex') || \
-             int8send(pg_snapshot_xmin(pg_current_snapshot())::text::bigint * 65536))",
-        );
     }
     row_statement(engine, request, predicates, binds)
 }
@@ -67,19 +62,45 @@ pub(super) fn read_table_history_index(
     engine: impl SqlLayout,
     read: &stream_provider::TableHistoryIndexRead,
 ) -> StorageResult<SqlStatement> {
-    let request = read.row_read();
-    let (mut predicates, mut binds) =
-        row_predicates(engine, &read.lane.physical_stream_name()?, &request);
-    predicates.push_str(&format!(
-        " AND item_id <= {}",
+    table_history_statement(engine, read, "entry_blob")
+}
+
+pub(super) fn read_table_history_observations(
+    engine: impl SqlLayout,
+    read: &stream_provider::TableHistoryIndexRead,
+) -> StorageResult<SqlStatement> {
+    table_history_statement(engine, read, "created_at")
+}
+
+fn table_history_statement(
+    engine: impl SqlLayout,
+    read: &stream_provider::TableHistoryIndexRead,
+    projection: &str,
+) -> StorageResult<SqlStatement> {
+    let (mut predicates, mut binds) = table_history_predicates(engine, &read.lane, read.through);
+    if let Some(start) = read.exclusive_start {
+        let comparison = match read.direction {
+            ReadDirection::Forward => ">",
+            ReadDirection::Backward => "<",
+        };
+        predicates.push_str(&format!(
+            " AND offset_order {comparison} {}",
+            engine.engine().placeholder(5)
+        ));
+        binds.push(SqlValue::Blob(sequence_order(start).to_be_bytes().to_vec()));
+    }
+    let direction = match read.direction {
+        ReadDirection::Forward => "ASC",
+        ReadDirection::Backward => "DESC",
+    };
+    let sql = format!(
+        "SELECT table_id, shard_id, lineage_id, offset_order, offset_text, {projection} FROM {} \
+         WHERE {predicates} ORDER BY offset_order {direction}, offset_text {direction} LIMIT {}",
+        engine.relation_name("sys_stream_entries"),
         engine.engine().placeholder(binds.len() + 1)
-    ));
-    binds.push(SqlValue::Blob(
-        read.through.native_key().as_bytes().to_vec(),
-    ));
-    // The caller captured this lineage's safe committed high. Applying the
-    // old merged-pointer xmin encoding here would compare unrelated layouts.
-    Ok(row_statement(engine, &request, predicates, binds))
+    );
+    binds.push(SqlValue::Integer(i64::from(read.limit.get()) + 1));
+    Ok(SqlStatement::new(sql, binds))
 }
 
 fn row_predicates(
@@ -125,19 +146,19 @@ fn row_statement(
 
 pub(super) fn read_item(
     engine: impl SqlLayout,
-    stream: &StreamRowKind,
+    stream: &storage_types::StreamName,
     item_id: StreamItemId,
 ) -> SqlStatement {
     let sql = crate::sql_template::sql_template!(engine,
         "SELECT item_id, row_blob FROM " ["sys_dynamo_stream_items"], " WHERE stream_name = " {1},
         " AND item_id = " {2};
-        postgres_suffix(matches!(stream, StreamRowKind::User(_)),
-            " AND item_id < (decode('58494431', 'hex') || int8send(pg_snapshot_xmin(pg_current_snapshot())::text::bigint))")
+        postgres_suffix(true,
+            " AND item_id < (decode('58494431', 'hex') || int8send(pg_snapshot_xmin(pg_current_snapshot())::text::bigint + (SELECT transaction_offset FROM sys_system_stream_scope WHERE scope_key = 'system')))")
     );
     SqlStatement::new(
         sql,
         vec![
-            SqlValue::Blob(stream.value().as_ref().to_vec()),
+            SqlValue::Blob(stream.as_ref().to_vec()),
             SqlValue::Blob(item_id.as_bytes().to_vec()),
         ],
     )
@@ -189,10 +210,10 @@ pub(super) fn read_history(
         .map_err(|_| StorageEnum::HistoryUnavailable)?;
     Ok(SqlStatement::new(
         format!(
-            "SELECT shard_id, lineage_id, offset_order, offset_text, table_id, record_blob, \
-             created_at FROM {} WHERE shard_id = {} AND lineage_id = {} AND offset_order > {} AND \
-             offset_order <= {} ORDER BY offset_order, offset_text LIMIT {}",
-            engine.relation_name("sys_dynamo_stream_records"),
+            "SELECT table_id, shard_id, lineage_id, offset_order, offset_text, entry_blob FROM {} \
+             WHERE shard_id = {} AND lineage_id = {} AND offset_order > {} AND offset_order <= {} \
+             ORDER BY offset_order, offset_text LIMIT {}",
+            engine.relation_name("sys_stream_entries"),
             engine.engine().placeholder(1),
             engine.engine().placeholder(2),
             engine.engine().placeholder(3),
@@ -211,134 +232,79 @@ pub(super) fn read_history(
 
 pub(crate) fn scan_trim_records(
     engine: impl SqlLayout,
-    after: Option<&storage_types::SystemStreamPosition>,
+    start: &storage_types::SystemStreamPosition,
+    limit: usize,
 ) -> StorageResult<SqlStatement> {
-    let (predicate, binds) = trim_cursor_predicate(engine, after)?;
     Ok(SqlStatement::new(
         format!(
-            "SELECT r.shard_id, r.lineage_id, r.offset_order, r.offset_text, r.table_id, \
-             r.created_at FROM {} AS r {predicate} ORDER BY r.shard_id, r.lineage_id, \
-             r.offset_order, r.offset_text LIMIT {}",
-            engine.relation_name("sys_dynamo_stream_records"),
-            stream_provider::MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS + 1
+            "SELECT shard_id, lineage_id, offset_order, offset_text, created_at FROM {} WHERE \
+             shard_id = {} AND lineage_id = {} AND (offset_order, offset_text) > ({}, {}) ORDER \
+             BY offset_order, offset_text LIMIT {limit}",
+            engine.relation_name("sys_stream_entries"),
+            engine.engine().placeholder(1),
+            engine.engine().placeholder(2),
+            engine.engine().placeholder(3),
+            engine.engine().placeholder(4),
         ),
-        binds,
-    ))
-}
-
-fn trim_cursor_predicate(
-    engine: impl SqlLayout,
-    after: Option<&storage_types::SystemStreamPosition>,
-) -> StorageResult<(String, Vec<SqlValue>)> {
-    let mut binds = Vec::new();
-    let predicate = if let Some(position) = after {
-        binds.extend([
-            SqlValue::Text(position.shard_id().as_str().to_owned()),
-            SqlValue::Text(position.lineage_id().as_str().to_owned()),
+        vec![
+            SqlValue::Text(start.shard_id().as_str().to_owned()),
+            SqlValue::Text(start.lineage_id().as_str().to_owned()),
             SqlValue::Blob(
-                position
+                start
                     .offset()
                     .order()
-                    .map_err(|_| {
-                        storage_types::StorageError::internal(
-                            "SystemStream trim cursor offset is invalid",
-                        )
-                    })?
+                    .map_err(|_| storage_types::StorageError::internal("Invalid trim offset"))?
                     .to_be_bytes()
                     .to_vec(),
             ),
-            SqlValue::Text(position.offset().as_str().to_owned()),
-        ]);
-        format!(
-            "WHERE (r.shard_id, r.lineage_id, r.offset_order, r.offset_text) > ({})",
-            engine.engine().placeholders(4),
-        )
-    } else {
-        String::new()
-    };
-    Ok((predicate, binds))
-}
-
-pub(super) fn read_history_metadata(
-    engine: impl SqlLayout,
-    history: &storage_types::ItemHistoryAddress,
-) -> StorageResult<SqlStatement> {
-    let (sql, binds) = history_header_statement(engine, history)?.into_parts();
-    Ok(SqlStatement::new(
-        format!(
-            "{sql} ORDER BY item_id ASC LIMIT {}",
-            storage_provider::maintenance::ItemHistoryMetadataPage::MAX_ENTRIES + 1
-        ),
-        binds,
+            SqlValue::Text(start.offset().as_str().to_owned()),
+        ],
     ))
 }
 
-pub(super) fn read_history_header(
-    engine: impl SqlLayout,
-    reference: &storage_types::ItemHistoryReference,
-) -> StorageResult<SqlStatement> {
-    let (sql, mut binds) = history_header_statement(engine, reference.address())?.into_parts();
-    binds.push(SqlValue::Blob(
-        StreamItemId::from(reference.version()).as_bytes().to_vec(),
-    ));
-    Ok(SqlStatement::new(
-        format!("{sql} AND item_id = {}", engine.engine().placeholder(2)),
-        binds,
-    ))
+fn sequence_order(sequence: storage_types::TableStreamSequence) -> u64 {
+    let bytes = sequence.native_key();
+    let mut order = [0; 8];
+    order.copy_from_slice(&bytes.as_bytes()[4..]);
+    u64::from_be_bytes(order)
 }
 
-fn history_header_statement(
+fn table_history_predicates(
     engine: impl SqlLayout,
-    history: &storage_types::ItemHistoryAddress,
-) -> StorageResult<SqlStatement> {
-    let stream = history.physical_stream_name()?;
-    // This codec-derived numeric bound is SQL syntax: PostgreSQL substr takes
-    // int4, while the shared SQL integer bind is int8.
-    let prefix = stream_provider::StreamRowValue::history_metadata_prefix_bytes(history)?.get();
-    let length = if engine.engine() == SqlEngine::Postgres {
-        "octet_length(row_blob)"
-    } else {
-        "length(row_blob)"
-    };
-    Ok(SqlStatement::new(
-        format!(
-            "SELECT item_id, {length}, substr(row_blob, 1, {prefix}) FROM {} WHERE stream_name = \
-             {}",
-            engine.relation_name("sys_dynamo_stream_items"),
-            engine.engine().placeholder(1),
-        ),
-        vec![SqlValue::Blob(stream.as_ref().to_vec())],
-    ))
-}
-
-pub(super) fn read_history_namespace(
-    engine: impl SqlLayout,
-    history: storage_types::TableHistoryId,
-    after: Option<&[u8]>,
-) -> StorageResult<SqlStatement> {
-    let prefix = history.stream_prefix();
-    if after.is_some_and(|cursor| !cursor.starts_with(&prefix)) {
-        return Err(storage_types::StorageError::internal(
-            "History cursor belongs to another namespace",
-        ));
-    }
-    let mut end = prefix.clone();
-    let _ = end.pop();
-    end.push(b'0');
-    let mut sql = format!(
-        "SELECT stream_name FROM {} WHERE stream_name >= {} AND stream_name < {}",
-        engine.relation_name("sys_dynamo_stream_items"),
+    lane: &storage_types::TableHistoryLane,
+    through: storage_types::TableStreamSequence,
+) -> (String, Vec<SqlValue>) {
+    let predicates = format!(
+        "table_id = {} AND shard_id = {} AND lineage_id = {} AND offset_order <= {}",
         engine.engine().placeholder(1),
-        engine.engine().placeholder(2)
+        engine.engine().placeholder(2),
+        engine.engine().placeholder(3),
+        engine.engine().placeholder(4)
     );
-    let mut values = vec![SqlValue::Blob(prefix), SqlValue::Blob(end)];
-    if let Some(after) = after {
-        sql.push_str(&format!(
-            " AND stream_name > {}",
-            engine.engine().placeholder(3)
-        ));
-        values.push(SqlValue::Blob(after.to_vec()));
-    }
-    sql.push_str(" ORDER BY stream_name LIMIT 1");
-    Ok(SqlStatement::new(sql, values))
+    let binds = vec![
+        SqlValue::Blob(lane.history_id().as_ref().to_vec()),
+        SqlValue::Text(lane.shard_id().as_str().to_owned()),
+        SqlValue::Text(lane.lineage_id().as_str().to_owned()),
+        SqlValue::Blob(sequence_order(through).to_be_bytes().to_vec()),
+    ];
+    (predicates, binds)
+}
+
+pub(super) fn read_table_history_boundary(
+    engine: impl SqlLayout,
+    read: &stream_provider::TableHistoryBoundaryRead,
+) -> SqlStatement {
+    let (predicates, binds) = table_history_predicates(engine, &read.lane, read.through);
+    let direction = match read.direction {
+        ReadDirection::Forward => "ASC",
+        ReadDirection::Backward => "DESC",
+    };
+    SqlStatement::new(
+        format!(
+            "SELECT offset_order, offset_text FROM {} WHERE {predicates} ORDER BY offset_order \
+             {direction}, offset_text {direction} LIMIT 1",
+            engine.relation_name("sys_stream_entries")
+        ),
+        binds,
+    )
 }

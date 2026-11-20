@@ -9,7 +9,7 @@ use super::{
 };
 use crate::types::{KeyAttributes, StorageError, TableName};
 
-#[derive(Debug)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub(super) struct PointReadRequest {
     pub(super) table_name: TableName,
     pub(super) key: KeyAttributes,
@@ -17,7 +17,8 @@ pub(super) struct PointReadRequest {
     pub(super) charge: NonZeroUsize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PointReadPlan {
     pub(super) observer: super::observer::PointReadObserver,
     requests: Vec<Arc<PointReadRequest>>,

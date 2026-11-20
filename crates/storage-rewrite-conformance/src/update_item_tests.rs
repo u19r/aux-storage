@@ -117,6 +117,7 @@ async fn given_versioned_item_when_conditional_updates_run_then_only_matching_ed
         .expect("valid seed PutItem");
         store.operations.put_item(put).await.expect("seed versioned item");
 
+        store.wait_until_changes_are_readable().await;
         let before = super::cdc_stream_tests::system_records(&store, 10)
             .await.expect("read CDC before update");
         assert_eq!(before.len(), 1);
@@ -180,6 +181,7 @@ async fn given_versioned_item_when_conditional_updates_run_then_only_matching_ed
         let read = store.operations.get_item(read).await.expect("read updated item");
         assert_eq!(serde_json::to_value(read).expect("serialize updated item"),
             json!({"Item": updated}));
+        store.wait_until_changes_are_readable().await;
         let after_commit = super::cdc_stream_tests::system_records(&store, 10)
             .await.expect("read CDC after accepted update");
         assert_eq!(after_commit.len(), 2);
@@ -217,10 +219,7 @@ async fn given_missing_table_when_update_item_runs_then_resource_not_found_respo
             .result
             .expect_err("missing table rejects UpdateItem"),
         axum::http::StatusCode::BAD_REQUEST,
-        &format!(
-            r#"{{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: {} not found"}}"#,
-            table.as_ref()
-        ),
+        r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
     );
     store.finish().await;
 }
@@ -269,10 +268,7 @@ async fn given_concurrent_updates_when_outcomes_vary_then_acknowledged_images_ar
                 );
                 acknowledged.insert(operation, count);
             }
-            Err(error)
-                if error.native_attempt_rejection()
-                    == Some(storage_types::NativeAttemptRejection::Conflict) =>
-            {
+            Err(error) if error.attempt_kind() == Some(storage_types::AttemptKind::Conflict) => {
                 rejected += 1
             }
             Err(error) if error.is_commit_unknown() => {
@@ -307,12 +303,24 @@ async fn given_concurrent_updates_when_outcomes_vary_then_acknowledged_images_ar
         acknowledged.values().all(|count| *count <= current),
         "acknowledged images cannot exceed current state"
     );
-    let records = crate::image_retention_tests::table_records(&store, &table)
+    store.wait_until_changes_are_readable().await;
+    // One lane can contain all 32 updates; the public page divides its budget
+    // among four native lanes, so a 100-record page can contain only 25 here.
+    let records = store
+        .operations
+        .get_stream_records(storage_types::GetStreamRecordsRequest::table(
+            table.clone(),
+            None,
+            Some(1000),
+        ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_parts()
+        .0;
     assert!(
         records.len() >= current,
-        "primary writes must have their history images"
+        "primary writes must have their history images: primary={current}, images={}",
+        records.len()
     );
     assert!(
         records.len() <= acknowledged.len() + unknown.len(),

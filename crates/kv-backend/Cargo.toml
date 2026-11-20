@@ -11,8 +11,8 @@ doctest = false
 
 [features]
 default = []
-fault-injection = ["dep:tracing"]
-foundationdb = ["dep:foundationdb"]
+fault-injection = ["dep:tracing", "storage-common/fault-injection"]
+foundationdb = ["dep:foundationdb", "dep:tracing"]
 simulation = ["foundationdb"]
 test-support = []
 rocksdb = ["dep:rocksdb"]
@@ -28,6 +28,7 @@ infrastructure-provider = { workspace = true }
 metrics-facade = { workspace = true }
 pubsub-provider = { path = "../pubsub-provider" }
 queue-provider = { path = "../queue-provider" }
+regional-replication = { path = "../regional-replication" }
 rocksdb = { workspace = true, optional = true }
 scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
@@ -35,7 +36,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 storage-backfill = { path = "../storage-backfill" }
 storage-common = { path = "../storage-common" }
-storage-condition = { path = "../storage-condition" }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types", default-features = false, features = ["rocksdb"] }
 stream-provider = { path = "../stream-provider" }
@@ -46,6 +46,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 storage-provider = { path = "../storage-provider", features = ["test-support"] }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

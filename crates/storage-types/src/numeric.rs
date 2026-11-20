@@ -8,29 +8,6 @@ use rust_decimal::prelude::*;
 
 use crate::constants::NUMERIC_HEX;
 
-/// Binary encoding for Decimal values with variable length encoding that
-/// preserves lexicographic sort order
-pub trait SortableVec {
-    /// Encode a numeric value (implemented for Decimal) into a byte vector that
-    /// preserves ascending lexicographic order matching its numeric order.
-    fn encode(&self) -> Vec<u8>;
-    /// Decode from previously produced bytes.
-    fn decode(bytes: &[u8]) -> Result<Self, DecimalEncodingError>
-    where Self: Sized;
-
-    /// NEW: Accept a numeric string (integer or decimal) and convert it into a
-    /// `SortableNumeric` newtype (hex string of encoded bytes) that can be
-    /// stored as part of keys (e.g. for descending/ascending ordering when
-    /// combined with other segments). Implemented only for Decimal; other
-    /// impls may return Unsupported errors if added later.
-    fn from_numeric_str(num: &str) -> Result<SortableNumeric, DecimalEncodingError>
-    where Self: Sized;
-
-    /// Decode a `SortableNumeric` back into a Decimal (implemented for
-    /// Decimal).
-    fn decode_numeric(sortable: &SortableNumeric) -> Result<Decimal, DecimalEncodingError>;
-}
-
 /// A wrapper around a hex-encoded sortable numeric representation. Chosen as
 /// String (not Vec<u8>) so it can easily concatenate into primary / sort keys
 /// directly without additional base encoding.
@@ -44,148 +21,150 @@ impl SortableNumeric {
     }
 
     pub fn ascending(num: &str) -> Result<Self, DecimalEncodingError> {
-        <Decimal as SortableVec>::from_numeric_str(num)
+        sortable_from_numeric_str(num)
     }
 
     /// Produce a descending sortable variant by bitwise inverting the encoded
     /// bytes (so lexicographic ascending gives numeric descending). This keeps
     /// the same length and character set.
     pub fn descending(num: &str) -> Result<Self, DecimalEncodingError> {
-        let base = <Decimal as SortableVec>::from_numeric_str(num)?;
+        let base = sortable_from_numeric_str(num)?;
         let bytes = hex_decode(base.as_str()).map_err(DecimalEncodingError::InvalidHex)?;
         let inverted: Vec<u8> = bytes.into_iter().map(|b| !b).collect();
         Ok(SortableNumeric(hex_encode(&inverted)))
     }
 }
 
-impl SortableVec for Decimal {
-    fn encode(&self) -> Vec<u8> {
-        let decimal = self;
-        if decimal.is_zero() {
-            // Special case for zero - use a value between negative and positive
-            // numbers
-            return vec![0b0000_1111]; // 15 - sorts between negatives (0-14) and positives (16+)
-        }
-
-        let is_positive = decimal.is_sign_positive();
-        let abs_decimal = decimal.abs();
-
-        // Get the decimal parts: mantissa and scale for exact reconstruction
-        let mantissa = abs_decimal.mantissa();
-        let scale = abs_decimal.scale();
-        let mantissa_u64 = if mantissa < 0 {
-            (-mantissa) as u64
-        } else {
-            mantissa as u64
-        };
-
-        // Calculate order-of-magnitude for scale index selection
-        let magnitude = calculate_magnitude(abs_decimal);
-        let scale_index = magnitude_to_scale_index(magnitude);
-
-        // Create a normalized value for sorting: multiply to get a large
-        // integer
-        let normalized_value = create_normalized_value(abs_decimal, scale_index);
-        let normalized_bytes = encode_normalized_value(normalized_value);
-
-        // Encode original scale and mantissa for exact reconstruction
-        let scale_bytes = encode_scale(scale);
-        let mantissa_bytes = encode_significand(mantissa_u64);
-
-        // Create the header byte: reserved(4) + scale_index(4) using least
-        // significant bits This ensures all decimal numbers sort before UTF-8
-        // characters (which start at 65+)
-        let mut result = Vec::with_capacity(
-            1 + normalized_bytes.len() + scale_bytes.len() + mantissa_bytes.len(),
-        );
-
-        if is_positive {
-            // For positive numbers: use scale_index directly in least
-            // significant bits
-
-            let header = 0b0001_0000 | (scale_index as u8); // 0001SSSS format
-            result.push(header);
-            result.extend_from_slice(&normalized_bytes);
-            result.extend_from_slice(&scale_bytes);
-            result.extend_from_slice(&mantissa_bytes);
-        } else {
-            // For negative numbers: use inverted scale index to preserve sort
-            // order
-            let inverted_scale = 15 - scale_index;
-
-            let header = inverted_scale as u8; // 0000SSSS format (no high bits set)
-            result.push(header);
-
-            // Invert normalized, scale and mantissa bytes for negative numbers
-            for byte in normalized_bytes {
-                result.push(!byte);
-            }
-            for byte in scale_bytes {
-                result.push(!byte);
-            }
-            for byte in mantissa_bytes {
-                result.push(!byte);
-            }
-        }
-
-        result
+/// Encode a decimal into bytes whose ascending lexicographic order matches its
+/// numeric order.
+#[must_use]
+pub fn encode_decimal(decimal: &Decimal) -> Vec<u8> {
+    if decimal.is_zero() {
+        // Special case for zero - use a value between negative and positive
+        // numbers
+        return vec![0b0000_1111]; // 15 - sorts between negatives (0-14) and positives (16+)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, DecimalEncodingError> {
-        if bytes.is_empty() {
-            return Err(DecimalEncodingError::EmptyInput);
+    let is_positive = decimal.is_sign_positive();
+    let abs_decimal = decimal.abs();
+
+    // Get the decimal parts: mantissa and scale for exact reconstruction
+    let mantissa = abs_decimal.mantissa();
+    let scale = abs_decimal.scale();
+    let mantissa_u64 = if mantissa < 0 {
+        (-mantissa) as u64
+    } else {
+        mantissa as u64
+    };
+
+    // Calculate order-of-magnitude for scale index selection
+    let magnitude = calculate_magnitude(abs_decimal);
+    let scale_index = magnitude_to_scale_index(magnitude);
+
+    // Create a normalized value for sorting: multiply to get a large
+    // integer
+    let normalized_value = create_normalized_value(abs_decimal, scale_index);
+    let normalized_bytes = encode_normalized_value(normalized_value);
+
+    // Encode original scale and mantissa for exact reconstruction
+    let scale_bytes = encode_scale(scale);
+    let mantissa_bytes = encode_significand(mantissa_u64);
+
+    // Create the header byte: reserved(4) + scale_index(4) using least
+    // significant bits This ensures all decimal numbers sort before UTF-8
+    // characters (which start at 65+)
+    let mut result =
+        Vec::with_capacity(1 + normalized_bytes.len() + scale_bytes.len() + mantissa_bytes.len());
+
+    if is_positive {
+        // For positive numbers: use scale_index directly in least
+        // significant bits
+
+        let header = 0b0001_0000 | (scale_index as u8); // 0001SSSS format
+        result.push(header);
+        result.extend_from_slice(&normalized_bytes);
+        result.extend_from_slice(&scale_bytes);
+        result.extend_from_slice(&mantissa_bytes);
+    } else {
+        // For negative numbers: use inverted scale index to preserve sort
+        // order
+        let inverted_scale = 15 - scale_index;
+
+        let header = inverted_scale as u8; // 0000SSSS format (no high bits set)
+        result.push(header);
+
+        // Invert normalized, scale and mantissa bytes for negative numbers
+        for byte in normalized_bytes {
+            result.push(!byte);
         }
-
-        let header = bytes[0];
-        let is_positive = (header & 0b0001_0000) != 0; // Check positive marker bit
-
-        if bytes.len() == 1 && header == 0b0000_1111 {
-            return Ok(Decimal::ZERO);
+        for byte in scale_bytes {
+            result.push(!byte);
         }
-
-        let scale_index = if is_positive {
-            (header & 0b0000_1111) as usize // Extract scale from least significant 4 bits
-        } else {
-            15 - (header & 0b0000_1111) as usize // Invert for negative numbers
-        };
-
-        if scale_index >= 16 {
-            return Err(DecimalEncodingError::InvalidScaleIndex(scale_index));
+        for byte in mantissa_bytes {
+            result.push(!byte);
         }
-
-        let data_bytes = &bytes[1..];
-        let (scale, mantissa) = if is_positive {
-            decode_normalized_scale_and_mantissa(data_bytes)?
-        } else {
-            // For negative numbers, invert the bytes back
-            let inverted: Vec<u8> = data_bytes.iter().map(|b| !b).collect();
-            decode_normalized_scale_and_mantissa(&inverted)?
-        };
-
-        // Reconstruct the decimal using mantissa and scale directly
-        let mut result = if scale == 0 {
-            Decimal::from(mantissa)
-        } else {
-            Decimal::from_i128_with_scale(i128::from(mantissa), scale)
-        };
-
-        if !is_positive {
-            result = -result;
-        }
-
-        Ok(result)
     }
 
-    fn from_numeric_str(num: &str) -> Result<SortableNumeric, DecimalEncodingError> {
-        let dec = Decimal::from_str(num)?;
-        let bytes = dec.encode();
-        Ok(SortableNumeric(hex_encode(&bytes)))
+    result
+}
+
+/// Decode bytes produced by [`encode_decimal`].
+pub fn decode_decimal(bytes: &[u8]) -> Result<Decimal, DecimalEncodingError> {
+    if bytes.is_empty() {
+        return Err(DecimalEncodingError::EmptyInput);
     }
 
-    fn decode_numeric(sortable: &SortableNumeric) -> Result<Decimal, DecimalEncodingError> {
-        let bytes = hex_decode(&sortable.0).map_err(DecimalEncodingError::InvalidHex)?;
-        Decimal::decode(&bytes)
+    let header = bytes[0];
+    let is_positive = (header & 0b0001_0000) != 0; // Check positive marker bit
+
+    if bytes.len() == 1 && header == 0b0000_1111 {
+        return Ok(Decimal::ZERO);
     }
+
+    let scale_index = if is_positive {
+        (header & 0b0000_1111) as usize // Extract scale from least significant 4 bits
+    } else {
+        15 - (header & 0b0000_1111) as usize // Invert for negative numbers
+    };
+
+    if scale_index >= 16 {
+        return Err(DecimalEncodingError::InvalidScaleIndex(scale_index));
+    }
+
+    let data_bytes = &bytes[1..];
+    let (scale, mantissa) = if is_positive {
+        decode_normalized_scale_and_mantissa(data_bytes)?
+    } else {
+        // For negative numbers, invert the bytes back
+        let inverted: Vec<u8> = data_bytes.iter().map(|b| !b).collect();
+        decode_normalized_scale_and_mantissa(&inverted)?
+    };
+
+    // Reconstruct the decimal using mantissa and scale directly
+    let mut result = if scale == 0 {
+        Decimal::from(mantissa)
+    } else {
+        Decimal::from_i128_with_scale(i128::from(mantissa), scale)
+    };
+
+    if !is_positive {
+        result = -result;
+    }
+
+    Ok(result)
+}
+
+/// Encode a numeric string as an ascending [`SortableNumeric`].
+pub fn sortable_from_numeric_str(num: &str) -> Result<SortableNumeric, DecimalEncodingError> {
+    let dec = Decimal::from_str(num)?;
+    let bytes = encode_decimal(&dec);
+    Ok(SortableNumeric(hex_encode(&bytes)))
+}
+
+/// Decode a [`SortableNumeric`] back into a decimal.
+pub fn decode_numeric(sortable: &SortableNumeric) -> Result<Decimal, DecimalEncodingError> {
+    let bytes = hex_decode(&sortable.0).map_err(DecimalEncodingError::InvalidHex)?;
+    decode_decimal(&bytes)
 }
 
 static SCALING_FACTORS: [i32; 16] = [

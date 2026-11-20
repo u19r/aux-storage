@@ -4,7 +4,7 @@ use foundationdb::{
     Transaction,
     options::{MutationType, TransactionOption},
 };
-use storage_types::{InfrastructureResultKind, StorageResult};
+use storage_types::StorageResult;
 
 use super::{error::map_operation_error, input_limits::NativeInputLimits};
 use crate::{KvMutation, KvVersionstampedMutation};
@@ -26,7 +26,8 @@ impl NativeInputLimits {
                 | KvMutation::DeleteUnchunked { key } => {
                     *key = self.prefix_key(std::mem::take(key))?;
                 }
-                KvMutation::DeleteRange { begin, end } => {
+                KvMutation::DeleteRange { begin, end }
+                | KvMutation::ClearUnchunkedRange { begin, end } => {
                     *begin = self.prefix_key(std::mem::take(begin))?;
                     *end = self.prefix_key(std::mem::take(end))?;
                 }
@@ -45,7 +46,7 @@ impl NativeInputLimits {
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(changes.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for change in changes {
             physical.push(self.prepare_stamped_key(change)?);
         }
@@ -62,16 +63,23 @@ impl NativeInputLimits {
         Self::versionstamped_value(&value, offset)?;
         value
             .try_reserve_exact(std::mem::size_of::<u32>())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         let key = self.prefix_key(key)?;
         value.extend_from_slice(&offset.to_le_bytes());
         Ok((key, value))
     }
 }
 
+/// The fault probe and the provider prefix bytes, to report each physical
+/// mutation.
+pub(super) type StageObserver<'a> = (Option<&'a dyn crate::KvFaultProbe>, usize);
+
 impl PreparedMutations {
-    pub(super) fn stage(self, transaction: &Transaction) {
+    pub(super) fn stage(self, transaction: &Transaction, (probe, prefix_bytes): StageObserver<'_>) {
         for change in self.0 {
+            if let Some(probe) = probe {
+                observe_mutation(probe, prefix_bytes, &change);
+            }
             match change {
                 KvMutation::Put { key, value } | KvMutation::PutUnchunked { key, value } => {
                     transaction.set(&key, &value)
@@ -79,15 +87,57 @@ impl PreparedMutations {
                 KvMutation::Delete { key } | KvMutation::DeleteUnchunked { key } => {
                     transaction.clear(&key)
                 }
-                KvMutation::DeleteRange { begin, end } => transaction.clear_range(&begin, &end),
+                KvMutation::DeleteRange { begin, end }
+                | KvMutation::ClearUnchunkedRange { begin, end } => {
+                    transaction.clear_range(&begin, &end)
+                }
             }
         }
     }
 }
 
+/// Each set and clear adds a write conflict key, a clear range a write
+/// conflict range.
+fn observe_mutation(probe: &dyn crate::KvFaultProbe, prefix_bytes: usize, change: &KvMutation) {
+    let (kind, key, native_bytes) = match change {
+        KvMutation::Put { key, value } | KvMutation::PutUnchunked { key, value } => {
+            (crate::KvAccessKind::Write, key, key.len() + value.len())
+        }
+        KvMutation::Delete { key } | KvMutation::DeleteUnchunked { key } => {
+            (crate::KvAccessKind::Clear, key, key.len())
+        }
+        KvMutation::DeleteRange { begin, end } | KvMutation::ClearUnchunkedRange { begin, end } => {
+            (
+                crate::KvAccessKind::ClearRange,
+                begin,
+                begin.len() + end.len(),
+            )
+        }
+    };
+    probe.observe_access(crate::KvAccess {
+        kind,
+        key: key.get(prefix_bytes..).unwrap_or_default(),
+        native_bytes,
+        conflict: true,
+    });
+}
+
 impl PreparedStampedMutations {
-    pub(super) fn stage(self, transaction: &Transaction) -> StorageResult<()> {
+    /// Each key has no write conflict range.
+    pub(super) fn stage(
+        self,
+        transaction: &Transaction,
+        (probe, prefix_bytes): StageObserver<'_>,
+    ) -> StorageResult<()> {
         for (key, value) in self.0 {
+            if let Some(probe) = probe {
+                super::attempt::observe_native_write(
+                    probe,
+                    prefix_bytes,
+                    (&key, value.len()),
+                    false,
+                );
+            }
             transaction
                 .set_option(TransactionOption::NextWriteNoWriteConflictRange)
                 .map_err(map_operation_error)?;

@@ -1,66 +1,28 @@
 //! KV key layouts for GSI build records and materialized projections.
 
 use sha2::{Digest as _, Sha256};
-use storage_types::{
-    AttributeMap, BoundTableInfo, IndexName, ItemKey, StorageError, StorageResult, WireItem,
-};
+use storage_types::{BoundTableInfo, IndexName, ItemKey, StorageError, StorageResult};
 
 use crate::{
-    catalog::{KvIndexKind, KvTableIdentity},
-    constants::{
-        GSI_BUILD_FAMILY, GSI_NAME_LOCK_FAMILY, GSI_PROJECTION_FAMILY, GSI_RUNNABLE_FAMILY,
-        GSI_TOMBSTONE_FAMILY,
-    },
+    constants::GSI_RUNNABLE_FAMILY,
+    table_key_layout::{TableSubFamily, table_key},
 };
 
-pub(super) struct ProjectionKeys {
-    pub live: Vec<u8>,
-    pub tombstone: Vec<u8>,
+pub(super) fn entry_key(table_id: u32, index_id: u16, suffix: &[u8]) -> StorageResult<Vec<u8>> {
+    table_key(
+        table_id,
+        TableSubFamily::GsiEntry,
+        &[&index_id.to_be_bytes(), suffix],
+    )
 }
 
-impl ProjectionKeys {
-    pub(super) fn try_from_suffix(
-        table_id: u32,
-        index_id: u16,
-        suffix: Vec<u8>,
-    ) -> StorageResult<Self> {
-        let physical = |family: u8, suffix: &[u8]| -> StorageResult<Vec<u8>> {
-            let count = 7usize
-                .checked_add(suffix.len())
-                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            let mut key = Vec::new();
-            key.try_reserve_exact(count)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            key.push(family);
-            key.extend_from_slice(&index_incarnation(table_id, index_id));
-            key.extend_from_slice(suffix);
-            Ok(key)
-        };
-        Ok(Self {
-            live: physical(GSI_PROJECTION_FAMILY, &suffix)?,
-            tombstone: physical(GSI_TOMBSTONE_FAMILY, &suffix)?,
-        })
-    }
+/// All entries of one index incarnation.
+pub(crate) fn index_entry_prefix(table_id: u32, index_id: u16) -> StorageResult<Vec<u8>> {
+    entry_key(table_id, index_id, &[])
 }
 
 fn hash_partition(suffix: &[u8]) -> [u8; 32] {
     Sha256::digest(suffix).into()
-}
-
-pub(super) fn projection_keys(
-    identity: &KvTableIdentity,
-    table: &BoundTableInfo,
-    key: &storage_backfill::GsiProjectionKey,
-) -> StorageResult<ProjectionKeys> {
-    let index_id = identity
-        .indexes
-        .iter()
-        .find(|candidate| {
-            candidate.index_name == key.index_name && candidate.index_kind == KvIndexKind::UserGsi
-        })
-        .ok_or_else(|| StorageError::internal("GSI projection has no KV index identity"))?
-        .index_id;
-    ProjectionKeys::try_from_suffix(identity.table_id, index_id, projection_suffix(table, key)?)
 }
 
 pub(super) fn projection_suffix(
@@ -71,17 +33,12 @@ pub(super) fn projection_suffix(
 }
 
 pub(crate) fn ordered_projection_key(
-    identity: &KvTableIdentity,
+    table_id: u32,
     index_id: u16,
     key: &ItemKey,
 ) -> StorageResult<Vec<u8>> {
     // Native order and public continuation evidence use the same complete key.
-    Ok([
-        vec![GSI_PROJECTION_FAMILY],
-        index_incarnation(identity.table_id, index_id).to_vec(),
-        ordered_projection_suffix(key)?,
-    ]
-    .concat())
+    entry_key(table_id, index_id, &ordered_projection_suffix(key)?)
 }
 
 pub(crate) fn ordered_projection_suffix(key: &ItemKey) -> StorageResult<Vec<u8>> {
@@ -114,22 +71,22 @@ fn compact_partition(key: &ItemKey, encoded: Vec<u8>) -> StorageResult<Vec<u8>> 
         .ok_or_else(|| StorageError::internal("GSI partition encoding differs from full key"))?;
     let count = 32usize
         .checked_add(tail.len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut suffix = Vec::new();
     suffix
         .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     suffix.extend_from_slice(&hash_partition(&partition));
     suffix.extend_from_slice(tail);
     Ok(suffix)
 }
 
-pub(crate) fn gsi_name_lock_key(table_id: u32, index: &IndexName) -> Vec<u8> {
-    let mut key = Vec::with_capacity(5 + index.as_ref().len());
-    key.push(GSI_NAME_LOCK_FAMILY);
-    key.extend_from_slice(&table_id.to_be_bytes());
-    key.extend_from_slice(index.as_ref().as_bytes());
-    key
+pub(crate) fn gsi_name_lock_key(table_id: u32, index: &IndexName) -> StorageResult<Vec<u8>> {
+    table_key(
+        table_id,
+        TableSubFamily::GsiNameLock,
+        &[index.as_ref().as_bytes()],
+    )
 }
 
 /// A GSI incarnation is the table ID followed by its stable index ID.
@@ -140,48 +97,17 @@ pub(crate) fn index_incarnation(table_id: u32, index_id: u16) -> [u8; 6] {
     bytes
 }
 
-pub(super) fn gsi_build_key(table_id: u32, index_id: u16) -> Vec<u8> {
-    let mut key = Vec::with_capacity(7);
-    key.push(GSI_BUILD_FAMILY);
-    key.extend_from_slice(&index_incarnation(table_id, index_id));
-    key
+pub(super) fn gsi_build_key(table_id: u32, index_id: u16) -> StorageResult<Vec<u8>> {
+    table_key(
+        table_id,
+        TableSubFamily::GsiBuild,
+        &[&index_id.to_be_bytes()],
+    )
 }
 
-pub(super) fn gsi_runnable_key(table_id: u32, index_id: u16) -> Vec<u8> {
+pub(crate) fn gsi_runnable_key(table_id: u32, index_id: u16) -> Vec<u8> {
     let mut key = Vec::with_capacity(7);
     key.push(GSI_RUNNABLE_FAMILY);
     key.extend_from_slice(&index_incarnation(table_id, index_id));
     key
-}
-
-pub(super) fn require_projection_key(
-    table: &BoundTableInfo,
-    index: &IndexName,
-    physical: &[u8],
-    image: &WireItem,
-) -> StorageResult<()> {
-    let definition = table
-        .global_secondary_indexes
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find(|definition| &definition.index_name == index)
-        .ok_or_else(|| StorageError::internal("KV projection index is absent"))?;
-    let attributes = AttributeMap::try_from(image)?;
-    let key = ItemKey::from_key_schema_for_index(
-        table.table_name.clone(),
-        &table.key_schema,
-        index,
-        &definition.key_schema,
-        &attributes,
-    )?
-    .ok_or_else(|| StorageError::internal("KV projection image lacks its key"))?;
-    if physical.get(crate::constants::GSI_PROJECTION_KEY_PREFIX_BYTES..)
-        != Some(ordered_projection_suffix(&key)?.as_slice())
-    {
-        return Err(StorageError::internal(
-            "KV projection image differs from its physical key",
-        ));
-    }
-    Ok(())
 }

@@ -12,7 +12,7 @@ use serde::Serialize;
 use storage_types::TimestampMillis;
 use url::Url;
 
-use crate::manager::PubsubDeliveryConfig;
+use crate::delivery_config::PubsubDeliveryConfig;
 
 pub trait PubsubNotificationSigner: Send + Sync {
     fn sign(&self, request: PubsubNotificationSignRequest<'_>) -> PubsubResult<String>;

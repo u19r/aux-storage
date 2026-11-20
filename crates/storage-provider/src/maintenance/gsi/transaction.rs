@@ -3,12 +3,11 @@
 use std::sync::Arc;
 
 use storage_backfill::{
-    GsiActivationState, GsiBuild, GsiBuildCandidates, GsiBuildTarget, GsiPageLimit, GsiProjection,
-    GsiProjectionKey, GsiProjectionStateReadBatch, GsiScanSourcePage, GsiStreamSourcePage,
+    GsiBuild, GsiBuildCandidates, GsiBuildTarget, GsiPageLimit, GsiScanSourcePage,
 };
 use storage_common::TtlConfigRecord;
 use storage_types::{
-    BoundTableInfo, Revision, StorageResult, SystemStreamCheckpoint, TableName,
+    BoundTableInfo, Revision, StorageResult, TableName,
     maintenance::{MaintenanceKind, TargetIncarnation, TaskProgress},
 };
 
@@ -22,8 +21,8 @@ pub struct GsiAttempt<'a, P: GsiPort, S = OrdinaryGsiBuild> {
     admission: S,
     pub(super) table: Option<Arc<BoundTableInfo>>,
     pub(super) ttl: Option<Option<TtlConfigRecord>>,
-    progress_fence: P::ProgressFence,
-    pub(super) captured_at: storage_types::TimestampMillis,
+    pub(super) progress_fence: crate::maintenance::ProgressFence,
+    primary_ttl_metadata: Vec<super::PrimaryTtlMetadata>,
 }
 
 impl<P: GsiPort> GsiAttempt<'_, P> {
@@ -55,7 +54,7 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiAttempt<'_, P, S> {
                 table: None,
                 ttl: None,
                 progress_fence,
-                captured_at: request.captured_at,
+                primary_ttl_metadata: Vec::new(),
             };
             start.advance(&mut attempt).await
         }
@@ -82,6 +81,17 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiCandidateRead<Vec<u8>> for GsiAtte
         if !build.state.is_runnable() {
             return Ok(true);
         }
+        // Only the empty Building page activates the TTL policy and changes the
+        // binding. Fill pages keep the shared catalog lock, so ordinary writers
+        // of the table do not wait for each page; their rows are read FOR
+        // UPDATE.
+        if build.target.index_name.is_ttl_index()
+            && matches!(build.state, storage_backfill::GsiState::Building(_))
+        {
+            self.port
+                .lock_catalog_for_change(&build.target.table_name)
+                .await?;
+        }
         let table = self.load_table(&build.target.table_name).await?;
         Ok(table.table_status == storage_types::TableStatus::Active)
     }
@@ -93,6 +103,26 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiCandidateRead<Vec<u8>> for GsiAtte
 
 impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_, P, S> {
     type Cursor = Vec<u8>;
+
+    async fn advance_native_gsi(
+        &mut self,
+        build: &GsiBuild<Vec<u8>>,
+        progress: super::NativeGsiProgress,
+    ) -> StorageResult<Option<GsiBuildAdvance>> {
+        if P::NATIVE_INDEX
+            && !build.target.index_name.is_ttl_index()
+            && matches!(
+                build.state,
+                storage_backfill::GsiState::Filling(_) | storage_backfill::GsiState::Building(_)
+            )
+        {
+            self.advance_native_index(build.clone(), progress)
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
 
     async fn read_gsi_admission(
         &mut self,
@@ -137,64 +167,38 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_
     ) -> StorageResult<GsiScanSourcePage<Self::Cursor>> {
         let table = self.load_table(&target.table_name).await?;
         target.validate_table(&table)?;
-        self.port
+        let page = self
+            .port
             .load_gsi_scan_source_page(GsiScanSource {
                 table: &table,
                 target,
                 after,
                 limit,
             })
-            .await
-    }
-
-    async fn read_gsi_stream_source_page(
-        &mut self,
-        target: &GsiBuildTarget,
-        after: &SystemStreamCheckpoint,
-        through: &SystemStreamCheckpoint,
-        limit: GsiPageLimit,
-    ) -> StorageResult<GsiStreamSourcePage> {
-        let table = self.load_table(&target.table_name).await?;
-        target.validate_table(&table)?;
-        let history = self.port.read_system_page_start().await?;
-        let plan = history
-            .plan_page(
-                after,
-                through,
-                u32::from(limit).min(crate::constants::GSI_STREAM_PAGE_ROWS),
-            )
-            .map_err(|_| storage_types::StorageEnum::HistoryUnavailable)?;
-        let pages = self.port.read_system_history_pages(plan.as_ref()).await?;
-        let mut assembly = storage_backfill::GsiStreamPageAssembly::new(&plan, table.history_id);
-        assembly.push_pages(plan.as_ref(), pages)?;
-        assembly.finish(self.port, &table, through).await
-    }
-
-    async fn read_gsi_projection_states(
-        &mut self,
-        batch: GsiProjectionStateReadBatch<'_>,
-    ) -> StorageResult<Vec<Option<GsiProjection<GsiProjectionKey>>>> {
-        let table = self.load_table(&batch.table.table_name).await?;
-        batch.target.validate_table(&table)?;
-        self.port.load_gsi_projection_states(&table, batch).await
-    }
-
-    async fn validate_gsi_frontier(
-        &mut self,
-        current: &SystemStreamCheckpoint,
-        through: &SystemStreamCheckpoint,
-    ) -> StorageResult<()> {
-        self.port.load_gsi_frontier(current, through).await
-    }
-
-    async fn read_gsi_activation_state(
-        &mut self,
-        target: &GsiBuildTarget,
-        _through: SystemStreamCheckpoint,
-    ) -> StorageResult<GsiActivationState> {
-        let table = self.load_table(&target.table_name).await?;
-        target.validate_table(&table)?;
-        self.port.load_gsi_activation_state(&table, target).await
+            .await?;
+        if P::NATIVE_INDEX && target.index_name.is_ttl_index() {
+            let config = table.binding.ttl.as_ref().ok_or_else(|| {
+                storage_types::StorageError::internal("TTL fill policy is absent")
+            })?;
+            // The page read its source rows FOR UPDATE; these current images
+            // remain protected through checkpoint commit.
+            let rows = page
+                .items
+                .iter()
+                .map(|source| {
+                    Ok(super::PrimaryTtlMetadata {
+                        key: table.info.table_key_from_wire(&source.item)?,
+                        ttl: storage_common::TtlIndexKey::for_wire_item(
+                            &table.info,
+                            &config.attribute,
+                            &source.item,
+                        )?,
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            self.primary_ttl_metadata = rows;
+        }
+        Ok(page)
     }
 
     async fn read_gsi_ttl_config(
@@ -221,30 +225,21 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_
 
     async fn write_gsi_transition(
         &mut self,
-        transition: GsiTransition<'_, Self::Cursor>,
+        mut transition: GsiTransition<'_, Self::Cursor>,
     ) -> StorageResult<()> {
         let table = self
             .load_table(&transition.expected.target.table_name)
             .await?;
         transition.validate_table(&table)?;
-        // The shared executor derives TTL activation from this attempt's
-        // protected policy observation. A concurrent policy change is rejected
-        // by the native conflict fence (KV) or conditional update (SQL), never
-        // a cached-value check.
-        let release = if !transition.next_state.is_runnable() {
-            crate::TableUpdateChange::release_gsi_capture(
-                &table.info,
-                &transition.expected.target.index_name,
-            )
-        } else {
-            None
-        };
+        transition.primary_ttl_metadata = std::mem::take(&mut self.primary_ttl_metadata);
+        let progress = crate::maintenance::ProgressWrite::new(
+            MaintenanceKind::GsiBackfill,
+            &self.progress_fence,
+            transition.expected_revision,
+            &transition.next_progress,
+        )?;
         self.port
-            .store_gsi_transition(&table, transition, &self.progress_fence)
-            .await?;
-        if let Some(change) = release {
-            self.persist_capture_release(&table, change).await?;
-        }
-        Ok(())
+            .store_gsi_transition(&table, transition, progress)
+            .await
     }
 }

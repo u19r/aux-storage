@@ -1,15 +1,12 @@
 //! Public stream append receipts and bounded reads on every replacement
 //! backend.
 
-use std::{
-    panic::{AssertUnwindSafe, resume_unwind},
-    time::Duration,
-};
+use std::panic::{AssertUnwindSafe, resume_unwind};
 
 use futures::FutureExt as _;
 use storage_observability_test_support::observation::observe;
 use storage_types::UserStreamName;
-use stream_provider::{StreamDataType, StreamPartitioningMode, StreamRowKind};
+use stream_provider::{StreamDataType, StreamPartitioningMode};
 
 use super::test_support::TestStore;
 
@@ -27,7 +24,7 @@ async fn given_user_stream_when_three_items_are_appended_then_pages_preserve_rec
         ))
         .await;
         created.assert_no_warning_or_error();
-        let stream = StreamRowKind::User(created.result.unwrap());
+        let stream = created.result.unwrap();
 
         let mut receipts = Vec::new();
         for data in [b"first".as_slice(), b"second", b"third"] {
@@ -42,28 +39,14 @@ async fn given_user_stream_when_three_items_are_appended_then_pages_preserve_rec
         }
         assert!(receipts.windows(2).all(|pair| pair[0] < pair[1]));
 
-        // PostgreSQL's safe visibility frontier may lag an acknowledged append
-        // while an older transaction elsewhere in the cluster is still open.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let page = store
-                    .stream_operations
-                    .read_forward(stream.clone(), None, 3)
-                    .await
-                    .unwrap();
-                if page.items.len() == receipts.len() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        store
+            .wait_until_user_item_is_readable(*receipts.last().unwrap())
+            .await;
 
         let first = observe(
             store
                 .stream_operations
-                .read_forward(stream.clone(), None, 2),
+                .read_forward(stream.clone().into(), None, 2),
         )
         .await;
         first.assert_no_warning_or_error();
@@ -78,7 +61,7 @@ async fn given_user_stream_when_three_items_are_appended_then_pages_preserve_rec
         assert_eq!(first.last_evaluated_key, Some(receipts[1]));
 
         let second = observe(store.stream_operations.read_forward(
-            stream.clone(),
+            stream.clone().into(),
             first.last_evaluated_key,
             2,
         ))
@@ -93,7 +76,7 @@ async fn given_user_stream_when_three_items_are_appended_then_pages_preserve_rec
         assert_eq!(second.last_evaluated_key, Some(receipts[2]));
 
         let exhausted = observe(store.stream_operations.read_forward(
-            stream.clone(),
+            stream.clone().into(),
             second.last_evaluated_key,
             2,
         ))
@@ -104,7 +87,7 @@ async fn given_user_stream_when_three_items_are_appended_then_pages_preserve_rec
         let newest = observe(
             store
                 .stream_operations
-                .read_backward(stream.clone(), None, 2),
+                .read_backward(stream.clone().into(), None, 2),
         )
         .await;
         newest.assert_no_warning_or_error();
@@ -118,7 +101,7 @@ async fn given_user_stream_when_three_items_are_appended_then_pages_preserve_rec
         assert_eq!(newest.last_evaluated_key, Some(receipts[1]));
 
         let oldest = observe(store.stream_operations.read_backward(
-            stream,
+            stream.into(),
             newest.last_evaluated_key,
             2,
         ))

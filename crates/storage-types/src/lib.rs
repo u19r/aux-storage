@@ -2,15 +2,37 @@
 extern crate self as storage;
 extern crate self as storage_types;
 
-pub mod types {
-    pub use crate::*;
-}
+pub mod types;
 
+pub mod ambient;
+mod attempt_deadline;
+mod attempt_outcome;
+#[cfg(test)]
+mod attempt_outcome_tests;
+mod cancellation_reason;
+#[cfg(test)]
+mod cancellation_reason_tests;
+pub mod condition;
+pub use attempt_outcome::{
+    AttemptFailure, AttemptKind, CapacityKind, ConflictCause, ErrorClass, FreshCause,
+    MissExpectation, NativeCallPhase, NativeCause, NativeCode, NativeEngine, PhysicalWriteMiss,
+    UnknownCause,
+};
+pub use cancellation_reason::{CancellationCode, CancellationReason};
+#[cfg(test)]
+mod attempt_deadline_tests;
 mod attribute_value;
 mod native_attempt;
+#[cfg(test)]
+mod native_attempt_tests;
 mod native_work;
-pub use native_work::NativeWorkLimits;
+pub use native_work::{BoundWorkLimits, NativeWorkLimits};
 mod frozen_image_projection;
+pub use attempt_deadline::{
+    AttemptDeadline, AttemptDeadlineSource, AttemptDeadlines, AttemptDurability, AttemptPlan,
+    AttemptRequest, AttemptScope, AttemptTry, DEFAULT_ATTEMPT_BUDGETS_MS, DEFAULT_COMMIT_GRACE_MS,
+    DeadlineClass, NativeWork, ReadVersionPolicy, expired_in,
+};
 pub(crate) use attribute_value::attribute_value_from_json_value;
 pub use attribute_value::{
     AttributeValue, ConversionError, canonical_dynamo_json, canonical_dynamo_map_json,
@@ -18,8 +40,7 @@ pub use attribute_value::{
 };
 pub use frozen_image_projection::{FrozenImageProjection, FrozenProjectionFields};
 pub use native_attempt::{
-    AttemptMode, NativeAttemptCall, NativeAttemptCapacity, NativeAttemptRejection,
-    NativeAttemptSettlement, ReadProtection,
+    AttemptMode, NativeAttemptCall, NativeAttemptCapacity, NativeAttemptSettlement, ReadProtection,
 };
 mod attribute_map;
 mod wire_attribute_order;
@@ -36,6 +57,16 @@ mod bounded_vec;
 #[cfg(test)]
 mod bounded_vec_tests;
 pub use bounded_vec::BoundedVec;
+mod exact_batch;
+#[cfg(test)]
+mod exact_batch_tests;
+pub use exact_batch::{Aligned, Exact};
+mod claim_window;
+#[cfg(test)]
+mod claim_window_tests;
+pub use claim_window::ClaimSlot;
+mod messaging_identity;
+pub use messaging_identity::MessagingIdentity;
 mod non_empty_string;
 #[cfg(test)]
 mod non_empty_string_tests;
@@ -58,17 +89,19 @@ pub use constants::{
     DYNAMODB_RESOURCE_IN_USE_MESSAGE, DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE,
     DYNAMODB_STREAM_RECORDS_LIMIT_MAX, DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE,
     DYNAMODB_STREAM_RECORDS_LIMIT_MIN, DYNAMODB_THROTTLING_MESSAGE,
-    DYNAMODB_TRANSACTION_CANCELED_MESSAGE, FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS,
-    HIDDEN_TTL_INDEX_PREFIX, INDEXED_VALUE_LZ4_HEADER, INDEXED_VALUE_RAW_HEADER,
+    DYNAMODB_TRANSACTION_CANCELED_MESSAGE, DYNAMODB_TRANSACTION_CONFLICT_MESSAGE,
+    FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS, FOUNDATIONDB_DEFAULT_REPLY_BYTE_LIMIT,
+    FOUNDATIONDB_MAX_REPLY_BYTE_LIMIT, FOUNDATIONDB_MIN_REPLY_BYTE_LIMIT, HIDDEN_TTL_INDEX_PREFIX,
     MAX_ATTRIBUTE_NESTING_DEPTH, MAX_EXPRESSION_BYTES, MAX_INDEX_NAME_BYTES,
     MAX_INDEXER_DECLARATION_BYTES, MAX_INDEXERS_CAPACITY, MAX_ITEM_SIZE_BYTES,
     MAX_LIST_TABLES_LIMIT, MAX_PARTITION_KEY_BYTES, MAX_SORT_KEY_BYTES,
     MAX_TARGET_INCARNATION_BYTES, MAX_TRANSACTION_ITEM_BYTES, MAX_TRANSACTION_MEMBERS,
-    MAX_TRANSACTION_REQUEST_BYTES, READ_SEQUENCE_DEFAULT_MAX_FANOUT_PER_STEP,
-    READ_SEQUENCE_DEFAULT_MAX_INTERMEDIATE_ITEMS, READ_SEQUENCE_DEFAULT_MAX_RESPONSE_BYTES,
-    READ_SEQUENCE_DEFAULT_MAX_ROOT_ITEMS, READ_SEQUENCE_DEFAULT_MAX_TOTAL_READ_ITEMS,
-    READ_SEQUENCE_HARD_MAX_ROOT_ITEMS, READ_SEQUENCE_HARD_MAX_SEQUENCE_STEPS,
-    READ_SEQUENCE_TOKEN_MAX_BYTES, READ_SEQUENCE_TOKEN_VERSION, STORAGE_SERDE_ENCODED_PREFIX_LEN,
+    MAX_TRANSACTION_REQUEST_BYTES, ONE_ONLINE_INDEX_MESSAGE,
+    READ_SEQUENCE_DEFAULT_MAX_FANOUT_PER_STEP, READ_SEQUENCE_DEFAULT_MAX_INTERMEDIATE_ITEMS,
+    READ_SEQUENCE_DEFAULT_MAX_RESPONSE_BYTES, READ_SEQUENCE_DEFAULT_MAX_ROOT_ITEMS,
+    READ_SEQUENCE_DEFAULT_MAX_TOTAL_READ_ITEMS, READ_SEQUENCE_HARD_MAX_ROOT_ITEMS,
+    READ_SEQUENCE_HARD_MAX_SEQUENCE_STEPS, READ_SEQUENCE_TOKEN_MAX_BYTES,
+    READ_SEQUENCE_TOKEN_VERSION, STORAGE_SERDE_ENCODED_PREFIX_LEN,
     STORAGE_SERDE_RAW_JSON_LIMIT_BYTES, STREAM_RECORDS_MAX_ENCODED_BYTES,
     SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES, SYSTEM_STREAM_LINEAGE_ID_MAX_BYTES,
     SYSTEM_STREAM_RECORDS_LIMIT_MAX, SYSTEM_STREAM_SCOPE_VERSION, TTL_PARTITION_ATTRIBUTE,
@@ -86,11 +119,7 @@ mod logical_item_size_set_tests;
 #[cfg(test)]
 mod logical_item_size_tests;
 pub use logical_item_size::LogicalItemSize;
-mod system_history_record;
-#[cfg(test)]
-mod system_history_record_tests;
 mod system_stream_effect_digest;
-pub use system_history_record::SystemHistoryRecord;
 pub use system_stream_effect_digest::SystemStreamEffectDigest;
 mod dynamodb_limits;
 #[cfg(test)]
@@ -114,9 +143,9 @@ mod key_attributes;
 #[cfg(test)]
 mod key_attributes_tests;
 pub use key_attributes::{
-    AttributeValueLookup, CanonicalKeyAttributes, KeyAttributes,
-    canonicalize_top_level_number_value, key_attribute_values_match,
-    normalize_key_attribute_value_for_write, verify_key_attributes,
+    AttributeValueLookup, CanonicalKeyAttributes, KeyAttributes, MissingKeyAttribute,
+    SchemaKeyValues, canonicalize_top_level_number_value, key_attribute_values_match,
+    normalize_key_attribute_value_for_write, schema_key_values, verify_key_attributes,
 };
 mod key_schema;
 #[cfg(test)]
@@ -124,10 +153,6 @@ mod key_schema_tests;
 pub use key_schema::{KeySchemaElement, PlannedKeyColumn, planned_key_columns};
 mod key_type;
 pub use key_type::KeyType;
-mod page_limits;
-#[cfg(test)]
-mod page_limits_tests;
-pub use page_limits::PageLimits;
 mod stream_record;
 pub use stream_record::StreamRecord;
 #[cfg(test)]
@@ -168,15 +193,6 @@ mod duration_seconds_tests;
 #[cfg(test)]
 mod timestamp_seconds_fractional_tests;
 pub use duration_seconds::*;
-mod durable_revision;
-pub use durable_revision::{
-    BatchGetExecutionRequest, BatchGetExecutionResult, BatchGetExecutionTable,
-    BatchGetExecutionTableOutcome, BatchProofSelection, DurableAbsenceProof,
-    DurableBatchPointReadProof, DurableBatchPointReadProofEntry, DurableItemRevision,
-    DurablePointReadGuard, DurablePointReadProof, DurablePointReadRequest,
-    DurableTransactWriteGuard, GuardedDeleteItemRequest, GuardedPutItemRequest,
-    GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest,
-};
 mod pagination_limit;
 #[cfg(test)]
 mod pagination_limit_tests;
@@ -204,33 +220,21 @@ pub use materialized_item_record::MaterializedItemRecord;
 mod item_key;
 mod item_key_ordered;
 pub use item_key::{IndexKey, IndexKeyPrefix, ItemKey, ItemKeyError, TableKey};
-mod table_key_canonical;
-mod table_key_range;
-pub use table_key_range::TableKeyRange;
 mod indexer_declaration;
+mod table_key_canonical;
 pub use indexer_declaration::IndexerDeclaration;
 mod indexed_wire_item;
-#[cfg(test)]
-mod indexed_wire_item_tests;
-pub use indexed_wire_item::{
-    DecodedIndexedWireItem, IndexedRowView, IndexedWireItem, indexer_tuple_index,
-};
+pub use indexed_wire_item::{validate_logical_item, validate_logical_item_names};
 mod index_name;
 #[cfg(test)]
 mod index_name_tests;
-mod item_revision;
 #[cfg(test)]
-mod item_revision_tests;
-mod item_stream_version;
-#[cfg(test)]
-mod item_stream_version_tests;
+mod indexed_wire_item_tests;
 #[cfg(test)]
 mod read_sequence_planner_boundary_tests;
 mod revision;
 #[cfg(test)]
 mod revision_tests;
-pub use item_revision::{ItemRevision, ItemWriteVersions};
-pub use item_stream_version::ItemStreamVersion;
 pub use revision::Revision;
 pub mod storage_serde;
 #[cfg(test)]
@@ -239,7 +243,7 @@ pub use index_name::IndexName;
 mod physical_name;
 #[cfg(test)]
 mod physical_name_tests;
-pub use physical_name::{AttributeName, GsiPhysicalName};
+pub use physical_name::AttributeName;
 mod table_name;
 pub use table_name::TableName;
 mod max_indexers;
@@ -258,12 +262,11 @@ pub use stream_name::*;
 mod user_stream_name;
 pub use user_stream_name::*;
 pub mod captured_entity_condition;
-#[cfg(feature = "rocksdb")]
+// Compiled for every backend: the regional marker sweep decodes ordered key
+// suffixes on SQL too.
 mod item_key_rocksdb;
 #[cfg(all(test, feature = "rocksdb"))]
 mod item_key_rocksdb_tests;
-#[cfg(any(feature = "sqlite", feature = "postgres", not(feature = "rocksdb")))]
-mod item_key_sqlite;
 #[cfg(test)]
 mod item_key_tests;
 mod key_validation;
@@ -289,19 +292,18 @@ pub mod maintenance;
 mod wire_item;
 pub use wire_item::{
     BatchGetWireItemResponse, TryFromWireItem, TryIntoWireItem, VerifiedWireItem,
-    WireAttributeDecode, WireItem, WireItemKeyAttributes, WireScalar, decode_wire_bool,
-    decode_wire_field, decode_wire_field_json, decode_wire_serde_string, dynamo_json,
-    encode_wire_attribute,
+    WireAttributeDecode, WireItem, WireScalar, decode_wire_bool, decode_wire_field,
+    decode_wire_field_json, decode_wire_serde_string, dynamo_json, encode_wire_attribute,
 };
-mod cacheable;
-pub use cacheable::Cacheable;
 mod validated_entity;
 pub use validated_entity::{NoopValidatedEntity, StoredEntity, ValidatedEntity};
 #[cfg(test)]
 mod error_message_tests;
 mod errors;
 mod infrastructure_result;
-pub use infrastructure_result::{InfrastructureContext, InfrastructureResultKind};
+pub use infrastructure_result::{
+    AttemptPhase, InfrastructureContext, InfrastructureResultKind, NativeUnavailable,
+};
 #[cfg(test)]
 mod errors_tests;
 pub use errors::{StorageEnum, StorageError, StorageResult, StorageValidationKind};
@@ -318,8 +320,8 @@ mod projection_expression_tests;
 mod request_expression_validation;
 pub use projection_expression::{
     AttributeProjection, ProjectionPath, ProjectionSegment, parse_projection_path,
-    project_attribute_map, project_wire_items, validate_gsi_projection,
-    validate_gsi_required_attributes,
+    validate_gsi_filter_attributes, validate_gsi_projection, validate_gsi_required_attributes,
+    validate_gsi_select,
 };
 mod request_response;
 pub use request_response::*;
@@ -332,7 +334,9 @@ pub use write_wire_request::*;
 #[cfg(test)]
 mod numeric_prop_tests;
 mod serde_types;
-pub use serde_types::{DynamoRequestValidate, validate_client_request_token};
+pub use serde_types::{
+    DynamoRequestValidate, undefined_index_keys_message, validate_client_request_token,
+};
 #[cfg(test)]
 mod write_wire_request_tests;
 
@@ -386,25 +390,16 @@ mod table_stream_sequence_tests;
 mod table_stream_checkpoint;
 pub use table_stream_checkpoint::{TableStreamCheckpoint, TableStreamReadProgress};
 mod table_binding;
+#[cfg(test)]
+mod table_binding_tests;
 pub use table_binding::{
-    BoundTableInfo, TableHistorySchema, TableHistoryState, TableHistoryTarget, TableStreamIdentity,
+    BoundGsi, BoundTableInfo, CatalogVersion, GsiPhase, KeyColumn, PairState, RegionId,
+    RegionalBinding, StoredGsiBinding, StreamBinding, TableBinding, TableHistorySchema,
+    TableHistoryState, TableHistoryTarget, TableStreamIdentity, TtlBinding,
 };
 
-mod item_history;
-mod item_history_pointer;
-pub use item_history_pointer::ItemHistoryPointer;
-mod item_history_record;
-pub use item_history_record::{ItemHistoryRecord, ItemHistoryRecordHeader};
-#[cfg(test)]
-mod item_history_tests;
-pub use item_history::{
-    ItemHistoryChange, ItemHistoryEntry, ItemHistoryKind, ItemHistoryMetadata,
-    ItemHistoryPublication, ItemHistoryReference, StreamUserIdentity,
-};
-mod item_history_address;
-#[cfg(test)]
-mod item_history_address_tests;
-pub use item_history_address::ItemHistoryAddress;
+mod stream_user_identity;
+pub use stream_user_identity::StreamUserIdentity;
 
 #[cfg(test)]
 mod transaction_error_tests;
@@ -414,12 +409,23 @@ pub use leader_routing::{STORAGE_LEADER_HINT_HEADER, STORAGE_NOT_LEADER_ERROR_TY
 
 mod item_provenance;
 pub use item_provenance::ItemProvenance;
+mod regional;
+#[cfg(test)]
+mod regional_tests;
+pub use regional::{
+    PairId, RegionalMark, RegionalMarker, RegionalOrder, RegionalRole, regional_marker_item_key,
+};
 
 #[cfg(test)]
 mod item_provenance_tests;
 
 #[cfg(test)]
 mod wire_alias_decode_tests;
+#[cfg(test)]
+mod wire_json_decoding_tests;
 
 mod page_byte_budget;
 pub use page_byte_budget::PageByteBudget;
+
+mod initial_stream_lineages;
+pub use initial_stream_lineages::InitialStreamLineages;

@@ -1,140 +1,12 @@
-use std::{borrow::Cow, hint::black_box, time::Instant};
-
 use alloc_counter::AllocationGuard;
 use serde::{Deserialize, Serialize};
 use storage_derive::WireItemEncode;
 
 use crate::{
-    AttributeDefinition, AttributeValue, KeyAttributeType, KeySchemaElement, KeyType, StorageError,
+    AttributeDefinition, AttributeMap, AttributeValue, KeyAttributeType, KeySchemaElement, KeyType,
     StorageResult, StoredTableInfo, TableName, TableStatus, TimestampMillis, TryFromWireItem,
-    TryIntoWireItem, WireItem, WireItemKeyAttributes, constants_tests::WIRE_ITEM_ALLOC_ITERATIONS,
-    to_hashmap,
+    TryIntoWireItem, WireItem, constants_tests::WIRE_ITEM_ALLOC_ITERATIONS,
 };
-
-fn legacy_timestamp_alias(field: &str) -> Option<&'static str> {
-    match field {
-        "created_at" => Some("c_at"),
-        "c_at" => Some("created_at"),
-        "updated_at" => Some("u_at"),
-        "u_at" => Some("updated_at"),
-        "expires_at" => Some("e_at"),
-        "e_at" => Some("expires_at"),
-        _ => None,
-    }
-}
-
-fn legacy_scalar_fields<'a>(
-    bytes: &'a [u8],
-    fields: &[&str],
-) -> StorageResult<Vec<Option<Cow<'a, str>>>> {
-    let mut values = crate::wire_item::projection::parse_dynamo_scalar_fields(bytes, fields)?;
-    for (index, field) in fields.iter().enumerate() {
-        if values[index].is_none()
-            && let Some(alias) = legacy_timestamp_alias(field)
-        {
-            let alias_value =
-                crate::wire_item::projection::parse_dynamo_scalar_fields(bytes, &[alias])?;
-            values[index] = alias_value.into_iter().next().flatten();
-        }
-    }
-    Ok(values)
-}
-
-fn aliased_projection_fixture() -> (WireItem, Vec<u8>, [&'static str; 4]) {
-    let bytes = br#"{
-        "created_at":{"N":"100"},
-        "c_at":{"N":"200"},
-        "updated_at":{"N":"300"},
-        "e_at":{"N":"600"},
-        "unrelated":{"S":"ignored"}
-    }"#
-    .to_vec();
-    (
-        WireItem::dynamo_json(bytes.clone()),
-        bytes,
-        ["created_at", "created_at", "updated_at", "expires_at"],
-    )
-}
-
-fn measure_aliased_projection(
-    label: &'static str,
-    baseline: bool,
-) -> alloc_counter::AllocationReport<'static> {
-    let (wire_item, bytes, fields) = aliased_projection_fixture();
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "wire_item_aliased_scalar_projection",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    for _ in 0..WIRE_ITEM_ALLOC_ITERATIONS {
-        let values = if baseline {
-            legacy_scalar_fields(bytes.as_slice(), &fields)
-        } else {
-            wire_item.scalar_attributes(&fields)
-        }
-        .unwrap();
-        assert_eq!(values[0].as_deref(), Some("100"));
-        assert_eq!(values[1].as_deref(), Some("200"));
-        assert_eq!(values[2].as_deref(), Some("300"));
-        assert_eq!(values[3].as_deref(), Some("600"));
-    }
-    guard.finish()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct NonKeyPayload {
-    status: String,
-    table_id: String,
-    revision: u64,
-    attempts: u32,
-    enabled: bool,
-    note: String,
-}
-
-fn sample_local_split_parts() -> (WireItemKeyAttributes, Vec<u8>) {
-    let key_attributes = WireItemKeyAttributes::new(
-        "pk".to_string(),
-        AttributeValue::S("org#o_123".to_string()),
-        Some("sk".to_string()),
-        Some(AttributeValue::S("user#u_456".to_string())),
-    );
-    let non_key_payload = NonKeyPayload {
-        status: "active".to_string(),
-        table_id: "t_789".to_string(),
-        revision: 42,
-        attempts: 3,
-        enabled: true,
-        note: "no eager parse on read".to_string(),
-    };
-    let non_key_attributes = match to_hashmap(&non_key_payload) {
-        Ok(map) => map,
-        Err(err) => panic!("serialize non-key payload to attribute map: {err}"),
-    };
-    let blob = match serde_json::to_vec(&non_key_attributes) {
-        Ok(blob) => blob,
-        Err(err) => panic!("serialize non-key attributes to blob: {err}"),
-    };
-    (key_attributes, blob)
-}
-
-fn measure_lazy_local_split_baseline() -> alloc_counter::AllocationReport<'static> {
-    let (key_attributes, blob) = sample_local_split_parts();
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "wire_item_local_split_lazy_read_baseline",
-        file!(),
-        line!(),
-        Some("baseline"),
-    );
-    for _ in 0..WIRE_ITEM_ALLOC_ITERATIONS {
-        let wire_item = WireItem::local_split(key_attributes.clone(), None, Some(blob.clone()));
-        assert!(matches!(wire_item, WireItem::LocalSplit { .. }));
-        assert!(wire_item.payload_len() > 0);
-    }
-    guard.finish()
-}
 
 fn sample_table_info() -> StoredTableInfo {
     StoredTableInfo {
@@ -166,6 +38,7 @@ fn sample_table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
@@ -183,7 +56,7 @@ fn sample_dynamo_wire_item() -> WireItem {
         ("enabled".to_string(), AttributeValue::BOOL(true)),
         (
             "metadata".to_string(),
-            AttributeValue::M(std::collections::HashMap::from([
+            AttributeValue::M(AttributeMap::from(std::collections::HashMap::from([
                 ("source".to_string(), AttributeValue::S("alloc".to_string())),
                 (
                     "tags".to_string(),
@@ -192,7 +65,7 @@ fn sample_dynamo_wire_item() -> WireItem {
                         AttributeValue::S("beta".to_string()),
                     ]),
                 ),
-            ])),
+            ]))),
         ),
     ]);
     let bytes = match serde_json::to_vec(&item) {
@@ -336,16 +209,6 @@ fn measure_manifest_view_decode_baseline() -> alloc_counter::AllocationReport<'s
 }
 
 #[test]
-fn lazy_local_split_read_allocation_baseline_tests() {
-    // Snapshot (2026-02-18, `cargo test -p storage-types wire_item_alloc_tests
-    // -- --nocapture`): allocation_count=5127, allocated_bytes=184229.
-    let report = measure_lazy_local_split_baseline();
-    let _ = alloc_counter::emit_report(&report);
-    assert!(report.allocation_count > 0);
-    assert!(report.allocated_bytes > 0);
-}
-
-#[test]
 fn wire_item_last_evaluated_key_projection_allocation_baseline_tests() {
     // Snapshot (2026-02-18, `cargo test -p storage-types wire_item_alloc_tests
     // -- --nocapture`): allocation_count=9223, allocated_bytes=192394.
@@ -405,175 +268,6 @@ fn measure_write_wire_encode_baseline() -> alloc_counter::AllocationReport<'stat
     guard.finish()
 }
 
-fn realistic_local_split_wire_item() -> WireItem {
-    let key_attributes = WireItemKeyAttributes::new(
-        "pk".to_string(),
-        AttributeValue::S("tenant#00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001".to_string()),
-        Some("sk".to_string()),
-        Some(AttributeValue::S(
-            "item#0001#sort-key-component-with-realistic-dynamodb-length-000000000000000000000000000000".to_string(),
-        )),
-    );
-    let mut non_keys = std::collections::HashMap::with_capacity(8);
-    non_keys.insert(
-        "ttl".to_string(),
-        AttributeValue::N("2200000000".to_string()),
-    );
-    non_keys.insert(
-        "status".to_string(),
-        AttributeValue::S("active".to_string()),
-    );
-    non_keys.insert("attempts".to_string(), AttributeValue::N("7".to_string()));
-    non_keys.insert("payload".to_string(), AttributeValue::S("x".repeat(1_100)));
-    non_keys.insert(
-        "category".to_string(),
-        AttributeValue::S("category#1".to_string()),
-    );
-    non_keys.insert(
-        "owner".to_string(),
-        AttributeValue::S("owner#2".to_string()),
-    );
-    non_keys.insert(
-        "gsi0pk".to_string(),
-        AttributeValue::S(format!("gsi0#partition#{:092}", 1)),
-    );
-    non_keys.insert(
-        "gsi0sk".to_string(),
-        AttributeValue::S(format!("gsi0#sort#{:092}", 1)),
-    );
-    let blob = serde_json::to_vec(&non_keys).unwrap();
-    WireItem::local_split(key_attributes, None, Some(blob))
-}
-
-#[test]
-fn borrowed_local_split_map_matches_owned_decode_and_keeps_corruption_errors() {
-    let item = realistic_local_split_wire_item();
-    let borrowed = item.to_attribute_map().unwrap();
-    let owned = item.clone().into_attribute_map().unwrap();
-    assert_eq!(borrowed, owned);
-
-    let primary = WireItemKeyAttributes::new(
-        "pk".to_string(),
-        AttributeValue::S("primary".to_string()),
-        None,
-        None,
-    );
-    let secondary = WireItemKeyAttributes::new(
-        "sk".to_string(),
-        AttributeValue::S("secondary".to_string()),
-        None,
-        None,
-    );
-    for blob in [
-        b"{}".to_vec(),
-        br#"{"pk":{"S":"residual"},"payload":{"N":"42"}}"#.to_vec(),
-    ] {
-        let item = WireItem::local_split(primary.clone(), Some(secondary.clone()), Some(blob));
-        assert_eq!(
-            item.to_attribute_map().unwrap(),
-            item.into_attribute_map().unwrap(),
-        );
-    }
-
-    let WireItem::LocalSplit {
-        primary_key,
-        secondary_key,
-        ..
-    } = item
-    else {
-        panic!("expected LocalSplit fixture");
-    };
-    let invalid = WireItem::local_split(primary_key, secondary_key, Some(b"{".to_vec()));
-    assert_eq!(
-        invalid.to_attribute_map().unwrap_err().to_string(),
-        invalid.into_attribute_map().unwrap_err().to_string(),
-    );
-}
-
-fn legacy_local_split_into_attribute_map(item: WireItem) -> StorageResult<crate::AttributeMap> {
-    match item {
-        WireItem::DynamoJson { data } => serde_json::from_slice::<
-            std::collections::HashMap<String, AttributeValue>,
-        >(data.as_slice())
-        .map(crate::AttributeMap::from)
-        .map_err(|err| {
-            StorageError::internal(&format!("decode wire dynamo json item into map: {err}"))
-        }),
-        WireItem::LocalSplit {
-            primary_key,
-            secondary_key,
-            non_key_attributes_blob,
-        } => {
-            let mut attributes = std::collections::HashMap::with_capacity(4);
-            attributes.insert(primary_key.hash_key_name.into_owned(), primary_key.hash_key);
-            if let (Some(name), Some(value)) = (primary_key.sort_key_name, primary_key.sort_key) {
-                attributes.insert(name.into_owned(), value);
-            }
-            if let Some(secondary_key) = secondary_key {
-                attributes.insert(
-                    secondary_key.hash_key_name.into_owned(),
-                    secondary_key.hash_key,
-                );
-                if let (Some(name), Some(value)) =
-                    (secondary_key.sort_key_name, secondary_key.sort_key)
-                {
-                    attributes.insert(name.into_owned(), value);
-                }
-            }
-            if let Some(blob) = non_key_attributes_blob
-                && !blob.is_empty()
-            {
-                let non_keys = serde_json::from_slice::<
-                    std::collections::HashMap<String, AttributeValue>,
-                >(blob.as_slice())
-                .map_err(|err| {
-                    StorageError::internal(&format!(
-                        "decode sqlite non-key attributes blob into map: {err}"
-                    ))
-                })?;
-                attributes.extend(non_keys);
-            }
-            Ok(attributes.into())
-        }
-    }
-}
-
-fn measure_local_split_map_decode(
-    label: &'static str,
-    decode: impl Fn(WireItem) -> StorageResult<crate::AttributeMap>,
-) -> alloc_counter::AllocationReport<'static> {
-    let wire_item = realistic_local_split_wire_item();
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "wire_item_realistic_local_split_map_decode",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    for _ in 0..WIRE_ITEM_ALLOC_ITERATIONS {
-        let map = decode(wire_item.clone()).unwrap();
-        assert_eq!(map.len(), 10);
-    }
-    guard.finish()
-}
-
-#[test]
-fn wire_item_realistic_local_split_map_decode_allocations_drop_tests() {
-    let legacy = measure_local_split_map_decode(
-        "wire_item_realistic_local_split_decode_legacy_capacity",
-        legacy_local_split_into_attribute_map,
-    );
-    let optimized = measure_local_split_map_decode(
-        "wire_item_realistic_local_split_decode_sized_capacity",
-        WireItem::into_attribute_map,
-    );
-
-    let _ = alloc_counter::emit_report(&legacy);
-    let _ = alloc_counter::emit_report(&optimized);
-
-    assert!(optimized.allocated_bytes < legacy.allocated_bytes);
-}
-
 #[test]
 fn wire_item_dynamo_json_map_decode_preserves_shapes_errors_and_avoids_payload_clone() {
     for count in [1, 10, 100] {
@@ -615,86 +309,4 @@ fn wire_item_write_encode_allocation_baseline_tests() {
     let _ = alloc_counter::emit_report(&report);
     assert!(report.allocation_count > 0);
     assert!(report.allocated_bytes > 0);
-}
-
-#[test]
-#[ignore = "manual differential allocation probe"]
-fn aliased_scalar_projection_allocations_drop_tests() {
-    let legacy = measure_aliased_projection("legacy_reparse", true);
-    let optimized = measure_aliased_projection("single_scan", false);
-
-    let _ = alloc_counter::emit_report(&legacy);
-    let _ = alloc_counter::emit_report(&optimized);
-    assert!(optimized.allocation_count < legacy.allocation_count);
-    assert!(optimized.allocated_bytes < legacy.allocated_bytes);
-}
-
-#[test]
-#[ignore = "manual differential CPU probe"]
-fn aliased_scalar_projection_cpu_probe_tests() {
-    let (wire_item, bytes, fields) = aliased_projection_fixture();
-    let start = Instant::now();
-    let mut legacy_checksum = 0usize;
-    for _ in 0..WIRE_ITEM_ALLOC_ITERATIONS {
-        let values = legacy_scalar_fields(bytes.as_slice(), &fields).unwrap();
-        legacy_checksum = legacy_checksum.wrapping_add(black_box(values.len()));
-    }
-    let legacy_ns = start.elapsed().as_nanos();
-
-    let start = Instant::now();
-    let mut optimized_checksum = 0usize;
-    for _ in 0..WIRE_ITEM_ALLOC_ITERATIONS {
-        let values = wire_item.scalar_attributes(&fields).unwrap();
-        optimized_checksum = optimized_checksum.wrapping_add(black_box(values.len()));
-    }
-    let optimized_ns = start.elapsed().as_nanos();
-
-    println!(
-        "aliased_scalar_projection_cpu legacy_ns={legacy_ns} optimized_ns={optimized_ns} \
-         iterations={WIRE_ITEM_ALLOC_ITERATIONS} checksum={legacy_checksum}/{optimized_checksum}"
-    );
-    assert_eq!(legacy_checksum, optimized_checksum);
-}
-
-#[test]
-#[ignore = "manual differential allocation and CPU probe"]
-fn given_mixed_wire_items_when_compared_then_borrowed_values_reduce_allocations() {
-    let (keys, blob) = sample_local_split_parts();
-    let left = WireItem::local_split(keys, None, Some(blob));
-    let right = WireItem::dynamo_json(left.dynamo_json_bytes().unwrap().into_owned());
-    for label in ["attribute_maps", "borrowed_attributes"] {
-        let guard = AllocationGuard::start(
-            module_path!(),
-            "wire_item_comparison",
-            file!(),
-            line!(),
-            Some(label),
-        );
-        let start = Instant::now();
-        for _ in 0..WIRE_ITEM_ALLOC_ITERATIONS {
-            let equal = if label == "attribute_maps" {
-                let left = black_box(&left).to_attribute_map().unwrap();
-                let right = black_box(&right).to_attribute_map().unwrap();
-                left.len() == right.len()
-                    && left
-                        .iter()
-                        .all(|(name, value)| right.get(name) == Some(value))
-            } else {
-                black_box(&left)
-                    .has_same_attributes(black_box(&right))
-                    .unwrap()
-            };
-            assert!(black_box(equal));
-        }
-        let elapsed = start.elapsed();
-        let report = guard.finish();
-        println!(
-            "{label}: allocations={} bytes={} elapsed_ns={} \
-             iterations={WIRE_ITEM_ALLOC_ITERATIONS}",
-            report.allocation_count,
-            report.allocated_bytes,
-            elapsed.as_nanos(),
-        );
-        let _ = alloc_counter::emit_report(&report);
-    }
 }

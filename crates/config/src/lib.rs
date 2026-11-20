@@ -19,13 +19,13 @@ pub(crate) mod launch;
 mod loader;
 mod messaging;
 mod model;
+mod remote_static_credentials;
 mod schema;
 
 pub use backends::{
     Backends, FoundationdbBackendConfig, PostgresBackendConfig, RemoteBackendConfig,
-    RemoteCredentialsConfig, RemoteDefaultStorageMode, RemoteStaticCredentialsConfig,
-    RemoteTimeoutOverrides, RocksdbBackendConfig, SqliteBackendConfig, StorageConnectionsConfig,
-    TursoBackendConfig,
+    RemoteCredentialsConfig, RemoteStaticCredentialsConfig, RemoteTimeoutOverrides,
+    RocksdbBackendConfig, SqliteBackendConfig, StorageConnectionsConfig, TursoBackendConfig,
 };
 pub use compile_time::{CompileTimeManifest, CrateFeature, ManifestCrate};
 pub use constants::{
@@ -34,10 +34,9 @@ pub use constants::{
 pub use error::ConfigError;
 pub use launch::{StorageApiLaunchConfig, StorageApiLaunchEffectiveConfig};
 pub use loader::{Config, load, load_optional_with_overrides, load_with_overrides};
-pub use messaging::QueueConfig;
+pub use messaging::{PubsubConfig, PubsubRunnerConfig, QueueConfig};
 pub use model::{
-    AppRole, Cors, Features, HttpConfig, Jobs, MetricsConfig, RootConfig, RuntimeEnvironment,
-    RuntimeFeatures, SlowOperationLogThresholds, StorageAdmissionConfig, Tracing, TracingTrace,
+    Cors, Features, HttpConfig, Jobs, MetricsConfig, RootConfig, RuntimeFeatures,
+    StorageAdmissionConfig, StorageDeadlinesConfig, Tracing,
 };
-
-pub type RemoteStaticCredentials = RemoteStaticCredentialsConfig;
+pub use remote_static_credentials::RemoteStaticCredentials;

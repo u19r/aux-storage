@@ -33,7 +33,11 @@ impl SqlFaultProbe for HeldCommit {
         None
     }
 
-    fn at_commit_boundary(&self, boundary: SqlCommitBoundary) -> BoxFuture<'_, StorageResult<()>> {
+    fn at_commit_boundary(
+        &self,
+        boundary: SqlCommitBoundary,
+        _mode: storage_types::AttemptMode,
+    ) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             if boundary == SqlCommitBoundary::BeforeCommit
                 && self.hold_next.swap(false, Ordering::SeqCst)

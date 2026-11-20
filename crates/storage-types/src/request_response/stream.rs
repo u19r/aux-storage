@@ -65,7 +65,8 @@ pub struct GetStreamRecordsRequest {
     limit: Option<u32>,
 }
 
-#[derive(Debug, Clone, ToSchema)]
+#[derive(Clone, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct GetStreamRecordsResponse {
     table_name: Option<TableName>,
     records: Vec<StreamRecord>,
@@ -98,7 +99,8 @@ struct GetStreamRecordsRequestWire {
     limit: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct GetStreamRecordsResponseWire {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,7 +134,8 @@ struct GetStreamRecordsRequestWireRef<'a> {
     limit: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 struct GetStreamRecordsResponseWireRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -604,7 +607,8 @@ pub struct GetRecordsRequest {
     pub limit: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct GetRecordsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -612,7 +616,8 @@ pub struct GetRecordsResponse {
     pub records: Vec<DynamoDbStreamsRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "camelCase")]
 pub struct DynamoDbStreamsRecord {
     #[serde(rename = "eventID")]
@@ -629,7 +634,8 @@ pub struct DynamoDbStreamsRecord {
     pub dynamodb: StreamRecordDetails,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct StreamRecordDetails {
     #[serde(

@@ -1,4 +1,4 @@
-use http_error::HttpApiError;
+use http_error::{AWS_QUERY_SERVICE_UNAVAILABLE_MESSAGE, HttpApiError};
 
 use crate::{
     PubsubError, PubsubValidationKind,
@@ -65,7 +65,7 @@ fn pubsub_errors_map_to_expected_aws_query_shapes() {
             PubsubError::topic_not_found("arn:aws:sns:us-east-1:000000000000:missing"),
             SNS_NOT_FOUND_ERROR_TYPE,
             "Topic does not exist",
-            400,
+            404,
         ),
         (
             PubsubError::subscription_not_found(
@@ -73,7 +73,7 @@ fn pubsub_errors_map_to_expected_aws_query_shapes() {
             ),
             SNS_NOT_FOUND_ERROR_TYPE,
             "Subscription does not exist",
-            400,
+            404,
         ),
         (
             PubsubError::storage("database unavailable"),
@@ -98,21 +98,110 @@ fn pubsub_error_maps_topic_not_found_to_shared_http_error() {
 
     assert_eq!(http_error.error_type, "NotFound");
     assert_eq!(http_error.message, "Topic does not exist");
-    assert_eq!(http_error.status_code, 400);
+    assert_eq!(http_error.status_code, 404);
 }
 
 #[test]
 fn given_unknown_commit_when_pubsub_maps_storage_error_then_outcome_and_http_shape_survive() {
-    let error = PubsubError::from(storage_types::StorageError::sync_submission_ambiguous(
-        None,
+    let error = PubsubError::from(storage_types::StorageError::commit_unknown(
         "native commit outcome unavailable",
     ));
     assert!(matches!(&error, PubsubError::Storage(source)
-        if matches!(source.as_ref(), storage_types::StorageEnum::SyncSubmissionAmbiguous { .. })));
+        if matches!(source.as_ref(), storage_types::StorageEnum::Attempt(storage_types::AttemptFailure::CommitUnknown(_)))));
     assert_eq!(error.aws_query_error_type(), SNS_INTERNAL_ERROR_TYPE);
     assert_eq!(error.aws_query_status_code(), 500);
     assert_eq!(error.aws_query_message(), "Internal server error: storage");
     let http_error = HttpApiError::from(error);
     assert_eq!(http_error.status_code, 500);
     assert_eq!(http_error.message, "Internal server error: storage");
+}
+
+#[test]
+fn native_unavailable_maps_to_retryable_503() {
+    let error = PubsubError::from(storage_types::StorageError::from(
+        storage_types::AttemptFailure::Unavailable(
+            storage_types::NativeUnavailable::WriterQueueFull,
+        ),
+    ));
+    let http = HttpApiError::from(error);
+
+    assert_eq!(http.status_code, 503);
+    assert!(
+        http.response_headers
+            .iter()
+            .any(|(name, value)| name == "Retry-After" && value == "1")
+    );
+}
+
+#[test]
+fn given_storage_internal_when_mapped_then_fixed_wire_and_cause_in_display() {
+    let error = PubsubError::from(storage_types::StorageError::internal("detail"));
+    assert_eq!(error.aws_query_message(), "Internal server error: storage");
+    assert_eq!(error.to_string(), "storage: internal error: detail");
+}
+
+#[test]
+fn given_storage_deadline_when_mapped_then_503() {
+    let error = PubsubError::from(storage_types::expired_in(
+        storage_types::AttemptPhase::Statement,
+    ));
+    assert_eq!(HttpApiError::from(error).status_code, 503);
+}
+
+#[test]
+fn given_admission_rejection_when_mapped_then_503_with_its_retry_after() {
+    let error = PubsubError::Storage(storage_types::StorageError::service_unavailable(7));
+    let http = HttpApiError::from(&error);
+
+    assert_eq!(http.status_code, 503);
+    assert_eq!(http.error_type, "ServiceUnavailable");
+    assert_eq!(http.message, AWS_QUERY_SERVICE_UNAVAILABLE_MESSAGE);
+    assert!(
+        http.response_headers
+            .iter()
+            .any(|(name, value)| name == "Retry-After" && value == "7")
+    );
+}
+
+#[test]
+fn given_storage_conflict_or_capacity_when_mapped_then_503_like_sqs() {
+    let errors = [
+        storage_types::StorageError::logical_conflict("test conflict"),
+        storage_types::StorageError::from(storage_types::AttemptFailure::CAPACITY),
+    ];
+    for storage in errors {
+        let error = PubsubError::Storage(storage);
+        assert_eq!(error.aws_query_status_code(), 503);
+        assert_eq!(error.aws_query_error_type(), "ServiceUnavailable");
+
+        let http = HttpApiError::from(&error);
+
+        assert_eq!(http.status_code, 503);
+        assert!(
+            http.response_headers
+                .iter()
+                .any(|(name, value)| name == "Retry-After" && value == "1"),
+            "{:?}",
+            http.response_headers
+        );
+    }
+}
+
+#[test]
+fn given_commit_unknown_when_mapped_then_500_internal_storage() {
+    let error = PubsubError::Storage(storage_types::StorageError::commit_unknown("lost"));
+
+    let http = HttpApiError::from(&error);
+
+    assert_eq!(http.status_code, 500);
+    assert_eq!(http.error_type, SNS_INTERNAL_ERROR_TYPE);
+    assert_eq!(http.message, "Internal server error: storage");
+    assert!(
+        !http
+            .response_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Retry-After"))
+    );
+    assert_eq!(error.aws_query_status_code(), 500);
+    assert_eq!(error.aws_query_error_type(), SNS_INTERNAL_ERROR_TYPE);
 }

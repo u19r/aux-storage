@@ -14,10 +14,18 @@ pub(crate) async fn initialize_maintenance<A: SqlAttempt>(
         .execute(sql_statements::create_identity(engine))
         .await?;
     attempt
-        .execute(sql_statements::seed_identity(engine))
-        .await?;
-    attempt
         .execute(sql_statements::create_progress(engine))
+        .await?;
+    Ok(())
+}
+
+/// Seed the identity row after `initialize_maintenance` and confirm it.
+pub(crate) async fn seed_maintenance<A: SqlAttempt>(
+    attempt: &mut A,
+    engine: impl SqlLayout,
+) -> StorageResult<()> {
+    attempt
+        .execute(sql_statements::seed_identity(engine))
         .await?;
     read_identity(attempt, engine).await?;
     Ok(())

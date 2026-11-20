@@ -1,6 +1,3 @@
-use std::hint::black_box;
-
-use alloc_counter::AllocationGuard;
 use storage_backfill::{GsiActive, GsiBuild, GsiBuildTarget, GsiState};
 use storage_types::{
     IndexName, SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope, TableName,
@@ -54,72 +51,7 @@ fn given_gsi_transition_when_rendered_then_preserve_sql_and_bind_slots() {
 }
 
 #[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_gsi_statement_shapes_when_rendered_then_report_cpu_and_allocations() {
-    let build = build();
-    for (engine, name) in [
-        (SqlEngine::Sqlite, "sqlite"),
-        (SqlEngine::Turso, "turso"),
-        (SqlEngine::Postgres, "postgres"),
-    ] {
-        report(&format!("{name}_transition"), || {
-            drop(black_box(
-                transition_state_statement(
-                    black_box(engine),
-                    black_box(&build),
-                    black_box(&build.state),
-                )
-                .unwrap(),
-            ));
-        });
-        for count in [2, 8, 32] {
-            let columns = (0..count)
-                .map(|index| format!("column_{index}"))
-                .collect::<Vec<_>>();
-            let mut numeric = vec![false; count];
-            numeric[0] = true;
-            numeric[1] = true;
-            report(&format!("{name}_upsert_{count}"), || {
-                let shape = UpsertShape::try_new(
-                    black_box(columns.clone()),
-                    black_box(numeric.clone()),
-                    black_box(columns[..2].to_vec()),
-                    true,
-                )
-                .unwrap();
-                drop(black_box(
-                    shape
-                        .render(
-                            black_box(engine),
-                            "physical_table",
-                            vec![(0..count).map(|_| SqlValue::Null).collect()],
-                        )
-                        .unwrap(),
-                ));
-            });
-        }
-    }
-}
-
-fn report(label: &str, mut render: impl FnMut()) {
-    for _ in 0..100 {
-        render();
-    }
-    let guard = AllocationGuard::start(module_path!(), "gsi_sql", file!(), line!(), Some(label));
-    let started = cpu_time::ProcessTime::now();
-    for _ in 0..100_000 {
-        render();
-    }
-    let cpu = started.elapsed();
-    alloc_counter::emit_report(&guard.finish()).unwrap();
-    eprintln!(
-        "gsi_sql label={label} iterations=100000 cpu_ns={}",
-        cpu.as_nanos()
-    );
-}
-
-#[test]
-fn given_gsi_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slots() {
+fn given_item_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slots() {
     for (engine, prefix) in [
         (SqlEngine::Sqlite, "?"),
         (SqlEngine::Turso, "?"),
@@ -130,7 +62,6 @@ fn given_gsi_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slot
             columns.clone(),
             vec![false, true, false],
             columns[..2].to_vec(),
-            true,
         )
         .unwrap();
         let (sql, binds) = shape
@@ -151,8 +82,7 @@ fn given_gsi_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slot
             format!(
                 "INSERT INTO \"physical\" (\"pk\", \"sk\", \"value\") VALUES ({prefix}1, \
                  CAST({prefix}2 AS TEXT)::NUMERIC, {prefix}3) ON CONFLICT (\"pk\", \"sk\") DO \
-                 UPDATE SET \"value\" = excluded.\"value\" WHERE excluded.__aux_item_version > \
-                 \"physical\".__aux_item_version"
+                 UPDATE SET \"value\" = excluded.\"value\""
             )
         );
         let columns = (1..=32)
@@ -162,8 +92,7 @@ fn given_gsi_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slot
         for index in [20, 21, 32] {
             numeric[index - 1] = true;
         }
-        let shape =
-            UpsertShape::try_new(columns.clone(), numeric, columns[..2].to_vec(), true).unwrap();
+        let shape = UpsertShape::try_new(columns.clone(), numeric, columns[..2].to_vec()).unwrap();
         let (sql, _) = shape
             .render(
                 engine,

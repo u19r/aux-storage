@@ -136,7 +136,7 @@ async fn given_invalid_graph_bound_when_manager_reads_then_validation_and_recove
 async fn given_native_storage_when_public_read_apis_run_then_transaction_and_sequence_return_same_authority()
  {
     let scope = crate::FoundationDbTestScope::try_new(
-        std::env::var("FDB_CLUSTER_FILE").expect("owned FDB_CLUSTER_FILE"),
+        std::env::var("TEST_FDB_CLUSTER_FILE").expect("owned TEST_FDB_CLUSTER_FILE"),
     )
     .await
     .expect("isolated native scope");
@@ -192,7 +192,7 @@ async fn given_native_storage_when_public_read_apis_run_then_transaction_and_seq
 async fn given_concurrent_native_pair_writes_when_public_snapshots_read_then_no_torn_generation_is_returned()
  {
     let scope = crate::FoundationDbTestScope::try_new(
-        std::env::var("FDB_CLUSTER_FILE").expect("owned cluster"),
+        std::env::var("TEST_FDB_CLUSTER_FILE").expect("owned TEST_FDB_CLUSTER_FILE"),
     )
     .await
     .expect("native scope");

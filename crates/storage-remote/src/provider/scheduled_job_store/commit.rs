@@ -3,8 +3,9 @@ use std::{sync::Arc, time::Instant};
 use scheduled_bg_jobs::store::{Check, CommitOutcome, Mutation, StoreTransaction};
 use storage_provider::RawOrderedJobStoreError;
 use storage_types::{
-    StorageEnum, StorageError, StorageResult, TransactConditionCheckRequest, TransactDeleteRequest,
-    TransactPutRequest, TransactWriteItem, TransactWriteItemsRequest, context::WrappedError,
+    CancellationReason, StorageEnum, StorageError, StorageResult, TransactConditionCheckRequest,
+    TransactDeleteRequest, TransactPutRequest, TransactWriteItem, TransactWriteItemsRequest,
+    context::WrappedError,
 };
 
 use crate::provider::{
@@ -63,11 +64,13 @@ fn classify_abort(error: StorageError) -> Result<AttemptDecision, RawOrderedJobS
         StorageEnum::TransactionCanceled { reasons }
             if reasons
                 .iter()
-                .any(|reason| reason.split('\t').next() == Some("ConditionalCheckFailed")) =>
+                .any(CancellationReason::is_conditional_check_failed) =>
         {
             Ok(AttemptDecision::Outcome(CommitOutcome::Conflict))
         }
-        StorageEnum::TransactionConflict { .. } => Ok(AttemptDecision::Retry),
+        StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(_)) => {
+            Ok(AttemptDecision::Retry)
+        }
         _ => Err(RawOrderedJobStoreError::Backend(error)),
     }
 }
@@ -149,6 +152,11 @@ fn mutation_item(mutation: &Mutation, check: Option<&Check>) -> StorageResult<Tr
             }),
             ..TransactWriteItem::default()
         },
+        Mutation::ClearEffectReceipts(_) => {
+            return Err(storage_types::StorageError::validation(
+                "the remote scheduled-job store does not support effect receipt clears",
+            ));
+        }
     })
 }
 

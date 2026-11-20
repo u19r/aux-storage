@@ -75,16 +75,23 @@ impl AdmissionRegistry {
 
     #[must_use]
     pub fn fixed_ingress_limit(&self) -> usize {
-        let configured = self
-            .controllers
-            .values()
-            .map(|controller| {
-                let config = controller.config();
-                config
-                    .maximum_concurrency
-                    .saturating_add(config.queue_capacity)
-            })
-            .fold(0usize, usize::saturating_add);
-        configured.clamp(FIXED_INGRESS_MINIMUM, FIXED_INGRESS_MAXIMUM)
+        fixed_ingress_limit(self.controllers.values())
     }
+}
+
+/// Host ingress bound: each connection's maximum concurrency plus queue
+/// capacity, summed and clamped.
+pub(crate) fn fixed_ingress_limit<'a>(
+    controllers: impl IntoIterator<Item = &'a AdmissionController>,
+) -> usize {
+    controllers
+        .into_iter()
+        .map(|controller| {
+            let config = controller.config();
+            config
+                .maximum_concurrency
+                .saturating_add(config.queue_capacity)
+        })
+        .fold(0usize, usize::saturating_add)
+        .clamp(FIXED_INGRESS_MINIMUM, FIXED_INGRESS_MAXIMUM)
 }

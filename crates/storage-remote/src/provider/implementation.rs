@@ -1,54 +1,32 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant as LatencyInstant, SystemTime},
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{StreamExt as _, TryStreamExt as _, stream as future_stream};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use http_request::{HttpRequestDispatchStatus, HttpRequestError, Url, reqwest::Client};
 use metrics_facade::counter;
 use rand::{RngExt as _, rng};
 use serde::{Serialize, de::DeserializeOwned};
-use storage_common::{
-    WriteCostTally, record_read_cost, record_write_cost, serializable_payload_bytes,
-    wire_items_payload_bytes,
-};
+use storage_common::{MAX_QUERY_LIMIT, record_read_cost, wire_items_payload_bytes};
 use storage_provider::{
-    BatchWriteContexts, MAX_RANGE_READ_EVALUATED_BYTES, OrderedOperationContexts, PhysicalWrite,
-    RangeReadBudget, RangeReadPage, RemoteCredentialStrategy, RemoteStorageSettings,
-    StorageProvider, TtlWriteContext,
+    MAX_RANGE_READ_EVALUATED_BYTES, RangeReadBudget, RangeReadPage, RemoteCredentialStrategy,
+    RemoteStorageSettings,
 };
 use storage_types::{
-    AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemRequest,
-    BatchWriteItemResponse, CreateTableRequest, CreateTableResponse, DeleteItemRequest,
-    DeleteItemResponse, DeleteTableRequest, DeleteTableResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, DurationSeconds,
-    GetItemRequest, KeyAttributes, KeysAndAttributes, ListTablesRequest, ListTablesResponse,
-    MAX_LIST_TABLES_LIMIT, PutItemRequest, PutItemResponse, QueryTableRequest,
-    STORAGE_LEADER_HINT_HEADER, STORAGE_NOT_LEADER_ERROR_TYPE, ScanTableRequest, StorageEnum,
-    StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName, TableStatus,
-    TimeToLiveSpecification, TransactGetItemsRequest, TransactGetItemsResponse,
-    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
-    UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
-    UserStreamName, WireItem,
+    DescribeTableRequest, DescribeTableResponse, QueryTableRequest, STORAGE_LEADER_HINT_HEADER,
+    STORAGE_NOT_LEADER_ERROR_TYPE, StorageEnum, StorageError, StorageResult, StoredTableInfo,
+    TableName, TableStatus, TimeToLiveSpecification, UpdateTableRequest, UpdateTableResponse,
+    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
     context::{ErrorContext as _, WrappedError},
-};
-use stream::{
-    CursorName, CursorPage, CursorPosition, Stream, StreamCursor, StreamError, StreamPage,
-    StreamPartitioningMode, StreamProvider, StreamResult,
 };
 use tokio::time::{Instant, sleep};
 use tracing::{Span, instrument};
 
 fn record_items_returned(count: usize) {
     Span::current().record("items_returned", count as u64);
-}
-
-fn record_items_updated(count: usize) {
-    Span::current().record("items_updated", count as u64);
 }
 
 fn record_remote_payload_bytes(operation: &str, request_bytes: u64, response_bytes: u64) {
@@ -70,10 +48,11 @@ use super::{
     provider_helpers::{
         RemoteRedirectPolicy, RetryTokenBucket, attempt_internal, attempt_signing,
         attempt_transport, build_client, build_endpoints, build_query_request_view,
-        build_scan_request, compute_backoff, error_label, extract_operation, record_latency,
-        redirect_url, signing_error_to_storage_error, to_table_info,
+        compute_backoff, extract_operation, record_latency, redirect_url,
+        signing_error_to_storage_error, to_table_info,
     },
-    wire_item_helper::{parse_batch_get_wire, parse_get_item_wire, parse_scan_query_wire},
+    replay_policy::{AfterFailure, REMOTE_WRITE_OUTCOME_UNKNOWN, ReplayPolicy},
+    wire_item_helper::parse_scan_query_wire,
 };
 use crate::{
     constants::{
@@ -86,43 +65,6 @@ use crate::{
     },
     error::{RemoteErrorResponse, classify_error_response},
 };
-
-const LIST_TABLE_DESCRIBE_CONCURRENCY: usize = 8;
-
-#[derive(Default)]
-pub(super) struct BatchGetProjection {
-    attributes_to_get: Option<Vec<String>>,
-    projection_expression: Option<String>,
-    expression_attribute_names: Option<storage_types::VecMap<String, String>>,
-    consistent_read: Option<bool>,
-}
-
-impl BatchGetProjection {
-    pub(super) fn restore(self, target: &mut KeysAndAttributes) {
-        target.attributes_to_get = self.attributes_to_get;
-        target.projection_expression = self.projection_expression;
-        target.expression_attribute_names = self.expression_attribute_names;
-        target.consistent_read = self.consistent_read;
-    }
-}
-
-pub(super) fn strip_batch_get_projections(
-    request: &mut BatchGetItemRequest,
-) -> HashMap<TableName, BatchGetProjection> {
-    let mut projections = HashMap::with_capacity(request.request_items.len());
-    for (table_name, keys_and_attributes) in &mut request.request_items {
-        projections.insert(
-            table_name.clone(),
-            BatchGetProjection {
-                attributes_to_get: keys_and_attributes.attributes_to_get.take(),
-                projection_expression: keys_and_attributes.projection_expression.take(),
-                expression_attribute_names: keys_and_attributes.expression_attribute_names.take(),
-                consistent_read: keys_and_attributes.consistent_read,
-            },
-        );
-    }
-    projections
-}
 
 pub(super) struct AttemptError {
     error: StorageError,
@@ -211,7 +153,6 @@ pub struct RemoteStorageProvider {
     pub credential_source: &'static str,
     pub primary_endpoint: AtomicUsize,
     pub probation_endpoint: AtomicUsize,
-    pub(crate) pressure_signals: AtomicUsize,
     pub(crate) retry_budget: RetryTokenBucket,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) redirect_policy: RemoteRedirectPolicy,
@@ -230,248 +171,17 @@ struct PointInTimeRecoverySpecification {
     point_in_time_recovery_enabled: bool,
 }
 
-#[async_trait]
-impl StorageProvider for RemoteStorageProvider {
-    fn take_admission_pressure_signal(&self) -> bool {
-        self.pressure_signals.swap(0, Ordering::AcqRel) > 0
-    }
-
-    fn supports_native_transact_get_items(&self) -> bool {
-        true
-    }
-
-    async fn initialize_storage(&self) -> StorageResult<()> {
-        Ok(())
-    }
-
-    #[instrument(skip_all, fields(feature = "storage", ddb_op = "table_exists"))]
-    async fn table_exists(&self, table_name: &TableName) -> StorageResult<bool> {
-        let request = DescribeTableRequest {
-            table_name: table_name.clone(),
-        };
-        match self
-            .invoke::<_, DescribeTableResponse>("DynamoDB_20120810.DescribeTable", &request)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(err) => {
-                if matches!(
-                    err.to_enum(),
-                    StorageEnum::TableNotFound { .. } | StorageEnum::ResourceNotFound { .. }
-                ) {
-                    Ok(false)
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    #[instrument(skip_all, fields(feature = "storage", ddb_op = "create_table"))]
-    async fn create_table(&self, request: &CreateTableRequest) -> StorageResult<()> {
-        let _response: CreateTableResponse = self
-            .invoke("DynamoDB_20120810.CreateTable", request)
-            .await?;
-        self.enable_managed_table_controls(&request.table_name)
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip_all, fields(feature = "storage", ddb_op = "update_table_status"))]
-    async fn update_table_status(
+impl RemoteStorageProvider {
+    pub(super) async fn query_table_page(
         &self,
-        _table_name: &TableName,
-        _status: TableStatus,
-    ) -> StorageResult<()> {
-        Ok(())
-    }
-
-    async fn get_table_info(&self, table_name: &TableName) -> StorageResult<StoredTableInfo> {
-        let request = DescribeTableRequest {
-            table_name: table_name.clone(),
-        };
-        let response: DescribeTableResponse = self
-            .invoke("DynamoDB_20120810.DescribeTable", &request)
-            .await?;
-        record_items_returned(1);
-        Ok(to_table_info(response.table))
-    }
-
-    #[instrument(skip_all, fields(feature = "storage", ddb_op = "list_tables"))]
-    async fn list_tables(
-        &self,
-        limit: u32,
-        exclusive_start_table_name: Option<TableName>,
-    ) -> StorageResult<Vec<StoredTableInfo>> {
-        let page_limit = limit.min(MAX_LIST_TABLES_LIMIT);
-        let requested = limit as usize;
-        let mut exclusive_start_table_name = exclusive_start_table_name;
-        let mut tables = Vec::with_capacity(requested.min(page_limit as usize));
-
-        loop {
-            if tables.len() >= requested {
-                break;
-            }
-
-            let request = ListTablesRequest {
-                exclusive_start_table_name: exclusive_start_table_name.clone(),
-                limit: Some(page_limit),
-            };
-            let response: ListTablesResponse = self
-                .invoke("DynamoDB_20120810.ListTables", &request)
-                .await?;
-
-            let remaining = requested.saturating_sub(tables.len());
-            let describe_results =
-                future_stream::iter(response.table_names.into_iter().take(remaining).map(
-                    |name| async move {
-                        self.invoke_optional::<_, DescribeTableResponse>(
-                            "DynamoDB_20120810.DescribeTable",
-                            &DescribeTableRequest { table_name: name },
-                        )
-                        .await
-                    },
-                ))
-                .buffered(LIST_TABLE_DESCRIBE_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await?;
-            for info in describe_results.into_iter().flatten() {
-                tables.push(to_table_info(info.table));
-            }
-
-            let Some(next_start) = response.last_evaluated_table_name else {
-                break;
-            };
-            if exclusive_start_table_name.as_ref() == Some(&next_start) {
-                return Err(StorageError::internal(
-                    "remote ListTables continuation did not advance",
-                ));
-            }
-            exclusive_start_table_name = Some(next_start);
-        }
-
-        Ok(tables)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "delete_table",
-            ddb_write = true,
-            items_updated = tracing::field::Empty)
-    )]
-    async fn delete_table(&self, table_name: &TableName) -> StorageResult<()> {
-        let request = DeleteTableRequest {
-            table_name: table_name.clone(),
-        };
-        self.invoke::<_, DeleteTableResponse>("DynamoDB_20120810.DeleteTable", &request)
-            .await?;
-        record_items_updated(1);
-        Ok(())
-    }
-
-    async fn create_table_storage(
-        &self,
-        _table_name: &TableName,
-        _request: &CreateTableRequest,
-    ) -> StorageResult<()> {
-        Ok(())
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "put_item",
-            ddb_write = true,
-            items_updated = tracing::field::Empty)
-    )]
-    async fn put_item_request(
-        &self,
-        write: PhysicalWrite<PutItemRequest, TtlWriteContext>,
-    ) -> StorageResult<PutItemResponse> {
-        let request = write.request().clone();
-        let response = self.invoke("DynamoDB_20120810.PutItem", &request).await?;
-        record_items_updated(1);
-        record_write_cost(
-            "put_item",
-            "put",
-            1,
-            serializable_payload_bytes(&request.item),
-        );
-        Ok(response)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "get_item",
-            ddb_read = true,
-            items_returned = tracing::field::Empty)
-    )]
-    async fn get_item(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        consistent_read: bool,
-    ) -> StorageResult<Option<WireItem>> {
-        let mut request = GetItemRequest::new(table_name, key);
-        request.consistent_read = Some(consistent_read);
-        let response = self
-            .invoke_bytes("DynamoDB_20120810.GetItem", &request)
-            .await?;
-        let item = parse_get_item_wire(&response)?;
-        let items_returned = usize::from(item.is_some());
-        record_items_returned(items_returned);
-        let read_bytes = item
-            .as_ref()
-            .map_or(0, |wire_item| wire_item.payload_len() as u64);
-        record_read_cost("get_item", "get", 1, read_bytes);
-        Ok(item)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "delete_item",
-            ddb_write = true,
-            items_updated = tracing::field::Empty)
-    )]
-    async fn delete_item_request(
-        &self,
-        write: PhysicalWrite<DeleteItemRequest, TtlWriteContext>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        // The storage manager applies the customer's ReturnValues policy after
-        // the provider returns its preimage. Native providers therefore return
-        // the old item for every delete; request it explicitly from Remote.
-        let mut request = write.request().clone();
-        request.return_values = Some(AllOld::AllOld);
-        let response: DeleteItemResponse = self
-            .invoke("DynamoDB_20120810.DeleteItem", &request)
-            .await?;
-        record_items_updated(usize::from(response.attributes.is_some()));
-        record_write_cost(
-            "delete_item",
-            "delete",
-            1,
-            serializable_payload_bytes(&request.key),
-        );
-        Ok(response.attributes.map(Into::into))
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "scan_table",
-            ddb_read = true,
-            items_returned = tracing::field::Empty)
-    )]
-    async fn scan_table(&self, request: &ScanTableRequest) -> StorageResult<RangeReadPage> {
-        let remote_request = build_scan_request(request)?;
+        request: &QueryTableRequest,
+    ) -> StorageResult<RangeReadPage> {
+        let remote_request = build_query_request_view(request)?;
         let max_items = remote_request
             .limit
-            .ok_or_else(|| StorageError::internal("remote scan request is missing its limit"))?;
+            .map_or(MAX_QUERY_LIMIT, |limit| limit.min(MAX_QUERY_LIMIT));
         let response = self
-            .invoke_bytes("DynamoDB_20120810.Scan", &remote_request)
+            .invoke_bytes("DynamoDB_20120810.Query", &remote_request)
             .await?;
         let parsed = parse_scan_query_wire(&response)?;
         let table_info = self
@@ -484,344 +194,6 @@ impl StorageProvider for RemoteStorageProvider {
         let items_returned = parsed.items.len();
         let budget = RangeReadBudget::try_new(max_items, MAX_RANGE_READ_EVALUATED_BYTES)?;
         let page = parsed.into_page(table_info.as_ref(), &request.index_name, budget)?;
-        record_items_returned(items_returned);
-        record_read_cost(
-            "scan_table",
-            "scan",
-            1,
-            wire_items_payload_bytes(page.items.as_slice()),
-        );
-        Ok(page)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "query_table",
-            ddb_read = true,
-            items_returned = tracing::field::Empty)
-    )]
-    async fn query_table(&self, request: &QueryTableRequest) -> StorageResult<RangeReadPage> {
-        self.query_table_with_metadata(request, None).await
-    }
-
-    async fn query_table_with_table_info(
-        &self,
-        request: &QueryTableRequest,
-        table_info: &StoredTableInfo,
-    ) -> StorageResult<RangeReadPage> {
-        self.query_table_with_metadata(request, Some(table_info))
-            .await
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "batch_write_item",
-            ddb_write = true,
-            items_updated = tracing::field::Empty)
-    )]
-    async fn batch_write_item(
-        &self,
-        request: BatchWriteItemRequest,
-        _contexts: BatchWriteContexts,
-        _should_write_to_stream: bool,
-    ) -> StorageResult<BatchWriteItemResponse> {
-        let mut requested_tally = WriteCostTally::default();
-        for write_requests in request.request_items.values() {
-            for write_request in write_requests {
-                requested_tally.record_write_request(write_request);
-            }
-        }
-        let total_requested = request.request_items.values().map(Vec::len).sum::<usize>();
-        let response: BatchWriteItemResponse = self
-            .invoke("DynamoDB_20120810.BatchWriteItem", &request)
-            .await?;
-        let unprocessed = response
-            .unprocessed_items
-            .as_ref()
-            .map_or(0, |items| items.values().map(Vec::len).sum::<usize>());
-        record_items_updated(total_requested.saturating_sub(unprocessed));
-        let mut unprocessed_tally = WriteCostTally::default();
-        if let Some(unprocessed_items) = response.unprocessed_items.as_ref() {
-            for write_requests in unprocessed_items.values() {
-                for write_request in write_requests {
-                    unprocessed_tally.record_write_request(write_request);
-                }
-            }
-        }
-        requested_tally
-            .subtract(&unprocessed_tally)
-            .emit("batch_write_item");
-        Ok(response)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "batch_get_item",
-            ddb_read = true,
-            items_returned = tracing::field::Empty)
-    )]
-    async fn batch_get_item(
-        &self,
-        mut request: BatchGetItemRequest,
-    ) -> StorageResult<BatchGetWireItemResponse> {
-        // Projection is applied by the API manager after wire items are
-        // decoded. Forward only the native BatchGet key/read envelope so a
-        // remote origin cannot project the response a first time and cause a
-        // second projection (notably list indexes) to erase attributes.
-        let mut projections = strip_batch_get_projections(&mut request);
-        let response = self
-            .invoke_bytes("DynamoDB_20120810.BatchGetItem", &request)
-            .await?;
-        let parsed = parse_batch_get_wire(&response)?;
-        let responses = parsed.responses;
-        let returned = responses
-            .as_ref()
-            .map_or(0, |map| map.values().map(Vec::len).sum::<usize>());
-        record_items_returned(returned);
-        let requested = request
-            .request_items
-            .values()
-            .map(|keys| keys.keys.len())
-            .sum::<usize>();
-        let read_bytes = responses.as_ref().map_or(0, |map| {
-            map.values()
-                .map(|items| wire_items_payload_bytes(items.as_slice()))
-                .sum::<u64>()
-        });
-        record_read_cost("batch_get_item", "get", requested, read_bytes);
-        let mut unprocessed_keys = parsed.unprocessed_keys;
-        if let Some(unprocessed_keys) = unprocessed_keys.as_mut() {
-            for (table_name, keys_and_attributes) in unprocessed_keys {
-                if let Some(projection) = projections.remove(table_name) {
-                    projection.restore(keys_and_attributes);
-                }
-            }
-        }
-        Ok(BatchGetWireItemResponse {
-            responses: responses.map(Into::into),
-            unprocessed_keys: unprocessed_keys.map(Into::into),
-            consumed_capacity: None,
-        })
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage", ddb_op = "transact_get_items", ddb_read = true)
-    )]
-    async fn transact_get_items(
-        &self,
-        request: TransactGetItemsRequest,
-    ) -> StorageResult<TransactGetItemsResponse> {
-        self.invoke("DynamoDB_20120810.TransactGetItems", &request)
-            .await
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "update_item",
-            ddb_write = true,
-            items_updated = tracing::field::Empty)
-    )]
-    async fn update_item(
-        &self,
-        write: PhysicalWrite<UpdateItemRequest, TtlWriteContext>,
-    ) -> StorageResult<UpdateItemResponse> {
-        let request = write.request().clone();
-        let response = self
-            .invoke("DynamoDB_20120810.UpdateItem", &request)
-            .await?;
-        record_items_updated(1);
-        record_write_cost(
-            "update_item",
-            "update",
-            1,
-            serializable_payload_bytes(&request),
-        );
-        Ok(response)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "transact_write_items",
-            ddb_write = true,
-            items_updated = tracing::field::Empty)
-    )]
-    async fn transact_write_items(
-        &self,
-        request: TransactWriteItemsRequest,
-        _contexts: OrderedOperationContexts,
-    ) -> StorageResult<TransactWriteItemsResponse> {
-        let mut tally = WriteCostTally::default();
-        for transact_item in &request.transact_items {
-            tally.record_transact_item(transact_item);
-        }
-        let total_items_updated = request
-            .transact_items
-            .iter()
-            .filter(|item| item.put.is_some() || item.delete.is_some() || item.update.is_some())
-            .count();
-        let response = self
-            .invoke("DynamoDB_20120810.TransactWriteItems", &request)
-            .await?;
-        record_items_updated(total_items_updated);
-        tally.emit("transact_write_items");
-        Ok(response)
-    }
-
-    async fn update_table(
-        &self,
-        request: UpdateTableRequest,
-    ) -> StorageResult<UpdateTableResponse> {
-        self.invoke("DynamoDB_20120810.UpdateTable", &request).await
-    }
-
-    async fn update_time_to_live(
-        &self,
-        request: UpdateTimeToLiveRequest,
-    ) -> StorageResult<UpdateTimeToLiveResponse> {
-        self.invoke("DynamoDB_20120810.UpdateTimeToLive", &request)
-            .await
-    }
-
-    async fn describe_time_to_live(
-        &self,
-        table_name: &TableName,
-    ) -> StorageResult<DescribeTimeToLiveResponse> {
-        let request = DescribeTimeToLiveRequest {
-            table_name: table_name.clone(),
-        };
-        self.invoke("DynamoDB_20120810.DescribeTimeToLive", &request)
-            .await
-    }
-}
-
-#[async_trait]
-impl StreamProvider for RemoteStorageProvider {
-    async fn initialize_stream(&self) -> StreamResult<()> {
-        Ok(())
-    }
-
-    async fn create_stream(
-        &self,
-        _stream_name: UserStreamName,
-        _ttl_seconds: Option<DurationSeconds>,
-        _partitioning_mode: StreamPartitioningMode,
-    ) -> StreamResult<StreamName> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn delete_stream(&self, _stream_name: UserStreamName) -> StreamResult<()> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn get_stream(&self, _stream_name: UserStreamName) -> StreamResult<Option<Stream>> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn append_item(
-        &self,
-        _stream_name: StreamName,
-        _item_data: &[u8],
-        _partition_key: Option<&str>,
-    ) -> StreamResult<StreamItemId> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn read_forward(
-        &self,
-        _stream_name: StreamName,
-        _exclusive_start_key: Option<StreamItemId>,
-        _limit: u32,
-    ) -> StreamResult<StreamPage> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn read_backward(
-        &self,
-        _stream_name: StreamName,
-        _exclusive_start_key: Option<StreamItemId>,
-        _limit: u32,
-    ) -> StreamResult<StreamPage> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn create_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-        _position: CursorPosition,
-    ) -> StreamResult<()> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn delete_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-    ) -> StreamResult<()> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn read_from_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-        _limit: u32,
-    ) -> StreamResult<CursorPage> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn advance_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-        _to_item_id: StreamItemId,
-    ) -> StreamResult<()> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-
-    async fn get_cursor(
-        &self,
-        _stream_name: StreamName,
-        _cursor_name: CursorName,
-    ) -> StreamResult<Option<StreamCursor>> {
-        Err(StreamError::internal("remote streams not implemented"))
-    }
-}
-
-impl RemoteStorageProvider {
-    pub(super) async fn query_table_with_metadata(
-        &self,
-        request: &QueryTableRequest,
-        table_info: Option<&StoredTableInfo>,
-    ) -> StorageResult<RangeReadPage> {
-        let remote_request = build_query_request_view(request)?;
-        let max_items = remote_request
-            .limit
-            .ok_or_else(|| StorageError::internal("remote query request is missing its limit"))?;
-        let response = self
-            .invoke_bytes("DynamoDB_20120810.Query", &remote_request)
-            .await?;
-        let parsed = parse_scan_query_wire(&response)?;
-        let loaded_table_info = if table_info.is_none() {
-            self.load_range_table_info_if_needed(
-                &parsed.items,
-                parsed.last_evaluated_key.as_ref(),
-                &request.table_name,
-            )
-            .await?
-        } else {
-            None
-        };
-        let resolved_table_info = table_info.or(loaded_table_info.as_ref());
-        let items_returned = parsed.items.len();
-        let budget = RangeReadBudget::try_new(max_items, MAX_RANGE_READ_EVALUATED_BYTES)?;
-        let page = parsed.into_page(resolved_table_info, &request.index_name, budget)?;
         record_items_returned(items_returned);
         record_read_cost(
             "query_table",
@@ -841,7 +213,44 @@ impl RemoteStorageProvider {
         if items.is_empty() && raw_key.is_none() {
             return Ok(None);
         }
-        self.get_table_info(table_name).await.map(Some)
+        self.get_table_info_inner(table_name).await.map(Some)
+    }
+
+    pub(super) async fn get_table_info_inner(
+        &self,
+        table_name: &TableName,
+    ) -> StorageResult<StoredTableInfo> {
+        let request = DescribeTableRequest {
+            table_name: table_name.clone(),
+        };
+        let response: DescribeTableResponse = self
+            .invoke("DynamoDB_20120810.DescribeTable", &request)
+            .await?;
+        record_items_returned(1);
+        Ok(to_table_info(response.table))
+    }
+
+    #[instrument(skip_all, fields(feature = "storage", ddb_op = "table_exists"))]
+    pub(super) async fn table_exists(&self, table_name: &TableName) -> StorageResult<bool> {
+        let request = DescribeTableRequest {
+            table_name: table_name.clone(),
+        };
+        match self
+            .invoke::<_, DescribeTableResponse>("DynamoDB_20120810.DescribeTable", &request)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if matches!(
+                    err.to_enum(),
+                    StorageEnum::TableNotFound { .. } | StorageEnum::ResourceNotFound { .. }
+                ) {
+                    Ok(false)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     #[instrument(name = "remote_storage.init", skip_all, fields(feature = "storage"))]
@@ -891,7 +300,6 @@ impl RemoteStorageProvider {
             credential_source,
             primary_endpoint: AtomicUsize::new(0),
             probation_endpoint: AtomicUsize::new(NO_ENDPOINT),
-            pressure_signals: AtomicUsize::new(0),
             retry_budget: RetryTokenBucket::new(),
             request_timeout,
             redirect_policy: RemoteRedirectPolicy::Disabled,
@@ -1186,20 +594,15 @@ impl RemoteStorageProvider {
     where
         Request: Serialize + ?Sized,
     {
-        self.invoke_bytes_with_dispatch_status(
-            target,
-            request,
-            super::transaction::ReplayPolicy::Transport,
-        )
-        .await
-        .map_err(|failure| failure.error)
+        self.invoke_bytes_with_dispatch_status(target, request)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     pub(super) async fn invoke_bytes_with_dispatch_status<Request>(
         &self,
         target: &str,
         request: &Request,
-        replay_policy: super::transaction::ReplayPolicy,
     ) -> Result<Bytes, RemoteInvocationError>
     where
         Request: Serialize + ?Sized,
@@ -1218,14 +621,15 @@ impl RemoteStorageProvider {
             current_index = 0;
             using_probation = false;
         }
-        let mut last_error: Option<StorageError> = None;
-        let mut request_dispatch_status = HttpRequestDispatchStatus::NotDispatched;
+        // The last attempt's failure with its own dispatch status. A
+        // `SendOnce` request never records an ambiguous failure: that attempt
+        // returns `CommitUnknown`.
+        let mut last_failure: Option<RemoteInvocationError> = None;
         let mut visited = 0;
         let mut total_attempts = 0;
         // Admission observes one pressure marker per logical request.  A
         // remote request may retry several times, but recording every retry
         // leaves connection-wide markers behind for later requests.
-        let mut pressure_signalled = false;
         let deadline = self
             .request_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
@@ -1277,20 +681,9 @@ impl RemoteStorageProvider {
                             status,
                             leader_hint,
                             retry_after,
-                            dispatch_status: attempt_dispatch_status,
+                            dispatch_status,
                         } = attempt_error;
-                        if attempt_dispatch_status == HttpRequestDispatchStatus::PossiblyDispatched
-                        {
-                            request_dispatch_status = HttpRequestDispatchStatus::PossiblyDispatched;
-                        }
-                        let failure = RemoteInvocationError::new(error, request_dispatch_status);
-                        if replay_policy == super::transaction::ReplayPolicy::Journal
-                            && failure.is_ambiguous()
-                        {
-                            return Err(failure);
-                        }
-                        let error = failure.error;
-                        let outcome = error_label(&error);
+                        let outcome = error.label();
                         let normal_operation_error = Self::is_normal_operation_error(&error);
                         record_latency(&operation, outcome, start.elapsed());
 
@@ -1321,19 +714,26 @@ impl RemoteStorageProvider {
                             }
                         }
 
-                        if !retryable {
-                            if replay_safety_blocks_retry(code.as_deref()) {
-                                record_retry_suppressed("replay_safety");
+                        let failure = RemoteInvocationError::new(error, dispatch_status);
+                        match ReplayPolicy::for_target(target).classify_failure(&failure, retryable)
+                        {
+                            AfterFailure::CommitUnknown => {
+                                record_retry_suppressed("commit_unknown");
+                                return Err(RemoteInvocationError::new(
+                                    StorageError::commit_unknown(REMOTE_WRITE_OUTCOME_UNKNOWN),
+                                    HttpRequestDispatchStatus::PossiblyDispatched,
+                                ));
                             }
-                            return Err(RemoteInvocationError::new(error, request_dispatch_status));
+                            AfterFailure::Return => {
+                                if replay_safety_blocks_retry(code.as_deref()) {
+                                    record_retry_suppressed("replay_safety");
+                                }
+                                return Err(failure);
+                            }
+                            AfterFailure::Retry => {}
                         }
 
-                        if !pressure_signalled && is_provider_pressure_error(&error) {
-                            self.pressure_signals.fetch_add(1, Ordering::Relaxed);
-                            pressure_signalled = true;
-                        }
-
-                        last_error = Some(error);
+                        last_failure = Some(failure);
 
                         let hinted_endpoint = code
                             .as_deref()
@@ -1370,27 +770,17 @@ impl RemoteStorageProvider {
                             .max(compute_backoff(attempts_on_endpoint));
                         if !self.retry_budget.try_take() {
                             record_retry_suppressed("token_budget");
-                            let Some(error) = last_error.take() else {
-                                return Err(RemoteInvocationError::new(
-                                    StorageError::internal(
-                                        "remote retry budget exhausted without a recorded error",
-                                    ),
-                                    request_dispatch_status,
-                                ));
-                            };
-                            return Err(RemoteInvocationError::new(error, request_dispatch_status));
+                            return Err(exhausted_failure(
+                                last_failure,
+                                "remote retry budget exhausted without a recorded error",
+                            ));
                         }
                         if !retry_deadline_allows(deadline, delay) {
                             record_retry_suppressed("deadline");
-                            let Some(error) = last_error.take() else {
-                                return Err(RemoteInvocationError::new(
-                                    StorageError::internal(
-                                        "remote retry deadline reached without a recorded error",
-                                    ),
-                                    request_dispatch_status,
-                                ));
-                            };
-                            return Err(RemoteInvocationError::new(error, request_dispatch_status));
+                            return Err(exhausted_failure(
+                                last_failure,
+                                "remote retry deadline reached without a recorded error",
+                            ));
                         }
                         if delay > Duration::ZERO {
                             tracing::info!(
@@ -1421,27 +811,17 @@ impl RemoteStorageProvider {
 
             if !self.retry_budget.try_take() {
                 record_retry_suppressed("token_budget");
-                let Some(error) = last_error.take() else {
-                    return Err(RemoteInvocationError::new(
-                        StorageError::internal(
-                            "remote retry budget exhausted without a recorded error",
-                        ),
-                        request_dispatch_status,
-                    ));
-                };
-                return Err(RemoteInvocationError::new(error, request_dispatch_status));
+                return Err(exhausted_failure(
+                    last_failure,
+                    "remote retry budget exhausted without a recorded error",
+                ));
             }
             if !retry_deadline_allows(deadline, Duration::ZERO) {
                 record_retry_suppressed("deadline");
-                let Some(error) = last_error.take() else {
-                    return Err(RemoteInvocationError::new(
-                        StorageError::internal(
-                            "remote retry deadline reached without a recorded error",
-                        ),
-                        request_dispatch_status,
-                    ));
-                };
-                return Err(RemoteInvocationError::new(error, request_dispatch_status));
+                return Err(exhausted_failure(
+                    last_failure,
+                    "remote retry deadline reached without a recorded error",
+                ));
             }
 
             metrics_facade::counter!(
@@ -1460,34 +840,10 @@ impl RemoteStorageProvider {
             using_probation = false;
         }
 
-        Err(RemoteInvocationError::new(
-            last_error.unwrap_or_else(|| {
-                StorageError::internal(
-                    "remote storage request exhausted retry budget without definitive outcome",
-                )
-            }),
-            request_dispatch_status,
+        Err(exhausted_failure(
+            last_failure,
+            "remote storage request exhausted retry budget without definitive outcome",
         ))
-    }
-
-    async fn invoke_optional<Request, Response>(
-        &self,
-        target: &str,
-        request: &Request,
-    ) -> StorageResult<Option<Response>>
-    where
-        Request: Serialize + ?Sized,
-        Response: DeserializeOwned,
-    {
-        match self.invoke(target, request).await {
-            Ok(response) => Ok(Some(response)),
-            Err(err) => match err.to_enum() {
-                StorageEnum::TableNotFound { .. } | StorageEnum::ResourceNotFound { .. } => {
-                    Ok(None)
-                }
-                _ => Err(err),
-            },
-        }
     }
 
     async fn invoke_once_bytes(
@@ -1568,11 +924,14 @@ impl RemoteStorageProvider {
             let response = match deadline {
                 Some(deadline) => {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        return Err(redirect_timeout_failure(possibly_dispatched));
+                        // Nothing of this hop was sent; an earlier hop may have
+                        // been.
+                        return Err(deadline_failure(possibly_dispatched));
                     };
                     tokio::time::timeout(remaining, request)
                         .await
-                        .map_err(|_| redirect_timeout_failure(possibly_dispatched))?
+                        // The request may be on the wire.
+                        .map_err(|_| deadline_failure(true))?
                         .map_err(|error| {
                             merge_redirect_dispatch(attempt_transport(error), possibly_dispatched)
                         })?
@@ -1632,12 +991,14 @@ impl RemoteStorageProvider {
             let retry_after = parse_retry_after(response.headers());
             let bytes = match deadline {
                 Some(deadline) => {
+                    // The server has answered with a status: the request was
+                    // sent.
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        return Err(redirect_timeout_failure(possibly_dispatched));
+                        return Err(deadline_failure(true));
                     };
                     tokio::time::timeout(remaining, response.bytes())
                         .await
-                        .map_err(|_| redirect_timeout_failure(possibly_dispatched))?
+                        .map_err(|_| deadline_failure(true))?
                         .map_err(|error| {
                             merge_redirect_dispatch(attempt_transport(error), possibly_dispatched)
                         })?
@@ -1707,14 +1068,19 @@ fn redirect_failure(status: StatusCode, message: &'static str) -> AttemptError {
         .with_dispatch_status(HttpRequestError::HttpStatus { status, body: None }.dispatch_status())
 }
 
-fn redirect_timeout_failure(possibly_dispatched: bool) -> AttemptError {
-    AttemptError::new(StorageError::service_unavailable(1), true, None, None).with_dispatch_status(
-        if possibly_dispatched {
-            HttpRequestDispatchStatus::PossiblyDispatched
-        } else {
-            HttpRequestDispatchStatus::NotDispatched
-        },
+/// The client deadline elapsed. Known not applied only when nothing was sent.
+fn deadline_failure(possibly_dispatched: bool) -> AttemptError {
+    AttemptError::new(
+        storage_types::expired_in(storage_types::AttemptPhase::Statement),
+        true,
+        None,
+        None,
     )
+    .with_dispatch_status(if possibly_dispatched {
+        HttpRequestDispatchStatus::PossiblyDispatched
+    } else {
+        HttpRequestDispatchStatus::NotDispatched
+    })
 }
 
 fn merge_redirect_dispatch(mut error: AttemptError, possibly_dispatched: bool) -> AttemptError {
@@ -1765,6 +1131,20 @@ fn retry_deadline_allows(deadline: Option<Instant>, delay: Duration) -> bool {
         .is_some_and(|next| next < deadline)
 }
 
+/// The answer when no attempt is left: the last attempt's failure, or fixed
+/// text when no attempt failed (nothing was sent).
+fn exhausted_failure(
+    last_failure: Option<RemoteInvocationError>,
+    missing: &'static str,
+) -> RemoteInvocationError {
+    last_failure.unwrap_or_else(|| {
+        RemoteInvocationError::new(
+            StorageError::internal(missing),
+            HttpRequestDispatchStatus::NotDispatched,
+        )
+    })
+}
+
 fn normalized_endpoint_match_key(endpoint: &str) -> &str {
     endpoint.trim_end_matches('/')
 }
@@ -1790,29 +1170,4 @@ fn replay_safety_blocks_retry(code: Option<&str>) -> bool {
         code,
         Some("ConditionalCheckFailedException" | "TransactionCanceledException")
     )
-}
-
-fn is_provider_pressure_error(error: &StorageError) -> bool {
-    match error.to_enum() {
-        StorageEnum::ProvisionedThroughputExceeded { .. }
-        | StorageEnum::Throttled { .. }
-        | StorageEnum::LimitExceeded { .. }
-        | StorageEnum::RequestLimitExceeded
-        | StorageEnum::ServiceUnavailable { .. }
-        | StorageEnum::InternalServerError { .. } => true,
-        StorageEnum::AwsService {
-            code: Some(code), ..
-        } => matches!(
-            code.as_str(),
-            "ServiceUnavailable"
-                | "ServiceUnavailableException"
-                | "RequestTimeout"
-                | "RequestTimeoutException"
-                | "ThrottlingException"
-                | "ProvisionedThroughputExceededException"
-                | "LimitExceededException"
-        ),
-        StorageEnum::AwsService { code: None, .. } => true,
-        _ => false,
-    }
 }

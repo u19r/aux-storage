@@ -1,34 +1,17 @@
 //! Table stream policy and exact resolution are shared across physical
 //! families.
 
-use std::{future::Future, num::NonZeroU32};
+use std::num::NonZeroU32;
 
 use storage_types::{
     BoundTableInfo, GetStreamRecordsRequest, GetStreamRecordsResponse, StorageError, StorageResult,
     TableName, TableStreamCheckpoint, TableStreamFrontier, TimestampMillis,
 };
-use stream_provider::{StreamAttempt, TableHistoryIndexAttempt};
 
 use crate::{
-    CachePublication, CatalogAttempt, TableMetadataCache,
-    dynamodb_streams::record::DynamoStreamRecord, resolve_table_in_attempt,
-    table_history_read::TableHistoryReadState,
+    CachePublication, TableMetadataCache, dynamodb_streams::record::DynamoStreamRecord,
+    maintenance::StreamRetentionPort, table_history_read::TableHistoryReadState,
 };
-
-pub trait TableHistoryRetentionAttempt {
-    /// Writers request conflict protection; readers use their coherent native
-    /// snapshot.
-    fn load_table_history_retention(
-        &mut self,
-        table: &BoundTableInfo,
-        protection: storage_types::ReadProtection,
-    ) -> impl Future<Output = StorageResult<Option<crate::StreamTrimState>>> + Send;
-}
-
-pub trait DynamoTableStreamAttempt:
-    CatalogAttempt + StreamAttempt + TableHistoryIndexAttempt + TableHistoryRetentionAttempt
-{
-}
 
 pub(crate) struct DynamoTableStreamPage {
     pub records: Vec<DynamoStreamRecord>,
@@ -49,12 +32,16 @@ pub(crate) struct TableStreamReadOptions<'a> {
     pub shard_id: Option<&'a str>,
 }
 
-pub async fn table_stream_checkpoint_in_attempt<A: DynamoTableStreamAttempt>(
+pub async fn table_stream_checkpoint_in_attempt<A: StreamRetentionPort>(
     attempt: &mut A,
     cache: &TableMetadataCache,
+    bindings: &crate::RequestTableBindings,
     target: &storage_types::TableHistoryTarget,
 ) -> StorageResult<(TableStreamCheckpoint, Option<CachePublication>)> {
-    let (table, publication) = resolve_table_in_attempt(attempt, cache, &target.table_name).await?;
+    let (table, publication) = bindings
+        .resolve_table(attempt, cache, &target.table_name)
+        .await?;
+    table.require_data_readable()?;
     if table.history_id != target.history_id {
         return Err(StorageError::table_not_found(&target.table_name));
     }
@@ -64,7 +51,7 @@ pub async fn table_stream_checkpoint_in_attempt<A: DynamoTableStreamAttempt>(
     ))
 }
 
-pub async fn table_stream_checkpoint_from_table<A: DynamoTableStreamAttempt>(
+pub async fn table_stream_checkpoint_from_table<A: StreamRetentionPort>(
     attempt: &mut A,
     table: &BoundTableInfo,
 ) -> StorageResult<TableStreamCheckpoint> {
@@ -74,23 +61,25 @@ pub async fn table_stream_checkpoint_from_table<A: DynamoTableStreamAttempt>(
         .checkpoint(table)
 }
 
-pub async fn get_table_stream_records_in_attempt<A: DynamoTableStreamAttempt>(
+pub async fn get_table_stream_records_in_attempt<A: StreamRetentionPort>(
     attempt: &mut A,
     cache: &TableMetadataCache,
+    bindings: &crate::RequestTableBindings,
     request: &GetStreamRecordsRequest,
     now: TimestampMillis,
 ) -> StorageResult<(GetStreamRecordsResponse, Option<CachePublication>)> {
     let name = request
         .table_name()
         .ok_or_else(|| StorageError::raw_validation("TableName is required"))?;
-    let (table, publication) = resolve_table_in_attempt(attempt, cache, name).await?;
+    let (table, publication) = bindings.resolve_table(attempt, cache, name).await?;
+    table.require_data_readable()?;
     Ok((
         get_table_stream_records_from_table(attempt, &table, request, now).await?,
         publication,
     ))
 }
 
-pub async fn get_table_stream_records_from_table<A: DynamoTableStreamAttempt>(
+pub async fn get_table_stream_records_from_table<A: StreamRetentionPort>(
     attempt: &mut A,
     table: &BoundTableInfo,
     request: &GetStreamRecordsRequest,
@@ -115,7 +104,7 @@ pub async fn get_table_stream_records_from_table<A: DynamoTableStreamAttempt>(
     ))
 }
 
-pub(crate) async fn read_table_stream_page<A: DynamoTableStreamAttempt>(
+pub(crate) async fn read_table_stream_page<A: StreamRetentionPort>(
     attempt: &mut A,
     table: &BoundTableInfo,
     request: &GetStreamRecordsRequest,

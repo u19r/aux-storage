@@ -21,6 +21,17 @@ fn fixture(source: &str) -> Value {
     FIXTURES.case(include_str!("../fixtures/get_item_cases.jsonl"), source)
 }
 
+/// The primary key attributes (`pk`, and `sk` when present) of a seeded item.
+fn item_key(item: &Value) -> Value {
+    let mut key = serde_json::Map::new();
+    for name in ["pk", "sk"] {
+        if let Some(value) = item.get(name) {
+            key.insert(name.to_owned(), value.clone());
+        }
+    }
+    Value::Object(key)
+}
+
 async fn run_case(store: &TestStore, case: &Value) {
     assert_eq!(case["operation"], "GetItem", "fixture operation");
     let table_kind = case["tables"][0].as_str().unwrap();
@@ -88,7 +99,7 @@ async fn run_case(store: &TestStore, case: &Value) {
         && let Some(precondition) = preconditions.last()
     {
         let seeded_item = &precondition["request"]["Item"];
-        let key = case["request"]["Key"].clone();
+        let key = item_key(seeded_item);
         let mut expected_item: AttributeMap = serde_json::from_value(seeded_item.clone()).unwrap();
         expected_item.normalize_numbers_for_write();
         let read = store
@@ -304,3 +315,66 @@ get_item_case!(
     given_reserved_word_count_when_get_item_runs_then_conformance_response_matches,
     "field-projection_expression/400/reserved_word_count.json"
 );
+
+// DDB-PAR-4 (AWS probe P15): `#a` -> `a.b` and `#l` -> `l[0]` project the
+// top-level attributes; unaliased `a.b` and `l[0]` project the nested values.
+get_item_case!(
+    given_aliased_and_unaliased_punctuated_paths_when_projecting_then_each_addresses_its_attribute,
+    "local/ddb-par-4/punctuated_alias_projection_get.json"
+);
+// AWS probe P1.
+get_item_case!(
+    given_trailing_comma_projection_when_get_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_trailing_comma_projection_when_get_runs_then_eof_syntax_error.json"
+);
+// AWS probe P1.
+get_item_case!(
+    given_space_separated_projection_when_get_runs_then_token_error,
+    "local/ddb-par-1/given_space_separated_projection_when_get_runs_then_token_error.json"
+);
+// AWS probe P4.
+get_item_case!(
+    given_empty_projection_when_get_runs_then_empty_expression_error,
+    "local/ddb-par-1/given_empty_projection_when_get_runs_then_empty_expression_error.json"
+);
+// AWS probe P9.
+get_item_case!(
+    given_names_without_expression_when_get_runs_then_only_with_expressions_error,
+    "local/ddb-par-1/\
+     given_names_without_expression_when_get_runs_then_only_with_expressions_error.json"
+);
+// AWS probe P11.
+get_item_case!(
+    given_attributes_to_get_and_projection_when_get_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/\
+     given_attributes_to_get_and_projection_when_get_runs_then_mixed_parameters_are_rejected.json"
+);
+// AWS CLI validates this client-side (probe P11); text from the AWS constraint
+// format.
+get_item_case!(
+    given_empty_attributes_to_get_when_get_runs_then_length_constraint_error,
+    "local/ddb-par-2/given_empty_attributes_to_get_when_get_runs_then_length_constraint_error.json"
+);
+// AWS probe P11.
+get_item_case!(
+    given_duplicate_attributes_to_get_when_get_runs_then_duplicate_value_error,
+    "local/ddb-par-2/given_duplicate_attributes_to_get_when_get_runs_then_duplicate_value_error.\
+     json"
+);
+
+// AWS behavioural suite
+get_item_case!(
+    given_check_error_validation_empty_key_when_get_item_runs_then_aws_behavioural_response_matches,
+    "local/aws-behav/check_error_validation_empty_key.json"
+);
+get_item_case!(given_check_get_item_attributes_to_get_omits_a_missing_attribute_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_attributes_to_get_omits_a_missing_attribute.json");
+get_item_case!(given_check_get_item_key_with_attribute_outside_schema_rejected_extra_key_attribute_refused_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_key_with_attribute_outside_schema_rejected--extra-key-attribute-refused.json");
+get_item_case!(given_check_get_item_key_with_attribute_outside_schema_rejected_exact_key_returns_item_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_key_with_attribute_outside_schema_rejected--exact-key-returns-item.json");
+get_item_case!(given_check_get_item_missing_range_key_rejected_hash_only_key_refused_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_missing_range_key_rejected--hash-only-key-refused.json");
+get_item_case!(given_check_get_item_missing_range_key_rejected_full_key_returns_item_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_missing_range_key_rejected--full-key-returns-item.json");
+get_item_case!(given_check_get_item_projection_expression_alias_substitution_exceeds_4kb_accepted_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_projection_expression_alias_substitution_exceeds_4kb_accepted.json");
+get_item_case!(given_check_get_item_unaliased_reserved_word_in_a_projection_path_segment_rejected_unaliased_refused_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_unaliased_reserved_word_in_a_projection_path_segment_rejected--unaliased-refused.json");
+get_item_case!(given_check_get_item_unaliased_reserved_word_in_a_projection_path_segment_rejected_aliased_returns_map_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_item_unaliased_reserved_word_in_a_projection_path_segment_rejected--aliased-returns-map.json");
+get_item_case!(given_check_get_nonexistent_item_returns_empty_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_get_nonexistent_item_returns_empty.json");
+get_item_case!(given_check_legacy_attributes_to_get_empty_item_and_whole_nested_values_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_legacy_attributes_to_get_empty_item_and_whole_nested_values.json");
+get_item_case!(given_check_cli_query_nested_extraction_when_get_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_cli_query_nested_extraction.json");

@@ -130,6 +130,34 @@ fn validate_root(root: &RootConfig) -> Result<(), ConfigError> {
     validate_queue_config(root)?;
     validate_pubsub_config(root)?;
     validate_storage_admission_config(&root.features.storage_admission)?;
+    validate_storage_deadlines_config(&root.features.storage_deadlines)?;
+    Ok(())
+}
+
+fn validate_storage_deadlines_config(
+    deadlines: &crate::StorageDeadlinesConfig,
+) -> Result<(), ConfigError> {
+    for (name, value) in [
+        ("point_read_ms", deadlines.point_read_ms),
+        ("range_read_ms", deadlines.range_read_ms),
+        ("write_ms", deadlines.write_ms),
+        ("transaction_ms", deadlines.transaction_ms),
+        ("schema_change_ms", deadlines.schema_change_ms),
+        ("background_page_ms", deadlines.background_page_ms),
+        ("long_poll_probe_ms", deadlines.long_poll_probe_ms),
+        ("commit_grace_ms", deadlines.commit_grace_ms),
+    ] {
+        if value == 0 {
+            return Err(ConfigError::validation(format!(
+                "features.storage_deadlines.{name} must be greater than 0"
+            )));
+        }
+    }
+    if deadlines.long_poll_probe_ms > deadlines.point_read_ms {
+        return Err(ConfigError::validation(
+            "features.storage_deadlines.long_poll_probe_ms must not exceed point_read_ms",
+        ));
+    }
     Ok(())
 }
 
@@ -211,6 +239,12 @@ fn validate_queue_config(root: &RootConfig) -> Result<(), ConfigError> {
             "queue.account_id must not be empty",
         ));
     }
+    if root.queue.region.trim().is_empty() {
+        return Err(ConfigError::validation("queue.region must not be empty"));
+    }
+    if root.queue.partition.trim().is_empty() {
+        return Err(ConfigError::validation("queue.partition must not be empty"));
+    }
     if let Some(public_base_url) = root.queue.public_base_url.as_deref()
         && public_base_url.trim().is_empty()
     {
@@ -221,8 +255,8 @@ fn validate_queue_config(root: &RootConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_pubsub_config(_root: &RootConfig) -> Result<(), ConfigError> {
-    Ok(())
+fn validate_pubsub_config(root: &RootConfig) -> Result<(), ConfigError> {
+    root.pubsub.validate()
 }
 
 fn validate_backend_details(backends: &crate::Backends, path: &str) -> Result<(), ConfigError> {
@@ -237,11 +271,24 @@ fn validate_backend_details(backends: &crate::Backends, path: &str) -> Result<()
                 "{path}.postgres.max_pool_size must be greater than 0"
             )));
         }
-        if postgres.background_max_pool_size == 0 {
-            return Err(ConfigError::validation(format!(
-                "{path}.postgres.background_max_pool_size must be greater than 0"
-            )));
-        }
+    }
+    if let Some(foundationdb) = &backends.foundationdb
+        && !(storage_types::FOUNDATIONDB_MIN_REPLY_BYTE_LIMIT
+            ..=storage_types::FOUNDATIONDB_MAX_REPLY_BYTE_LIMIT)
+            .contains(&foundationdb.reply_byte_limit)
+    {
+        return Err(ConfigError::validation(format!(
+            "{path}.foundationdb.reply_byte_limit must be between {} and {}",
+            storage_types::FOUNDATIONDB_MIN_REPLY_BYTE_LIMIT,
+            storage_types::FOUNDATIONDB_MAX_REPLY_BYTE_LIMIT
+        )));
+    }
+    if let Some(rocksdb) = &backends.rocksdb
+        && rocksdb.writer_queue_capacity == 0
+    {
+        return Err(ConfigError::validation(format!(
+            "{path}.rocksdb.writer_queue_capacity must be greater than 0"
+        )));
     }
     if let Some(remote) = &backends.remote {
         if remote.endpoint_urls.is_empty() {
@@ -258,10 +305,15 @@ fn validate_backend_details(backends: &crate::Backends, path: &str) -> Result<()
                 "{path}.remote.region must not be empty"
             )));
         }
-        if let Some(credentials) = &remote.credentials
-            && let Err(error) = credentials.validate()
+        if let Some(timeouts) = &remote.timeout_overrides
+            && let (Some(connect), Some(request)) =
+                (timeouts.connect_timeout_ms, timeouts.request_timeout_ms)
+            && connect >= request
         {
-            return Err(ConfigError::validation(error.to_string()));
+            return Err(ConfigError::validation(format!(
+                "{path}.remote.timeout_overrides.connect_timeout_ms ({connect}) must be less than \
+                 request_timeout_ms ({request})"
+            )));
         }
     }
     Ok(())

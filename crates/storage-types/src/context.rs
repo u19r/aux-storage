@@ -16,37 +16,6 @@ impl<F: FnOnce() -> String> From<LazyContext<F>> for String {
     }
 }
 
-pub trait ResultExt<T, E> {
-    /// Log/map the error using the provided function.
-    fn log_and_map<F, E2>(self, f: F) -> Result<T, E2>
-    where F: FnOnce(&E) -> E2;
-}
-
-impl<T, E> ResultExt<T, E> for Result<T, E> {
-    fn log_and_map<F, E2>(self, f: F) -> Result<T, E2>
-    where F: FnOnce(&E) -> E2 {
-        match self {
-            Ok(value) => Ok(value),
-            Err(error) => Err(f(&error)),
-        }
-    }
-}
-
-pub trait ResultOptionExt<T, E> {
-    /// Convert Ok(None) into the supplied error.
-    fn and_required(self, error: E) -> Result<T, E>;
-}
-
-impl<T, E> ResultOptionExt<T, E> for Result<Option<T>, E> {
-    fn and_required(self, error: E) -> Result<T, E> {
-        match self {
-            Ok(Some(value)) => Ok(value),
-            Ok(None) => Err(error),
-            Err(err) => Err(err),
-        }
-    }
-}
-
 pub trait WrappedError<I: std::fmt::Display> {
     fn to_enum(&self) -> &I;
     fn recursive_context(&self, context: Vec<String>) -> (&I, Vec<String>);

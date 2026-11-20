@@ -1,15 +1,12 @@
-use std::{collections::HashMap, convert::TryFrom, io::Write as _, num::NonZeroU64};
+use std::{collections::HashMap, convert::TryFrom, num::NonZeroU64};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use storage_types::{
     AttributeValue, HIDDEN_TTL_INDEX_PREFIX, IndexName, ItemKey, StorageError, StorageResult,
-    StoredTableInfo, TableName, TimeToLiveStatus, TimestampMillis, WireItem,
+    StoredTableInfo, TableName, TimeToLiveStatus, TimestampMillis, TtlBinding, WireItem,
 };
 
-use super::{
-    TTL_INDEX_PREFIX, TTL_INDEX_WIDTH, TtlIndexWrite, TtlIndexWriteBatch, TtlMaintenanceCheckpoint,
-    TtlMaintenanceCursor,
-};
+use super::{TtlIndexWrite, TtlIndexWriteBatch, TtlMaintenanceCheckpoint, TtlMaintenanceCursor};
 
 impl TtlIndexWriteBatch {
     fn from_keys(old: Option<TtlIndexKey>, new: Option<TtlIndexKey>) -> Self {
@@ -24,24 +21,19 @@ impl TtlIndexWriteBatch {
 
     pub fn for_wire_items(
         table: &StoredTableInfo,
-        config: Option<&TtlConfigRecord>,
+        config: Option<&TtlBinding>,
         old_item: Option<&WireItem>,
         new_item: Option<&WireItem>,
     ) -> StorageResult<Self> {
-        let Some(config) = config.filter(|config| {
-            matches!(
-                config.status,
-                TimeToLiveStatus::Enabled | TimeToLiveStatus::Enabling
-            )
-        }) else {
+        let Some(config) = config.filter(|config| config.tracks()) else {
             return Ok(Self(Vec::new()));
         };
         let old_key = old_item
-            .map(|item| TtlIndexKey::for_wire_item(table, &config.attribute_name, item))
+            .map(|item| TtlIndexKey::for_wire_item(table, &config.attribute, item))
             .transpose()?
             .flatten();
         let new_key = new_item
-            .map(|item| TtlIndexKey::for_wire_item(table, &config.attribute_name, item))
+            .map(|item| TtlIndexKey::for_wire_item(table, &config.attribute, item))
             .transpose()?
             .flatten();
         Ok(Self::from_keys(old_key, new_key))
@@ -52,38 +44,32 @@ impl TtlIndexWriteBatch {
     /// backends keep only their DELETE/INSERT strings.
     pub fn for_items(
         table: &StoredTableInfo,
-        config: Option<&TtlConfigRecord>,
+        config: Option<&TtlBinding>,
         old_item: Option<&HashMap<String, AttributeValue>>,
         new_item: Option<&HashMap<String, AttributeValue>>,
     ) -> StorageResult<Self> {
-        let Some(config) = config.filter(|config| {
-            matches!(
-                config.status,
-                TimeToLiveStatus::Enabled | TimeToLiveStatus::Enabling
-            )
-        }) else {
+        let Some(config) = config.filter(|config| config.tracks()) else {
             return Ok(Self(Vec::new()));
         };
         let old_key = old_item
             .filter(|item| !item.is_empty())
-            .map(|item| TtlIndexKey::for_item(table, &config.attribute_name, item))
+            .map(|item| TtlIndexKey::for_item(table, &config.attribute, item))
             .transpose()?
             .flatten();
         let new_key = new_item
             .filter(|item| !item.is_empty())
-            .map(|item| TtlIndexKey::for_item(table, &config.attribute_name, item))
+            .map(|item| TtlIndexKey::for_item(table, &config.attribute, item))
             .transpose()?
             .flatten();
         Ok(Self::from_keys(old_key, new_key))
     }
 }
 
-/// New-image TTL work completed against the operation's observed policy.
+/// New-image TTL work completed against the operation's bound TTL policy.
 pub enum PreparedTtlPut {
     Disabled,
     NewItem {
         attribute_name: String,
-        generation: TtlPolicyGeneration,
         token: TtlIndexKeyToken,
         key: Option<TtlIndexKey>,
     },
@@ -92,44 +78,47 @@ pub enum PreparedTtlPut {
 impl PreparedTtlPut {
     pub fn try_new(
         table: &StoredTableInfo,
-        config: Option<&TtlConfigRecord>,
+        ttl: Option<&TtlBinding>,
         item: &WireItem,
     ) -> StorageResult<Self> {
-        let Some(config) = config.filter(|config| ttl_tracking_enabled(Some(config))) else {
+        let Some(ttl) = ttl.filter(|ttl| ttl.tracks()) else {
             return Ok(Self::Disabled);
         };
-        let key = TtlIndexKey::for_wire_item(table, &config.attribute_name, item)?;
+        let key = TtlIndexKey::for_wire_item(table, &ttl.attribute, item)?;
         let token = match &key {
             Some(key) => key.token.clone(),
             None => TtlIndexKeyToken::from_wire_item(table, item)?,
         };
         Ok(Self::NewItem {
-            attribute_name: config.attribute_name.clone(),
-            generation: config.policy_generation,
+            attribute_name: ttl.attribute.clone(),
             token,
             key,
         })
     }
 
+    pub fn new_key(&self) -> Option<&TtlIndexKey> {
+        match self {
+            Self::Disabled => None,
+            Self::NewItem { key, .. } => key.as_ref(),
+        }
+    }
+
     pub fn finish(
         &self,
-        config: Option<&TtlConfigRecord>,
+        ttl: Option<&TtlBinding>,
         old: Option<&WireItem>,
     ) -> StorageResult<TtlIndexWriteBatch> {
-        let config = config.filter(|config| ttl_tracking_enabled(Some(config)));
-        match (self, config) {
+        let ttl = ttl.filter(|ttl| ttl.tracks());
+        match (self, ttl) {
             (Self::Disabled, None) => Ok(TtlIndexWriteBatch::empty()),
             (
                 Self::NewItem {
                     attribute_name,
-                    generation,
                     token,
                     key,
                 },
-                Some(config),
-            ) if *attribute_name == config.attribute_name
-                && *generation == config.policy_generation =>
-            {
+                Some(ttl),
+            ) if *attribute_name == ttl.attribute => {
                 let old_key = old
                     .map(|item| item.scalar_attributes(&[attribute_name.as_str()]))
                     .transpose()?
@@ -141,10 +130,9 @@ impl PreparedTtlPut {
                     .map(|seconds| TtlIndexKey::new(seconds, token.clone()));
                 Ok(TtlIndexWriteBatch::from_keys(old_key, key.clone()))
             }
-            _ => Err(storage_types::StorageEnum::TransactionConflict {
-                message: "prepared TTL policy changed".to_owned(),
-            }
-            .into()),
+            _ => Err(storage_types::StorageError::logical_conflict(
+                "prepared TTL policy changed",
+            )),
         }
     }
 }
@@ -340,6 +328,24 @@ pub struct TtlConfigRecord {
 }
 
 impl TtlConfigRecord {
+    /// The writer-visible part of the policy.
+    #[must_use]
+    pub fn binding(&self) -> TtlBinding {
+        TtlBinding {
+            attribute: self.attribute_name.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    /// Equal policies that differ at most in the sweep checkpoint.
+    #[must_use]
+    pub fn same_policy(&self, other: &Self) -> bool {
+        Self {
+            checkpoint: other.checkpoint.clone(),
+            ..self.clone()
+        } == *other
+    }
+
     pub fn try_new(
         attribute_name: String,
         table_name: &TableName,
@@ -389,23 +395,6 @@ impl TtlConfigRecord {
                 "ttl policy timestamps are invalid",
             ));
         }
-        Ok(())
-    }
-
-    /// A completed direct sweep promotes an enabling table policy to enabled.
-    /// The caller persists this record in the same native attempt that removed
-    /// the final expired index entry.
-    pub fn complete_enabling_at(&mut self, now: TimestampMillis) -> StorageResult<()> {
-        if self.status != TimeToLiveStatus::Enabling {
-            return Ok(());
-        }
-        if now < self.updated_at {
-            return Err(StorageError::internal(
-                "ttl activation time precedes the current policy",
-            ));
-        }
-        self.status = TimeToLiveStatus::Enabled;
-        self.updated_at = now;
         Ok(())
     }
 
@@ -562,7 +551,55 @@ impl TtlIndexKey {
         Self { ttl_seconds, token }
     }
 
+    /// Signed seconds followed by the UTF-8 token preserve logical expiry/token
+    /// order.
+    pub fn append_ordered_bytes(&self, bytes: &mut Vec<u8>) -> StorageResult<()> {
+        let count = 8usize
+            .checked_add(self.token.as_ref().len())
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
+        bytes
+            .try_reserve_exact(count)
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+        bytes.extend_from_slice(&Self::encode_ordered_seconds(self.ttl_seconds));
+        bytes.extend_from_slice(self.token.as_ref().as_bytes());
+        Ok(())
+    }
+
+    pub fn encode_ordered_bytes(&self) -> StorageResult<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.append_ordered_bytes(&mut bytes)?;
+        Ok(bytes)
+    }
+
     #[must_use]
+    pub fn encode_ordered_seconds(seconds: i64) -> [u8; 8] {
+        let mut bytes = seconds.to_be_bytes();
+        bytes[0] ^= 0x80;
+        bytes
+    }
+
+    pub fn decode_ordered_bytes(mut bytes: Vec<u8>) -> StorageResult<Self> {
+        let (seconds, token) = bytes
+            .split_at_checked(8)
+            .ok_or_else(|| StorageError::internal("TTL ordered key is too short"))?;
+        let mut seconds: [u8; 8] = seconds
+            .try_into()
+            .map_err(|_| StorageError::internal("TTL ordered seconds have invalid width"))?;
+        seconds[0] ^= 0x80;
+        if token.is_empty() {
+            return Err(StorageError::internal("TTL ordered token is empty"));
+        }
+        bytes.drain(..8);
+        let token = String::from_utf8(bytes)
+            .map_err(|_| StorageError::internal("TTL ordered token is invalid UTF-8"))?;
+        Ok(Self::new(i64::from_be_bytes(seconds), token.into()))
+    }
+
+    #[must_use]
+    pub fn token(&self) -> &str {
+        self.token.as_ref()
+    }
+
     pub fn ttl_seconds(&self) -> i64 {
         self.ttl_seconds
     }
@@ -594,67 +631,6 @@ impl TtlIndexKey {
             return Ok(None);
         };
         Ok(Some(Self::new(ttl_seconds, token.into())))
-    }
-
-    #[must_use]
-    pub fn parse(key: &[u8], prefix: &[u8]) -> Option<Self> {
-        if !key.starts_with(prefix) {
-            return None;
-        }
-        let rest = &key[prefix.len()..];
-        if rest.len() <= TTL_INDEX_WIDTH {
-            return None;
-        }
-        let (ttl_bytes, remainder) = rest.split_at(TTL_INDEX_WIDTH);
-        if remainder.first().copied()? != b'/' {
-            return None;
-        }
-        let token_bytes = &remainder[1..];
-        if token_bytes.is_empty() {
-            return None;
-        }
-        let ttl_str = std::str::from_utf8(ttl_bytes).ok()?;
-        let ttl_u64 = ttl_str.parse::<u64>().ok()?;
-        let ttl_seconds = i64::try_from(ttl_u64).unwrap_or(i64::MAX);
-        let token = String::from_utf8(token_bytes.to_vec()).ok()?;
-        Some(Self::new(ttl_seconds, token.into()))
-    }
-
-    #[must_use]
-    pub fn encode(&self, table_name: &TableName) -> Vec<u8> {
-        let table = table_name.sanitized_name();
-        let mut key = Vec::with_capacity(
-            TTL_INDEX_PREFIX.len() + table.len() + TTL_INDEX_WIDTH + self.token.as_ref().len() + 2,
-        );
-        let normalized = self.ttl_seconds.max(0);
-        let _ = write!(
-            key,
-            "{TTL_INDEX_PREFIX}{table}/{normalized:0width$}/{}",
-            self.token.as_ref(),
-            width = TTL_INDEX_WIDTH
-        );
-        key
-    }
-
-    #[must_use]
-    pub fn prefix(table_name: &TableName) -> Vec<u8> {
-        format!("{TTL_INDEX_PREFIX}{}/", table_name.sanitized_name()).into_bytes()
-    }
-
-    #[must_use]
-    pub fn range_start(table_name: &TableName) -> Vec<u8> {
-        let mut key = Self::prefix(table_name);
-        let ttl_str = format!("{:0width$}", 0, width = TTL_INDEX_WIDTH);
-        key.extend_from_slice(ttl_str.as_bytes());
-        key
-    }
-
-    #[must_use]
-    pub fn range_end(table_name: &TableName, ttl_seconds: i64) -> Vec<u8> {
-        let mut key = Self::prefix(table_name);
-        let ttl_str = format!("{:0width$}", ttl_seconds.max(0), width = TTL_INDEX_WIDTH);
-        key.extend_from_slice(ttl_str.as_bytes());
-        key
     }
 }
 

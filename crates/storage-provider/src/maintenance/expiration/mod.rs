@@ -10,8 +10,6 @@ mod page_write;
 mod repository;
 mod scan;
 mod scope;
-mod selected;
-mod selection;
 mod target;
 mod target_read;
 mod transact_receipt_trim;
@@ -40,9 +38,8 @@ use models::{
 pub use page_write::{
     accept_expiration_item_deletes, expiration_index_deletes, prepare_expiration_item_deletes,
 };
-pub use repository::{ExpirationRepository, ExpirationTransaction};
+pub use repository::ExpirationTransaction;
 pub use scope::{ExpirationEffectPolicy, ExpirationTargetAdmission, OrdinaryExpiration};
-pub use selection::ExpirationSelection;
 pub use target_read::read_expiration_target_in_attempt;
 pub use transact_receipt_trim::{
     TransactReceiptRow, TransactReceiptTrimHandler, trim_transact_receipts_page,

@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::{ItemStreamVersion, StreamItemId};
+use crate::StreamItemId;
 
 #[test]
 fn increment_item_id() {
@@ -61,13 +61,4 @@ fn stream_item_id_from_uuid_uses_ordered_uuid_prefix() {
     expected.copy_from_slice(&uuid.as_bytes()[..12]);
 
     assert_eq!(id.as_bytes(), &expected);
-}
-
-#[test]
-fn stream_item_id_encodes_item_stream_version_for_transition_boundary() {
-    let version = ItemStreamVersion::new(42);
-    let id = StreamItemId::from(version);
-
-    assert_eq!(&id.as_bytes()[..4], &[0; 4]);
-    assert_eq!(ItemStreamVersion::from(id), version);
 }

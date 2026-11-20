@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use pubsub_provider::{STALE_SUBSCRIPTION_PAGE, StaleSubscriptionSweepHandler};
 use queue_provider::QueueMessageCleanupHandler;
 use scheduled_bg_jobs::{
     EffectMode, EnqueueOptions, FairnessClass, FairnessPolicy, JobCatalog, JobHandler, JobSpec,
@@ -12,7 +13,7 @@ use scheduled_bg_jobs::{
 use storage_backfill::GsiPageLimit;
 use storage_common::{DatabaseJobIntervals, StorageJob};
 use storage_provider::{
-    StreamDurationTrimConfig, TableReclaimHandler, TableReclaimRepository,
+    StreamDurationTrimConfig, TableReclaimHandler,
     maintenance::{
         ExpirationHandler, GsiBuildHandler, PartitionReconciliationHandler, RetentionHandler,
         TransactReceiptTrimHandler,
@@ -30,10 +31,13 @@ pub(super) struct MaintenanceJobCatalog;
 impl MaintenanceJobCatalog {
     pub(super) fn try_new(
         repositories: MaintenanceRepositories,
-        table_reclaim_repository: Option<Arc<dyn TableReclaimRepository>>,
         intervals: DatabaseJobIntervals,
         seed_now: Timestamp,
-    ) -> StorageResult<JobCatalog> {
+        regional: Option<crate::regional::RegionalPairHandler>,
+    ) -> StorageResult<(
+        JobCatalog,
+        Option<scheduled_bg_jobs::JobHandle<crate::regional::PairJobPayload>>,
+    )> {
         let mut catalog = repositories.job_catalog;
         let schema_version = NonZeroU16::new(MAINTENANCE_JOB_SCHEMA_VERSION)
             .ok_or_else(|| StorageError::validation("maintenance job schema version"))?;
@@ -43,23 +47,15 @@ impl MaintenanceJobCatalog {
             seed_now,
         };
         registration.register_job(&mut catalog, StorageJob::TransactReceiptTrim, |interval| {
-            TransactReceiptTrimHandler::try_new(
-                Arc::clone(&repositories.expiration_repository),
-                interval,
-            )
+            TransactReceiptTrimHandler::try_new(Arc::clone(&repositories.operations), interval)
         })?;
         registration.register_job(&mut catalog, StorageJob::TtlSweep, |interval| {
-            ExpirationHandler::try_new(repositories.expiration_repository, interval)
+            ExpirationHandler::try_new(Arc::clone(&repositories.operations), interval)
         })?;
         let page_limit = GsiPageLimit::try_from(256usize)
             .map_err(|_| StorageError::validation("invalid GSI maintenance page limit"))?;
         registration.register_job(&mut catalog, StorageJob::GsiBackfill, |interval| {
-            GsiBuildHandler::try_new(
-                repositories.gsi_build_repository,
-                repositories.stream_initialization_repository,
-                interval,
-                page_limit,
-            )
+            GsiBuildHandler::try_new(Arc::clone(&repositories.operations), interval, page_limit)
         })?;
         if let Some(repository) = repositories.partition_reconciliation_repository {
             registration.register_job(
@@ -77,18 +73,56 @@ impl MaintenanceJobCatalog {
                 |interval| QueueMessageCleanupHandler::try_new(repository, interval, page_limit),
             )?;
         }
+        if let Some(provider) = repositories.pubsub_stale_subscriptions {
+            registration.register_job(
+                &mut catalog,
+                StorageJob::PubsubStaleSubscriptionSweep,
+                |interval| {
+                    StaleSubscriptionSweepHandler::try_new(
+                        provider,
+                        interval,
+                        STALE_SUBSCRIPTION_PAGE,
+                    )
+                },
+            )?;
+        }
         registration.register_job(&mut catalog, StorageJob::StreamTrim, |interval| {
             RetentionHandler::try_new(
-                repositories.retention_repository,
+                Arc::clone(&repositories.operations),
                 interval,
                 StreamDurationTrimConfig::default(),
             )
         })?;
-        if let Some(repository) = table_reclaim_repository {
-            registration.register_job(&mut catalog, StorageJob::TableReclaim, |interval| {
-                TableReclaimHandler::try_new(repository, interval)
-            })?;
-        }
+        registration.register_job(&mut catalog, StorageJob::TableReclaim, |interval| {
+            TableReclaimHandler::try_new(repositories.operations, interval)
+        })?;
+        let regional = regional
+            .map(|handler| {
+                let kind =
+                    scheduled_bg_jobs::JobKind::try_new(crate::regional::REGIONAL_PAIR_JOB_KIND)
+                        .map_err(|_| StorageError::validation("regional job kind"))?;
+                let queue = scheduled_bg_jobs::QueueName::try_new(crate::regional::REGIONAL_QUEUE)
+                    .map_err(|_| StorageError::validation("regional queue"))?;
+                let lease = handler.lease();
+                catalog
+                    .register(
+                        JobSpec::new(
+                            kind,
+                            schema_version,
+                            queue,
+                            handler,
+                            crate::regional::encode_pair_job_payload,
+                        )
+                        .policy(
+                            EffectMode::Fenced,
+                            FairnessPolicy::low_volume(),
+                            RetrySelection::Preset(RetryPreset::Maintenance),
+                            lease,
+                        ),
+                    )
+                    .map_err(|_| StorageError::validation("invalid regional job registration"))
+            })
+            .transpose()?;
         let mut seed_ids = StorageJob::ALL
             .into_iter()
             .map(StorageJob::job_id)
@@ -108,7 +142,7 @@ impl MaintenanceJobCatalog {
         let manifest =
             scheduled_bg_jobs::CatalogManifest::try_new(revision, seed_ids, schedules)
                 .map_err(|_| StorageError::validation("invalid maintenance namespace manifest"))?;
-        Ok(catalog.with_manifest(manifest))
+        Ok((catalog.with_manifest(manifest), regional))
     }
 }
 

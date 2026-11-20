@@ -42,14 +42,6 @@ struct IdentityRequest<'a> {
     return_item_collection_metrics: Option<&'a str>,
 }
 
-/// The compact JSON job receipts written by the prior main implementation.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredJobDigests {
-    execution_digest: [u8; 32],
-    request_digest: [u8; 32],
-}
-
 impl TransactRequestIdentity {
     pub(crate) fn try_from_request(request: &TransactWriteItemsRequest) -> StorageResult<Self> {
         let identity = IdentityRequest {
@@ -80,7 +72,6 @@ impl TransactRequestIdentity {
                     ),
                 })
             }
-            Some(b'{') | Some(b'[') => Self::parse_prior_identity(bytes),
             _ => Err(invalid_fingerprint()),
         }
     }
@@ -111,28 +102,6 @@ impl TransactRequestIdentity {
         digest.update(self.digest);
         self.digest = digest.finalize().into();
         self.execution = Some(execution);
-    }
-
-    // Public JSON receipts expire after ten minutes. Both prior job formats
-    // remain replayable indefinitely and converge on the fixed fingerprint.
-    fn parse_prior_identity(bytes: &[u8]) -> StorageResult<Self> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)?;
-        if value.is_array() {
-            let (execution, request): (Vec<u8>, serde_json::Value) = serde_json::from_value(value)?;
-            let mut identity = Self::from_value(request)?;
-            identity.bind_execution(Sha256::digest(execution).into());
-            return Ok(identity);
-        }
-        if value.get("execution_digest").is_some() {
-            let stored: StoredJobDigests = serde_json::from_value(value)?;
-            let mut identity = Self {
-                digest: stored.request_digest,
-                execution: None,
-            };
-            identity.bind_execution(stored.execution_digest);
-            return Ok(identity);
-        }
-        Self::from_value(value)
     }
 
     fn from_value(mut value: serde_json::Value) -> StorageResult<Self> {

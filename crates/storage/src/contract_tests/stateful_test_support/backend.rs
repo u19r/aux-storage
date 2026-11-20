@@ -23,14 +23,11 @@ use super::{
         ExpirationFixtureTarget, GsiFixtureTarget, QueueReclamationFixtureTarget,
         StreamReclamationFixtureTarget,
     },
-    sql_statements,
 };
 use crate::{
     DatabaseManager, DatabaseManagerRuntimeOptions, DeleteItemInput, QueryIndexInput,
     database_manager::construction_tests::database_manager_with_components,
-    provider::{
-        FoundationDbSettings, PostgresSettings, SqliteSettings, StorageBackend, StorageConfig,
-    },
+    provider::{SqliteSettings, StorageBackend, StorageConfig},
 };
 
 static PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +40,10 @@ pub struct StatefulTestBackend {
     pub(super) target: Mutex<Option<ExpirationFixtureTarget>>,
     pub(super) gsi_target: Mutex<Option<GsiFixtureTarget>>,
     pub(super) stream_reclamation_target: Mutex<Option<StreamReclamationFixtureTarget>>,
+    #[cfg_attr(
+        not(any(feature = "foundationdb", feature = "rocksdb")),
+        expect(dead_code, reason = "queue reclamation contracts run on KV providers")
+    )]
     pub(super) queue_reclamation_target: Mutex<Option<QueueReclamationFixtureTarget>>,
     pub(super) generation: AtomicU64,
 }
@@ -61,29 +62,29 @@ impl StatefulTestBackend {
         Self::try_new(config, Some(path)).await
     }
 
+    #[cfg(feature = "rocksdb")]
     pub async fn rocksdb() -> Result<Self, storage::StorageError> {
         let path = unique_database_path();
         let config = local_config(StorageBackend::RocksDB, &path);
         Self::try_new(config, Some(path)).await
     }
 
+    #[cfg(feature = "postgres")]
     pub async fn postgres() -> Result<Option<Self>, storage::StorageError> {
-        let Some(base_dsn) = std::env::var("TEST_POSTGRES_DSN")
-            .ok()
-            .or_else(|| std::env::var("CUCUMBER_POSTGRES_DSN").ok())
-        else {
+        let Some(base_dsn) = std::env::var("TEST_POSTGRES_DSN").ok() else {
             return Ok(None);
         };
         let dsn = isolated_postgres_dsn(&base_dsn).await?;
         let config = StorageConfig {
+            initial_stream_lineages: None,
             backend_type: StorageBackend::Postgres,
             connection_string: None,
             file_path: None,
             sqlite: None,
-            postgres: Some(PostgresSettings {
+            postgres: Some(crate::provider::PostgresSettings {
                 dsn,
                 tls: false,
-                ..PostgresSettings::default()
+                ..crate::provider::PostgresSettings::default()
             }),
             turso: None,
             rocksdb: None,
@@ -93,14 +94,13 @@ impl StatefulTestBackend {
         Self::try_new(config, None).await.map(Some)
     }
 
+    #[cfg(feature = "foundationdb")]
     pub async fn foundationdb() -> Result<Option<Self>, storage::StorageError> {
-        let Some(cluster_file) = std::env::var("TEST_FDB_CLUSTER_FILE")
-            .ok()
-            .or_else(|| std::env::var("FDB_CLUSTER_FILE").ok())
-        else {
+        let Some(cluster_file) = std::env::var("TEST_FDB_CLUSTER_FILE").ok() else {
             return Ok(None);
         };
         let config = StorageConfig {
+            initial_stream_lineages: None,
             backend_type: StorageBackend::FoundationDb,
             connection_string: None,
             file_path: None,
@@ -108,10 +108,10 @@ impl StatefulTestBackend {
             postgres: None,
             turso: None,
             rocksdb: None,
-            foundationdb: Some(FoundationDbSettings {
+            foundationdb: Some(crate::provider::FoundationDbSettings {
                 cluster_file: Some(cluster_file),
                 subspace_prefix: Some(unique_external_scope("gsi-contract")),
-                ..FoundationDbSettings::default()
+                ..crate::provider::FoundationDbSettings::default()
             }),
             remote: None,
         };
@@ -257,12 +257,6 @@ impl StatefulTestBackend {
         Ok(())
     }
 
-    pub async fn establish_non_origin_gsi_history(&self) -> Result<(), storage::StorageError> {
-        self.create_index_named(IndexName::new("history_anchor"))
-            .await?;
-        self.put_gsi_item("A", "x").await
-    }
-
     async fn create_index_named(
         &self,
         index_name: IndexName,
@@ -371,85 +365,6 @@ impl StatefulTestBackend {
                     error.to_enum()
                 ))
             })?;
-        Ok(())
-    }
-
-    pub async fn discard_required_gsi_history(&mut self) -> Result<(), storage::StorageError> {
-        self.put_gsi_item("A", "y").await?;
-        self.database.take();
-        self.maintenance.take();
-        let updated = match &self.config.backend_type {
-            #[cfg(feature = "sqlite")]
-            StorageBackend::SQLite => {
-                let driver =
-                    sql_backend::sqlite::SqliteBackend::initialize(self.path.as_ref().ok_or_else(
-                        || storage::StorageError::internal("SQLite fixture path is missing"),
-                    )?)
-                    .await?;
-                inject_sql_required_history_gap(&driver).await?
-            }
-            #[cfg(feature = "turso")]
-            StorageBackend::Turso => {
-                let path = self.path.as_ref().ok_or_else(|| {
-                    storage::StorageError::internal("Turso fixture path is missing")
-                })?;
-                let driver =
-                    sql_backend::turso::TursoBackend::initialize(&path.to_string_lossy()).await?;
-                inject_sql_required_history_gap(&driver).await?
-            }
-            #[cfg(feature = "postgres")]
-            StorageBackend::Postgres => {
-                let settings = self.config.postgres.as_ref().ok_or_else(|| {
-                    storage::StorageError::internal("Postgres fixture settings are missing")
-                })?;
-                let driver = sql_backend::postgres::PostgresBackend::initialize(
-                    &settings.dsn,
-                    settings.max_pool_size,
-                    settings.tls,
-                )
-                .await?;
-                inject_sql_required_history_gap(&driver).await?
-            }
-            #[cfg(feature = "rocksdb")]
-            StorageBackend::RocksDB => {
-                let path = self.path.as_ref().ok_or_else(|| {
-                    storage::StorageError::internal("RocksDB fixture path is missing")
-                })?;
-                let driver = kv_backend::rocksdb::RocksDbBackend::initialize(path.clone())?;
-                inject_kv_required_history_gap(&driver).await?
-            }
-            #[cfg(feature = "foundationdb")]
-            StorageBackend::FoundationDb => {
-                let settings = self.config.foundationdb.as_ref().ok_or_else(|| {
-                    storage::StorageError::internal("FDB fixture settings are missing")
-                })?;
-                let driver = kv_backend::foundationdb::FoundationDbBackend::initialize(
-                    kv_backend::foundationdb::FoundationDbOptions {
-                        cluster_file: settings.cluster_file.as_deref(),
-                        subspace_prefix: settings.subspace_prefix.as_deref().map(str::as_bytes),
-                        tenant_name: settings.tenant_name.as_deref().map(str::as_bytes),
-                        cache_read_version_ms: settings.cache_read_version_ms,
-                        report_conflicting_keys: false,
-                        transaction_byte_limit: settings.transaction_byte_limit,
-                    },
-                )
-                .await?;
-                inject_kv_required_history_gap(&driver).await?
-            }
-            _ => {
-                return Err(storage::StorageError::unsupported(
-                    "the selected provider has no history-gap fault injector",
-                ));
-            }
-        };
-        if updated != 1 {
-            return Err(storage::StorageError::internal(
-                "GSI fixture did not inject exactly one required history gap",
-            ));
-        }
-        let (database, maintenance) = Self::open(&self.config).await?;
-        self.database = Some(database);
-        self.maintenance = Some(maintenance);
         Ok(())
     }
 
@@ -603,6 +518,7 @@ fn unique_database_path() -> PathBuf {
     ))
 }
 
+#[cfg(any(feature = "postgres", feature = "foundationdb"))]
 fn unique_external_scope(label: &str) -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -615,6 +531,7 @@ fn unique_external_scope(label: &str) -> String {
     )
 }
 
+#[cfg(feature = "postgres")]
 pub(crate) async fn isolated_postgres_dsn(base_dsn: &str) -> Result<String, storage::StorageError> {
     let schema = unique_external_scope("gsi_contract")
         .replace(['/', '-'], "_")
@@ -648,6 +565,7 @@ fn sqlite_config(path: &Path) -> StorageConfig {
 
 fn local_config(backend_type: StorageBackend, path: &Path) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type,
         connection_string: Some(path.to_string_lossy().into_owned()),
         file_path: None,
@@ -658,98 +576,6 @@ fn local_config(backend_type: StorageBackend, path: &Path) -> StorageConfig {
         foundationdb: None,
         remote: None,
     }
-}
-
-#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
-async fn inject_sql_required_history_gap<B: sql_backend::SqlBackend>(
-    driver: &B,
-) -> Result<usize, storage::StorageError> {
-    use sql_backend::SqlAttempt as _;
-    let engine = driver.engine();
-    let deleted = driver
-        .with_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                let page = attempt
-                    .query(
-                        sql_statements::latest_system_record(),
-                        storage_types::ReadProtection::Conflict,
-                        storage_provider::CATALOG_READ_BYTES,
-                    )
-                    .await?;
-                let [row]: [_; 1] = page
-                    .rows
-                    .try_into()
-                    .map_err(|_| storage::StorageError::internal("fault source is not unique"))?;
-                let [sql_backend::SqlValue::Blob(bytes)]: [_; 1] = row
-                    .into_values()
-                    .try_into()
-                    .map_err(|_| storage::StorageError::internal("fault source width differs"))?
-                else {
-                    return Err(storage::StorageError::internal(
-                        "fault source is not a blob",
-                    ));
-                };
-                let record: storage_types::SystemHistoryRecord =
-                    storage_types::storage_serde::from_bytes(&bytes)?;
-                let pointer = record.pointer().ok_or_else(|| {
-                    storage::StorageError::internal("fault source has no history target")
-                })?;
-                attempt
-                    .execute(sql_statements::delete_history_body(engine, pointer)?)
-                    .await
-            })
-        })
-        .await?;
-    usize::try_from(deleted).map_err(|error| storage::StorageError::internal(&error))
-}
-
-#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
-async fn inject_kv_required_history_gap<B: kv_backend::KvBackend>(
-    driver: &B,
-) -> Result<usize, storage::StorageError> {
-    use kv_backend::{KvAttempt as _, KvMutation, catalog::KvCatalogAttempt};
-    use storage_types::{AttemptMode, ReadProtection};
-    use stream_provider::SystemHistoryReadAttempt;
-
-    driver
-        .with_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                let position = {
-                    let mut catalog = KvCatalogAttempt::new(attempt, ReadProtection::Conflict);
-                    let history = catalog.read_system_page_start().await?;
-                    let high = history.capture_high().map_err(|_| {
-                        storage::StorageError::internal("invalid fault source high")
-                    })?;
-                    let [position]: [_; 1] = high.frontier().to_vec().try_into().map_err(|_| {
-                        storage::StorageError::internal("fault fixture requires one source lineage")
-                    })?;
-                    position
-                };
-                let key = kv_backend::stream_write::key_layout::record_key(&position)?;
-                let bytes = attempt
-                    .get(&key, ReadProtection::Conflict)
-                    .await?
-                    .ok_or_else(|| storage::StorageError::internal("fault source is absent"))?;
-                let mut record: storage_types::SystemHistoryRecord =
-                    storage_types::storage_serde::from_bytes(&bytes)?;
-                if let Some(stamp) = position.offset().versionstamp() {
-                    record = record.with_versionstamp(stamp)?;
-                }
-                let pointer = record.pointer().ok_or_else(|| {
-                    storage::StorageError::internal("fault source has no history target")
-                })?;
-                let key = kv_backend::stream_write::key_layout::item_key(
-                    &pointer.metadata().address().physical_stream_name()?,
-                    pointer.metadata().version().into(),
-                )?;
-                if attempt.get(&key, ReadProtection::Conflict).await?.is_none() {
-                    return Ok(0);
-                }
-                attempt.stage(vec![KvMutation::Delete { key }])?;
-                Ok(1)
-            })
-        })
-        .await
 }
 
 fn remove_local_artifacts(path: &Path) {

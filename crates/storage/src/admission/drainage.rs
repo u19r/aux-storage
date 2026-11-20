@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use super::{AdmissionController, AdmissionRegistry, state::lock_state};
+use super::{AdmissionController, state::lock_state};
 
 impl AdmissionController {
     /// The host stops intake and joins dispatching workers before awaiting
@@ -21,16 +21,5 @@ impl AdmissionController {
             }
             notified.await;
         }
-    }
-}
-
-impl AdmissionRegistry {
-    pub(crate) async fn wait_for_native_idle(&self) {
-        futures::future::join_all(
-            self.connection_ids()
-                .filter_map(|id| self.for_connection(id))
-                .map(AdmissionController::wait_for_native_idle),
-        )
-        .await;
     }
 }

@@ -8,7 +8,7 @@ use storage_common::{DatabaseJobIntervals, StorageJob};
 use storage_provider::{StorageBackend, StorageConfig};
 
 use super::catalog::MaintenanceJobCatalog;
-use crate::{StorageProviderBundle, provider_bundle::create_storage_provider_bundle};
+use crate::provider_bundle::{CallerMaintenance, open_store};
 
 #[cfg(any(
     feature = "sqlite",
@@ -26,6 +26,7 @@ fn fixture_scope() -> String {
 
 fn build_config(backend: &StorageBackend, directory: &std::path::Path) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: backend.clone(),
         connection_string: Some(
             directory
@@ -50,14 +51,15 @@ fn registered_identities(catalog: &JobCatalog) -> BTreeSet<(String, u16)> {
         .collect()
 }
 
-fn assert_catalog(bundle: StorageProviderBundle, backend: &StorageBackend) {
+fn assert_catalog(bundle: CallerMaintenance, backend: &StorageBackend) {
     let catalog = MaintenanceJobCatalog::try_new(
         bundle.maintenance.unwrap(),
-        bundle.table_reclaim_repository,
         DatabaseJobIntervals::default(),
         Timestamp::ZERO,
+        None,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     let expected = StorageJob::ALL
         .into_iter()
         .filter(|job| {
@@ -87,9 +89,10 @@ async fn given_local_native_bundles_when_maintenance_catalogs_are_assembled_then
         StorageBackend::RocksDB,
     ] {
         let config = build_config(&backend, &directory);
-        let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+        let bundle = open_store(config, &Default::default(), "default")
             .await
-            .unwrap();
+            .unwrap()
+            .caller_maintenance();
         assert_catalog(bundle, &backend);
     }
     std::fs::remove_dir_all(directory).unwrap();
@@ -102,19 +105,22 @@ async fn given_absent_optional_maintenance_repositories_when_catalog_is_assemble
     let directory = std::env::temp_dir().join(fixture_scope());
     std::fs::create_dir(&directory).unwrap();
     let config = build_config(&StorageBackend::SQLite, &directory);
-    let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+    let bundle = open_store(config, &Default::default(), "default")
         .await
-        .unwrap();
+        .unwrap()
+        .caller_maintenance();
     let mut repositories = bundle.maintenance.unwrap();
     repositories.partition_reconciliation_repository = None;
     repositories.queue_message_cleanup_repository = None;
+    repositories.pubsub_stale_subscriptions = None;
     let catalog = MaintenanceJobCatalog::try_new(
         repositories,
-        None,
         DatabaseJobIntervals::default(),
         Timestamp::ZERO,
+        None,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     let expected = StorageJob::ALL
         .into_iter()
         .filter(|job| {
@@ -124,6 +130,7 @@ async fn given_absent_optional_maintenance_repositories_when_catalog_is_assemble
                     | StorageJob::TransactReceiptTrim
                     | StorageJob::TtlSweep
                     | StorageJob::StreamTrim
+                    | StorageJob::TableReclaim
             )
         })
         .map(|job| (job.as_str().into(), 1))
@@ -137,20 +144,29 @@ async fn given_absent_optional_maintenance_repositories_when_catalog_is_assemble
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(all(feature = "postgres", feature = "test-support"))]
 #[tokio::test]
 #[ignore = "requires a configured PostgreSQL service"]
 async fn given_native_postgres_when_maintenance_catalog_is_assembled_then_sql_families_are_registered()
  {
+    let base = std::env::var("TEST_JOB_EFFECT_POSTGRES_DSN")
+        .or_else(|_| std::env::var("TEST_POSTGRES_DSN"))
+        .unwrap();
+    let (dsn, schema) =
+        sql_backend::postgres::test_schema::isolated_test_dsn(&base, "storage_catalog");
+    sql_backend::postgres::test_schema::create_test_schema(&dsn, &schema)
+        .await
+        .unwrap();
     let mut config = build_config(&StorageBackend::Postgres, &std::env::temp_dir());
     config.postgres = Some(storage_provider::PostgresSettings {
-        dsn: std::env::var("TEST_JOB_EFFECT_POSTGRES_DSN").unwrap(),
+        dsn,
         tls: false,
         ..Default::default()
     });
-    let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+    let bundle = open_store(config, &Default::default(), "default")
         .await
-        .unwrap();
+        .unwrap()
+        .caller_maintenance();
     assert_catalog(bundle, &StorageBackend::Postgres);
 }
 
@@ -165,8 +181,9 @@ async fn given_native_foundationdb_when_maintenance_catalog_is_assembled_then_kv
         subspace_prefix: Some(fixture_scope()),
         ..Default::default()
     });
-    let bundle = create_storage_provider_bundle(config, &Default::default(), "default")
+    let bundle = open_store(config, &Default::default(), "default")
         .await
-        .unwrap();
+        .unwrap()
+        .caller_maintenance();
     assert_catalog(bundle, &StorageBackend::FoundationDb);
 }

@@ -32,6 +32,21 @@ pub(crate) fn validate_expression_attribute_value_keys(
     values: Option<&crate::AttributeMap>,
     prefixed: bool,
 ) -> Result<(), String> {
+    validate_value_keys(values, prefixed, true)
+}
+
+/// A transactional member reports an overlong value key without its size.
+pub(crate) fn validate_transact_expression_attribute_value_keys(
+    values: Option<&crate::AttributeMap>,
+) -> Result<(), String> {
+    validate_value_keys(values, false, false)
+}
+
+fn validate_value_keys(
+    values: Option<&crate::AttributeMap>,
+    prefixed: bool,
+    report_key_size: bool,
+) -> Result<(), String> {
     let Some(values) = values else {
         return Ok(());
     };
@@ -54,7 +69,7 @@ pub(crate) fn validate_expression_attribute_value_keys(
     }
     for key in values.keys() {
         if key.len() > 255 {
-            let size_suffix = if prefixed {
+            let size_suffix = if report_key_size {
                 format!(" size of key: {}", key.len())
             } else {
                 String::new()
@@ -106,7 +121,7 @@ pub(crate) fn validate_expression_attribute_name_keys(
             prefixed,
         ));
     }
-    for key in names.keys() {
+    for (key, value) in names.iter() {
         if key.len() > 255 {
             return Err(validation_message(
                 format!(
@@ -125,6 +140,15 @@ pub(crate) fn validate_expression_attribute_name_keys(
             return Err(validation_message(
                 format!(
                     "ExpressionAttributeNames contains invalid key: Syntax error; key: \"{key}\""
+                ),
+                prefixed,
+            ));
+        }
+        if value.is_empty() {
+            return Err(validation_message(
+                format!(
+                    "ExpressionAttributeNames contains invalid value: Empty attribute name for \
+                     key {key}"
                 ),
                 prefixed,
             ));

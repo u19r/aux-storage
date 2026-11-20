@@ -177,9 +177,9 @@ async fn given_arn_and_plain_table_names_when_transact_get_runs_then_capacity_mo
             let mut expected = json!({"Responses": [{"Item": item}, {}]});
             if matches!(mode, Some("TOTAL" | "INDEXES")) {
                 let mut capacity =
-                    json!({"TableName": arn, "CapacityUnits": 4.0, "ReadCapacityUnits": 4.0});
+                    json!({"TableName": arn, "CapacityUnits": 0.0, "ReadCapacityUnits": 0.0});
                 if mode == Some("INDEXES") {
-                    capacity["Table"] = json!({"CapacityUnits": 4.0, "ReadCapacityUnits": 4.0});
+                    capacity["Table"] = json!({"CapacityUnits": 0.0, "ReadCapacityUnits": 0.0});
                 }
                 expected["ConsumedCapacity"] = json!([capacity]);
             }
@@ -280,7 +280,7 @@ async fn given_two_present_items_when_arn_and_plain_transact_get_runs_then_items
         })).expect("valid ARN request")).await.expect("read both items");
         assert_eq!(serde_json::to_value(response).expect("serialize items"), json!({
             "Responses": [{"Item": items[0]}, {"Item": items[1]}],
-            "ConsumedCapacity": [{"TableName": arn, "CapacityUnits": 4.0, "ReadCapacityUnits": 4.0}]
+            "ConsumedCapacity": [{"TableName": arn, "CapacityUnits": 0.0, "ReadCapacityUnits": 0.0}]
         }));
     }).catch_unwind().await;
     store.finish().await;

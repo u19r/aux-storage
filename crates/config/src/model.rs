@@ -1,19 +1,16 @@
-use std::{collections::BTreeMap, net::IpAddr};
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     backends::{Backends, StorageConnectionsConfig},
     constants::{
-        DEFAULT_CONFIG_VERSION, DEFAULT_HTTP_BIND_ADDR, DEFAULT_JOBS_GSI_BACKFILL_INTERVAL_MS,
-        DEFAULT_JOBS_JITTER_PERCENT, DEFAULT_JOBS_MAX_IMMEDIATE_WORKERS, DEFAULT_LOG_DESTINATION,
-        DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS, DEFAULT_TRACING_LOG_LEVEL,
+        DEFAULT_HTTP_BIND_ADDR, DEFAULT_JOBS_GSI_BACKFILL_INTERVAL_MS,
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE_SECONDS, DEFAULT_TRACING_LOG_LEVEL,
     },
     messaging::{PubsubConfig, QueueConfig},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct RootConfig {
     #[serde(rename = "$schema")]
@@ -21,12 +18,6 @@ pub struct RootConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default)]
     pub description: Option<String>,
-    #[serde(default = "default_version")]
-    #[schemars(default = "default_version")]
-    pub version: String,
-    #[serde(default = "default_roles")]
-    #[schemars(default = "default_roles")]
-    pub roles: Vec<AppRole>,
     #[serde(default)]
     #[schemars(default)]
     pub http: HttpConfig,
@@ -44,44 +35,11 @@ pub struct RootConfig {
     pub jobs: Jobs,
 }
 
-impl Default for RootConfig {
-    fn default() -> Self {
-        Self {
-            schema: None,
-            description: None,
-            version: default_version(),
-            roles: default_roles(),
-            http: HttpConfig::default(),
-            features: Features::default(),
-            queue: QueueConfig::default(),
-            pubsub: PubsubConfig::default(),
-            jobs: Jobs::default(),
-        }
-    }
-}
-
 impl RootConfig {
     #[must_use]
     pub fn background_workers_enabled(&self) -> bool {
         self.features.runtime.enable_background_workers
     }
-}
-
-fn default_version() -> String {
-    DEFAULT_CONFIG_VERSION.to_string()
-}
-
-fn default_roles() -> Vec<AppRole> {
-    vec![AppRole::Api, AppRole::DatabaseJobs]
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum AppRole {
-    Api,
-    DatabaseJobs,
-    PeriodicJobs,
-    ImmediateJobs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -95,13 +53,7 @@ pub struct HttpConfig {
     pub routes: HttpRoutesConfig,
     #[serde(default)]
     #[schemars(default)]
-    pub trusted_proxy_ips: Vec<IpAddr>,
-    #[serde(default)]
-    #[schemars(default)]
     pub cors: Cors,
-    #[serde(default)]
-    #[schemars(default)]
-    pub slow_operation_log_ms: SlowOperationLogThresholds,
 }
 
 impl Default for HttpConfig {
@@ -109,9 +61,7 @@ impl Default for HttpConfig {
         Self {
             bind_addr: default_bind_addr(),
             routes: HttpRoutesConfig::default(),
-            trusted_proxy_ips: Vec::new(),
             cors: Cors::default(),
-            slow_operation_log_ms: SlowOperationLogThresholds::default(),
         }
     }
 }
@@ -162,44 +112,6 @@ pub struct Cors {
     #[serde(default)]
     #[schemars(default)]
     pub allow_origins: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct SlowOperationLogThresholds {
-    #[serde(
-        rename = "default",
-        default = "default_slow_operation_log_threshold_ms"
-    )]
-    #[schemars(
-        rename = "default",
-        default = "default_slow_operation_log_threshold_ms"
-    )]
-    pub default: u64,
-    #[serde(flatten, default)]
-    pub overrides: BTreeMap<String, u64>,
-}
-
-impl SlowOperationLogThresholds {
-    #[must_use]
-    pub fn threshold_ms_for(&self, operation_name: &str) -> u64 {
-        self.overrides
-            .get(operation_name)
-            .copied()
-            .unwrap_or(self.default)
-    }
-}
-
-impl Default for SlowOperationLogThresholds {
-    fn default() -> Self {
-        Self {
-            default: default_slow_operation_log_threshold_ms(),
-            overrides: BTreeMap::new(),
-        }
-    }
-}
-
-fn default_slow_operation_log_threshold_ms() -> u64 {
-    DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS
 }
 
 /// Foreground provider admission and overload protection settings.
@@ -276,6 +188,83 @@ const fn default_storage_admission_max_queue_wait_ms() -> u64 {
     25
 }
 
+/// Deadline budgets of native attempts, one per deadline class.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(deny_unknown_fields)]
+pub struct StorageDeadlinesConfig {
+    #[serde(default = "default_storage_deadline_point_read_ms")]
+    #[schemars(default = "default_storage_deadline_point_read_ms")]
+    pub point_read_ms: u64,
+    #[serde(default = "default_storage_deadline_range_read_ms")]
+    #[schemars(default = "default_storage_deadline_range_read_ms")]
+    pub range_read_ms: u64,
+    #[serde(default = "default_storage_deadline_write_ms")]
+    #[schemars(default = "default_storage_deadline_write_ms")]
+    pub write_ms: u64,
+    #[serde(default = "default_storage_deadline_transaction_ms")]
+    #[schemars(default = "default_storage_deadline_transaction_ms")]
+    pub transaction_ms: u64,
+    #[serde(default = "default_storage_deadline_schema_change_ms")]
+    #[schemars(default = "default_storage_deadline_schema_change_ms")]
+    pub schema_change_ms: u64,
+    #[serde(default = "default_storage_deadline_background_page_ms")]
+    #[schemars(default = "default_storage_deadline_background_page_ms")]
+    pub background_page_ms: u64,
+    #[serde(default = "default_storage_deadline_long_poll_probe_ms")]
+    #[schemars(default = "default_storage_deadline_long_poll_probe_ms")]
+    pub long_poll_probe_ms: u64,
+    #[serde(default = "default_storage_deadline_commit_grace_ms")]
+    #[schemars(default = "default_storage_deadline_commit_grace_ms")]
+    pub commit_grace_ms: u64,
+}
+
+impl Default for StorageDeadlinesConfig {
+    fn default() -> Self {
+        Self {
+            point_read_ms: default_storage_deadline_point_read_ms(),
+            range_read_ms: default_storage_deadline_range_read_ms(),
+            write_ms: default_storage_deadline_write_ms(),
+            transaction_ms: default_storage_deadline_transaction_ms(),
+            schema_change_ms: default_storage_deadline_schema_change_ms(),
+            background_page_ms: default_storage_deadline_background_page_ms(),
+            long_poll_probe_ms: default_storage_deadline_long_poll_probe_ms(),
+            commit_grace_ms: default_storage_deadline_commit_grace_ms(),
+        }
+    }
+}
+
+const fn default_storage_deadline_point_read_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[0]
+}
+
+const fn default_storage_deadline_range_read_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[1]
+}
+
+const fn default_storage_deadline_write_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[2]
+}
+
+const fn default_storage_deadline_transaction_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[3]
+}
+
+const fn default_storage_deadline_schema_change_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[4]
+}
+
+const fn default_storage_deadline_background_page_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[5]
+}
+
+const fn default_storage_deadline_long_poll_probe_ms() -> u64 {
+    storage_types::DEFAULT_ATTEMPT_BUDGETS_MS[6]
+}
+
+const fn default_storage_deadline_commit_grace_ms() -> u64 {
+    storage_types::DEFAULT_COMMIT_GRACE_MS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[schemars(deny_unknown_fields)]
 pub struct Features {
@@ -302,6 +291,9 @@ pub struct Features {
     #[serde(default)]
     #[schemars(default)]
     pub storage_admission: StorageAdmissionConfig,
+    #[serde(default)]
+    #[schemars(default)]
+    pub storage_deadlines: StorageDeadlinesConfig,
 }
 
 fn default_backends() -> Backends {
@@ -314,20 +306,12 @@ pub struct Tracing {
     #[serde(default = "default_tracing_log_level")]
     #[schemars(default = "default_tracing_log_level")]
     pub log_level: Option<String>,
-    #[serde(default = "default_log_destination")]
-    #[schemars(default = "default_log_destination")]
-    pub log_destination: String,
-    #[serde(default)]
-    #[schemars(default)]
-    pub traces: Vec<TracingTrace>,
 }
 
 impl Default for Tracing {
     fn default() -> Self {
         Self {
             log_level: default_tracing_log_level(),
-            log_destination: default_log_destination(),
-            traces: Vec::new(),
         }
     }
 }
@@ -336,27 +320,17 @@ fn default_tracing_log_level() -> Option<String> {
     Some(DEFAULT_TRACING_LOG_LEVEL.to_string())
 }
 
-fn default_log_destination() -> String {
-    DEFAULT_LOG_DESTINATION.to_string()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default = "default_true")]
     #[schemars(default = "default_true")]
     pub enabled: bool,
-    #[serde(default)]
-    #[schemars(default)]
-    pub prometheus: PrometheusMetricsConfig,
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            prometheus: PrometheusMetricsConfig::default(),
-        }
+        Self { enabled: true }
     }
 }
 
@@ -364,66 +338,44 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct PrometheusMetricsConfig {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct TracingTrace {
-    pub module_path: String,
-    pub log_level: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeEnvironment {
-    Development,
-    Test,
-    Staging,
-    Production,
-}
-
-impl RuntimeEnvironment {
-    #[must_use]
-    pub const fn allows_debug_endpoints(self) -> bool {
-        matches!(self, Self::Development | Self::Test)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct RuntimeFeatures {
-    #[serde(default = "default_runtime_environment")]
-    #[schemars(default = "default_runtime_environment")]
-    pub environment: RuntimeEnvironment,
     #[serde(default = "default_true")]
     #[schemars(default = "default_true")]
     pub enable_background_workers: bool,
+    /// Seconds the HTTP server drains after a shutdown signal.
+    #[serde(default = "default_runtime_shutdown_grace_seconds")]
+    #[schemars(default = "default_runtime_shutdown_grace_seconds")]
+    pub shutdown_grace_seconds: u64,
+    /// Tokio worker threads; absent uses the available parallelism.
+    #[serde(default)]
+    #[schemars(default)]
+    pub worker_threads: Option<std::num::NonZeroUsize>,
+    /// Starts the tokio console layer; needs the `tokio-console` build feature.
+    #[serde(default)]
+    #[schemars(default)]
+    pub tokio_console: bool,
 }
 
 impl Default for RuntimeFeatures {
     fn default() -> Self {
         Self {
-            environment: default_runtime_environment(),
             enable_background_workers: true,
+            shutdown_grace_seconds: default_runtime_shutdown_grace_seconds(),
+            worker_threads: None,
+            tokio_console: false,
         }
     }
 }
 
-fn default_runtime_environment() -> RuntimeEnvironment {
-    RuntimeEnvironment::Production
+fn default_runtime_shutdown_grace_seconds() -> u64 {
+    DEFAULT_RUNTIME_SHUTDOWN_GRACE_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Jobs {
-    #[serde(default = "default_jobs_max_immediate_workers")]
-    #[schemars(default = "default_jobs_max_immediate_workers")]
-    pub max_immediate_workers: usize,
-    #[serde(default = "default_jobs_jitter_percent")]
-    #[schemars(default = "default_jobs_jitter_percent")]
-    pub jitter_percent: u8,
     #[serde(default = "default_jobs_gsi_backfill_interval_ms")]
     #[schemars(default = "default_jobs_gsi_backfill_interval_ms")]
     pub gsi_backfill_interval_ms: u64,
@@ -432,19 +384,9 @@ pub struct Jobs {
 impl Default for Jobs {
     fn default() -> Self {
         Self {
-            max_immediate_workers: default_jobs_max_immediate_workers(),
-            jitter_percent: default_jobs_jitter_percent(),
             gsi_backfill_interval_ms: default_jobs_gsi_backfill_interval_ms(),
         }
     }
-}
-
-fn default_jobs_max_immediate_workers() -> usize {
-    DEFAULT_JOBS_MAX_IMMEDIATE_WORKERS
-}
-
-fn default_jobs_jitter_percent() -> u8 {
-    DEFAULT_JOBS_JITTER_PERCENT
 }
 
 fn default_jobs_gsi_backfill_interval_ms() -> u64 {

@@ -9,26 +9,21 @@ use http_request::Url;
 use storage_common::serializable_payload_bytes;
 use storage_provider::{MAX_RANGE_READ_EVALUATED_BYTES, RangeReadBudget, RangeReadPage};
 use storage_types::{
-    AttributeDefinition, AttributeValue, BatchGetItemRequest, GlobalSecondaryIndex, IndexName,
-    KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes, MaxIndexers,
-    Projection, ProjectionType, STORAGE_LEADER_HINT_HEADER, StorageEnum, StorageError,
-    StorageResult, StoredTableInfo, TableName, TableStatus, TimestampMillis, WireItem,
-    context::WrappedError as _,
+    AttributeDefinition, GlobalSecondaryIndex, IndexName, KeyAttributeType, KeySchemaElement,
+    KeyType, MaxIndexers, Projection, ProjectionType, STORAGE_LEADER_HINT_HEADER, StorageEnum,
+    StorageError, StorageResult, StoredTableInfo, TableName, TableStatus, TimestampMillis,
+    WireItem, context::WrappedError as _,
 };
 
 use crate::{
     constants::MAX_RETRY_AFTER_SECS,
     provider::{
-        implementation::{
-            leader_hint_header, parse_retry_after, preserve_retry_after,
-            strip_batch_get_projections,
-        },
+        implementation::{leader_hint_header, parse_retry_after, preserve_retry_after},
         wire_item_helper::ScanQueryWireParsed,
     },
 };
 
 const BILLING_BYTE_COUNT_ITERATIONS: usize = 256;
-const BATCH_GET_PROJECTION_ITERATIONS: usize = 64;
 const HTTP_ATTEMPT_SETUP_ITERATIONS: usize = 128;
 
 fn range_table_info_with_keys_only_gsi() -> StoredTableInfo {
@@ -66,7 +61,6 @@ fn range_table_info_with_keys_only_gsi() -> StoredTableInfo {
         ],
         max_indexers: MaxIndexers::default(),
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
-            capture_for_build: false,
             index_name: IndexName::new("by_gsi"),
             key_schema: vec![
                 KeySchemaElement {
@@ -86,6 +80,7 @@ fn range_table_info_with_keys_only_gsi() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: Default::default(),
         deletion_protection_enabled: false,
     }
@@ -256,136 +251,6 @@ fn given_serializable_payload_when_billing_bytes_are_counted_then_no_output_buff
         "expected counting writer to allocate fewer bytes, baseline={} candidate={}",
         baseline.allocated_bytes,
         candidate.allocated_bytes
-    );
-}
-
-fn batch_get_projection_fixture() -> BatchGetItemRequest {
-    let keys = (0..100)
-        .map(|index| {
-            HashMap::from([
-                (
-                    "pk".to_string(),
-                    AttributeValue::S(format!("partition-{index}")),
-                ),
-                ("sk".to_string(), AttributeValue::S(format!("sort-{index}"))),
-            ])
-            .into()
-        })
-        .collect::<Vec<KeyAttributes>>();
-    let attributes_to_get = (0..10).map(|index| format!("attribute_{index}"));
-    let expression_attribute_names = (0..10)
-        .map(|index| (format!("#a{index}"), format!("attribute_{index}")))
-        .collect();
-
-    BatchGetItemRequest {
-        request_items: HashMap::from([(
-            TableName::new("items"),
-            KeysAndAttributes {
-                keys,
-                attributes_to_get: Some(attributes_to_get.collect()),
-                projection_expression: Some(
-                    (0..10)
-                        .map(|index| format!("#a{index}"))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-                expression_attribute_names: Some(expression_attribute_names),
-                consistent_read: Some(true),
-            },
-        )])
-        .into(),
-        return_consumed_capacity: Some(storage_types::ReturnConsumedCapacity::Total),
-    }
-}
-
-fn clone_and_strip_batch_get_request(request: &BatchGetItemRequest) -> BatchGetItemRequest {
-    let mut remote_request = request.clone();
-    for keys_and_attributes in remote_request.request_items.values_mut() {
-        keys_and_attributes.attributes_to_get = None;
-        keys_and_attributes.projection_expression = None;
-        keys_and_attributes.expression_attribute_names = None;
-    }
-    remote_request
-}
-
-fn measure_batch_get_projection_clone_baseline(
-    fixture: &BatchGetItemRequest,
-) -> alloc_counter::AllocationReport<'static> {
-    let inputs = (0..BATCH_GET_PROJECTION_ITERATIONS)
-        .map(|_| fixture.clone())
-        .collect::<Vec<_>>();
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "batch_get_projection_clone_baseline",
-        file!(),
-        line!(),
-        Some("baseline"),
-    );
-    for input in inputs {
-        std::hint::black_box(clone_and_strip_batch_get_request(&input));
-    }
-    guard.finish()
-}
-
-fn measure_batch_get_projection_sidecar_candidate(
-    fixture: &BatchGetItemRequest,
-) -> alloc_counter::AllocationReport<'static> {
-    let inputs = (0..BATCH_GET_PROJECTION_ITERATIONS)
-        .map(|_| fixture.clone())
-        .collect::<Vec<_>>();
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "batch_get_projection_sidecar_candidate",
-        file!(),
-        line!(),
-        Some("candidate"),
-    );
-    for mut input in inputs {
-        let projections = strip_batch_get_projections(&mut input);
-        std::hint::black_box((input, projections));
-    }
-    guard.finish()
-}
-
-#[test]
-fn given_batch_get_projection_metadata_when_preparing_remote_request_then_sidecar_preserves_wire_and_reduces_clone_allocations()
- {
-    let fixture = batch_get_projection_fixture();
-    let baseline = clone_and_strip_batch_get_request(&fixture);
-    let mut candidate = fixture.clone();
-    let projections = strip_batch_get_projections(&mut candidate);
-    assert_eq!(
-        serde_json::to_vec(&candidate).expect("candidate serializes"),
-        serde_json::to_vec(&baseline).expect("baseline serializes")
-    );
-
-    let table_name = TableName::new("items");
-    let mut restored = candidate
-        .request_items
-        .remove(&table_name)
-        .expect("candidate table");
-    let projection = projections.into_iter().next().expect("one projection").1;
-    projection.restore(&mut restored);
-    assert_eq!(
-        serde_json::to_vec(&restored).expect("restored serializes"),
-        serde_json::to_vec(
-            fixture
-                .request_items
-                .get(&table_name)
-                .expect("fixture table")
-        )
-        .expect("fixture serializes")
-    );
-
-    let baseline_report = measure_batch_get_projection_clone_baseline(&fixture);
-    let candidate_report = measure_batch_get_projection_sidecar_candidate(&fixture);
-    let _ = alloc_counter::emit_report(&baseline_report);
-    let _ = alloc_counter::emit_report(&candidate_report);
-    assert!(
-        candidate_report.allocated_bytes < baseline_report.allocated_bytes,
-        "expected projection sidecar to allocate fewer bytes, baseline={} candidate={}",
-        baseline_report.allocated_bytes,
-        candidate_report.allocated_bytes
     );
 }
 

@@ -19,12 +19,19 @@ fn transaction_request(token: Option<&str>) -> Value {
 
 #[test]
 fn given_out_of_range_token_when_transaction_is_validated_then_request_is_rejected() {
-    for token in [String::new(), "a".repeat(37), "界".repeat(37)] {
+    let error = TransactWriteItemsRequest::try_from(transaction_request(Some("")))
+        .expect_err("token length must be validated before execution");
+    assert_eq!(
+        error,
+        "ClientRequestToken must contain between 1 and 36 characters"
+    );
+    for token in ["a".repeat(37), "界".repeat(37)] {
         let error = TransactWriteItemsRequest::try_from(transaction_request(Some(&token)))
             .expect_err("token length must be validated before execution");
         assert_eq!(
             error,
-            "ClientRequestToken must contain between 1 and 36 characters"
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length less than or equal to 36"
         );
     }
 }

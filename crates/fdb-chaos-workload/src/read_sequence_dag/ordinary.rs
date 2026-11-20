@@ -116,7 +116,10 @@ async fn load_query_items(
             .query_page(QueryTableRequest {
                 table_name: query.table_name.clone(),
                 index_name: query.index_name.clone(),
-                key_condition_expression: query.key_condition_expression.clone(),
+                key_condition_expression: query
+                    .key_condition_expression
+                    .clone()
+                    .unwrap_or_default(),
                 expression_attribute_names: query.expression_attribute_names.clone(),
                 expression_attribute_values: query.expression_attribute_values.clone(),
                 projection_expression: query.projection_expression.clone(),

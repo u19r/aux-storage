@@ -26,7 +26,7 @@ pub(crate) async fn initialize_maintenance<A: KvAttempt>(attempt: &mut A) -> Sto
     if read_identity(attempt).await?.is_none() {
         attempt.stage(vec![KvMutation::Put {
             key: IDENTITY_KEY.to_vec(),
-            value: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            value: storage_types::ambient::uuid_now_v7().as_bytes().to_vec(),
         }])?;
     }
     Ok(())

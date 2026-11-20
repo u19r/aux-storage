@@ -5,7 +5,7 @@ use infrastructure_provider::{
     limits::InfrastructureLimits,
     physical_store::{PhysicalRecordCapacity, PhysicalRecordStore},
 };
-use storage_types::{AttemptMode, StorageResult};
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass, StorageResult};
 
 use super::layout;
 use crate::{KvBackend, KvStore};
@@ -21,9 +21,11 @@ impl<B: KvBackend> PhysicalRecordStore for KvStore<B> {
     async fn initialize_records(&self, limits: InfrastructureLimits) -> StorageResult<[u8; 16]> {
         self.record_capacity(limits)?;
         self.backend
-            .with_attempt(AttemptMode::ReadWrite, |native| {
-                Box::pin(async move { layout::initialize_layout(native).await })
-            })
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::SchemaChange)
+                    .start(self.backend.attempt_deadlines()),
+                |native| Box::pin(async move { layout::initialize_layout(native).await }),
+            )
             .await
     }
 }

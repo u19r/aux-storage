@@ -63,7 +63,7 @@ impl PreparedValueHydration {
         prepared
             .values
             .try_reserve_exact(raw.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for (slot, (_, value)) in raw.iter_mut().enumerate() {
             match ValueSlot::decode_bounded(value.take(), &mut allowance)? {
                 ValueSlot::Absent => {}
@@ -91,14 +91,14 @@ impl PreparedValueHydration {
         let mut addresses = Vec::new();
         addresses
             .try_reserve_exact(self.values.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for value in &self.values {
             addresses.push(ChunkAddress::prepare(raw[value.slot].0.as_slice())?);
         }
         let count = self.values.last().map_or(0, |value| value.chunks.end);
         self.keys
             .try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for (value, address) in self.values.iter().zip(addresses) {
             for number in 0..value.chunks.len() {
                 self.keys.push(address.chunk_key(number)?);
@@ -124,18 +124,18 @@ impl PreparedValueHydration {
     }
 
     fn hydrate_values(
-        self,
+        &self,
         raw: &mut [(Vec<u8>, Option<Vec<u8>>)],
         chunks: Vec<Option<Vec<u8>>>,
     ) -> StorageResult<()> {
         self.validate_chunks(&chunks)?;
         let mut chunks = chunks.into_iter();
-        for prepared in self.values {
+        for prepared in &self.values {
             let mut value = Vec::new();
             value
                 .try_reserve_exact(prepared.length)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            for _ in prepared.chunks {
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+            for _ in prepared.chunks.clone() {
                 let chunk = chunks.next().flatten().ok_or_else(invalid_chunks)?;
                 value.extend_from_slice(&chunk);
             }
@@ -147,22 +147,47 @@ impl PreparedValueHydration {
 
 pub(crate) async fn resolve_values<A: KvAttempt + ?Sized>(
     attempt: &A,
-    mut raw: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    raw: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     protection: ReadProtection,
     allowance: crate::KvValueAllowance,
 ) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    resolve_values_with_layouts(attempt, raw, protection, allowance, None).await
+}
+
+pub(crate) async fn resolve_values_with_layouts<A: KvAttempt + ?Sized>(
+    attempt: &A,
+    mut raw: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    protection: ReadProtection,
+    allowance: crate::KvValueAllowance,
+    layouts: Option<&mut Vec<(Vec<u8>, bool)>>,
+) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
     let prepared = PreparedValueHydration::prepare_reads(&mut raw, allowance)?;
-    if prepared.keys.is_empty() {
-        return Ok(raw);
+    if !prepared.keys.is_empty() {
+        let chunks = attempt
+            .native_get_batch(
+                &prepared.keys,
+                protection,
+                crate::KvValueAllowance::for_chunks(prepared.bytes),
+            )
+            .await?;
+        prepared.hydrate_values(&mut raw, chunks)?;
     }
-    let chunks = attempt
-        .native_get_batch(
-            &prepared.keys,
-            protection,
-            crate::KvValueAllowance::for_chunks(prepared.bytes),
-        )
-        .await?;
-    prepared.hydrate_values(&mut raw, chunks)?;
+    if let Some(layouts) = layouts {
+        let additional = raw
+            .iter()
+            .filter(|(key, _)| !layouts.iter().any(|(known, _)| known == key))
+            .count();
+        layouts
+            .try_reserve(additional)
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+        for (slot, (key, _)) in raw.iter_mut().enumerate() {
+            // A repeated read must not replace the result of an earlier flush.
+            if !layouts.iter().any(|(known, _)| known == key) {
+                let has_chunks = prepared.values.iter().any(|value| value.slot == slot);
+                layouts.push((std::mem::take(key), has_chunks));
+            }
+        }
+    }
     Ok(raw)
 }
 

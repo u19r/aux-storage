@@ -16,4 +16,6 @@ pub use crate::{
 };
 
 #[cfg(test)]
+mod error_tests;
+#[cfg(test)]
 mod provider_job_store_tests;

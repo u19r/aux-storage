@@ -57,9 +57,21 @@ async fn given_mixed_item_writers_when_targets_overlap_then_increments_and_image
     for writer in writers {
         writer.await.unwrap().expect("every mixed writer commits");
     }
-    let records = crate::image_retention_tests::table_records(&store, &table)
+    store.wait_until_changes_are_readable().await;
+    // Both keys can share one of four lanes; reserve enough of its page budget
+    // for all 36 known changes rather than assuming the keys use separate
+    // lanes.
+    let records = store
+        .operations
+        .get_stream_records(storage_types::GetStreamRecordsRequest::table(
+            table.clone(),
+            None,
+            Some(1000),
+        ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_parts()
+        .0;
     assert_eq!(
         records.len(),
         36,
@@ -133,6 +145,7 @@ async fn given_missing_item_when_ordinary_and_transactional_conditions_race_then
             storage_types::StorageEnum::TransactionCanceled { .. }
         ));
     }
+    store.wait_until_changes_are_readable().await;
     let records = crate::image_retention_tests::table_records(&store, &table)
         .await
         .unwrap();

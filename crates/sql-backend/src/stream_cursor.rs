@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use storage_types::{
-    StorageEnum, StorageError, StorageResult, StreamItemId, StreamName, storage_serde,
+    MissExpectation, StorageError, StorageResult, StreamItemId, StreamName, storage_serde,
 };
 use stream_provider::{CursorName, StreamCursor};
 
@@ -123,10 +123,10 @@ pub(crate) async fn write_cursor<A: SqlAttempt>(
     };
     let changed = native.execute(SqlStatement::new(sql, binds)).await?;
     if changed != 1 {
-        return Err(StorageEnum::TransactionConflict {
-            message: "SQL stream cursor position changed".to_owned(),
-        }
-        .into());
+        return Err(StorageError::write_miss(
+            "stream_cursor",
+            MissExpectation::Revision,
+        ));
     }
     Ok(())
 }
@@ -154,10 +154,10 @@ pub(crate) async fn delete_cursor<A: SqlAttempt>(
         ))
         .await?;
     if changed != 1 {
-        return Err(StorageEnum::TransactionConflict {
-            message: "SQL stream cursor disappeared".to_owned(),
-        }
-        .into());
+        return Err(StorageError::write_miss(
+            "stream_cursor",
+            MissExpectation::Present,
+        ));
     }
     Ok(())
 }

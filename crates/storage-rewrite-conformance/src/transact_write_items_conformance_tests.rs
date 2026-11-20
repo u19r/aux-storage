@@ -650,3 +650,39 @@ transact_write_case!(given_remaining_docs_limit_expression_attribute_name_token_
 transact_write_case!(given_remaining_docs_limit_expression_attribute_value_token_255_bytes_valid_when_transact_write_runs_then_response_and_state_match_aws, "field-update_expression/200/docs_limit_expression_attribute_value_token_255_bytes_valid.json");
 transact_write_case!(given_remaining_docs_limit_update_expression_4096_bytes_valid_when_transact_write_runs_then_response_and_state_match_aws, "field-update_expression/200/docs_limit_update_expression_4096_bytes_valid.json");
 transact_write_case!(given_remaining_parser_update_alias_reserved_child_after_list_valid_when_transact_write_runs_then_response_and_state_match_aws, "field-update_expression/200/parser_update_alias_reserved_child_after_list_valid.json");
+
+// AWS behavioural suite
+// AWS behavioural:
+// check_transact_items_accept_placeholders_without_an_expression.py
+transact_write_case!(
+    given_put_with_names_and_no_expression_when_transaction_runs_then_item_stored_match_aws,
+    "local/aws-behav/check_transact_items_accept_placeholders_without_an_expression.json#\
+     put_with_names_no_expression"
+);
+// AWS behavioural:
+// check_transact_items_accept_placeholders_without_an_expression.py
+transact_write_case!(
+    given_put_with_values_and_no_expression_when_transaction_runs_then_item_stored_match_aws,
+    "local/aws-behav/check_transact_items_accept_placeholders_without_an_expression.json#\
+     put_with_values_no_expression"
+);
+// AWS behavioural:
+// check_transact_items_accept_placeholders_without_an_expression.py
+transact_write_case!(
+    given_delete_with_names_and_no_expression_when_transaction_runs_then_item_removed_match_aws,
+    "local/aws-behav/check_transact_items_accept_placeholders_without_an_expression.json#\
+     delete_with_names_no_expression"
+);
+// AWS behavioural:
+// check_transact_items_accept_placeholders_without_an_expression.py
+transact_write_case!(
+    given_delete_with_values_and_no_expression_when_transaction_runs_then_item_removed_match_aws,
+    "local/aws-behav/check_transact_items_accept_placeholders_without_an_expression.json#\
+     delete_with_values_no_expression"
+);
+// AWS behavioural:
+// check_transact_write_items_several_deletes_of_distinct_items_all_apply.py
+transact_write_case!(
+    given_several_distinct_deletes_when_transaction_runs_then_all_items_removed_match_aws,
+    "local/aws-behav/check_transact_write_items_several_deletes_of_distinct_items_all_apply.json"
+);

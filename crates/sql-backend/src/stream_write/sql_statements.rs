@@ -152,7 +152,8 @@ pub(super) fn postgres_append_user_item(
             engine,
             "INSERT INTO "["sys_dynamo_stream_items"],
             " (stream_name, item_id, row_blob, created_at) VALUES ($1, decode('58494431', 'hex') \
-             || int8send(pg_current_xact_id()::text::bigint), $2, $3) RETURNING item_id"
+             || int8send(pg_current_xact_id()::text::bigint + (SELECT transaction_offset FROM \
+             sys_system_stream_scope WHERE scope_key = 'system')), $2, $3) RETURNING item_id"
         )
         .to_owned(),
         vec![
@@ -163,18 +164,15 @@ pub(super) fn postgres_append_user_item(
     ))
 }
 
-pub(crate) fn item(
-    engine: impl SqlLayout,
-    row: stream_provider::StreamWriteKind<StreamItem>,
-) -> StorageResult<SqlStatement> {
-    let name =
-        row.value().stream_name.as_ref().ok_or_else(|| {
-            StorageError::internal("planned Dynamo stream row has no stream name")
-        })?;
+pub(crate) fn item(engine: impl SqlLayout, row: StreamItem) -> StorageResult<SqlStatement> {
+    let name = row
+        .stream_name
+        .as_ref()
+        .ok_or_else(|| StorageError::internal("user stream row has no stream name"))?;
     let name = name.as_ref().to_vec();
-    let id = row.value().id.as_bytes().to_vec();
-    let created_at = row.value().created_at.timestamp_millis();
-    let payload = StreamRowValue::from_planned(row)?.to_bytes()?;
+    let id = row.id.as_bytes().to_vec();
+    let created_at = row.created_at.timestamp_millis();
+    let payload = StreamRowValue::from(row).to_bytes()?;
     let binds = vec![
         SqlValue::Blob(name),
         SqlValue::Blob(id),
@@ -192,51 +190,151 @@ pub(crate) fn item(
     ))
 }
 
-pub(crate) fn delete_history_row(
+pub(crate) fn native_entry(
     engine: impl SqlLayout,
-    stream: storage_types::StreamName,
-    version: storage_types::StreamItemId,
-) -> SqlStatement {
-    SqlStatement::new(
-        format!(
-            "DELETE FROM {} WHERE stream_name = {} AND item_id = {}",
-            engine.relation_name("sys_dynamo_stream_items"),
-            engine.engine().placeholder(1),
-            engine.engine().placeholder(2)
-        ),
-        vec![
-            SqlValue::Blob(stream.as_ref().to_vec()),
-            SqlValue::Blob(version.as_bytes().to_vec()),
-        ],
+    table: &storage_types::BoundTableInfo,
+    lineage: &stream_provider::SystemStreamLineage,
+    (entry, scope): (
+        &stream_provider::StreamEntryInput<'_>,
+        &storage_types::SystemStreamScope,
+    ),
+    (event_number, transaction_offset): (u16, i64),
+) -> StorageResult<SqlStatement> {
+    let (sql, binds) = native_entry_parts(
+        engine,
+        table,
+        lineage,
+        (entry, scope),
+        (event_number, transaction_offset),
+    )?;
+    Ok(SqlStatement::new(sql, binds))
+}
+
+pub(crate) fn counted_native_entry(
+    engine: impl SqlLayout,
+    table: &storage_types::BoundTableInfo,
+    lineage: &stream_provider::SystemStreamLineage,
+    (entry, scope): (
+        &stream_provider::StreamEntryInput<'_>,
+        &storage_types::SystemStreamScope,
+    ),
+    (event_number, transaction_offset): (u16, i64),
+) -> StorageResult<crate::SqlCountedWrite> {
+    let (body, binds) = native_entry_parts(
+        engine,
+        table,
+        lineage,
+        (entry, scope),
+        (event_number, transaction_offset),
+    )?;
+    let mut sql = crate::statement::SqlText::start_counted_write()?;
+    sql.append(format_args!("{body}"))?;
+    sql.finish_counted_write(
+        binds,
+        crate::catalog::SqlDynamoCount::ExactlyOne,
+        crate::catalog::SqlDynamoWriteKind::Stream.error_factory(),
     )
 }
 
-pub(super) fn record(
+fn native_entry_parts(
     engine: impl SqlLayout,
-    record: storage_types::SystemHistoryRecord,
+    table: &storage_types::BoundTableInfo,
+    lineage: &stream_provider::SystemStreamLineage,
+    (entry, scope): (
+        &stream_provider::StreamEntryInput<'_>,
+        &storage_types::SystemStreamScope,
+    ),
+    (event_number, transaction_offset): (u16, i64),
+) -> StorageResult<(String, Vec<SqlValue>)> {
+    Ok((
+        format!(
+            "WITH stream_position AS MATERIALIZED (SELECT ((pg_current_xact_id()::text::bigint + \
+             $7::bigint) * 65536 + $4::bigint) AS stream_offset) INSERT INTO {} (table_id, \
+             shard_id, lineage_id, offset_order, offset_text, entry_blob, created_at) SELECT $1, \
+             $2, $3, int8send(stream_offset), lpad(stream_offset::text, 20, '0') || '-ns', $5, $6 \
+             FROM stream_position",
+            engine.relation_name("sys_stream_entries"),
+        ),
+        vec![
+            SqlValue::Blob(table.history_id.as_ref().to_vec()),
+            SqlValue::Text(lineage.shard_id().as_str().to_owned()),
+            SqlValue::Text(lineage.lineage_id().as_str().to_owned()),
+            SqlValue::Integer(i64::from(event_number)),
+            SqlValue::Blob(stream_provider::PositionedStreamEntry::encode_input(
+                &table.table_name,
+                scope,
+                entry,
+            )?),
+            SqlValue::Integer(entry.created_at().timestamp_millis()),
+            SqlValue::Integer(transaction_offset),
+        ],
+    ))
+}
+
+pub(crate) fn entry(
+    engine: impl SqlLayout,
+    table: &storage_types::BoundTableInfo,
+    position: &storage_types::SystemStreamPosition,
+    (entry, scope): (
+        &stream_provider::StreamEntryInput<'_>,
+        &storage_types::SystemStreamScope,
+    ),
 ) -> StorageResult<SqlStatement> {
-    let position = record.position();
+    let (sql, binds) = entry_parts(engine, table, position, (entry, scope))?;
+    Ok(SqlStatement::new(sql, binds))
+}
+
+pub(crate) fn counted_entry(
+    engine: impl SqlLayout,
+    table: &storage_types::BoundTableInfo,
+    position: &storage_types::SystemStreamPosition,
+    (entry, scope): (
+        &stream_provider::StreamEntryInput<'_>,
+        &storage_types::SystemStreamScope,
+    ),
+) -> StorageResult<crate::SqlCountedWrite> {
+    let (body, binds) = entry_parts(engine, table, position, (entry, scope))?;
+    let mut sql = crate::statement::SqlText::start_counted_write()?;
+    sql.append(format_args!("{body}"))?;
+    sql.finish_counted_write(
+        binds,
+        crate::catalog::SqlDynamoCount::ExactlyOne,
+        crate::catalog::SqlDynamoWriteKind::Stream.error_factory(),
+    )
+}
+
+fn entry_parts(
+    engine: impl SqlLayout,
+    table: &storage_types::BoundTableInfo,
+    position: &storage_types::SystemStreamPosition,
+    (entry, scope): (
+        &stream_provider::StreamEntryInput<'_>,
+        &storage_types::SystemStreamScope,
+    ),
+) -> StorageResult<(String, Vec<SqlValue>)> {
     let order = position
         .offset()
         .order()
-        .map_err(|_| StorageError::internal("Invalid system history position"))?;
-    Ok(SqlStatement::new(
+        .map_err(|_| StorageError::internal("Invalid stream entry position"))?;
+    Ok((
         format!(
-            "INSERT INTO {} (shard_id, lineage_id, offset_order, offset_text, table_id, \
-             record_blob, created_at) VALUES ({})",
-            engine.relation_name("sys_dynamo_stream_records"),
+            "INSERT INTO {} (table_id, shard_id, lineage_id, offset_order, offset_text, \
+             entry_blob, created_at) VALUES ({})",
+            engine.relation_name("sys_stream_entries"),
             engine.engine().placeholders(7)
         ),
         vec![
+            SqlValue::Blob(table.history_id.as_ref().to_vec()),
             SqlValue::Text(position.shard_id().as_str().to_owned()),
             SqlValue::Text(position.lineage_id().as_str().to_owned()),
             SqlValue::Blob(order.to_be_bytes().to_vec()),
             SqlValue::Text(position.offset().as_str().to_owned()),
-            record
-                .table_history_id()
-                .map_or(SqlValue::Null, |id| SqlValue::Blob(id.as_ref().to_vec())),
-            SqlValue::Blob(storage_serde::to_bytes(&record)?),
-            SqlValue::Integer(record.created_at().timestamp_millis()),
+            SqlValue::Blob(stream_provider::PositionedStreamEntry::encode_input(
+                &table.table_name,
+                scope,
+                entry,
+            )?),
+            SqlValue::Integer(entry.created_at().timestamp_millis()),
         ],
     ))
 }
@@ -259,17 +357,17 @@ pub(super) fn schema(engine: impl SqlLayout) -> [SqlStatement; 5] {
             relation_sys_dynamo_stream_items = engine.relation_name("sys_dynamo_stream_items"),
         ),
         format!(
-            "CREATE TABLE IF NOT EXISTS {} (shard_id {text} NOT NULL, lineage_id {text} NOT NULL, \
-             offset_order {blob} NOT NULL, offset_text {text} NOT NULL, table_id {blob}, \
-             record_blob {blob} NOT NULL, created_at {int} NOT NULL, PRIMARY KEY (shard_id, \
-             lineage_id, offset_order, offset_text)){suffix}",
-            engine.relation_name("sys_dynamo_stream_records")
+            "CREATE TABLE IF NOT EXISTS {} (table_id {blob} NOT NULL, shard_id {text} NOT NULL, \
+             lineage_id {text} NOT NULL, offset_order {blob} NOT NULL, offset_text {text} NOT \
+             NULL, entry_blob {blob} NOT NULL, created_at {int} NOT NULL, PRIMARY KEY (table_id, \
+             shard_id, lineage_id, offset_order, offset_text)){suffix}",
+            engine.relation_name("sys_stream_entries")
         ),
         format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {} (table_id, shard_id, lineage_id, offset_order, \
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (shard_id, lineage_id, offset_order, \
              offset_text)",
-            engine.relation_name("idx_dynamo_stream_records_table"),
-            engine.relation_name("sys_dynamo_stream_records")
+            engine.relation_name("idx_stream_entries_feed"),
+            engine.relation_name("sys_stream_entries")
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {relation_sys_dynamo_stream_sequence} (name {text} \
@@ -279,4 +377,35 @@ pub(super) fn schema(engine: impl SqlLayout) -> [SqlStatement; 5] {
         ),
     ]
     .map(|sql| SqlStatement::new(sql, vec![]))
+}
+
+/// Exact canonical primary key; the native feed index is removed with the row.
+pub(crate) fn delete_entry(
+    engine: impl SqlLayout,
+    history_id: storage_types::TableHistoryId,
+    position: &storage_types::SystemStreamPosition,
+) -> StorageResult<SqlStatement> {
+    let order = position
+        .offset()
+        .order()
+        .map_err(|_| StorageError::internal("Invalid stream entry position"))?;
+    Ok(SqlStatement::new(
+        format!(
+            "DELETE FROM {} WHERE table_id = {} AND shard_id = {} AND lineage_id = {} AND \
+             offset_order = {} AND offset_text = {}",
+            engine.relation_name("sys_stream_entries"),
+            engine.engine().placeholder(1),
+            engine.engine().placeholder(2),
+            engine.engine().placeholder(3),
+            engine.engine().placeholder(4),
+            engine.engine().placeholder(5)
+        ),
+        vec![
+            SqlValue::Blob(history_id.as_ref().to_vec()),
+            SqlValue::Text(position.shard_id().as_str().to_owned()),
+            SqlValue::Text(position.lineage_id().as_str().to_owned()),
+            SqlValue::Blob(order.to_be_bytes().to_vec()),
+            SqlValue::Text(position.offset().as_str().to_owned()),
+        ],
+    ))
 }

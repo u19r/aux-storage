@@ -1,15 +1,16 @@
-//! A native PostgreSQL allocation floor fences both snapshot readers and trim.
+//! An unfinished PostgreSQL write keeps later records out of reads and trim.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use serde_json::json;
 use storage_provider::{
-    BoundItemWrite, DynamoPort, PutItemShape, SystemStreamTrimExecutor, resolve_table_in_attempt,
+    BoundItemWrite, BoundPutItem, DynamoPort, ItemWriteAttempt as _, PutItemShape,
+    SystemStreamTrimExecutor, resolve_table_in_attempt,
 };
 use storage_types::{
-    AttemptMode, Clock, GetStreamRecordsRequest, PutItemRequest, StorageError, TableName,
-    TimestampMillis,
+    AttemptMode, AttemptPlan, Clock, DeadlineClass, GetStreamRecordsRequest, PutItemRequest,
+    StorageError, TableName, TimestampMillis,
 };
 use stream_provider::SystemStreamPageRequest;
 
@@ -30,12 +31,14 @@ impl Clock for MaintenanceClock {
 }
 
 #[tokio::test]
+#[ignore = "requires STORAGE_TEST_BACKEND=postgres and TEST_POSTGRES_DSN"]
 async fn given_earlier_uncommitted_history_when_later_write_commits_then_read_and_trim_do_not_skip_the_earlier_commit()
 -> anyhow::Result<()> {
     qualify_publication_floor(Settlement::Commit).await
 }
 
 #[tokio::test]
+#[ignore = "requires STORAGE_TEST_BACKEND=postgres and TEST_POSTGRES_DSN"]
 async fn given_earlier_aborted_history_when_later_write_commits_then_read_and_trim_resume_without_a_phantom()
 -> anyhow::Result<()> {
     qualify_publication_floor(Settlement::Abort).await
@@ -46,8 +49,15 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
     let outcome = async {
         let (table, _) = create_stream_table(&store, "NEW_AND_OLD_IMAGES").await;
         let writer = sql_backend::SqlStore::initialize_schema(
-            sql_backend::postgres::PostgresBackend::initialize(&store.postgres_dsn(), 2, false)
-                .await?,
+            sql_backend::postgres::PostgresBackend::initialize(
+                &store.postgres_dsn(),
+                2,
+                false,
+                storage_types::AttemptDeadlines::default(),
+            )
+            .await?,
+            storage_types::InitialStreamLineages::ONE,
+            true,
         )
         .await?;
         let cache = writer.metadata_cache();
@@ -61,13 +71,29 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
         let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let pending = tokio::spawn(async move {
-            writer
-                .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
+            // Use the same shared catalog lock as customer item writes.
+            // Schema-mode attempts deliberately exclude other writers.
+            storage_provider::DynamoPort::with_attempt(
+                &writer,
+                AttemptPlan::new(AttemptMode::ReadWriteItems, DeadlineClass::Write).start(
+                    storage_types::AttemptDeadlineSource::attempt_deadlines(&writer),
+                ),
+                move |attempt| {
                     Box::pin(async move {
                         let (table, _) = resolve_table_in_attempt(attempt, &cache, &name).await?;
-                        PutItemShape::try_from_request(history_put(&name, "earlier"))?
-                            .bind_table(table, None)?
-                            .execute(attempt, created_at)
+                        let bound = Arc::new(PutItemShape::try_from_request(history_put(
+                            &name, "earlier",
+                        ))?)
+                        .bind_table(table)?;
+                        let (target, key) = bound.observation_read().target();
+                        let (observed, lifecycle) = attempt.observe_for_write(target, key).await?;
+                        let accepted = bound
+                            .accept_observation(observed, lifecycle)?
+                            .into_result()?;
+                        BoundPutItem::apply_accepted(attempt, accepted, created_at).await?;
+                        // apply_accepted only stages; the SQL (and the xid)
+                        // exist after the flush.
+                        storage_provider::DynamoStreamWriteAttempt::finish_dynamo_write(attempt)
                             .await?;
                         staged_tx.send(()).unwrap();
                         release_rx.await.unwrap();
@@ -78,8 +104,9 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
                             }
                         }
                     })
-                })
-                .await
+                },
+            )
+            .await
         });
         tokio::time::timeout(Duration::from_secs(10), staged_rx).await??;
         tokio::time::timeout(
@@ -131,7 +158,7 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
             }
             Settlement::Abort => anyhow::ensure!(result.is_err()),
         }
-        let expected = match settlement {
+        let mut expected = match settlement {
             Settlement::Commit => vec!["earlier", "later"],
             Settlement::Abort => vec!["later"],
         };
@@ -147,7 +174,7 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
         )
         .await
         .context("settled table read")?;
-        let keys = visible
+        let mut keys = visible
             .records()
             .iter()
             .map(|record| {
@@ -157,6 +184,10 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
                     .to_owned()
             })
             .collect::<Vec<_>>();
+        // Different keys can route to independent lineages. Their delivery
+        // order is unspecified; the native publication bound covers both.
+        expected.sort_unstable();
+        keys.sort_unstable();
         anyhow::ensure!(
             keys == expected,
             "table continuation skipped or invented a settled event"
@@ -177,7 +208,7 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
         )
         .await
         .context("settled system read")?;
-        let keys = visible_system
+        let mut keys = visible_system
             .records()
             .iter()
             .map(|record| {
@@ -187,6 +218,7 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
                     .to_owned()
             })
             .collect::<Vec<_>>();
+        keys.sort_unstable();
         anyhow::ensure!(
             keys == expected,
             "system continuation skipped or invented a settled event"

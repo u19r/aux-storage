@@ -72,6 +72,7 @@ async fn given_enabled_and_disabled_tables_when_created_and_described_then_only_
         let label = created
             .latest_stream_label
             .expect("enabled table has a stream label");
+        super::describe_table_conformance_tests::assert_iso_stream_label(&label, "created table");
         assert_eq!(
             created.latest_stream_arn,
             Some(format!(
@@ -124,6 +125,7 @@ async fn given_enabled_table_when_stream_read_requires_another_incarnation_then_
         let name = unique_table_name();
         let request = CreateTableRequest::try_from(json!({
             "TableName": name.as_ref(),
+            "BillingMode": "PAY_PER_REQUEST",
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"}
@@ -135,9 +137,7 @@ async fn given_enabled_table_when_stream_read_requires_another_incarnation_then_
             .await
             .unwrap()
             .table_description;
-        let label = created.latest_stream_label.unwrap();
-        let (_, id) = label.rsplit_once('-').unwrap();
-        let history_id = TableHistoryId::from(uuid::Uuid::parse_str(id).unwrap());
+        let history_id = TableHistoryId::from(uuid::Uuid::parse_str(&created.table_id).unwrap());
         let item: storage_types::AttributeMap =
             serde_json::from_value(json!({"pk": {"S": "one"}})).unwrap();
         let item = storage_types::WireItem::try_from(&item).unwrap();
@@ -150,6 +150,7 @@ async fn given_enabled_table_when_stream_read_requires_another_incarnation_then_
             table_name: name.clone(),
             history_id,
         };
+        store.wait_until_changes_are_readable().await;
         let page = store
             .operations
             .get_stream_records(GetStreamRecordsRequest::table_at_incarnation(

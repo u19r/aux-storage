@@ -1,7 +1,6 @@
-//! The assembled scheduler publishes streams only after all initial images
-//! exist.
+//! GSI maintenance does not synthesize stream entries for existing items.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use bg_jobs_tokio::test_support::{TestClock, runtime_builder};
 use scheduled_bg_jobs::{
@@ -9,26 +8,28 @@ use scheduled_bg_jobs::{
 };
 use storage_common::{DatabaseJobIntervals, StorageJob};
 use storage_provider::DynamoOperations;
-use storage_types::{BoundTableInfo, TableHistoryId, TableName, TimestampMillis};
-use stream_provider::StreamOperations;
+use storage_types::{TableName, TimestampMillis};
 
 use super::catalog::MaintenanceJobCatalog;
-use crate::StorageProviderBundle;
 
 #[tokio::test]
-async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_image_precedes_publication()
- {
+async fn given_immediate_enable_when_gsi_job_runs_then_no_synthetic_images_are_published() {
     let store = Arc::new(
         sql_backend::SqlStore::initialize_schema(
-            sql_backend::sqlite::SqliteBackend::initialize(":memory:")
-                .await
-                .unwrap(),
+            sql_backend::sqlite::SqliteBackend::initialize(
+                ":memory:",
+                storage_types::AttemptDeadlines::default(),
+            )
+            .await
+            .unwrap(),
+            storage_types::InitialStreamLineages::ONE,
+            true,
         )
         .await
         .unwrap(),
     );
     let table = TableName::new("runtime-stream-capture");
-    let created = store
+    store
         .create_table(
             serde_json::from_value(serde_json::json!({
                 "TableName": table,
@@ -55,7 +56,7 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
         "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"}
     })).unwrap()).await.unwrap();
     assert!(
-        !updated
+        updated
             .table_description
             .stream_specification
             .unwrap()
@@ -63,16 +64,15 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
     );
     let now = Timestamp::from_millis(TimestampMillis::now().timestamp_millis());
     let clock = Arc::new(TestClock::new(now, MonotonicDeadline::ZERO));
-    let bundle =
-        StorageProviderBundle::try_from_initialized_store(store.clone(), Default::default())
-            .unwrap();
+    let bundle = crate::InitializedStore::native(store.clone()).caller_maintenance();
     let catalog = MaintenanceJobCatalog::try_new(
         bundle.maintenance.unwrap(),
-        bundle.table_reclaim_repository,
         DatabaseJobIntervals::default(),
         now,
+        None,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     let runtime = runtime_builder(
         bundle.scheduled_job_store,
         catalog,
@@ -97,39 +97,25 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
         {
             break;
         }
-        clock.advance(Duration::from_millis(1));
+        clock.advance(StorageJob::GsiBackfill.interval(DatabaseJobIntervals::default()));
     }
     let info = store.get_table_info(table.clone()).await.unwrap();
     assert!(
         info.has_enabled_stream(),
-        "GSI maintenance did not complete initialization"
+        "GSI maintenance changed immediate stream enablement"
     );
-    let bound = BoundTableInfo {
-        history_id: TableHistoryId::from(
-            *uuid::Uuid::parse_str(&created.table_description.table_id)
-                .unwrap()
-                .as_bytes(),
-        ),
-        info,
-    };
-    for index in 0..40 {
-        let key =
-            serde_json::from_value(serde_json::json!({"pk": {"S": index.to_string()}})).unwrap();
-        let address = stream_provider::dynamo_item_history_address(&bound, &key).unwrap();
-        let page = store
-            .read_forward(
-                stream_provider::StreamRowKind::Item(address.physical_stream_name().unwrap()),
+    assert!(
+        store
+            .get_stream_records(storage_types::GetStreamRecordsRequest::table(
+                table.clone(),
                 None,
-                2,
-            )
+                Some(100)
+            ))
             .await
-            .unwrap();
-        assert_eq!(
-            page.items.len(),
-            1,
-            "public stream is missing an initial current image"
-        );
-    }
+            .unwrap()
+            .records()
+            .is_empty()
+    );
     store
         .update_table(
             serde_json::from_value(serde_json::json!({
@@ -153,11 +139,11 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
         .await
         .unwrap();
     assert!(
-        store
+        !store
             .get_table_info(table.clone())
             .await
             .unwrap()
-            .has_internal_stream_capture()
+            .requires_stream_entry()
     );
     for _ in 0..64 {
         runtime.drive_once().await.unwrap();
@@ -166,10 +152,7 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
             !info.has_enabled_stream(),
             "internal GSI build exposed a public stream"
         );
-        if !info.has_internal_stream_capture() {
-            break;
-        }
-        clock.advance(Duration::from_millis(1));
+        clock.advance(StorageJob::GsiBackfill.interval(DatabaseJobIntervals::default()));
     }
     assert!(
         !store
@@ -177,7 +160,7 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
             .await
             .unwrap()
             .requires_stream_entry(),
-        "assembled GSI maintenance left temporary capture enabled"
+        "GSI maintenance unexpectedly enabled stream capture"
     );
     store
         .put_item(
@@ -188,20 +171,13 @@ async fn given_pending_stream_when_existing_gsi_job_runs_then_every_current_imag
         )
         .await
         .unwrap();
-    let key = serde_json::from_value(serde_json::json!({"pk": {"S": "after-build"}})).unwrap();
-    let address = stream_provider::dynamo_item_history_address(&bound, &key).unwrap();
     assert!(
         store
-            .read_forward(
-                stream_provider::StreamRowKind::Item(address.physical_stream_name().unwrap()),
-                None,
-                2,
-            )
+            .list_streams(serde_json::from_value(serde_json::json!({"TableName": table})).unwrap())
             .await
             .unwrap()
-            .items
-            .is_empty(),
-        "write after GSI completion created history"
+            .streams
+            .is_empty()
     );
     let query = store
         .query(

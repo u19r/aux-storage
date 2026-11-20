@@ -51,7 +51,7 @@ async fn given_markers_when_list_due_then_bounded() -> anyhow::Result<()> {
                 .await
                 .map_err(|err| anyhow::anyhow!("put {pk}: {err:?}"))?;
         }
-        let repository = fixture.stream_retention_repository.as_ref();
+        let repository = fixture.maintenance.as_ref();
         let wide = repository
             .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 10)
             .await
@@ -130,7 +130,7 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
             "table duration: {:?}",
             info.table_stream_duration
         );
-        let repository = fixture.stream_retention_repository.as_ref();
+        let repository = fixture.maintenance.as_ref();
         // Ordinary writes use the single table policy and preserve their exact
         // value.
         let item = AttributeMap::from_iter([
@@ -221,7 +221,7 @@ async fn given_expired_candidate_when_concurrent_update_moves_ttl_then_sweep_rev
 -> anyhow::Result<()> {
     let fixture = TestStore::new().await;
     let outcome = async {
-        let repository = fixture.expiration_repository.as_ref();
+        let repository = fixture.maintenance.as_ref();
         let table = TableName::new("ret-revalidate");
         fixture
             .operations
@@ -421,7 +421,7 @@ async fn given_missing_or_malformed_target_when_observed_then_fail_closed_withou
         // Missing TTL target: advancing a table without TTL enabled
         // completes with no deletions and the witness item intact.
         fixture
-            .expiration_repository
+            .maintenance
             .as_ref()
             .advance_expiration(expiration_request())
             .await
@@ -443,7 +443,7 @@ async fn given_missing_or_malformed_target_when_observed_then_fail_closed_withou
             "witness mutated by advance without ttl: {kept:?}"
         );
         // Missing retention scope loads as absent.
-        let repository = fixture.stream_retention_repository.as_ref();
+        let repository = fixture.maintenance.as_ref();
         let states = repository
             .load_stream_trim_states(&[storage_provider::StreamTrimScope::table(
                 "ret-missing/no-such-scope".to_string(),
@@ -482,7 +482,7 @@ async fn given_due_markers_when_worker_runs_then_pages_bounded_and_restart_resum
                 .await
                 .map_err(|err| anyhow::anyhow!("put {pk}: {err:?}"))?;
         }
-        let repository = fixture.stream_retention_repository.as_ref();
+        let repository = fixture.maintenance.as_ref();
         let due_before = repository
             .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 10)
             .await
@@ -518,7 +518,7 @@ async fn given_due_markers_when_worker_runs_then_pages_bounded_and_restart_resum
     };
     let reopened = fixture.reopen().await;
     let outcome = async {
-        let repository = reopened.stream_retention_repository.as_ref();
+        let repository = reopened.maintenance.as_ref();
         let worker = storage_provider::StreamDurationTrimWorker::new(
             repository,
             storage_provider::StreamDurationTrimConfig {
@@ -579,7 +579,7 @@ async fn verify_stale_policy_wave(fixture: &TestStore) -> anyhow::Result<()> {
     request.aux_stream_duration_hours =
         Some(storage_types::StreamRetentionDuration::from_hours(24).unwrap());
     fixture.operations.create_table(request.clone()).await?;
-    let repository = fixture.stream_retention_repository.as_ref();
+    let repository = fixture.maintenance.as_ref();
     let due = fixture.now() + 48 * 60 * 60 * 1000;
     let marker = repository
         .list_due_stream_trim_markers(due, 10)

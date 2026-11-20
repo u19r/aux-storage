@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{Duration, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -10,7 +10,8 @@ use crate::{
     constants::{READ_SEQUENCE_TOKEN_MAX_BYTES, READ_SEQUENCE_TOKEN_VERSION},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "camelCase")]
 pub struct ReadSequenceToken {
     pub version: u8,
@@ -36,7 +37,8 @@ pub struct ReadSequenceToken {
     pub integrity: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "camelCase")]
 pub struct ReadSequenceQueryContinuation {
     pub node_ordinal: usize,
@@ -46,7 +48,8 @@ pub struct ReadSequenceQueryContinuation {
 
 /// A pending ancestor Query page is replayed to rebuild descendant bindings.
 /// Its next cursor is visited only after those descendants finish.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "camelCase")]
 pub struct ReadSequenceReplayPage {
     pub node_ordinal: usize,
@@ -117,7 +120,7 @@ pub fn prepare_resume_token(
     };
     let token = decode_read_sequence_token(&raw_token)?;
     if token.version != READ_SEQUENCE_TOKEN_VERSION
-        || token.expires_at_epoch_seconds <= Utc::now().timestamp()
+        || token.expires_at_epoch_seconds <= Timestamp::now().as_second()
         || token.consistency != request.read_consistency
     {
         return Err(read_sequence_error(ReadSequenceValidationError::StaleToken));
@@ -354,7 +357,7 @@ fn has_valid_resume_continuation_state(token: &ReadSequenceToken, plan: &ReadSeq
 }
 
 fn read_sequence_token_expiration() -> i64 {
-    (Utc::now() + Duration::minutes(15)).timestamp()
+    Timestamp::now().as_second() + 15 * 60
 }
 
 fn read_sequence_token_timestamp() -> i64 {

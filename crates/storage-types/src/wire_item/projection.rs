@@ -55,9 +55,9 @@ pub(crate) fn parse_dynamo_attribute_fields(
     fields: &[&str],
 ) -> StorageResult<AttributeMap> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    AttributeFieldSeed { fields }
-        .deserialize(&mut deserializer)
-        .map_err(StorageError::from)
+    let attributes = AttributeFieldSeed { fields }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(attributes)
 }
 
 struct AttributeValuesSeed<'a> {

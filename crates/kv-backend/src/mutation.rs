@@ -25,6 +25,13 @@ pub enum KvMutation {
         begin: Vec<u8>,
         end: Vec<u8>,
     },
+    /// Clear every key in `[begin, end)` of a format that never uses value
+    /// chunks (scheduled-job effect receipt groups). FoundationDB issues one
+    /// native range clear; RocksDB deletes each present key in its writer.
+    ClearUnchunkedRange {
+        begin: Vec<u8>,
+        end: Vec<u8>,
+    },
 }
 
 /// One key whose 10-byte commit versionstamp is inserted after `prefix`.
@@ -47,12 +54,14 @@ impl KvMutation {
                 (key.len(), value.len())
             }
             Self::Delete { key } | Self::DeleteUnchunked { key } => (key.len(), 0),
-            Self::DeleteRange { begin, end } => (begin.len(), end.len()),
+            Self::DeleteRange { begin, end } | Self::ClearUnchunkedRange { begin, end } => {
+                (begin.len(), end.len())
+            }
         };
         let bytes = key
             .checked_add(value)
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         settlement.charge_data(bytes)
     }
 }
@@ -69,7 +78,7 @@ impl KvVersionstampedMutation {
             .checked_add(self.suffix.len())
             .and_then(|bytes| bytes.checked_add(self.value.len()))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         settlement.charge_data(bytes)
     }
 }

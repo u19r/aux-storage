@@ -1,14 +1,16 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, HashMap},
+    marker::PhantomData,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use storage_types::TimestampMillis;
 use utoipa::ToSchema;
 
-use crate::{ReceiptHandle, newtypes::MessageId};
+use crate::{ReceiptHandle, constants::TRACE_HEADER_ATTRIBUTE, newtypes::MessageId};
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct CreateQueueRequest {
     #[serde(rename = "QueueName")]
     #[schema(
@@ -21,6 +23,10 @@ pub struct CreateQueueRequest {
 
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
     pub attributes: Option<HashMap<String, String>>,
+
+    /// SQS spells this member with a lower-case first letter.
+    #[serde(rename = "tags", skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -30,34 +36,107 @@ pub struct CreateQueueResponse {
     pub queue_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeleteQueueRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct DeleteQueueResponse {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ListQueuesRequest {
     #[serde(rename = "QueueNamePrefix", skip_serializing_if = "Option::is_none")]
     pub queue_name_prefix: Option<String>,
+
+    /// 1 to 1,000; 0 or absent lists up to 1,000 queues with no `NextToken`.
+    #[serde(rename = "MaxResults", skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 0, maximum = 1000)] // Keep in sync with MAX_LIST_QUEUES_RESULTS.
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub max_results: Option<i64>,
+
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListQueuesResponse {
     #[serde(rename = "QueueUrls")]
     pub queue_urls: Vec<String>,
+
+    /// Present only when `MaxResults` was given and more queues remain.
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ListDeadLetterSourceQueuesRequest {
+    /// The dead-letter queue.
+    #[serde(rename = "QueueUrl", default)]
+    pub queue_url: String,
+
+    #[serde(rename = "MaxResults", skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1, maximum = 1000)] // Keep in sync with MAX_DEAD_LETTER_SOURCE_RESULTS.
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub max_results: Option<i64>,
+
+    /// The last URL of the previous page.
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+pub struct ListDeadLetterSourceQueuesResponse {
+    /// SQS spells this field with a lower-case first letter.
+    #[serde(rename = "queueUrls")]
+    pub queue_urls: Vec<String>,
+
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct TagQueueRequest {
+    #[serde(rename = "QueueUrl", default)]
+    pub queue_url: String,
+
+    #[serde(rename = "Tags")]
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct UntagQueueRequest {
+    #[serde(rename = "QueueUrl", default)]
+    pub queue_url: String,
+
+    #[serde(rename = "TagKeys")]
+    pub tag_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ListQueueTagsRequest {
+    #[serde(rename = "QueueUrl", default)]
+    pub queue_url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ListQueueTagsResponse {
+    #[serde(rename = "Tags", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct GetQueueUrlRequest {
     #[serde(rename = "QueueName")]
     pub queue_name: String,
+
+    /// Another account than the configured one names no queue.
+    #[serde(
+        rename = "QueueOwnerAWSAccountId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub queue_owner_aws_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -66,10 +145,9 @@ pub struct GetQueueUrlResponse {
     pub queue_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct GetQueueAttributesRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 
     #[serde(rename = "AttributeNames", skip_serializing_if = "Option::is_none")]
@@ -78,14 +156,18 @@ pub struct GetQueueAttributesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GetQueueAttributesResponse {
-    #[serde(rename = "Attributes")]
+    /// Probe 7: no selected attribute gives `{}`, with no `Attributes` member.
+    #[serde(
+        rename = "Attributes",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub attributes: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SetQueueAttributesRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 
     #[serde(rename = "Attributes")]
@@ -95,20 +177,19 @@ pub struct SetQueueAttributesRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct SetQueueAttributesResponse {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct PurgeQueueRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct PurgeQueueResponse {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SendMessageRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     #[schema(
         min_length = 1,
         example = "http://127.0.0.1:3000/queue/000000000000/MyQueue"
@@ -121,10 +202,25 @@ pub struct SendMessageRequest {
 
     #[serde(rename = "DelaySeconds", skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 0, maximum = 900, example = 0)] // Keep in sync with MAX_DELAY_SECONDS.
-    pub delay_seconds: Option<u32>,
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub delay_seconds: Option<i64>,
 
     #[serde(rename = "MessageAttributes", skip_serializing_if = "Option::is_none")]
     pub message_attributes: Option<HashMap<String, MessageAttributeValue>>,
+
+    /// FIFO only: a standard queue rejects it (probe 12).
+    /// Only `AWSTraceHeader` (a `String`) exists.
+    #[serde(
+        rename = "MessageSystemAttributes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_system_attributes: Option<HashMap<String, MessageAttributeValue>>,
+
+    #[serde(
+        rename = "MessageDeduplicationId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_deduplication_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -142,20 +238,26 @@ pub struct SendMessageResponse {
         skip_serializing_if = "Option::is_none"
     )]
     pub md5_of_message_attributes: Option<String>,
+
+    #[serde(
+        rename = "MD5OfMessageSystemAttributes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub md5_of_message_system_attributes: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SendMessageBatchRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 
     #[serde(rename = "Entries")]
     pub entries: Vec<SendMessageBatchRequestEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SendMessageBatchRequestEntry {
     #[serde(rename = "Id")]
     pub id: String,
@@ -164,10 +266,24 @@ pub struct SendMessageBatchRequestEntry {
     pub message_body: String,
 
     #[serde(rename = "DelaySeconds", skip_serializing_if = "Option::is_none")]
-    pub delay_seconds: Option<u32>,
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub delay_seconds: Option<i64>,
 
     #[serde(rename = "MessageAttributes", skip_serializing_if = "Option::is_none")]
     pub message_attributes: Option<HashMap<String, MessageAttributeValue>>,
+
+    /// Only `AWSTraceHeader` (a `String`) exists.
+    #[serde(
+        rename = "MessageSystemAttributes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_system_attributes: Option<HashMap<String, MessageAttributeValue>>,
+
+    #[serde(
+        rename = "MessageDeduplicationId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_deduplication_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -196,12 +312,18 @@ pub struct SendMessageBatchResultEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub md5_of_message_attributes: Option<String>,
+
+    #[serde(
+        rename = "MD5OfMessageSystemAttributes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub md5_of_message_system_attributes: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(from = "ReceiveMessageMembers")]
 pub struct ReceiveMessageRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     #[schema(
         min_length = 1,
         example = "http://127.0.0.1:3000/queue/000000000000/MyQueue"
@@ -214,21 +336,23 @@ pub struct ReceiveMessageRequest {
     )]
     #[schema(minimum = 1, maximum = 10, example = 1)]
     // Keep in sync with MAX_RECEIVE_MESSAGES.
-    pub max_number_of_messages: Option<u32>,
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub max_number_of_messages: Option<i64>,
 
     #[serde(rename = "VisibilityTimeout", skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 0, maximum = 43_200, example = 30)]
     // Keep in sync with MAX_VISIBILITY_TIMEOUT_SECONDS.
-    pub visibility_timeout: Option<u32>,
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub visibility_timeout: Option<i64>,
 
     #[serde(rename = "WaitTimeSeconds", skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 0, maximum = 20, example = 0)]
     // Keep in sync with MAX_WAIT_TIME_SECONDS.
-    pub wait_time_seconds: Option<u32>,
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    pub wait_time_seconds: Option<i64>,
 
     #[serde(
         rename = "MessageSystemAttributeNames",
-        alias = "AttributeNames",
         skip_serializing_if = "Option::is_none"
     )]
     pub attribute_names: Option<Vec<String>>,
@@ -240,17 +364,68 @@ pub struct ReceiveMessageRequest {
     pub message_attribute_names: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// The decoded `ReceiveMessage` members. AWS accepts the deprecated
+/// `AttributeNames` together with `MessageSystemAttributeNames` and selects
+/// their union (probe 12); a single field with an alias rejects both.
+#[derive(Deserialize)]
+struct ReceiveMessageMembers {
+    #[serde(rename = "QueueUrl", default)]
+    queue_url: String,
+    #[serde(rename = "MaxNumberOfMessages")]
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    max_number_of_messages: Option<i64>,
+    #[serde(rename = "VisibilityTimeout")]
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    visibility_timeout: Option<i64>,
+    #[serde(rename = "WaitTimeSeconds")]
+    #[serde(default, deserialize_with = "crate::integer_member::optional")]
+    wait_time_seconds: Option<i64>,
+    #[serde(rename = "AttributeNames")]
+    attribute_names: Option<Vec<String>>,
+    #[serde(rename = "MessageSystemAttributeNames")]
+    message_system_attribute_names: Option<Vec<String>>,
+    #[serde(rename = "MessageAttributeNames")]
+    message_attribute_names: Option<Vec<String>>,
+}
+
+impl From<ReceiveMessageMembers> for ReceiveMessageRequest {
+    fn from(members: ReceiveMessageMembers) -> Self {
+        let attribute_names = match (
+            members.attribute_names,
+            members.message_system_attribute_names,
+        ) {
+            (Some(mut names), Some(system)) => {
+                for name in system {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                Some(names)
+            }
+            (names, system) => names.or(system),
+        };
+        Self {
+            queue_url: members.queue_url,
+            max_number_of_messages: members.max_number_of_messages,
+            visibility_timeout: members.visibility_timeout,
+            wait_time_seconds: members.wait_time_seconds,
+            attribute_names,
+            message_attribute_names: members.message_attribute_names,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ReceiveMessageResponse {
     #[serde(rename = "Messages")]
     #[schema(max_items = 10)] // Keep in sync with MAX_RECEIVE_MESSAGES.
     pub messages: Vec<MessageResponse>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeleteMessageRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     #[schema(
         min_length = 1,
         example = "http://127.0.0.1:3000/queue/000000000000/MyQueue"
@@ -262,18 +437,16 @@ pub struct DeleteMessageRequest {
     pub receipt_handle: ReceiptHandle,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeleteMessageBatchRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 
     #[serde(rename = "Entries")]
     pub entries: Vec<DeleteMessageBatchRequestEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeleteMessageBatchRequestEntry {
     #[serde(rename = "Id")]
     pub id: String,
@@ -298,10 +471,9 @@ pub struct DeleteMessageBatchResultEntry {
     pub id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ChangeMessageVisibilityRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     #[schema(
         min_length = 1,
         example = "http://127.0.0.1:3000/queue/000000000000/MyQueue"
@@ -319,21 +491,20 @@ pub struct ChangeMessageVisibilityRequest {
     #[serde(rename = "VisibilityTimeout")]
     #[schema(minimum = 0, maximum = 43_200, example = 60)]
     // Keep in sync with MAX_VISIBILITY_TIMEOUT_SECONDS.
-    pub visibility_timeout: u32,
+    #[serde(deserialize_with = "crate::integer_member::required")]
+    pub visibility_timeout: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ChangeMessageVisibilityBatchRequest {
-    #[serde(rename = "QueueUrl")]
+    #[serde(rename = "QueueUrl", default)]
     pub queue_url: String,
 
     #[serde(rename = "Entries")]
     pub entries: Vec<ChangeMessageVisibilityBatchRequestEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ChangeMessageVisibilityBatchRequestEntry {
     #[serde(rename = "Id")]
     pub id: String,
@@ -343,7 +514,8 @@ pub struct ChangeMessageVisibilityBatchRequestEntry {
     pub receipt_handle: ReceiptHandle,
 
     #[serde(rename = "VisibilityTimeout")]
-    pub visibility_timeout: u32,
+    #[serde(deserialize_with = "crate::integer_member::required")]
+    pub visibility_timeout: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -376,7 +548,8 @@ pub struct BatchResultErrorEntry {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct UpdateMessageSnapshotRequest {
     #[schema(
         min_length = 1,
@@ -389,7 +562,8 @@ pub struct UpdateMessageSnapshotRequest {
     pub checkpoint_data: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct Message {
     #[serde(rename = "MessageId")]
     #[schema(value_type = String, example = "5fea77560ea4451aa703a558b933e274")]
@@ -410,8 +584,8 @@ pub struct Message {
     pub message_attributes: Option<HashMap<String, MessageAttributeValue>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct MessageAttributeValue {
     #[serde(rename = "StringValue", skip_serializing_if = "Option::is_none")]
     #[schema(example = "John Doe")]
@@ -430,7 +604,8 @@ pub struct MessageAttributeValue {
     pub data_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct QueueMessage {
     /// Durable deliveries, incremented atomically with each visibility lease.
     #[serde(default)]
@@ -438,10 +613,39 @@ pub struct QueueMessage {
     pub message_id: MessageId,
     pub queue_url: String,
     pub body: String,
+    /// Stored in name order, so that the bytes of one record are the same
+    /// after each decode; ordered-key stores compare those bytes to detect a
+    /// concurrent change.
+    #[serde(serialize_with = "serialize_sorted_attributes")]
     pub message_attributes: Option<HashMap<String, MessageAttributeValue>>,
     pub receipt_handle: Option<ReceiptHandle>,
     pub created_at: TimestampMillis,
     pub visibility_timestamp: Option<TimestampMillis>,
+    /// The `AWSTraceHeader` system attribute: immutable message content that
+    /// a dead-letter move keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_header: Option<String>,
+}
+
+fn serialize_sorted_attributes<S: serde::Serializer>(
+    attributes: &Option<HashMap<String, MessageAttributeValue>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    attributes
+        .as_ref()
+        .map(|attributes| {
+            attributes
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .serialize(serializer)
+}
+
+/// A request integer after `validate_request`. Every validated range is
+/// inside `u32`, so the fallback is never used.
+#[must_use]
+pub fn validated_u32(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or_default()
 }
 
 /// Build the provider message for one validated send, sharing the batch
@@ -454,17 +658,40 @@ pub fn queue_message_for_send(
 ) -> QueueMessage {
     let visibility_timestamp = request
         .delay_seconds
-        .map(|seconds| created_at + storage_types::DurationSeconds::from(seconds));
+        .map(|seconds| created_at + storage_types::DurationSeconds::from(validated_u32(seconds)));
     QueueMessage {
         receive_count: 0,
         message_id: MessageId::default(),
         queue_url: request.queue_url,
         body: request.message_body,
-        message_attributes: request.message_attributes,
+        message_attributes: request.message_attributes.map(plain_exponent_numbers),
         receipt_handle: None,
         created_at,
         visibility_timestamp,
+        trace_header: request
+            .message_system_attributes
+            .and_then(|mut attributes| attributes.remove(TRACE_HEADER_ATTRIBUTE))
+            .filter(crate::request_validation::keeps_trace_header)
+            .and_then(|value| value.string_value),
     }
+}
+
+/// Suite script: a Number written with an exponent is stored and read back in
+/// plain notation; every other value stays as sent. The request validation has
+/// already accepted each Number value.
+fn plain_exponent_numbers(
+    mut attributes: HashMap<String, MessageAttributeValue>,
+) -> HashMap<String, MessageAttributeValue> {
+    for value in attributes.values_mut() {
+        if value.data_type.starts_with("Number")
+            && let Some(text) = value.string_value.as_mut()
+            && text.contains(['e', 'E'])
+            && let Ok(plain) = storage_types::canonical_sqs_number(text)
+        {
+            *text = plain;
+        }
+    }
+    attributes
 }
 
 pub struct Visible;
@@ -538,7 +765,8 @@ impl InvisibleQueueMessage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct MessageResponse {
     #[serde(rename = "MessageId")]
     pub message_id: String,
@@ -567,7 +795,7 @@ impl MessageResponse {
             .message_attributes
             .as_ref()
             .and_then(md5_of_message_attributes);
-        let attributes = Some(HashMap::from([
+        let mut attributes = HashMap::from([
             (
                 "SentTimestamp".to_string(),
                 msg.created_at.timestamp_millis().to_string(),
@@ -576,7 +804,11 @@ impl MessageResponse {
                 "ApproximateReceiveCount".to_string(),
                 msg.receive_count.to_string(),
             ),
-        ]));
+        ]);
+        if let Some(trace_header) = msg.trace_header {
+            attributes.insert(TRACE_HEADER_ATTRIBUTE.to_owned(), trace_header);
+        }
+        let attributes = Some(attributes);
         Self {
             message_id: msg.message_id.to_string(),
             receipt_handle: receipt_handle.0,
@@ -615,6 +847,18 @@ pub fn md5_of_message_attributes(
     Some(format!("{:x}", context.finalize()))
 }
 
+/// `MD5OfMessageSystemAttributes` of a message whose only system attribute
+/// is `AWSTraceHeader` (the message attribute MD5 algorithm).
+#[must_use]
+pub fn md5_of_trace_header(trace_header: &str) -> String {
+    let mut context = md5::Context::new();
+    encode_queue_attribute_string(&mut context, TRACE_HEADER_ATTRIBUTE);
+    encode_queue_attribute_string(&mut context, "String");
+    context.consume([1]);
+    encode_queue_attribute_string(&mut context, trace_header);
+    format!("{:x}", context.finalize())
+}
+
 fn encode_queue_attribute_string(output: &mut md5::Context, value: &str) {
     encode_queue_attribute_binary(output, value.as_bytes());
 }
@@ -625,22 +869,22 @@ fn encode_queue_attribute_binary(output: &mut md5::Context, value: &[u8]) {
     output.consume(value);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Queue {
     pub queue_name: String,
     pub queue_url: String,
     pub attributes: HashMap<String, String>,
     pub created_at: TimestampMillis,
+    /// Set by create and by each attribute change (`LastModifiedTimestamp`).
+    #[serde(default)]
+    pub updated_at: TimestampMillis,
+    /// Stored in the catalog row; `tag_rules` bounds the set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QueueMessageCounts {
-    pub visible: u64,
-    pub not_visible: u64,
-    pub delayed: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct MessageCheckpoint {
     pub message_id: MessageId,
     pub checkpoint_data: String,

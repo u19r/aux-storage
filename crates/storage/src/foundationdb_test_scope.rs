@@ -22,6 +22,7 @@ impl FoundationDbTestScope {
             FoundationDbBackend::initialize(kv_backend::foundationdb::FoundationDbOptions {
                 cluster_file: Some(&cluster_file),
                 subspace_prefix: Some(prefix.as_bytes()),
+                attempt_deadlines: storage_types::AttemptDeadlines::default(),
                 ..Default::default()
             })
             .await?;
@@ -44,6 +45,7 @@ impl FoundationDbTestScope {
     pub async fn open_database(settings: FoundationDbSettings) -> StorageResult<DatabaseManager> {
         DatabaseManager::new_with_config_and_runtime_options(
             StorageConfig {
+                initial_stream_lineages: None,
                 backend_type: StorageBackend::FoundationDb,
                 connection_string: None,
                 file_path: None,
@@ -63,7 +65,6 @@ impl FoundationDbTestScope {
 
     fn native_settings(mut settings: FoundationDbSettings) -> FoundationDbSettings {
         settings.cache_read_version_ms = 0;
-        settings.immediate_gsi_consistency = true;
         settings
     }
 

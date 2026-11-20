@@ -1,6 +1,6 @@
 use std::ops::{Add, Deref, Sub};
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
+use jiff::{SignedDuration, Timestamp, tz::Offset};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -26,7 +26,7 @@ pub struct TimestampMillis(i64);
 impl TimestampMillis {
     #[must_use]
     pub fn now() -> Self {
-        Self(Utc::now().timestamp_millis())
+        Self(crate::ambient::now_millis())
     }
 
     #[must_use]
@@ -46,19 +46,23 @@ impl TimestampMillis {
 
     #[must_use]
     pub fn to_rfc3339(self) -> String {
-        DateTime::<Utc>::from(self).to_rfc3339()
+        self.to_string()
     }
 
     #[must_use]
-    pub fn checked_add_signed(self, duration: ChronoDuration) -> Option<Self> {
-        self.0
-            .checked_add(duration.num_milliseconds())
+    pub fn checked_add_signed(self, duration: SignedDuration) -> Option<Self> {
+        i64::try_from(i128::from(self.0) + duration.as_millis())
+            .ok()
             .map(Self::from_timestamp)
     }
 
     #[must_use]
     pub fn add_duration_seconds(&self, seconds: &DurationSeconds) -> Self {
         Self(self.0 + i64::from(**seconds) * 1000)
+    }
+
+    fn from_saturating_millis(millis: i128) -> Self {
+        Self(millis.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
     }
 }
 
@@ -92,19 +96,19 @@ impl Add<DurationSeconds> for TimestampMillis {
     }
 }
 
-impl Add<ChronoDuration> for TimestampMillis {
+impl Add<SignedDuration> for TimestampMillis {
     type Output = Self;
 
-    fn add(self, rhs: ChronoDuration) -> Self::Output {
-        Self::from_timestamp(self.0 + rhs.num_milliseconds())
+    fn add(self, rhs: SignedDuration) -> Self::Output {
+        Self::from_saturating_millis(i128::from(self.0) + rhs.as_millis())
     }
 }
 
-impl Sub<ChronoDuration> for TimestampMillis {
+impl Sub<SignedDuration> for TimestampMillis {
     type Output = Self;
 
-    fn sub(self, rhs: ChronoDuration) -> Self::Output {
-        Self::from_timestamp(self.0 - rhs.num_milliseconds())
+    fn sub(self, rhs: SignedDuration) -> Self::Output {
+        Self::from_saturating_millis(i128::from(self.0) - rhs.as_millis())
     }
 }
 
@@ -118,17 +122,15 @@ impl Deref for TimestampMillis {
 
 impl std::fmt::Display for TimestampMillis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_rfc3339_utc(
-            DateTime::from_timestamp_millis(self.0).unwrap_or_else(Utc::now),
-            f,
-        )
+        write_rfc3339_utc(Timestamp::from(*self), f)
     }
 }
 
 pub(crate) fn write_rfc3339_utc(
-    datetime: DateTime<Utc>,
+    timestamp: Timestamp,
     formatter: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
+    let datetime = Offset::UTC.to_datetime(timestamp);
     let year = datetime.year();
     if (0..=9999).contains(&year) {
         write!(formatter, "{year:04}")?;
@@ -144,7 +146,7 @@ pub(crate) fn write_rfc3339_utc(
         datetime.minute(),
         datetime.second()
     )?;
-    let nanos = datetime.nanosecond();
+    let nanos = datetime.subsec_nanosecond().unsigned_abs();
     if nanos != 0 {
         let (fraction, width) = if nanos.is_multiple_of(1_000_000) {
             (nanos / 1_000_000, 3)
@@ -158,21 +160,22 @@ pub(crate) fn write_rfc3339_utc(
     formatter.write_str("+00:00")
 }
 
-impl From<&chrono::DateTime<Utc>> for TimestampMillis {
-    fn from(value: &chrono::DateTime<Utc>) -> Self {
-        Self(value.timestamp_millis())
+impl From<&Timestamp> for TimestampMillis {
+    fn from(value: &Timestamp) -> Self {
+        let millis = i64::from(value.subsec_nanosecond().div_euclid(1_000_000));
+        Self(value.as_second() * 1_000 + millis)
     }
 }
 
-impl From<chrono::DateTime<Utc>> for TimestampMillis {
-    fn from(value: chrono::DateTime<Utc>) -> Self {
-        Self(value.timestamp_millis())
+impl From<Timestamp> for TimestampMillis {
+    fn from(value: Timestamp) -> Self {
+        Self::from(&value)
     }
 }
 
-impl From<TimestampMillis> for chrono::DateTime<Utc> {
+impl From<TimestampMillis> for Timestamp {
     fn from(value: TimestampMillis) -> Self {
-        DateTime::<Utc>::from_timestamp_millis(value.0).unwrap_or_else(Utc::now)
+        Timestamp::from_millisecond(value.0).unwrap_or_else(|_| Timestamp::now())
     }
 }
 

@@ -30,11 +30,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 cargo_metadata = { workspace = true, optional = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 jsonschema = { workspace = true }
 schemars = { workspace = true }
 storage-types = { path = "../storage-types" }
 toml = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

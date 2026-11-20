@@ -67,10 +67,7 @@ impl StreamTrimStateWrite {
             StreamTrimDueMarker::new(due_at, current.scope.clone(), current.policy_version)
         });
         self.state.next_due_at = match self.state.retention {
-            StreamRetentionDuration::Forever
-                if self.state.frontier.has_pending_cleanup()?
-                    || self.state.frontier.item_history_sweep.is_some() =>
-            {
+            StreamRetentionDuration::Forever if self.state.frontier.has_pending_cleanup()? => {
                 Some(self.state.updated_at)
             }
             StreamRetentionDuration::Forever => None,

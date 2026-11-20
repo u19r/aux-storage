@@ -27,7 +27,9 @@ async fn given_file_sqlite_native_writer_lock_when_catalog_begin_fails_then_conf
     };
 
     let fixture = fixture::FileSqlite::try_new().await?;
-    let backend = SqliteBackend::initialize(&fixture.path).await?;
+    let backend =
+        SqliteBackend::initialize(&fixture.path, storage_types::AttemptDeadlines::default())
+            .await?;
     backend
         .with_schema_attempt(|attempt| {
             Box::pin(async move {
@@ -42,7 +44,9 @@ async fn given_file_sqlite_native_writer_lock_when_catalog_begin_fails_then_conf
             })
         })
         .await?;
-    let store = SqlStore::initialize_schema(backend).await?;
+    let store =
+        SqlStore::initialize_schema(backend, storage_types::InitialStreamLineages::ONE, true)
+            .await?;
     let original = key(1, b"begin-conflict".to_vec())?;
     seed_records(&store, vec![insert(original.clone(), b"original")]).await?;
     let locker = rusqlite::Connection::open(&fixture.path)?;
@@ -53,7 +57,7 @@ async fn given_file_sqlite_native_writer_lock_when_catalog_begin_fails_then_conf
     .await;
     assert!(
         matches!(outcome.as_ref(), Err(error) if matches!(error.as_ref(),
-        StorageEnum::TransactionConflict { .. }))
+        StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(_))))
     );
     let observed = load_records(&store, vec![original.clone()]).await?;
     assert_eq!(
@@ -290,7 +294,7 @@ where
         })
         .await;
     assert!(
-        matches!(outcome.as_ref(), Err(error) if matches!(error.as_ref(), StorageEnum::InfrastructureResult(InfrastructureResultKind::ProtectedConflict { context: InfrastructureContext::AttemptSettlement })))
+        matches!(outcome.as_ref(), Err(error) if matches!(error.as_ref(), StorageEnum::InfrastructureResult(InfrastructureResultKind::InvalidBound { context: InfrastructureContext::AttemptSettlement })))
     );
     assert!(load_records(port, vec![failed]).await?[0].is_none());
     seed_records(
@@ -394,7 +398,7 @@ where
 }
 
 fn callback_failure() -> StorageError {
-    InfrastructureResultKind::ProtectedConflict {
+    InfrastructureResultKind::InvalidBound {
         context: InfrastructureContext::AttemptSettlement,
     }
     .into()

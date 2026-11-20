@@ -65,6 +65,7 @@ fn unique_database_path(round: usize, worker: usize) -> PathBuf {
 
 fn sqlite_config(path: &Path) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(path.to_string_lossy().into_owned()),
         file_path: None,

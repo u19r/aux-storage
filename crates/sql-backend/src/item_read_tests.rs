@@ -1,16 +1,11 @@
-use std::{hint::black_box, sync::Arc};
+use std::sync::Arc;
 
-use alloc_counter::AllocationGuard;
 use storage_types::{
     AttributeDefinition, AttributeValue, BoundTableInfo, KeyAttributeType, KeyAttributes,
     KeySchemaElement, KeyType,
 };
 
-use crate::{
-    SqlEngine,
-    item_read::{point_read_statement, primary_key_predicate},
-    test_support::table,
-};
+use crate::{SqlEngine, item_read::primary_key_predicate, test_support::table};
 
 fn keyed_table(count: usize, width: usize, numeric: bool) -> (BoundTableInfo, KeyAttributes) {
     let mut table = table();
@@ -44,69 +39,6 @@ fn keyed_table(count: usize, width: usize, numeric: bool) -> (BoundTableInfo, Ke
         );
     }
     (table, key)
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_primary_predicate_shapes_when_constructed_then_report_cpu_and_allocations() {
-    for (engine, name) in [
-        (SqlEngine::Sqlite, "sqlite"),
-        (SqlEngine::Turso, "turso"),
-        (SqlEngine::Postgres, "postgres"),
-    ] {
-        for (count, width, numeric) in [(1, 0, false), (2, 0, false), (2, 0, true), (2, 128, false)]
-        {
-            let (table, key) = keyed_table(count, width, numeric);
-            for outer in [false, true] {
-                let label = format!("{name}_{count}_{width}_{numeric}_{outer}");
-                report(&label, || {
-                    if outer {
-                        drop(black_box(
-                            point_read_statement(
-                                black_box(engine),
-                                black_box(&table),
-                                black_box(&key),
-                                "item_bytes",
-                            )
-                            .unwrap(),
-                        ));
-                    } else {
-                        drop(black_box(
-                            primary_key_predicate(
-                                black_box(engine),
-                                black_box(&table),
-                                black_box(&key),
-                            )
-                            .unwrap(),
-                        ));
-                    }
-                });
-            }
-        }
-    }
-}
-
-fn report(label: &str, mut render: impl FnMut()) {
-    for _ in 0..100 {
-        render();
-    }
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "primary_predicate",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    let started = cpu_time::ProcessTime::now();
-    for _ in 0..100_000 {
-        render();
-    }
-    let cpu = started.elapsed();
-    alloc_counter::emit_report(&guard.finish()).unwrap();
-    eprintln!(
-        "gsi_sql label={label} iterations=100000 cpu_ns={}",
-        cpu.as_nanos()
-    );
 }
 
 #[test]

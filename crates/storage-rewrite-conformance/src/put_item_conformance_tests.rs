@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use futures::FutureExt as _;
 use serde_json::{Value, json};
 use storage_observability_test_support::observation::observe;
-use storage_types::{AttributeMap, AttributeValue, GetItemRequest, PutItemRequest, TableName};
+use storage_types::{AttributeMap, GetItemRequest, KeyAttributes, PutItemRequest, TableName};
 
 use crate::test_support::{ConformanceFixtures, TestStore};
 
@@ -17,6 +17,17 @@ static FIXTURES: ConformanceFixtures = ConformanceFixtures::new();
 
 fn fixture(source: &str) -> Value {
     FIXTURES.case(include_str!("../fixtures/put_item_cases.jsonl"), source)
+}
+
+/// The primary key attributes (`pk`, and `sk` when present) of an item.
+fn item_key(item: &Value) -> Value {
+    let mut key = serde_json::Map::new();
+    for name in ["pk", "sk"] {
+        if let Some(value) = item.get(name) {
+            key.insert(name.to_owned(), value.clone());
+        }
+    }
+    Value::Object(key)
 }
 
 async fn run_case(store: &TestStore, case: &Value) {
@@ -88,14 +99,10 @@ async fn run_case(store: &TestStore, case: &Value) {
             .map(|precondition| &precondition["request"]["Item"])
     };
     if let Some(expected_item) = expected_item {
-        let pk: AttributeValue = serde_json::from_value(expected_item["pk"].clone()).unwrap();
-        let sk: AttributeValue = serde_json::from_value(expected_item["sk"].clone()).unwrap();
+        let key: KeyAttributes = serde_json::from_value(item_key(expected_item)).unwrap();
         let read = store
             .operations
-            .get_item(GetItemRequest::new(
-                table,
-                [("pk".to_owned(), pk), ("sk".to_owned(), sk)],
-            ))
+            .get_item(GetItemRequest::new(table, key))
             .await
             .unwrap();
         let read = serde_json::to_value(read).unwrap();
@@ -359,3 +366,74 @@ put_item_case!(given_docs_limit_number_partition_key_under_min_exponent_rejected
 put_item_case!(given_docs_limit_number_sort_key_39_digits_rejected_when_put_item_runs_then_conformance_response_matches, "field-item/400/docs_limit_number_sort_key_39_digits_rejected.json");
 put_item_case!(given_docs_limit_number_sort_key_empty_rejected_when_put_item_runs_then_conformance_response_matches, "field-item/400/docs_limit_number_sort_key_empty_rejected.json");
 put_item_case!(given_docs_limit_number_sort_key_under_min_exponent_rejected_when_put_item_runs_then_conformance_response_matches, "field-item/400/docs_limit_number_sort_key_under_min_exponent_rejected.json");
+
+// DDB-PAR-4 (AWS probe P15): an expression attribute name is one attribute
+// name, so `#a` -> `a.b` reads the top-level `a.b`, never `a` -> `b`.
+put_item_case!(
+    given_dotted_alias_condition_when_put_runs_then_top_level_attribute_is_compared,
+    "local/ddb-par-4/dotted_alias_condition_put.json"
+);
+put_item_case!(
+    given_dotted_alias_condition_on_nested_value_when_put_runs_then_condition_fails,
+    "local/ddb-par-4/dotted_alias_condition_nested_put.json"
+);
+// AWS probe P11.
+put_item_case!(
+    given_conditional_operator_when_put_runs_then_legacy_parameter_is_rejected,
+    "local/ddb-par-2/given_conditional_operator_when_put_runs_then_legacy_parameter_is_rejected.\
+     json"
+);
+// AWS probe P11.
+put_item_case!(
+    given_expected_and_condition_expression_when_put_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/\
+     given_expected_and_condition_expression_when_put_runs_then_mixed_parameters_are_rejected.json"
+);
+
+// AWS behavioural suite
+put_item_case!(given_check_attribute_name_length_limit_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_name_length_limit.json");
+put_item_case!(given_check_attribute_name_length_limit_over_65536_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_name_length_limit--over-65536.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_control_one_member_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member--control-one-member.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_zero_top_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member--zero-top.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_zero_in_m_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member--zero-in-m.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_rejected_control_one_member_at_every_depth_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member_rejected--control-one-member-at-every-depth.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_rejected_zero_in_l_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member_rejected--zero-in-l.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_rejected_two_top_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member_rejected--two-top.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_rejected_two_in_m_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member_rejected--two-in-m.json");
+put_item_case!(given_check_attribute_value_union_requires_exactly_one_member_rejected_two_in_l_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_attribute_value_union_requires_exactly_one_member_rejected--two-in-l.json");
+put_item_case!(given_check_put_item_key_type_mismatch_rejected_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_key_type_mismatch_rejected.json");
+put_item_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_put_wrong_typed_key_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--put-wrong-typed-key.json");
+put_item_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_put_list_typed_key_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--put-list-typed-key.json");
+put_item_case!(given_check_batch_write_item_key_defects_message_diverges_from_put_item_put_missing_key_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_batch_write_item_key_defects_message_diverges_from_put_item--put-missing-key.json");
+put_item_case!(given_check_condition_attribute_exists_absent_flag_refused_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_condition_attribute_exists--absent-flag-refused.json");
+put_item_case!(given_check_condition_attribute_exists_present_flag_applies_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_condition_attribute_exists--present-flag-applies.json");
+put_item_case!(given_check_condition_attribute_type_gates_the_write_wrong_stored_type_refused_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_condition_attribute_type_gates_the_write--wrong-stored-type-refused.json");
+put_item_case!(given_check_condition_attribute_type_gates_the_write_matching_type_applies_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_condition_attribute_type_gates_the_write--matching-type-applies.json");
+put_item_case!(
+    given_check_condition_on_missing_item_when_put_item_runs_then_aws_behavioural_response_matches,
+    "local/aws-behav/check_condition_on_missing_item.json"
+);
+put_item_case!(given_check_ddb_numeric_sort_key_magnitude_ceiling_rejected_ceiling_accepted_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_ddb_numeric_sort_key_magnitude_ceiling_rejected--ceiling-accepted.json");
+put_item_case!(given_check_ddb_numeric_sort_key_magnitude_ceiling_rejected_over_ceiling_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_ddb_numeric_sort_key_magnitude_ceiling_rejected--over-ceiling.json");
+put_item_case!(given_check_ddb_numeric_sort_key_magnitude_ceiling_rejected_under_negative_ceiling_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_ddb_numeric_sort_key_magnitude_ceiling_rejected--under-negative-ceiling.json");
+put_item_case!(given_check_nesting_depth_limit_enforced_at_32_levels_map_32_levels_accepted_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_nesting_depth_limit_enforced_at_32_levels--map-32-levels-accepted.json");
+put_item_case!(given_check_nesting_depth_limit_enforced_at_32_levels_map_33_levels_refused_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_nesting_depth_limit_enforced_at_32_levels--map-33-levels-refused.json");
+put_item_case!(given_check_nesting_depth_limit_enforced_at_32_levels_list_33_levels_refused_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_nesting_depth_limit_enforced_at_32_levels--list-33-levels-refused.json");
+put_item_case!(given_check_put_and_delete_item_reject_return_values_all_new_refuse_all_new_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_and_delete_item_reject_return_values_all_new--refuse-all-new.json");
+put_item_case!(given_check_put_and_delete_item_reject_return_values_all_new_refuse_updated_old_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_and_delete_item_reject_return_values_all_new--refuse-updated-old.json");
+put_item_case!(given_check_put_and_delete_item_reject_return_values_all_new_refuse_updated_new_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_and_delete_item_reject_return_values_all_new--refuse-updated-new.json");
+put_item_case!(given_check_put_item_default_response_omits_attributes_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_default_response_omits_attributes.json");
+put_item_case!(given_check_put_item_and_search_vectors_return_consumed_capacity_invalid_enum_rejected_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_and_search_vectors_return_consumed_capacity_invalid_enum_rejected.json");
+put_item_case!(given_check_put_update_delete_item_return_consumed_capacity_invalid_enum_rejected_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_update_delete_item_return_consumed_capacity_invalid_enum_rejected.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_empty_ss_in_list_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--empty-ss-in-list.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_empty_ns_in_list_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--empty-ns-in-list.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_empty_bs_in_list_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--empty-bs-in-list.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_empty_ss_in_map_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--empty-ss-in-map.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_empty_ns_in_map_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--empty-ns-in-map.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_empty_bs_in_map_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--empty-bs-in-map.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_ss_empty_member_in_list_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--ss-empty-member-in-list.json");
+put_item_case!(given_check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips_ss_empty_member_in_map_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_nested_set_in_list_or_map_empty_rejected_empty_string_member_round_trips--ss-empty-member-in-map.json");
+put_item_case!(given_check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections_ss_two_empty_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections--ss-two-empty.json");
+put_item_case!(given_check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections_bs_two_empty_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections--bs-two-empty.json");
+put_item_case!(given_check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections_ss_one_empty_round_trips_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections--ss-one-empty-round-trips.json");
+put_item_case!(given_check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections_bs_one_empty_round_trips_when_put_item_runs_then_aws_behavioural_response_matches, "local/aws-behav/check_put_item_two_empty_members_in_ss_and_bs_rejected_as_duplicate_collections--bs-one-empty-round-trips.json");

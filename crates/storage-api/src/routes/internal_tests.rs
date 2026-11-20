@@ -876,3 +876,22 @@ async fn public_dispatch_returns_stream_records_from_real_table_writes() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn given_internal_storage_error_when_internal_route_maps_it_then_one_warn_event() {
+    let observation = storage_observability_test_support::observation::observe(async {
+        let _ =
+            internal::storage_system_error(storage_types::StorageError::internal("secret detail"));
+    })
+    .await;
+
+    observation.assert_only_event_exact(
+        tracing::Level::WARN,
+        &[
+            ("service", "dynamodb"),
+            ("class", "internal"),
+            ("kind", "internal_server_error"),
+            ("message", "storage operation failed"),
+        ],
+    );
+}

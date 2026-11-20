@@ -71,9 +71,15 @@ impl SqlFaultProbe for NativeFaultProbe {
     fn alter_query_page(&self, call: SqlFaultCall<'_>, mut page: SqlQueryPage) -> SqlQueryPage {
         let mut state = self.0.lock().unwrap();
         if state.corrupt_catalog
-            && call
+            && (call
                 .sql
                 .starts_with("SELECT id, catalog_revision FROM tables")
+                || call
+                    .sql
+                    .starts_with("SELECT id, catalog_revision, table_name FROM tables WHERE")
+                || call.sql.starts_with(
+                    "WITH authority AS (SELECT id, catalog_revision FROM tables WHERE",
+                ))
         {
             state.corrupt_catalog = false;
             state.fired += 1;

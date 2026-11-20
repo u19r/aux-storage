@@ -14,11 +14,11 @@ use crate::{KvEntry, constants::INFRASTRUCTURE_RECORD_HEADER_BYTES};
 pub(super) fn encode_record(record: &DurableRecord) -> StorageResult<Vec<u8>> {
     let size = INFRASTRUCTURE_RECORD_HEADER_BYTES
         .checked_add(record.bytes.len())
-        .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(size)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     bytes.extend_from_slice(&u64::from(record.revision).to_be_bytes());
     bytes.extend_from_slice(&record.bytes);
     Ok(bytes)
@@ -64,7 +64,7 @@ pub(super) fn decode_records<'a>(
     let mut records = Vec::new();
     records
         .try_reserve_exact(count)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for (key, bytes) in keys.zip(values) {
         let record = bytes
             .map(|bytes| decode_record(DurableRecordKey::try_from(key)?, bytes))
@@ -93,7 +93,7 @@ pub(super) fn decode_revisions(
     let mut revisions = Vec::new();
     revisions
         .try_reserve_exact(values.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for value in values {
         revisions.push(
             value

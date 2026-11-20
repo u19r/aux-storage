@@ -1,167 +1,215 @@
 //! Shared subscription lifecycle and visibility decisions.
 
-use async_trait::async_trait;
-use storage_common::retry::retry_native_conflicts;
-use storage_types::{AttemptMode, StorageError, StorageResult};
+use std::sync::Arc;
+
+use storage_types::{StorageError, StorageResult};
 
 use crate::{
     ConfirmSubscriptionRequest, ConfirmSubscriptionResponse, ListSubscriptionsRequest,
     ListSubscriptionsResponse, PreparedSubscription, PubsubAttempt, PubsubError, PubsubPort,
-    PubsubResult, PubsubSubscriptionRepository, PubsubValidationKind,
-    SetSubscriptionAttributesRequest, Subscription, SubscriptionAcceptanceInput, SubscriptionArn,
-    SubscriptionConfirmation, SubscriptionPage, SubscriptionPageRequest, SubscriptionRecord,
-    constants::{PUBSUB_PAGE_LIMIT, PUBSUB_WRITE_RETRY},
+    PubsubResult, PubsubValidationKind, Subscription, SubscriptionAcceptanceInput, SubscriptionArn,
+    SubscriptionAttributes, SubscriptionConfirmation, SubscriptionPage, SubscriptionPageRequest,
+    SubscriptionRecord, TopicArn,
+    constants::{CATALOG_POINT_READ, CATALOG_RANGE_READ, CATALOG_WRITE, PUBSUB_PAGE_LIMIT},
     pubsub_port::read_topic,
 };
 
-#[async_trait]
-impl<P: PubsubPort> PubsubSubscriptionRepository for P {
-    async fn create_subscription(
-        &self,
-        input: SubscriptionAcceptanceInput,
-    ) -> PubsubResult<Subscription> {
-        retry_native_conflicts(self, PUBSUB_WRITE_RETRY, || {
-            let input = input.clone();
-            self.with_pubsub_attempt(AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(async move { create_subscription_in_attempt(attempt, input).await })
-            })
-        })
-        .await
-        .map_err(PubsubError::from)?
-    }
-
-    async fn confirm_subscription(
-        &self,
-        request: ConfirmSubscriptionRequest,
-    ) -> PubsubResult<ConfirmSubscriptionResponse> {
-        retry_native_conflicts(self, PUBSUB_WRITE_RETRY, || {
-            let request = request.clone();
-            self.with_pubsub_attempt(AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(async move { confirm_subscription_in_attempt(attempt, request).await })
-            })
-        })
-        .await
-        .map_err(PubsubError::from)?
-    }
-
-    async fn delete_subscription(&self, arn: &SubscriptionArn) -> PubsubResult<()> {
-        let arn = arn.clone();
-        retry_native_conflicts(self, PUBSUB_WRITE_RETRY, || {
-            let arn = arn.clone();
-            self.with_pubsub_attempt(AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(async move { delete_subscription_in_attempt(attempt, &arn).await })
-            })
-        })
-        .await
-        .map_err(PubsubError::from)
-    }
-
-    async fn get_subscription(&self, arn: &SubscriptionArn) -> PubsubResult<Option<Subscription>> {
-        let arn = arn.clone();
-        self.with_pubsub_attempt(AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(async move {
-                let Some(record) = attempt.read_subscription(&arn).await? else {
-                    return Ok(None);
-                };
-                Ok(is_active(attempt, &record)
-                    .await?
-                    .then_some(record.subscription))
-            })
-        })
-        .await
-        .map_err(PubsubError::from)
-    }
-
-    async fn set_subscription_attributes(
-        &self,
-        request: SetSubscriptionAttributesRequest,
-    ) -> PubsubResult<Subscription> {
-        retry_native_conflicts(self, PUBSUB_WRITE_RETRY, || {
-            let request = request.clone();
-            self.with_pubsub_attempt(AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(
-                    async move { set_subscription_attributes_in_attempt(attempt, request).await },
-                )
-            })
-        })
-        .await
-        .map_err(PubsubError::from)?
-    }
-
-    async fn list_subscriptions(
-        &self,
-        request: ListSubscriptionsRequest,
-    ) -> PubsubResult<ListSubscriptionsResponse> {
-        let after = request.next_token.map(SubscriptionArn::new).transpose()?;
-        self.with_pubsub_attempt(AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(async move {
-                let topic_incarnation = if let Some(arn) = &request.topic_arn {
-                    let Some(topic) = read_topic(attempt, arn).await? else {
-                        return Ok(ListSubscriptionsResponse {
-                            subscriptions: Vec::new(),
-                            next_token: None,
-                        });
-                    };
-                    Some(topic.incarnation)
-                } else {
-                    None
-                };
-                let page = attempt
-                    .read_subscription_page(SubscriptionPageRequest {
-                        topic_incarnation,
-                        after: after.as_ref(),
-                        limit: PUBSUB_PAGE_LIMIT,
-                    })
-                    .await?;
-                validate_page(&page, after.as_ref())?;
-                let more = page.more || page.rows.len() > PUBSUB_PAGE_LIMIT.get() as usize;
-                let selected = page
-                    .rows
-                    .into_iter()
-                    .take(PUBSUB_PAGE_LIMIT.get() as usize)
-                    .collect::<Vec<_>>();
-                let next_token = more
-                    .then(|| {
-                        selected
-                            .last()
-                            .map(|row| row.subscription.subscription_arn.to_string())
-                    })
-                    .flatten();
-                let subscriptions = if topic_incarnation.is_some() {
-                    selected.into_iter().map(|row| row.subscription).collect()
-                } else {
-                    let arns = selected
-                        .iter()
-                        .map(|row| row.subscription.topic_arn.clone())
-                        .collect();
-                    let topics = attempt.read_topics(arns).await?;
-                    if topics.len() != selected.len() {
-                        return Err(StorageError::internal(
-                            "subscription topic batch count differs",
-                        ));
-                    }
-                    selected
-                        .into_iter()
-                        .zip(topics)
-                        .filter_map(|(row, topic)| {
-                            topic
-                                .filter(|topic| topic.incarnation == row.topic_incarnation)
-                                .map(|_| row.subscription)
-                        })
-                        .collect()
-                };
-                Ok(ListSubscriptionsResponse {
-                    subscriptions,
-                    next_token,
-                })
-            })
-        })
-        .await
-        .map_err(PubsubError::from)
-    }
+struct SubscriptionAttributesInput {
+    arn: SubscriptionArn,
+    attributes: SubscriptionAttributes,
 }
 
-async fn is_active<A: PubsubAttempt>(
+struct ListSubscriptionsInput {
+    topic_arn: Option<TopicArn>,
+    after: Option<SubscriptionArn>,
+}
+
+pub(crate) async fn create_subscription<P: PubsubPort>(
+    port: &P,
+    input: SubscriptionAcceptanceInput,
+) -> PubsubResult<Subscription> {
+    port.run(CATALOG_WRITE, Arc::new(input), |attempt, input, _| {
+        Box::pin(create_subscription_in_attempt(attempt, input.clone()))
+    })
+    .await
+    .map_err(PubsubError::from)?
+}
+
+pub(crate) async fn confirm_subscription<P: PubsubPort>(
+    port: &P,
+    request: ConfirmSubscriptionRequest,
+) -> PubsubResult<ConfirmSubscriptionResponse> {
+    port.run(CATALOG_WRITE, Arc::new(request), |attempt, input, _| {
+        Box::pin(confirm_subscription_in_attempt(attempt, input.clone()))
+    })
+    .await
+    .map_err(PubsubError::from)?
+}
+
+pub(crate) async fn delete_subscription<P: PubsubPort>(
+    port: &P,
+    arn: &SubscriptionArn,
+) -> PubsubResult<()> {
+    port.run(CATALOG_WRITE, Arc::new(arn.clone()), |attempt, input, _| {
+        Box::pin(delete_subscription_in_attempt(attempt, input))
+    })
+    .await
+    .map_err(PubsubError::from)
+}
+
+pub(crate) async fn unsubscribe<P: PubsubPort>(
+    port: &P,
+    arn: &SubscriptionArn,
+) -> PubsubResult<()> {
+    port.run(CATALOG_WRITE, Arc::new(arn.clone()), |attempt, input, _| {
+        Box::pin(unsubscribe_in_attempt(attempt, input))
+    })
+    .await
+    .map_err(PubsubError::from)?
+}
+
+pub(crate) async fn get_subscription<P: PubsubPort>(
+    port: &P,
+    arn: &SubscriptionArn,
+) -> PubsubResult<Option<Subscription>> {
+    port.run(
+        CATALOG_POINT_READ,
+        Arc::new(arn.clone()),
+        |attempt, input, _| Box::pin(get_subscription_in_attempt(attempt, input)),
+    )
+    .await
+    .map_err(PubsubError::from)
+}
+
+pub(crate) async fn set_subscription_attributes<P: PubsubPort>(
+    port: &P,
+    arn: &SubscriptionArn,
+    attributes: SubscriptionAttributes,
+) -> PubsubResult<Subscription> {
+    let input = Arc::new(SubscriptionAttributesInput {
+        arn: arn.clone(),
+        attributes,
+    });
+    port.run(CATALOG_WRITE, input, |attempt, input, _| {
+        Box::pin(set_subscription_attributes_in_attempt(
+            attempt,
+            &input.arn,
+            input.attributes.clone(),
+        ))
+    })
+    .await
+    .map_err(PubsubError::from)?
+}
+
+pub(crate) async fn list_subscriptions<P: PubsubPort>(
+    port: &P,
+    request: ListSubscriptionsRequest,
+) -> PubsubResult<ListSubscriptionsResponse> {
+    let after = request
+        .next_token
+        .map(|token| {
+            queue_provider::decode_page_token(&token)
+                .and_then(|arn| SubscriptionArn::new(arn).ok())
+                .ok_or_else(|| {
+                    PubsubError::validation_with_detail(
+                        PubsubValidationKind::InvalidNextToken,
+                        &token,
+                    )
+                })
+        })
+        .transpose()?;
+    let missing_topic = request
+        .topic_arn
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let input = Arc::new(ListSubscriptionsInput {
+        topic_arn: request.topic_arn,
+        after,
+    });
+    port.run(CATALOG_RANGE_READ, input, |attempt, input, _| {
+        Box::pin(list_subscriptions_in_attempt(attempt, input))
+    })
+    .await
+    .map_err(PubsubError::from)?
+    .ok_or_else(|| PubsubError::topic_not_found(missing_topic))
+}
+
+async fn get_subscription_in_attempt<A: PubsubAttempt>(
+    attempt: &mut A,
+    arn: &SubscriptionArn,
+) -> StorageResult<Option<Subscription>> {
+    let Some(record) = attempt
+        .read_subscription(arn, attempt.default_protection())
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(is_active(attempt, &record)
+        .await?
+        .then_some(record.subscription))
+}
+
+async fn list_subscriptions_in_attempt<A: PubsubAttempt>(
+    attempt: &mut A,
+    input: &ListSubscriptionsInput,
+) -> StorageResult<Option<ListSubscriptionsResponse>> {
+    let topic_incarnation = if let Some(arn) = &input.topic_arn {
+        // AWS documents `NotFound` for a missing topic.
+        let Some(topic) = read_topic(attempt, arn).await? else {
+            return Ok(None);
+        };
+        Some(topic.incarnation)
+    } else {
+        None
+    };
+    let page = attempt
+        .read_subscription_page(SubscriptionPageRequest {
+            topic_incarnation,
+            after: input.after.as_ref(),
+            limit: PUBSUB_PAGE_LIMIT,
+        })
+        .await?;
+    validate_page(&page, input.after.as_ref())?;
+    let more = page.more || page.rows.len() > PUBSUB_PAGE_LIMIT.get() as usize;
+    let selected = page
+        .rows
+        .into_iter()
+        .take(PUBSUB_PAGE_LIMIT.get() as usize)
+        .collect::<Vec<_>>();
+    let next_token = more
+        .then(|| {
+            selected.last().map(|row| {
+                queue_provider::encode_page_token(row.subscription.subscription_arn.as_str())
+            })
+        })
+        .flatten();
+    let subscriptions = if topic_incarnation.is_some() {
+        selected.into_iter().map(|row| row.subscription).collect()
+    } else {
+        let arns = selected
+            .iter()
+            .map(|row| row.subscription.topic_arn.clone())
+            .collect();
+        let topics = attempt
+            .read_topics(arns, attempt.default_protection())
+            .await?;
+        topics
+            .zip(selected)
+            .filter_map(|(row, topic)| {
+                topic
+                    .filter(|topic| topic.incarnation == row.topic_incarnation)
+                    .map(|_| row.subscription)
+            })
+            .collect()
+    };
+    Ok(Some(ListSubscriptionsResponse {
+        subscriptions,
+        next_token,
+    }))
+}
+
+pub(crate) async fn is_active<A: PubsubAttempt>(
     attempt: &mut A,
     record: &SubscriptionRecord,
 ) -> StorageResult<bool> {
@@ -194,11 +242,10 @@ pub async fn create_subscription_in_attempt<A: PubsubAttempt>(
     attempt: &mut A,
     input: SubscriptionAcceptanceInput,
 ) -> StorageResult<PubsubResult<Subscription>> {
-    let arn = input.subscription().topic_arn.clone();
-    let Some(prepared) = PreparedSubscription::prepare(attempt, input).await? else {
-        return Ok(Err(PubsubError::topic_not_found(arn.to_string())));
-    };
-    Ok(Ok(prepared.apply().await?))
+    match PreparedSubscription::prepare(attempt, input).await? {
+        Ok(prepared) => Ok(Ok(prepared.apply().await?)),
+        Err(error) => Ok(Err(error)),
+    }
 }
 
 pub async fn confirm_subscription_in_attempt<A: PubsubAttempt>(
@@ -232,27 +279,55 @@ pub async fn delete_subscription_in_attempt<A: PubsubAttempt>(
     attempt: &mut A,
     arn: &SubscriptionArn,
 ) -> StorageResult<()> {
-    if let Some(record) = attempt.read_subscription(arn).await? {
+    if let Some(record) = attempt
+        .read_subscription(arn, attempt.default_protection())
+        .await?
+    {
         attempt.delete_subscription(record).await?;
     }
     Ok(())
 }
 
+/// The customer `Unsubscribe`: a subscription still pending confirmation
+/// cannot be unsubscribed (suite script
+/// `unsubscribe_pending_subscription_rejected`). The deletion itself is
+/// `delete_subscription_in_attempt`, which the stale sweep also uses.
+pub async fn unsubscribe_in_attempt<A: PubsubAttempt>(
+    attempt: &mut A,
+    arn: &SubscriptionArn,
+) -> StorageResult<PubsubResult<()>> {
+    if let Some(record) = attempt
+        .read_subscription(arn, attempt.default_protection())
+        .await?
+    {
+        if record.subscription.confirmation.pending_confirmation() {
+            return Ok(Err(PubsubError::validation_with_detail(
+                PubsubValidationKind::InvalidAttributeValue,
+                "SubscriptionArn Reason: Cannot unsubscribe a subscription that is pending \
+                 confirmation",
+            )));
+        }
+        attempt.delete_subscription(record).await?;
+    }
+    Ok(Ok(()))
+}
+
 pub async fn set_subscription_attributes_in_attempt<A: PubsubAttempt>(
     attempt: &mut A,
-    request: SetSubscriptionAttributesRequest,
+    arn: &SubscriptionArn,
+    attributes: SubscriptionAttributes,
 ) -> StorageResult<PubsubResult<Subscription>> {
-    let arn = request.subscription_arn.clone();
-    let Some(previous) = attempt.read_subscription(&arn).await? else {
+    let Some(previous) = attempt
+        .read_subscription(arn, attempt.default_protection())
+        .await?
+    else {
         return Ok(Err(PubsubError::subscription_not_found(arn.to_string())));
     };
     if !is_active(attempt, &previous).await? {
         return Ok(Err(PubsubError::subscription_not_found(arn.to_string())));
     }
     let mut current = previous.clone();
-    if let Some(value) = request.attributes.get("RawMessageDelivery") {
-        current.subscription.raw_message_delivery = value.eq_ignore_ascii_case("true");
-    }
+    attributes.apply(&mut current.subscription);
     let subscription = current.subscription.clone();
     current.validate_revision(&previous)?;
     attempt.write_subscription(current, Some(previous)).await?;

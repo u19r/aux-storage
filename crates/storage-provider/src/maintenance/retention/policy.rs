@@ -1,8 +1,7 @@
 use storage_types::{
-    ItemHistoryAddress, StorageError, StorageResult, StreamName, StreamRetentionDuration,
-    TableHistoryId, TimestampMillis, UpdateTableRequest,
+    StorageError, StorageResult, StreamRetentionDuration, TableHistoryId, TimestampMillis,
+    UpdateTableRequest,
 };
-use stream_provider::StreamRowKind;
 
 use super::{
     StreamTrimDueMarker, StreamTrimScope, StreamTrimState, StreamTrimStateWrite,
@@ -12,33 +11,6 @@ use super::{
 /// One stable table-incarnation namespace across SQL and KV retention layouts.
 pub fn table_retention_scope_id(history_id: TableHistoryId) -> String {
     format!("table:{:032x}", u128::from_be_bytes(*history_id.as_ref()))
-}
-
-/// Resolve a persisted scope to the typed physical stream used by both backend
-/// families.
-pub fn stream_retention_kind(scope: &StreamTrimScope) -> StorageResult<StreamRowKind> {
-    let id = decode_history_id(&scope.scope_id, "table:")?;
-    let address = ItemHistoryAddress {
-        history_id: id,
-        stream_name: StreamName::table_stream(&scope.table_name),
-    };
-    if table_retention_scope_id(id) != scope.scope_id {
-        return Err(StorageError::internal(
-            "table retention scope is not canonical",
-        ));
-    }
-    Ok(StreamRowKind::Table(address.physical_stream_name()?))
-}
-
-fn decode_history_id(scope_id: &str, prefix: &str) -> StorageResult<TableHistoryId> {
-    let hex = scope_id
-        .strip_prefix(prefix)
-        .ok_or_else(|| StorageError::internal("stream retention scope is invalid"))?;
-    let bytes: [u8; 16] = hex::decode(hex)
-        .map_err(|_| StorageError::internal("stream retention history is invalid"))?
-        .try_into()
-        .map_err(|_| StorageError::internal("stream retention history is invalid"))?;
-    Ok(TableHistoryId::from(bytes))
 }
 
 pub fn plan_table_stream_duration(

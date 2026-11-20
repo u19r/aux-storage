@@ -4,28 +4,27 @@ use std::sync::Arc;
 
 use storage_backfill::GsiProjectionLifecycle;
 use storage_types::{
-    AttributeMap, BoundTableInfo, DynamoRequestValidate, IndexedWireItem, IndexerDeclaration,
-    KeyAttributes, LogicalItemSize, ReturnValuesOldNewUpdated, StorageError, StorageResult,
-    TableName, UpdateItemRequest, UpdateItemResponse, WireItem,
+    AttributeMap, BoundTableInfo, DynamoRequestValidate, IndexerDeclaration, KeyAttributes,
+    LogicalItemSize, ReturnValuesOldNewUpdated, StorageEnum, StorageError, StorageResult,
+    TableName, UpdateItemRequest, UpdateItemResponse, condition::CompiledCondition,
     return_values_on_condition_check_failure_all_old, validate_transact_key,
 };
 
 use crate::{
-    AcceptedUpsert, ItemWriteObservation, SemanticDecision, UncheckedCondition,
-    dynamo_put_item::{ObservedWrite, check_write_condition},
+    AcceptedUpsert, ItemWriteObservation, SemanticDecision,
+    dynamo_put_item::ObservedWrite,
     update_logic::{
-        UpdateOperation, apply_update_operations, parse_update_expression,
-        update_item_response_attributes,
+        UpdateOperation, apply_update_operations, parse_update_expression, updated_attribute_map,
+        updated_attribute_map_borrowed,
     },
 };
 
-#[derive(Clone)]
 pub struct UpdateItemShape {
     pub table_name: TableName,
     key: KeyAttributes,
-    operations: Vec<UpdateOperation>,
+    pub(crate) operations: Vec<UpdateOperation>,
     indexers: Option<Vec<String>>,
-    condition: Option<UncheckedCondition>,
+    condition: Option<CompiledCondition>,
     return_values: Option<ReturnValuesOldNewUpdated>,
     return_old_on_condition_failure: bool,
 }
@@ -35,14 +34,11 @@ fn reject_key_attribute_updates(
     operations: &[UpdateOperation],
 ) -> StorageResult<()> {
     for operation in operations {
-        let root = operation
-            .field_name()
-            .split(['.', '['])
-            .next()
-            .unwrap_or_default();
+        let root = operation.field_path().root();
         if key_schema.iter().any(|key| key.attribute_name == root) {
             return Err(StorageError::validation(format!(
-                "Cannot update attribute '{root}'. This attribute is part of the key"
+                "One or more parameter values were invalid: Cannot update attribute {root}. This \
+                 attribute is part of the key"
             )));
         }
     }
@@ -62,7 +58,7 @@ impl UpdateItemShape {
     }
 
     /// Parent batch/transaction validation covers member request fields.
-    pub(crate) fn from_validated_request(request: UpdateItemRequest) -> StorageResult<Self> {
+    pub(crate) fn from_validated_request(mut request: UpdateItemRequest) -> StorageResult<Self> {
         let operations = match (
             request.update_expression.as_deref(),
             request.attribute_updates,
@@ -84,11 +80,12 @@ impl UpdateItemShape {
                 ));
             }
         };
-        let condition = UncheckedCondition::parse(
+        let condition = CompiledCondition::compile_write(
             request.condition_expression,
             request.expression_attribute_names,
             request.expression_attribute_values,
         )?;
+        request.key.normalize_numbers_for_write();
         Ok(Self {
             table_name: request.table_name,
             key: request.key,
@@ -102,18 +99,16 @@ impl UpdateItemShape {
         })
     }
 
-    pub fn bind_table(mut self, table: Arc<BoundTableInfo>) -> StorageResult<BoundUpdateItem> {
+    pub fn bind_table(
+        self: Arc<Self>,
+        table: Arc<BoundTableInfo>,
+    ) -> StorageResult<BoundUpdateItem> {
         validate_transact_key(&table.info, &self.key)?;
         reject_key_attribute_updates(&table.info.key_schema, &self.operations)?;
-        self.key.normalize_numbers_for_write();
         Ok(BoundUpdateItem {
             table,
-            key: self.key,
-            operations: self.operations,
-            indexers: self.indexers,
-            condition: self.condition,
-            return_values: self.return_values,
-            return_old_on_condition_failure: self.return_old_on_condition_failure,
+            key: self.key.clone(),
+            shape: self,
         })
     }
 }
@@ -121,39 +116,58 @@ impl UpdateItemShape {
 pub struct BoundUpdateItem {
     pub table: Arc<BoundTableInfo>,
     pub key: KeyAttributes,
-    operations: Vec<UpdateOperation>,
-    indexers: Option<Vec<String>>,
-    condition: Option<UncheckedCondition>,
-    return_values: Option<ReturnValuesOldNewUpdated>,
-    return_old_on_condition_failure: bool,
+    shape: Arc<UpdateItemShape>,
 }
 
 impl BoundUpdateItem {
     pub fn accept_old(
-        mut self,
+        self,
         observed: ItemWriteObservation,
         lifecycle: GsiProjectionLifecycle,
     ) -> StorageResult<SemanticDecision<(AcceptedUpsert, UpdateReturnShape)>> {
-        let old = ObservedWrite::try_new(observed, &self.key)?;
-        if let SemanticDecision::Rejected(error) = check_write_condition(
-            self.condition.as_ref(),
-            old.item.as_deref(),
-            self.return_old_on_condition_failure,
-        )? {
-            return Ok(SemanticDecision::Rejected(error));
+        // An if_not_exists operand too large for any item is a size error
+        // whether or not the condition would pass.
+        for operation in &self.shape.operations {
+            if let UpdateOperation::SetIfNotExists { operand, .. } = operation {
+                LogicalItemSize::try_from_updated_entries([("x", operand)])?;
+            }
         }
-        let base = old
+        let old = ObservedWrite::try_new(observed, &self.key)?;
+        // The only decode of the old image: condition, failure item, response
+        // and update base.
+        let old_map = old
             .item
             .as_deref()
             .map(AttributeMap::try_from)
-            .transpose()?
-            .unwrap_or_else(|| AttributeMap::from(&self.key));
-        let indexers = self.indexers.take().unwrap_or_else(|| old.indexers.clone());
+            .transpose()?;
+        if let Some(condition) = self.shape.condition.as_ref() {
+            let absent = AttributeMap::new();
+            if !condition.matches(old_map.as_ref().unwrap_or(&absent)) {
+                let error = match (self.shape.return_old_on_condition_failure, old_map) {
+                    (true, Some(item)) => StorageEnum::ConditionalCheckFailedWithItem { item },
+                    _ => StorageEnum::ConditionalCheckFailed,
+                };
+                return Ok(SemanticDecision::Rejected(error.into()));
+            }
+        }
+        let old_response = match self.shape.return_values {
+            Some(ReturnValuesOldNewUpdated::AllOld) => old_map.clone(),
+            Some(ReturnValuesOldNewUpdated::UpdatedOld) => old_map
+                .as_ref()
+                .and_then(|item| updated_attribute_map_borrowed(&self.shape.operations, item)),
+            _ => None,
+        };
+        let base = old_map.unwrap_or_else(|| AttributeMap::from(&self.key));
+        let indexers = self
+            .shape
+            .indexers
+            .clone()
+            .unwrap_or_else(|| old.indexers.clone());
         let updated = match self.evaluate_updated_item(base, indexers)? {
             SemanticDecision::Accepted(updated) => updated,
             SemanticDecision::Rejected(error) => return Ok(SemanticDecision::Rejected(error)),
         };
-        SemanticDecision::try_from(self.accept_updated_item(old, lifecycle, updated))
+        SemanticDecision::try_from(self.accept_updated_item(old, lifecycle, updated, old_response))
     }
 
     fn evaluate_updated_item(
@@ -162,12 +176,12 @@ impl BoundUpdateItem {
         indexers: Vec<String>,
     ) -> StorageResult<SemanticDecision<(AttributeMap, LogicalItemSize, IndexerDeclaration)>> {
         let result: StorageResult<(AttributeMap, LogicalItemSize, IndexerDeclaration)> = (|| {
-            let mut updated =
-                apply_update_operations(base, &self.operations)?.with_verified_keys(&self.key)?;
+            let mut updated = apply_update_operations(base, &self.shape.operations)?
+                .with_verified_keys(&self.key)?;
             updated.normalize_numbers_for_write();
-            let item_size = LogicalItemSize::try_from_entries(updated.iter())?;
+            let item_size = LogicalItemSize::try_from_updated_entries(updated.iter())?;
             let declaration = IndexerDeclaration::try_new(indexers, self.table.info.max_indexers)?;
-            IndexedWireItem::validate_logical_item(&updated, &declaration)?;
+            storage_types::validate_logical_item(&updated, &declaration)?;
             Ok((updated, item_size, declaration))
         })(
         );
@@ -179,17 +193,26 @@ impl BoundUpdateItem {
         old: ObservedWrite,
         lifecycle: GsiProjectionLifecycle,
         (updated, item_size, declaration): (AttributeMap, LogicalItemSize, IndexerDeclaration),
+        old_response: Option<AttributeMap>,
     ) -> StorageResult<(AcceptedUpsert, UpdateReturnShape)> {
-        let new_item = WireItem::try_from(updated)?;
+        let new_item = storage_types::VerifiedWireItem::encode_key_complete(&updated)?;
+        let attributes = match self.shape.return_values {
+            Some(ReturnValuesOldNewUpdated::AllOld | ReturnValuesOldNewUpdated::UpdatedOld) => {
+                old_response
+            }
+            Some(ReturnValuesOldNewUpdated::AllNew) => Some(updated),
+            Some(ReturnValuesOldNewUpdated::UpdatedNew) => {
+                updated_attribute_map(&self.shape.operations, updated)
+            }
+            None | Some(ReturnValuesOldNewUpdated::None) => None,
+        };
         let prepared_gsi =
-            storage_backfill::PreparedGsiPut::try_new(&self.table.info, &new_item, &declaration)?;
-        let history = crate::dynamo_write_execution::PreparedItemHistory::try_new(
-            &self.table,
-            &self.key,
-            &new_item,
-        )?;
+            storage_backfill::PreparedGsiPut::try_new(&self.table.info, &new_item, &declaration)
+                .map_err(StorageError::for_index_key_update)?;
+        let history_route =
+            crate::dynamo_write_execution::prepare_history_route(&self.table, &self.key)?;
         let accepted = AcceptedUpsert {
-            history,
+            history_route,
             ttl: crate::dynamo_put_item::UpsertTtlPreparation::ObservedItem,
             table: self.table,
             key: self.key,
@@ -198,56 +221,26 @@ impl BoundUpdateItem {
             old_item: old.item,
             declaration,
             old_indexers: old.indexers,
-            old_revision: old.revision,
             old_provenance: old.provenance,
-            old_ttl_epoch: old.ttl_epoch,
+            old_marker: old.marker,
+            regional: None,
             gsi_lifecycle: lifecycle,
             prepared_gsi,
         };
-        Ok((
-            accepted,
-            UpdateReturnShape {
-                operations: self.operations,
-                return_values: self.return_values,
-            },
-        ))
+        Ok((accepted, UpdateReturnShape { attributes }))
     }
 }
 
-/// Response-only work consumes committed images outside the write connection.
+/// The response attributes, shaped from the maps the accept step already held.
 pub struct UpdateReturnShape {
-    operations: Vec<UpdateOperation>,
-    return_values: Option<ReturnValuesOldNewUpdated>,
+    attributes: Option<AttributeMap>,
 }
 
 impl UpdateReturnShape {
-    pub(crate) fn finish(
-        self,
-        item: crate::dynamo_write_execution::UpsertResponseImages,
-    ) -> StorageResult<UpdateItemResponse> {
-        let old_response = matches!(
-            self.return_values,
-            Some(ReturnValuesOldNewUpdated::AllOld | ReturnValuesOldNewUpdated::UpdatedOld)
-        )
-        .then(|| {
-            item.old_item
-                .as_ref()
-                .map(AttributeMap::try_from)
-                .transpose()
-        })
-        .transpose()?
-        .flatten();
-        let new_response = matches!(
-            self.return_values,
-            Some(ReturnValuesOldNewUpdated::AllNew | ReturnValuesOldNewUpdated::UpdatedNew)
-        )
-        .then(|| AttributeMap::try_from(&item.new_item))
-        .transpose()?;
-        update_item_response_attributes(
-            &self.operations,
-            old_response,
-            new_response,
-            self.return_values.as_ref(),
-        )
+    pub(crate) fn into_response(self) -> UpdateItemResponse {
+        UpdateItemResponse {
+            attributes: self.attributes,
+            consumed_capacity: None,
+        }
     }
 }

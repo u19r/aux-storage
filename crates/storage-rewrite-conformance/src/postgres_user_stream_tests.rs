@@ -3,19 +3,19 @@
 use std::{
     collections::HashSet,
     panic::{AssertUnwindSafe, resume_unwind},
-    time::Duration,
 };
 
 use futures::{FutureExt as _, future::join_all};
-use storage_types::{AttemptMode, TimestampMillis, UserStreamName};
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass, TimestampMillis, UserStreamName};
 use stream_provider::{
-    CursorName, CursorPosition, StreamAttempt, StreamDataType, StreamOperations,
-    StreamPartitioningMode, StreamPort, StreamRowKind, StreamRowValue,
+    CursorName, CursorPosition, StreamAttempt, StreamDataType, StreamPartitioningMode,
+    StreamRowValue,
 };
 
 use super::test_support::TestStore;
 
 #[tokio::test]
+#[ignore = "requires STORAGE_TEST_BACKEND=postgres and TEST_POSTGRES_DSN"]
 async fn given_one_stream_when_many_writers_append_then_cursor_reads_every_unique_item() {
     let store = TestStore::new_postgres().await;
     let outcome = AssertUnwindSafe(async {
@@ -25,11 +25,11 @@ async fn given_one_stream_when_many_writers_append_then_cursor_reads_every_uniqu
             .create_stream(name.clone(), None, StreamPartitioningMode::Single)
             .await
             .expect("create user stream");
-        let stream = StreamRowKind::User(internal_id);
+        let stream = internal_id;
         let cursors = store.stream_operations.clone();
         cursors
             .create_cursor(
-                stream.clone(),
+                stream.clone().into(),
                 CursorName::new("reader"),
                 CursorPosition::Head,
             )
@@ -51,9 +51,11 @@ async fn given_one_stream_when_many_writers_append_then_cursor_reads_every_uniqu
         let unique_ids = committed.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
         assert_eq!(unique_ids.len(), committed.len());
 
-        await_visible_items(cursors.as_ref(), stream.clone(), committed.len()).await;
+        store
+            .wait_until_user_item_is_readable(*unique_ids.iter().max().unwrap())
+            .await;
         let page = cursors
-            .read_from_cursor(stream.clone(), CursorName::new("reader"), 32)
+            .read_from_cursor(stream.clone().into(), CursorName::new("reader"), 32)
             .await
             .expect("consume committed rows");
         assert_eq!(page.items.len(), committed.len());
@@ -64,7 +66,7 @@ async fn given_one_stream_when_many_writers_append_then_cursor_reads_every_uniqu
             .collect::<HashSet<_>>();
         assert_eq!(seen.len(), committed.len());
         let exhausted = cursors
-            .read_from_cursor(stream, CursorName::new("reader"), 32)
+            .read_from_cursor(stream.into(), CursorName::new("reader"), 32)
             .await
             .expect("read exhausted cursor");
         assert!(exhausted.items.is_empty());
@@ -78,6 +80,7 @@ async fn given_one_stream_when_many_writers_append_then_cursor_reads_every_uniqu
 }
 
 #[tokio::test]
+#[ignore = "requires STORAGE_TEST_BACKEND=postgres and TEST_POSTGRES_DSN"]
 async fn given_earlier_uncommitted_insert_when_later_insert_commits_then_cursor_does_not_skip() {
     let store = TestStore::new_postgres().await;
     let outcome = AssertUnwindSafe(async {
@@ -87,21 +90,33 @@ async fn given_earlier_uncommitted_insert_when_later_insert_commits_then_cursor_
             .create_stream(name.clone(), None, StreamPartitioningMode::Single)
             .await
             .expect("create user stream");
-        let stream = StreamRowKind::User(internal_id.clone());
+        let stream = internal_id.clone();
         let cursor_name = CursorName::new("reader");
         store
             .stream_operations
-            .create_cursor(stream.clone(), cursor_name.clone(), CursorPosition::Head)
+            .create_cursor(
+                stream.clone().into(),
+                cursor_name.clone(),
+                CursorPosition::Head,
+            )
             .await
             .expect("create head cursor");
 
-        let backend =
-            sql_backend::postgres::PostgresBackend::initialize(&store.postgres_dsn(), 2, false)
-                .await
-                .expect("open separate writer pool");
-        let writer = sql_backend::SqlStore::initialize_schema(backend)
-            .await
-            .expect("open separate writer store");
+        let backend = sql_backend::postgres::PostgresBackend::initialize(
+            &store.postgres_dsn(),
+            2,
+            false,
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .expect("open separate writer pool");
+        let writer = sql_backend::SqlStore::initialize_schema(
+            backend,
+            storage_types::InitialStreamLineages::ONE,
+            true,
+        )
+        .await
+        .expect("open separate writer store");
         let row = StreamRowValue::new(
             internal_id.clone(),
             b"earlier".to_vec(),
@@ -111,17 +126,22 @@ async fn given_earlier_uncommitted_insert_when_later_insert_commits_then_cursor_
         let (inserted_tx, inserted_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let earlier_task = tokio::spawn(async move {
-            writer
-                .with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
+            stream_provider::StreamPort::with_attempt(
+                &writer,
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write).start(
+                    storage_types::AttemptDeadlineSource::attempt_deadlines(&writer),
+                ),
+                move |attempt| {
                     Box::pin(async move {
                         let id = attempt.append_attempt_allocated_user_item(row).await?;
                         inserted_tx.send(id).expect("reader waits for earlier ID");
                         finish_rx.await.expect("release earlier transaction");
                         Ok(())
                     })
-                })
-                .await
-                .expect("commit earlier stream append");
+                },
+            )
+            .await
+            .expect("commit earlier stream append");
         });
         let earlier = inserted_rx
             .await
@@ -135,7 +155,7 @@ async fn given_earlier_uncommitted_insert_when_later_insert_commits_then_cursor_
         assert!(earlier < later);
         let blocked = store
             .stream_operations
-            .read_from_cursor(stream.clone(), cursor_name.clone(), 10)
+            .read_from_cursor(stream.clone().into(), cursor_name.clone(), 10)
             .await
             .expect("read before earlier commit");
         assert!(
@@ -145,10 +165,10 @@ async fn given_earlier_uncommitted_insert_when_later_insert_commits_then_cursor_
 
         finish_tx.send(()).expect("release earlier transaction");
         earlier_task.await.expect("earlier append task completes");
-        await_visible_items(store.stream_operations.as_ref(), stream.clone(), 2).await;
+        store.wait_until_user_item_is_readable(later).await;
         let visible = store
             .stream_operations
-            .read_from_cursor(stream, cursor_name, 10)
+            .read_from_cursor(stream.into(), cursor_name, 10)
             .await
             .expect("read both committed rows");
         assert_eq!(visible.items.len(), 2);
@@ -161,27 +181,4 @@ async fn given_earlier_uncommitted_insert_when_later_insert_commits_then_cursor_
     if let Err(panic) = outcome {
         resume_unwind(panic);
     }
-}
-
-async fn await_visible_items(
-    operations: &dyn StreamOperations,
-    stream: StreamRowKind,
-    expected: usize,
-) {
-    // The snapshot floor is cluster-wide; another test's older write can
-    // delay this stream after all of its own rows have committed.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let page = operations
-                .read_forward(stream.clone(), None, expected as u32)
-                .await
-                .expect("read committed stream rows");
-            if page.items.len() == expected {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("older cluster transaction released the visibility floor");
 }

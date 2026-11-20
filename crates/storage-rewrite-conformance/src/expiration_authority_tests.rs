@@ -70,13 +70,13 @@ async fn given_bound_expiration_when_older_fence_runs_then_items_survive() -> an
     let fixture = TestStore::new().await;
     let outcome = async {
         fixture
-            .expiration_repository
+            .maintenance
             .advance_expiration(request(7, 2))
             .await
             .map_err(|error| anyhow::anyhow!("bind: {error:?}"))?;
         seed_due_items(&fixture).await?;
         let result = fixture
-            .expiration_repository
+            .maintenance
             .advance_expiration(request(7, 1))
             .await
             .map_err(|error| anyhow::anyhow!("stale: {error:?}"))?;
@@ -97,15 +97,12 @@ async fn given_bound_expiration_when_foreign_job_runs_then_items_survive() -> an
     let fixture = TestStore::new().await;
     let outcome = async {
         fixture
-            .expiration_repository
+            .maintenance
             .advance_expiration(request(7, 2))
             .await
             .map_err(|error| anyhow::anyhow!("bind: {error:?}"))?;
         seed_due_items(&fixture).await?;
-        let result = fixture
-            .expiration_repository
-            .advance_expiration(request(8, 3))
-            .await;
+        let result = fixture.maintenance.advance_expiration(request(8, 3)).await;
         let remaining = count_survivors(&fixture).await?;
         let rejected = result.as_ref().is_err_and(|error| {
             matches!(
@@ -125,7 +122,7 @@ async fn given_bound_expiration_when_foreign_job_runs_then_items_survive() -> an
 }
 
 async fn direct_pages(fixture: &TestStore) -> anyhow::Result<()> {
-    let repository = &fixture.ttl_sweep_repository;
+    let repository = &fixture.maintenance;
     seed_due_items(fixture).await?;
     let table = TableName::new("expiration_authority");
     let mut old_command = None;
@@ -215,7 +212,7 @@ async fn given_direct_expiration_when_page_commits_then_cursor_is_persisted_and_
 
 async fn consume_one(fixture: &TestStore, expected_remaining: usize) -> anyhow::Result<()> {
     let result = fixture
-        .expiration_repository
+        .maintenance
         .advance_expiration(request(7, 2))
         .await
         .map_err(|error| anyhow::anyhow!("advance: {error:?}"))?;
@@ -243,7 +240,7 @@ async fn resume_equal_deadlines() -> anyhow::Result<()> {
     }
     let outcome = async {
         let result = fixture
-            .expiration_repository
+            .maintenance
             .advance_expiration(request(7, 2))
             .await
             .map_err(|error| anyhow::anyhow!("complete: {error:?}"))?;
@@ -329,7 +326,7 @@ async fn changed_target_survives(recreate: bool) -> anyhow::Result<()> {
     let fixture = fixture.reopen().await;
     let outcome = async {
         let result = fixture
-            .expiration_repository
+            .maintenance
             .advance_expiration(request(7, 2))
             .await?;
         anyhow::ensure!(
@@ -341,7 +338,7 @@ async fn changed_target_survives(recreate: bool) -> anyhow::Result<()> {
             "old cursor consumed a changed target"
         );
         let result = fixture
-            .expiration_repository
+            .maintenance
             .advance_expiration(request(7, 2))
             .await?;
         anyhow::ensure!(

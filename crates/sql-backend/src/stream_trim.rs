@@ -1,48 +1,16 @@
 //! Bounded ordered SystemStream record scans on the caller's SQL attempt.
 
-use std::future::Future;
-
 use storage_provider::CATALOG_READ_BYTES;
 use storage_types::{
-    StorageEnum, StorageError, StorageResult, SystemStreamPosition, TimestampMillis, storage_serde,
+    MissExpectation, StorageError, StorageResult, SystemStreamPosition, TimestampMillis,
+    storage_serde,
 };
 use stream_provider::{
-    MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS, SystemStreamTrimAttempt, SystemStreamTrimOperationId,
-    SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest, SystemStreamTrimRecord,
+    MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS, SystemStreamTrimOperationId, SystemStreamTrimPageReceipt,
+    SystemStreamTrimRecord,
 };
 
-use crate::{
-    ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue, catalog::SqlCatalogAttempt,
-};
-
-impl<A: SqlAttempt, L: SqlLayout> SystemStreamTrimAttempt for SqlCatalogAttempt<'_, A, L> {
-    fn read_trim_receipts(
-        &mut self,
-        request: &SystemStreamTrimPageRequest,
-    ) -> impl Future<
-        Output = StorageResult<(
-            Option<SystemStreamTrimPageReceipt>,
-            Option<SystemStreamTrimPageReceipt>,
-        )>,
-    > + Send {
-        read_receipts(self.attempt, self.engine, request)
-    }
-
-    fn scan_trim_records(
-        &mut self,
-        after: Option<&SystemStreamPosition>,
-    ) -> impl Future<Output = StorageResult<(Vec<SystemStreamTrimRecord>, bool)>> + Send {
-        scan_records(self.attempt, self.engine, after)
-    }
-
-    fn apply_trim_page(
-        &mut self,
-        selected: &[SystemStreamTrimRecord],
-        receipt: &SystemStreamTrimPageReceipt,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        apply_page(self.attempt, self.engine, selected, receipt)
-    }
-}
+use crate::{ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue};
 
 pub(crate) async fn initialize_trim_receipts<A: SqlAttempt>(
     attempt: &mut A,
@@ -67,45 +35,20 @@ pub(crate) async fn initialize_trim_receipts<A: SqlAttempt>(
     Ok(())
 }
 
-pub(crate) async fn read_receipts<A: SqlAttempt>(
+pub(crate) async fn load_receipts<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
-    request: &SystemStreamTrimPageRequest,
-) -> StorageResult<(
-    Option<SystemStreamTrimPageReceipt>,
-    Option<SystemStreamTrimPageReceipt>,
-)> {
-    let sequence = request.continuation().map_or(0, |cursor| cursor.sequence());
-    let mut statements = vec![receipt_read_statement(
-        engine,
-        request.operation_id(),
-        sequence,
-    )?];
-    if let Some(previous) = sequence.checked_sub(1) {
-        statements.push(receipt_read_statement(
-            engine,
-            request.operation_id(),
-            previous,
-        )?);
-    }
+    operation: &SystemStreamTrimOperationId,
+    sequences: &[u64],
+) -> StorageResult<storage_types::Exact<Option<SystemStreamTrimPageReceipt>>> {
+    let statements = sequences
+        .iter()
+        .map(|sequence| receipt_read_statement(engine, operation, *sequence))
+        .collect::<StorageResult<Vec<_>>>()?;
     let pages = attempt
-        .query_batch(statements, ReadProtection::Conflict, CATALOG_READ_BYTES)
+        .query_batch_exact(statements, ReadProtection::Conflict, CATALOG_READ_BYTES)
         .await?;
-    if pages.len() != if sequence == 0 { 1 } else { 2 } {
-        return Err(invalid_receipt());
-    }
-    let mut pages = pages.into_iter();
-    let current = decode_receipt(pages.next().ok_or_else(invalid_receipt)?, request, sequence)?;
-    let predecessor = if sequence == 0 {
-        None
-    } else {
-        decode_receipt(
-            pages.next().ok_or_else(invalid_receipt)?,
-            request,
-            sequence - 1,
-        )?
-    };
-    Ok((current, predecessor))
+    pages.try_map(decode_receipt)
 }
 
 fn receipt_insert_statement(
@@ -151,11 +94,7 @@ fn receipt_read_statement(
     ))
 }
 
-fn decode_receipt(
-    page: crate::SqlQueryPage,
-    request: &SystemStreamTrimPageRequest,
-    sequence: u64,
-) -> StorageResult<Option<SystemStreamTrimPageReceipt>> {
+fn decode_receipt(page: crate::SqlQueryPage) -> StorageResult<Option<SystemStreamTrimPageReceipt>> {
     if page.more || page.rows.len() > 1 {
         return Err(invalid_receipt());
     }
@@ -171,10 +110,6 @@ fn decode_receipt(
                 return Err(invalid_receipt());
             };
             let receipt: SystemStreamTrimPageReceipt = storage_serde::from_bytes(&bytes)?;
-            if receipt.operation_id != *request.operation_id() || receipt.input_sequence != sequence
-            {
-                return Err(invalid_receipt());
-            }
             Ok(receipt)
         })
         .transpose()
@@ -187,27 +122,35 @@ fn invalid_receipt() -> StorageError {
 pub(crate) async fn scan_records<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
-    after: Option<&SystemStreamPosition>,
+    starts: &[SystemStreamPosition],
 ) -> StorageResult<(Vec<SystemStreamTrimRecord>, bool)> {
-    let page = attempt
-        .query(
-            crate::stream_read::scan_trim_records(engine, after)?,
-            ReadProtection::Conflict,
-            CATALOG_READ_BYTES,
-        )
-        .await?;
-    let more = page.more || page.rows.len() > MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS;
-    let records = page
-        .rows
-        .into_iter()
-        .take(MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS)
-        .map(decode_trim_record)
-        .collect::<StorageResult<Vec<_>>>()?;
-    Ok((records, more))
+    let mut records = Vec::new();
+    for start in starts {
+        let remaining = MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS + 1 - records.len();
+        let page = attempt
+            .query(
+                crate::stream_read::scan_trim_records(engine, start, remaining)?,
+                ReadProtection::Conflict,
+                CATALOG_READ_BYTES,
+            )
+            .await?;
+        let more = page.more;
+        records.extend(
+            page.rows
+                .into_iter()
+                .map(decode_trim_record)
+                .collect::<StorageResult<Vec<_>>>()?,
+        );
+        if more || records.len() > MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS {
+            records.truncate(MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS);
+            return Ok((records, true));
+        }
+    }
+    Ok((records, false))
 }
 
 fn decode_trim_record(row: crate::SqlRow) -> StorageResult<SystemStreamTrimRecord> {
-    let [shard, lineage, order, offset, history, created]: [SqlValue; 6] =
+    let [shard, lineage, order, offset, created]: [SqlValue; 5] =
         row.into_values().try_into().map_err(|_| invalid_record())?;
     let (
         SqlValue::Text(shard),
@@ -230,17 +173,9 @@ fn decode_trim_record(row: crate::SqlRow) -> StorageResult<SystemStreamTrimRecor
     {
         return Err(invalid_record());
     }
-    let table_history_id = match history {
-        SqlValue::Null => None,
-        SqlValue::Blob(bytes) => Some(storage_types::TableHistoryId::from(
-            <[u8; 16]>::try_from(bytes).map_err(|_| invalid_record())?,
-        )),
-        _ => return Err(invalid_record()),
-    };
     Ok(SystemStreamTrimRecord {
         position,
         created_at: TimestampMillis::from_timestamp(created),
-        table_history_id,
     })
 }
 
@@ -248,53 +183,20 @@ fn invalid_record() -> StorageError {
     StorageError::internal("SQL SystemStream trim record is invalid")
 }
 
-async fn apply_page<A: SqlAttempt>(
+pub(crate) async fn apply_page<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
-    selected: &[SystemStreamTrimRecord],
+    frontiers: &[SystemStreamPosition],
     receipt: &SystemStreamTrimPageReceipt,
 ) -> StorageResult<()> {
-    let mut statements = selected
-        .iter()
-        .map(|record| delete_record_statement(engine, &record.position))
-        .collect::<StorageResult<Vec<_>>>()?;
-    statements.push(receipt_insert_statement(engine, receipt)?);
-    let counts = attempt.execute_batch(statements).await?;
-    if counts.len() != selected.len() + 1 || counts.into_iter().any(|count| count != 1) {
-        return Err(StorageEnum::TransactionConflict {
-            message: "SystemStream trim changed while deleting its page".to_owned(),
-        }
-        .into());
+    let counts = attempt
+        .execute_batch(vec![receipt_insert_statement(engine, receipt)?])
+        .await?;
+    if counts != vec![1] {
+        return Err(StorageError::write_miss(
+            "stream_trim_receipt",
+            MissExpectation::Absent,
+        ));
     }
-    crate::stream_allocation::store_retired_offsets(attempt, engine, selected).await
-}
-
-fn delete_record_statement(
-    engine: impl SqlLayout,
-    position: &SystemStreamPosition,
-) -> StorageResult<SqlStatement> {
-    Ok(SqlStatement::new(
-        format!(
-            "DELETE FROM {} WHERE shard_id = {} AND lineage_id = {} AND offset_order = {} AND \
-             offset_text = {}",
-            engine.relation_name("sys_dynamo_stream_records"),
-            engine.engine().placeholder(1),
-            engine.engine().placeholder(2),
-            engine.engine().placeholder(3),
-            engine.engine().placeholder(4)
-        ),
-        vec![
-            SqlValue::Text(position.shard_id().as_str().to_owned()),
-            SqlValue::Text(position.lineage_id().as_str().to_owned()),
-            SqlValue::Blob(
-                position
-                    .offset()
-                    .order()
-                    .map_err(|_| invalid_record())?
-                    .to_be_bytes()
-                    .to_vec(),
-            ),
-            SqlValue::Text(position.offset().as_str().to_owned()),
-        ],
-    ))
+    crate::stream_allocation::store_retired_offsets(attempt, engine, frontiers).await
 }

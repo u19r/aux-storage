@@ -4,19 +4,18 @@ use scheduled_bg_jobs::{ExecutionContext, HandlerFuture, JobHandler, JobOutcome,
 use storage_backfill::GsiPageLimit;
 use storage_types::{StorageError, StorageResult, TimestampMillis, maintenance::StepResult};
 
-use super::{GsiBuildRepository, GsiBuildRequest};
+use super::GsiBuildRequest;
+use crate::maintenance::MaintenanceOperations;
 
 pub struct GsiBuildHandler {
-    repository: Arc<dyn GsiBuildRepository>,
-    initialization: Arc<dyn crate::TableStreamInitializationRepository>,
+    repository: Arc<dyn MaintenanceOperations>,
     interval: Duration,
     page_limit: GsiPageLimit,
 }
 
 impl GsiBuildHandler {
     pub fn try_new(
-        repository: Arc<dyn GsiBuildRepository>,
-        initialization: Arc<dyn crate::TableStreamInitializationRepository>,
+        repository: Arc<dyn MaintenanceOperations>,
         interval: Duration,
         page_limit: GsiPageLimit,
     ) -> StorageResult<Self> {
@@ -27,20 +26,14 @@ impl GsiBuildHandler {
         }
         Ok(Self {
             repository,
-            initialization,
             interval,
             page_limit,
         })
     }
 
-    fn outcome(
-        &self,
-        result: StepResult<()>,
-        initialized: bool,
-        wall_now: Timestamp,
-    ) -> StorageResult<JobOutcome> {
+    fn outcome(&self, result: StepResult<()>, wall_now: Timestamp) -> StorageResult<JobOutcome> {
         let delay = match result {
-            StepResult::Complete if !initialized => self.interval,
+            StepResult::Complete => self.interval,
             _ => Duration::ZERO,
         };
         let not_before = wall_now
@@ -83,12 +76,7 @@ impl JobHandler for GsiBuildHandler {
                     })
                     .await
                     .map_err(Self::handler_error)?;
-                let initialized = self
-                    .initialization
-                    .advance_table_stream_initialization()
-                    .await
-                    .map_err(Self::handler_error)?;
-                self.outcome(result, initialized, context.wall_now())
+                self.outcome(result, context.wall_now())
                     .map_err(Self::handler_error)
             },
             now,

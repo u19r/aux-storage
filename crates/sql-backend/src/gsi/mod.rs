@@ -1,24 +1,17 @@
-//! GSI catalog records, protected lifecycle reads, and projection writes.
+//! GSI build records, binding readiness, and the TTL index build. User GSIs
+//! are key columns and partial indexes on the item relation (W6F N3).
 
 mod catalog;
 mod discovery;
-mod projection;
+mod fill;
 mod read;
 mod scan;
 mod sql_statements;
 mod transaction;
 mod transition;
-mod write;
 
 pub(crate) use catalog::{initialize_gsi, register_gsi_builds};
 pub(crate) use discovery::{read_candidate_binding, scan_build_candidates};
-pub(crate) use projection::read_projection_states;
-pub(crate) use read::{
-    decode_gsi_lifecycle, gsi_lifecycle_statement, read_activation_state, read_gsi_readiness,
-};
 pub(crate) use scan::read_scan_source_page;
+pub(crate) use sql_statements::index_state_statement;
 pub(crate) use transition::apply_gsi_transition;
-pub(crate) use write::{GsiWriteInput, PreparedGsiWrite, prepare_gsi_writes};
-
-#[cfg(test)]
-mod read_tests;

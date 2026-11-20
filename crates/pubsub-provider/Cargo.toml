@@ -8,21 +8,35 @@ version = "0.1.0"
 [lib]
 doctest = false
 
+[features]
+test-support = [
+    "http-error/test-support",
+    "queue-provider/test-support",
+    "storage-types/test-support",
+]
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
 http-error = { path = "../http-error" }
+metrics = { workspace = true }
+queue-provider = { path = "../queue-provider" }
+scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 storage-common = { path = "../storage-common" }
 storage-types = { path = "../storage-types" }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+http-error = { path = "../http-error", features = ["test-support"] }
+queue-provider = { path = "../queue-provider", features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
 
 [lints]
 workspace = true

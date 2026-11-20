@@ -3,22 +3,26 @@
 use std::sync::Arc;
 
 use storage_provider::{
-    CATALOG_READ_BYTES, CatalogAttempt, GsiReadinessSnapshot, StreamTrimScope, TableUpdateChange,
-    TableUpdateRetention, TableUpdateTransaction, table_retention_scope_id,
+    CATALOG_READ_BYTES, CatalogAttempt, StreamTrimScope, TableUpdateChange, TableUpdateRetention,
+    TableUpdateTransaction, table_retention_scope_id,
 };
 use storage_types::{
-    BoundTableInfo, IndexName, StorageError, StorageResult, TableName, TimestampMillis,
+    BoundTableInfo, IndexName, StorageError, StorageResult, StreamBinding, TableBinding, TableName,
+    TimestampMillis,
 };
 
 use super::{layout, sql_statements};
 use crate::{
     ColumnIndex, ReadProtection, SqlAttempt, SqlLayout, SqlValue,
     catalog::SqlCatalogAttempt,
-    gsi::read_gsi_readiness,
     retention::{load_stream_trim_states, write_stream_retention},
 };
 
 impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'_, A, L> {
+    async fn load_stream_source(&mut self) -> StorageResult<stream_provider::SystemStreamHistory> {
+        stream_provider::StreamAttempt::read_system_page_start_snapshot(self).await
+    }
+
     async fn observe_table_update(
         &mut self,
         name: &TableName,
@@ -114,35 +118,29 @@ impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
+            catalog
+                .take_exclusive_catalog_lock(&current.info.table_name)
+                .await?;
             let (plan, retention, name_locked_until) = change.into_parts();
-            let (_, targets) = read_gsi_readiness(
-                catalog.attempt,
-                catalog.engine,
+            let targets = storage_provider::gsi_build_targets_from_catalog(&current)?;
+            // SQL keeps a native index per GSI; reclaim drops it.
+            if let Some(retirement) = storage_provider::deleted_index_retirement(
                 &current,
-                catalog.protection,
-                None,
-            )
-            .await?;
-            if let Some(storage_common::GsiLifecycleAction::Delete(delete)) =
-                plan.lifecycle.as_ref()
-            {
-                let target = targets
-                    .iter()
-                    .find(|target| {
-                        target.table_name == current.table_name
-                            && target.index_name == delete.index_name
-                    })
-                    .ok_or_else(|| {
-                        StorageError::internal("SQL deleted index has no physical incarnation")
-                    })?;
+                &plan,
+                <Self as storage_provider::maintenance::GsiPort>::NATIVE_INDEX,
+            )? {
                 storage_provider::register_index_retirement(
                     catalog,
                     current.history_id,
-                    target.clone(),
+                    retirement.target,
+                    retirement.native_index,
                 )
                 .await?;
             }
-            layout::write_layout(
+            let layout::LayoutEffects {
+                binding: gsi_binding,
+                alters,
+            } = layout::write_layout(
                 catalog.attempt,
                 catalog.engine,
                 layout::GsiLayoutChange {
@@ -156,43 +154,34 @@ impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'
             if let Some(write) = retention {
                 write_stream_retention(catalog.attempt, catalog.engine, write).await?;
             }
+            // Without a GSI set change the stored GSI binding stays: a caller
+            // can hold a table observed before a phase change of this attempt.
+            let binding = TableBinding {
+                stream: StreamBinding::for_info(&plan.next_table),
+                ..gsi_binding.clone().unwrap_or(current.binding)
+            };
             let next = BoundTableInfo {
                 history_id: current.history_id,
                 info: Arc::new(plan.next_table),
+                binding,
             };
             let changed = catalog
-                .attempt
-                .execute(sql_statements::save_catalog(catalog.engine, &next)?)
+                .execute_catalog_change(
+                    &next.info.table_name,
+                    vec![sql_statements::save_catalog(
+                        catalog.engine,
+                        &next,
+                        gsi_binding.is_some(),
+                    )?],
+                )
                 .await?;
-            if changed != 1 {
+            if changed != [1] {
                 return Err(StorageError::internal(
                     "SQL table update lost its catalog incarnation",
                 ));
             }
+            catalog.stage_layout_ddl(alters)?;
             Ok(next)
-        }
-        .await;
-        settlement.complete(result)
-    }
-
-    async fn observe_table_update_readiness(
-        &mut self,
-        table: &BoundTableInfo,
-    ) -> StorageResult<GsiReadinessSnapshot> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async {
-            let (snapshot, targets) = read_gsi_readiness(
-                catalog.attempt,
-                catalog.engine,
-                table,
-                catalog.protection,
-                None,
-            )
-            .await?;
-            catalog.bind_gsi_targets(targets)?;
-            Ok(snapshot)
         }
         .await;
         settlement.complete(result)

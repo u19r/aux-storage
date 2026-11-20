@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hint::black_box,
-    time::Instant,
-};
+use std::collections::{HashMap, HashSet};
 
 use alloc_counter::AllocationGuard;
 use serde::Serialize;
@@ -13,15 +9,9 @@ use crate::{
     DescribeTableResponse, GetItemResponse, GetStreamRecordsRequest, GetStreamRecordsResponse,
     KeyAttributeType, KeySchemaElement, KeyType, MaxIndexers, PutItemResponse, StreamRecord,
     StreamSpecification, StreamViewType, SystemStreamPosition, SystemStreamScope, TableName,
-    TableStreamFrontier, TimestampMillis, WireItem, WireItemKeyAttributes, latest_stream_metadata,
+    TableStreamFrontier, TimestampMillis, WireItem, latest_stream_metadata,
     prepare_table_metadata_at,
 };
-
-#[derive(Clone, Serialize)]
-struct MapGetItemResponse {
-    #[serde(rename = "Item")]
-    item: crate::AttributeMap,
-}
 
 const GET_ITEM_JSON: &[u8] = br#"{"pk":{"S":"tenant#001"},"sk":{"S":"item#001"},"payload":{"S":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"},"counter":{"N":"42"},"active":{"BOOL":true}}"#;
 
@@ -29,6 +19,7 @@ const GET_ITEM_JSON: &[u8] = br#"{"pk":{"S":"tenant#001"},"sk":{"S":"item#001"},
 fn given_wire_item_when_get_item_response_round_trips_then_dynamo_json_is_preserved() {
     let response = GetItemResponse {
         item: Some(WireItem::dynamo_json(GET_ITEM_JSON.to_vec())),
+        consumed_capacity: None,
     };
     let bytes = serde_json::to_vec(&response).unwrap();
     let expected: serde_json::Value = serde_json::from_slice(GET_ITEM_JSON).unwrap();
@@ -36,69 +27,8 @@ fn given_wire_item_when_get_item_response_round_trips_then_dynamo_json_is_preser
     assert_eq!(actual["Item"], expected);
 
     let decoded: GetItemResponse = serde_json::from_slice(&bytes).unwrap();
-    let WireItem::DynamoJson { data } = decoded.item.unwrap() else {
-        panic!("GetItem must retain Dynamo JSON wire data");
-    };
+    let WireItem::DynamoJson { data } = decoded.item.unwrap();
     assert_eq!(data, GET_ITEM_JSON);
-}
-
-#[test]
-fn given_local_split_item_when_get_item_response_serializes_then_keys_override_blob() {
-    let primary = WireItemKeyAttributes::new(
-        "pk".to_owned(),
-        AttributeValue::S("key".to_owned()),
-        None,
-        None,
-    );
-    let response = GetItemResponse {
-        item: Some(WireItem::local_split(
-            primary,
-            None,
-            Some(br#"{"pk":{"S":"stale"},"payload":{"N":"42"}}"#.to_vec()),
-        )),
-    };
-    let value = serde_json::to_value(response).unwrap();
-    assert_eq!(value["Item"]["pk"]["S"], "key");
-    assert_eq!(value["Item"]["payload"]["N"], "42");
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_get_item_image_when_response_clones_and_serializes_then_report_allocations_and_time() {
-    const ITERATIONS: usize = 20_000;
-    let map = MapGetItemResponse {
-        item: serde_json::from_slice(GET_ITEM_JSON).unwrap(),
-    };
-    let wire = GetItemResponse {
-        item: Some(WireItem::dynamo_json(GET_ITEM_JSON.to_vec())),
-    };
-    for label in ["map_clone", "wire_clone", "map_serialize", "wire_serialize"] {
-        let guard = AllocationGuard::start(
-            module_path!(),
-            "given_get_item_image_when_response_clones_and_serializes_then_report_allocations_and_time",
-            file!(),
-            line!(),
-            Some(label),
-        );
-        let started = Instant::now();
-        let mut total = 0_usize;
-        for _ in 0..ITERATIONS {
-            total += match label {
-                "map_clone" => black_box(map.clone()).item.len(),
-                "wire_clone" => black_box(wire.clone()).item.unwrap().payload_len(),
-                "map_serialize" => serde_json::to_vec(black_box(&map)).unwrap().len(),
-                _ => serde_json::to_vec(black_box(&wire)).unwrap().len(),
-            };
-        }
-        let elapsed = started.elapsed();
-        let report = guard.finish();
-        alloc_counter::emit_report(&report).unwrap();
-        assert!(total > 0);
-        println!(
-            "get_item_response label={label} iterations={ITERATIONS} elapsed_ns={}",
-            elapsed.as_nanos()
-        );
-    }
 }
 
 fn legacy_validate_key_schema(request: &CreateTableRequest) -> Result<(), crate::StorageError> {
@@ -159,54 +89,54 @@ fn measure_key_schema_allocations(
 }
 
 #[test]
-fn enabled_table_stream_metadata_uses_creation_time_and_table_identity() {
+fn enabled_table_stream_metadata_uses_the_enable_time_as_the_iso_label() {
     let (arn, label) = latest_stream_metadata(
         &TableName::new("orders"),
-        crate::TableStreamIdentity {
+        Some(crate::TableStreamIdentity {
             history_id: 1_u32.into(),
-            created_at: TimestampMillis::from_timestamp(1_700_000_000_123),
-        },
+            enabled_at: TimestampMillis::from_timestamp(1_700_000_000_123),
+        }),
         Some(&StreamSpecification {
             stream_enabled: true,
             stream_view_type: Some(StreamViewType::NewAndOldImages),
         }),
     );
 
-    assert_eq!(
-        label.as_deref(),
-        Some("2023-11-14T22:13:20.123-00000000000000000000000000000001")
-    );
+    assert_eq!(label.as_deref(), Some("2023-11-14T22:13:20.123"));
     assert_eq!(
         arn.as_deref(),
-        Some(
-            "arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2023-11-14T22:13:20.\
-             123-00000000000000000000000000000001"
-        )
+        Some("arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2023-11-14T22:13:20.123")
     );
 }
 
 #[test]
 fn disabled_or_missing_table_stream_metadata_is_absent() {
+    let identity = Some(crate::TableStreamIdentity {
+        history_id: 1_u32.into(),
+        enabled_at: TimestampMillis::from_timestamp(1),
+    });
     assert_eq!(
-        latest_stream_metadata(
-            &TableName::new("orders"),
-            crate::TableStreamIdentity {
-                history_id: 1_u32.into(),
-                created_at: TimestampMillis::from_timestamp(1)
-            },
-            None
-        ),
+        latest_stream_metadata(&TableName::new("orders"), identity, None),
         (None, None)
     );
     assert_eq!(
         latest_stream_metadata(
             &TableName::new("orders"),
-            crate::TableStreamIdentity {
-                history_id: 1_u32.into(),
-                created_at: TimestampMillis::from_timestamp(1)
-            },
+            identity,
             Some(&StreamSpecification {
                 stream_enabled: false,
+                stream_view_type: None,
+            }),
+        ),
+        (None, None)
+    );
+    // An enabled specification without an issued enable stamp names no stream.
+    assert_eq!(
+        latest_stream_metadata(
+            &TableName::new("orders"),
+            None,
+            Some(&StreamSpecification {
+                stream_enabled: true,
                 stream_view_type: None,
             }),
         ),
@@ -768,14 +698,18 @@ fn given_table_response_without_frontier_when_decoded_then_it_is_rejected() {
 #[test]
 fn given_independent_table_lanes_when_serialized_then_no_global_order_is_imposed() {
     let mut frontier = table_frontier_fixture(
-        Some(crate::StreamItemId::from(crate::ItemStreamVersion::new(1))),
-        Some(crate::StreamItemId::from(crate::ItemStreamVersion::new(3))),
+        Some(crate::StreamItemId::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ])),
+        Some(crate::StreamItemId::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+        ])),
     );
     let mut second = frontier.lanes[0].clone();
     second.shard_id = crate::SystemStreamShardId::try_new("shard-b").unwrap();
     second.lineage_id = crate::SystemStreamLineageId::try_new("lineage-b").unwrap();
     second.oldest = Some(crate::TableStreamSequence::from(crate::StreamItemId::from(
-        crate::ItemStreamVersion::new(100),
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100],
     )));
     second.head = second.oldest;
     frontier.lanes.push(second);
@@ -941,24 +875,42 @@ fn given_absent_optional_wire_fields_when_decoding_responses_then_items_are_none
 }
 
 #[test]
-fn given_same_name_and_clock_when_table_id_changes_then_stream_identity_changes() {
+fn given_same_name_when_enable_stamp_changes_then_stream_label_and_arn_change() {
     let name = TableName::new("orders");
-    let created_at = TimestampMillis::from_timestamp(1_700_000_000_123);
+    let enabled_at = TimestampMillis::from_timestamp(1_700_000_000_123);
     let before = crate::stream_identity(
         &name,
         crate::TableStreamIdentity {
             history_id: 1_u32.into(),
-            created_at,
+            enabled_at,
         },
     );
     let after = crate::stream_identity(
         &name,
         crate::TableStreamIdentity {
-            history_id: 2_u32.into(),
-            created_at,
+            history_id: 1_u32.into(),
+            enabled_at: enabled_at + 1,
         },
     );
-    assert_ne!(before, after);
+    // The AWS label is the enable timestamp alone; the store issues each
+    // enable a later stamp, so a later enable has another label and ARN.
+    assert_eq!(before.1, "2023-11-14T22:13:20.123");
+    assert_eq!(after.1, "2023-11-14T22:13:20.124");
+    assert_ne!(before.0, after.0);
+}
+
+#[test]
+fn given_stream_label_when_parsed_then_enable_stamp_round_trips() {
+    let enabled_at = TimestampMillis::from_timestamp(1_700_000_000_123);
+    let (_, label) = crate::stream_identity(
+        &TableName::new("orders"),
+        crate::TableStreamIdentity {
+            history_id: 1_u32.into(),
+            enabled_at,
+        },
+    );
+    assert_eq!(crate::stream_label_enabled_at(&label), Some(enabled_at));
+    assert_eq!(crate::stream_label_enabled_at("not-a-label"), None);
 }
 
 #[test]

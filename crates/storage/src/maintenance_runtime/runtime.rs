@@ -8,7 +8,6 @@ use scheduled_bg_jobs::{
     DriveBudget, DriveBudgetInput, Namespace, OwnerId, QueueSelection, Timestamp,
 };
 use storage_common::DatabaseJobIntervals;
-use storage_provider::TableReclaimRepository;
 use storage_types::{StorageError, StorageResult};
 
 use super::catalog::MaintenanceJobCatalog;
@@ -21,19 +20,22 @@ use crate::{
         MAINTENANCE_NAMESPACE_PREFIX,
     },
     provider_bundle::MaintenanceRepositories,
+    regional::{PairJobs, RegionalPairHandler},
 };
 
 pub(crate) struct MaintenanceRuntime {
-    runtime: JobRuntime<ScheduledJobStore>,
+    runtime: Arc<JobRuntime<ScheduledJobStore>>,
     seed_retries: usize,
+    /// Present exactly when the catalog registered the regional pair job.
+    pair_jobs: Option<PairJobs>,
 }
 
 pub(crate) struct SeededMaintenanceRuntime {
-    runtime: Arc<MaintenanceRuntime>,
+    runtime: Arc<JobRuntime<ScheduledJobStore>>,
 }
 
 pub(crate) struct MaintenanceDriver {
-    runtime: Arc<MaintenanceRuntime>,
+    runtime: Arc<JobRuntime<ScheduledJobStore>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -45,7 +47,7 @@ impl Drop for MaintenanceDriver {
 
 impl MaintenanceDriver {
     pub(crate) fn request_shutdown(&self) {
-        self.runtime.runtime.request_shutdown();
+        self.runtime.request_shutdown();
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -70,29 +72,28 @@ impl MaintenanceRuntime {
         destination_namespace: &str,
         job_store: ScheduledJobStore,
         repositories: MaintenanceRepositories,
-        table_reclaim_repository: Option<Arc<dyn TableReclaimRepository>>,
         intervals: DatabaseJobIntervals,
+        regional: Option<RegionalPairHandler>,
     ) -> StorageResult<Self> {
         let namespace = Self::namespace(destination_namespace)?;
-        let catalog = MaintenanceJobCatalog::try_new(
-            repositories,
-            table_reclaim_repository,
-            intervals,
-            Self::wall_now(),
-        )?;
+        let (catalog, pair_job_handle) =
+            MaintenanceJobCatalog::try_new(repositories, intervals, Self::wall_now(), regional)?;
         let seed_retries = catalog
             .manifest()
             .map_or(0, |manifest| manifest.seed_ids().len());
         let owner = OwnerId::generate()
             .map_err(|_| StorageError::internal("maintenance owner generation failed"))?;
         let budget = Self::drive_profile(job_store.capabilities().max_transaction_duration())?;
-        let runtime = if job_store.capabilities().is_distributed() {
-            JobRuntime::distributed(job_store, catalog, budget, namespace, owner)
-        } else {
-            JobRuntime::local(job_store, catalog, budget, namespace, owner)
-        }
-        .map_err(|_| StorageError::validation("invalid maintenance runtime"))?;
+        let runtime = Arc::new(
+            if job_store.capabilities().is_distributed() {
+                JobRuntime::distributed(job_store, catalog, budget, namespace, owner)
+            } else {
+                JobRuntime::local(job_store, catalog, budget, namespace, owner)
+            }
+            .map_err(|_| StorageError::validation("invalid maintenance runtime"))?,
+        );
         Ok(Self {
+            pair_jobs: pair_job_handle.map(|handle| PairJobs::new(handle, Arc::clone(&runtime))),
             runtime,
             seed_retries,
         })
@@ -103,7 +104,7 @@ impl MaintenanceRuntime {
             match self.runtime.ensure_seeds().await {
                 Ok(_) => {
                     return Ok(SeededMaintenanceRuntime {
-                        runtime: Arc::new(self),
+                        runtime: self.runtime,
                     });
                 }
                 Err(
@@ -120,14 +121,19 @@ impl MaintenanceRuntime {
         }
     }
 
-    async fn drive(&self) {
+    /// The regional pair-job capability of this connection, when regional
+    /// replication is on.
+    pub(crate) fn pair_jobs(&self) -> Option<PairJobs> {
+        self.pair_jobs.clone()
+    }
+
+    async fn drive(runtime: &JobRuntime<ScheduledJobStore>) {
         loop {
-            let Err(error) = self.runtime.run_until_shutdown().await else {
+            let Err(error) = runtime.run_until_shutdown().await else {
                 break;
             };
             tracing::warn!(error = ?error, "storage maintenance drive failed");
-            let wait = self
-                .runtime
+            let wait = runtime
                 .wait_after_error(Duration::from_millis(MAINTENANCE_DRIVER_ERROR_WAKE_MS))
                 .await;
             if !matches!(wait, Ok(WaitOutcome::Woken)) {
@@ -177,7 +183,7 @@ impl MaintenanceRuntime {
 impl SeededMaintenanceRuntime {
     pub(crate) fn start(self) -> MaintenanceDriver {
         let runtime = Arc::clone(&self.runtime);
-        let handle = tokio::spawn(async move { runtime.drive().await });
+        let handle = tokio::spawn(async move { MaintenanceRuntime::drive(&runtime).await });
         MaintenanceDriver {
             runtime: self.runtime,
             handle: Some(handle),

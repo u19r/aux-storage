@@ -1,7 +1,9 @@
 use crate::{
-    ClaimedPublishChunk, DeliveryRecord, PendingNotificationContext, PublishAcceptanceInput,
+    ClaimedPublishChunk, DeliveryPayload, DeliveryRecordId, DeliveryRecordKind,
+    DeliveryRetryPolicy, DeliveryTarget, DestinationKey, NewDelivery, PublishAcceptanceInput,
     PublishChunkCommit, PublishIntent, PubsubError, PubsubResult, Subscription,
-    SubscriptionSnapshot, SubscriptionSnapshotGeneration, SubscriptionSnapshotRoot, TopicArn,
+    SubscriptionProtocol, SubscriptionSnapshot, SubscriptionSnapshotGeneration,
+    SubscriptionSnapshotRoot, TopicArn,
 };
 
 impl SubscriptionSnapshot {
@@ -51,24 +53,60 @@ impl PublishIntent {
         }
     }
 
+    /// The deliveries of one chunk: confirmed subscriptions whose filter
+    /// policy accepts the message (design 3.5). Also returns how many the
+    /// filter excluded.
     #[must_use]
-    pub fn delivery_records(&self, subscriptions: Vec<Subscription>) -> Vec<DeliveryRecord> {
-        let context = PendingNotificationContext::new(
-            self.acceptance.accepted_at,
-            self.acceptance.custom_sender_enabled,
-        );
-        subscriptions
+    pub fn deliveries(&self, subscriptions: Vec<Subscription>) -> (Vec<NewDelivery>, u32) {
+        let mut filtered_out = 0_u32;
+        let deliveries = subscriptions
             .into_iter()
             .filter(|subscription| !subscription.confirmation.pending_confirmation())
-            .map(|subscription| {
-                DeliveryRecord::pending_notification_at(
-                    &self.acceptance.request,
-                    &self.acceptance.message_id,
-                    &subscription,
-                    context,
-                )
+            .filter(|subscription| {
+                let accepted = subscription.accepts(&self.acceptance.request);
+                filtered_out += u32::from(!accepted);
+                accepted
             })
-            .collect()
+            .map(|subscription| self.delivery_for(subscription))
+            .collect();
+        (deliveries, filtered_out)
+    }
+
+    fn delivery_for(&self, subscription: Subscription) -> NewDelivery {
+        let accepted_at = self.acceptance.accepted_at;
+        let is_http = matches!(
+            subscription.protocol,
+            SubscriptionProtocol::Http | SubscriptionProtocol::Https
+        );
+        let target = if self.acceptance.custom_sender_enabled && is_http {
+            DeliveryTarget::CustomSender
+        } else {
+            DeliveryTarget::BuiltIn
+        };
+        let request = &self.acceptance.request;
+        let message_id = &self.acceptance.message_id;
+        let payload = DeliveryPayload {
+            id: DeliveryRecordId(format!("{}:{message_id}", subscription.subscription_arn)),
+            kind: DeliveryRecordKind::Notification,
+            message_id: message_id.clone(),
+            destination: DestinationKey::of_endpoint(subscription.protocol, &subscription.endpoint),
+            message_body: Some(request.message.clone()),
+            subject: request.subject.clone(),
+            message_attributes: request.message_attributes.clone(),
+            target,
+            created_at: accepted_at,
+            subscription: None,
+        };
+        let deadline =
+            DeliveryRetryPolicy::for_protocol(subscription.protocol).deadline(accepted_at);
+        let state = payload.first_state(subscription.subscription_arn.clone(), deadline);
+        (
+            DeliveryPayload {
+                subscription: Some(subscription),
+                ..payload
+            },
+            state,
+        )
     }
 }
 
@@ -76,11 +114,12 @@ impl TryFrom<ClaimedPublishChunk> for PublishChunkCommit {
     type Error = storage_types::StorageError;
 
     fn try_from(chunk: ClaimedPublishChunk) -> Result<Self, Self::Error> {
-        let records = chunk.intent.delivery_records(chunk.subscriptions);
+        let (records, filtered_out) = chunk.intent.deliveries(chunk.subscriptions);
         let next_intent = chunk.intent.next_chunk()?;
         Ok(PublishChunkCommit {
             claimed_intent: chunk.intent,
             records,
+            filtered_out,
             next_intent,
         })
     }

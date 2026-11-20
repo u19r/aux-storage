@@ -87,15 +87,25 @@ impl ReadSequenceDagWorkload {
         db: SimDatabase,
     ) -> Result<Arc<dyn storage_provider::DynamoOperations>, String> {
         let tenant = self.mapped_tenant();
-        let driver =
-            kv_backend::foundationdb::FoundationDbBackend::from_simulation(db, None, Some(&tenant));
+        let driver = kv_backend::foundationdb::FoundationDbBackend::from_simulation(
+            db,
+            None,
+            Some(&tenant),
+            storage_types::ReadVersionPolicy::Fresh,
+            crate::simulation_clock::phase_clock(self.clock.as_ref())?,
+        );
         let clock = self
             .clock
             .as_ref()
             .ok_or("simulation phase clock is absent")?;
-        let store = kv_backend::KvStore::initialize_format_with_clock(driver, clock.clone())
-            .await
-            .map_err(|error| storage_error_detail(&error))?;
+        let store = kv_backend::KvStore::initialize_format_with_clock(
+            driver,
+            storage_types::InitialStreamLineages::ONE,
+            clock.clone(),
+        )
+        .await
+        .map_err(|error| storage_error_detail(&error))?
+        .with_metadata_cache_ttl(SIMULATION_METADATA_CACHE_TTL);
         Ok(Arc::new(store))
     }
 }

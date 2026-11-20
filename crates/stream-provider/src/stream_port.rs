@@ -6,12 +6,16 @@ use futures::future::BoxFuture;
 use storage_common::partition::{
     PartitionInfo, PartitionLoadSampleRecord, ResolvedPartitionFamily,
 };
-use storage_types::{AttemptMode, Clock, StorageError, StorageResult, StreamItemId, StreamName};
+use storage_types::{
+    AttemptPlan, AttemptRequest, Clock, StorageError, StorageResult, StreamItemId, StreamName,
+    SystemStreamPosition,
+};
 
 use crate::{
     CursorName, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem, StreamReadKind,
-    StreamReadRequest, StreamReadResult, StreamRowKind, StreamRowPage, StreamRowValue,
-    SystemStreamHistory, SystemStreamSplitOperationId, SystemStreamSplitReceipt,
+    StreamReadRequest, StreamReadResult, StreamRowPage, StreamRowValue, SystemStreamHistory,
+    SystemStreamHistoryRead, SystemStreamSplitOperationId, SystemStreamSplitReceipt,
+    SystemStreamTrimOperationId, SystemStreamTrimPageReceipt, SystemStreamTrimRecord,
 };
 
 /// The selected physical stream layout's behavior when a caller requests
@@ -30,8 +34,13 @@ pub enum StreamItemIdAllocation {
     CommitVersionstamped,
 }
 
+/// Logical source observations remain in the caller's native attempt.
+///
+/// The physical family observes and applies one bounded trim page on the
+/// caller's native attempt. All authorization and candidate selection stay in
+/// this shared executor.
 pub trait StreamAttempt:
-    Send + crate::ItemHistoryReadAttempt + crate::SystemHistoryReadAttempt
+    Send + infrastructure_provider::physical_attempt::PhysicalRecordAttempt
 {
     /// The physical layout is a property of the attempt family, not a flag
     /// supplied by a domain caller or stored on each request.
@@ -86,6 +95,7 @@ pub trait StreamAttempt:
     /// native attempt before the shared split decision.
     fn read_system_split_state(
         &mut self,
+        parent: &storage_types::SystemStreamLineageId,
         operation_id: &SystemStreamSplitOperationId,
     ) -> impl Future<Output = StorageResult<(SystemStreamHistory, Option<SystemStreamSplitReceipt>)>>
     + Send;
@@ -94,7 +104,7 @@ pub trait StreamAttempt:
     /// this attempt. A partial publication must abort with the attempt.
     fn write_system_split(
         &mut self,
-        receipt: &SystemStreamSplitReceipt,
+        receipt: &crate::SystemStreamSplitPlan,
     ) -> impl Future<Output = StorageResult<()>> + Send;
 
     /// Store the caller's fully addressed row in this native attempt. The
@@ -184,7 +194,7 @@ pub trait StreamAttempt:
 
     fn read_cursor(
         &mut self,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
         cursor_name: &CursorName,
     ) -> impl Future<Output = StorageResult<Option<StreamCursor>>> + Send;
 
@@ -196,13 +206,73 @@ pub trait StreamAttempt:
 
     fn delete_cursor(
         &mut self,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
         cursor_name: &CursorName,
+    ) -> impl Future<Output = StorageResult<()>> + Send;
+
+    fn load_table_history_states(
+        &mut self,
+        histories: &[storage_types::TableHistoryId],
+    ) -> impl Future<Output = StorageResult<Vec<Option<storage_types::TableHistoryState>>>> + Send;
+
+    fn read_system_page_start(
+        &mut self,
+    ) -> impl Future<Output = StorageResult<SystemStreamHistory>> + Send;
+
+    /// Read the history snapshot for one page without adding the hot sequence
+    /// rows to the native write conflict range.
+    ///
+    /// A page read writes nothing; its resume token carries the frontier. The
+    /// sequence rows advance on every ordinary write, so protecting them would
+    /// make every concurrent write abort the page read. A snapshot read
+    /// observes a consistent frontier and the next page advances from it.
+    fn read_system_page_start_snapshot(
+        &mut self,
+    ) -> impl Future<Output = StorageResult<SystemStreamHistory>> + Send {
+        self.read_system_page_start()
+    }
+
+    fn load_system_retired_frontiers(
+        &mut self,
+        origins: &[SystemStreamPosition],
+    ) -> impl Future<Output = StorageResult<storage_types::Exact<Option<SystemStreamPosition>>>> + Send;
+
+    fn read_system_history_pages(
+        &mut self,
+        reads: &[SystemStreamHistoryRead],
+    ) -> impl Future<Output = StorageResult<Vec<crate::SystemStreamHistoryReadPage>>> + Send;
+
+    /// Load the stored receipts of `operation` at each sequence, in order, in
+    /// one protected (conflict) batch. Physical decode only.
+    fn load_trim_receipts(
+        &mut self,
+        operation: &SystemStreamTrimOperationId,
+        sequences: &[u64],
+    ) -> impl Future<
+        Output = StorageResult<storage_types::Exact<Option<SystemStreamTrimPageReceipt>>>,
+    > + Send;
+
+    /// Scan the ordered exclusive lower bounds, one per remaining lineage.
+    /// Each bound includes its retirement frontier observed in this attempt.
+    fn scan_trim_records(
+        &mut self,
+        starts: &[SystemStreamPosition],
+    ) -> impl Future<Output = StorageResult<(Vec<SystemStreamTrimRecord>, bool)>> + Send;
+
+    /// Delete or retire `selected`, store each lane's retired frontier from
+    /// `frontiers` (one per `(shard_id, lineage_id)`, ordered by that pair,
+    /// each strictly after the frontier observed in this attempt), and store
+    /// `receipt`, atomically with the attempt.
+    fn apply_trim_page(
+        &mut self,
+        selected: &[SystemStreamTrimRecord],
+        frontiers: &[SystemStreamPosition],
+        receipt: &SystemStreamTrimPageReceipt,
     ) -> impl Future<Output = StorageResult<()>> + Send;
 }
 
 /// One customer stream operation owns one native attempt.
-pub trait StreamPort: Clock + Send + Sync {
+pub trait StreamPort: Clock + storage_types::AttemptDeadlineSource + Send + Sync {
     type Attempt<'native>: StreamAttempt
     where Self: 'native;
 
@@ -216,10 +286,11 @@ pub trait StreamPort: Clock + Send + Sync {
         StreamItemIdAllocation::AttemptAllocated
     }
 
-    fn with_stream_attempt<R, F>(
+    /// One native attempt under this store value's admission lane.
+    fn with_attempt<R, F>(
         &self,
-        mode: AttemptMode,
-        operation: F,
+        request: AttemptRequest,
+        step: F,
     ) -> impl Future<Output = StorageResult<R>> + Send
     where
         R: Send + 'static,
@@ -229,23 +300,9 @@ pub trait StreamPort: Clock + Send + Sync {
             + Send
             + 'static;
 
-    fn with_topology_attempt<R, F>(
-        &self,
-        operation: F,
-    ) -> impl Future<Output = StorageResult<R>> + Send
-    where
-        R: Send + 'static,
-        F: for<'native, 'borrow> FnOnce(
-                &'borrow mut Self::Attempt<'native>,
-            ) -> BoxFuture<'borrow, StorageResult<R>>
-            + Send
-            + 'static,
-    {
-        self.with_stream_attempt(AttemptMode::ReadWrite, operation)
-    }
-
     fn with_committed_stream_attempt<R, F>(
         &self,
+        request: AttemptRequest,
         operation: F,
     ) -> impl Future<Output = StorageResult<(R, Option<[u8; 10]>)>> + Send
     where
@@ -257,10 +314,44 @@ pub trait StreamPort: Clock + Send + Sync {
             + 'static,
     {
         async move {
-            self.with_stream_attempt(AttemptMode::ReadWrite, operation)
+            self.with_attempt(request, operation)
                 .await
                 .map(|value| (value, None))
         }
+    }
+
+    /// Retry known aborts with a fresh try; return an unknown outcome
+    /// unchanged. Never overridden.
+    fn run<I, R, S>(
+        &self,
+        plan: AttemptPlan,
+        input: std::sync::Arc<I>,
+        step: S,
+    ) -> impl Future<Output = StorageResult<R>> + Send
+    where
+        I: Send + Sync + 'static,
+        R: Send + 'static,
+        S: for<'native, 'borrow> Fn(
+                &'borrow mut Self::Attempt<'native>,
+                &'borrow I,
+                storage_types::AttemptTry,
+            ) -> BoxFuture<'borrow, StorageResult<R>>
+            + Copy
+            + Send
+            + Sync
+            + 'static,
+    {
+        storage_common::retry::retry_tries(
+            self,
+            self.attempt_deadlines(),
+            plan,
+            move |attempt_request, attempt_try| {
+                let input = std::sync::Arc::clone(&input);
+                self.with_attempt(attempt_request, move |attempt| {
+                    Box::pin(async move { step(attempt, &input, attempt_try).await })
+                })
+            },
+        )
     }
 }
 

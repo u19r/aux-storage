@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Write as _};
 
 use alloc_counter::AllocationGuard;
-use chrono::Duration as ChronoDuration;
+use jiff::{SignedDuration, Timestamp, tz::Offset};
 use serde::Deserialize;
 
 use crate::{AttributeValue, TimestampMillis, TimestampSeconds, from_hashmap};
@@ -71,7 +71,7 @@ fn timestamp_seconds_addition_saturates_at_i64_bounds() {
     let min = TimestampSeconds::from_timestamp(i64::MIN);
 
     assert_eq!((max + 1).as_seconds(), i64::MAX);
-    assert_eq!((min + ChronoDuration::seconds(-1)).as_seconds(), i64::MIN);
+    assert_eq!((min + SignedDuration::from_secs(-1)).as_seconds(), i64::MIN);
 }
 
 #[test]
@@ -82,9 +82,12 @@ fn timestamp_seconds_converts_to_millis_with_saturation() {
     assert_eq!(millis.timestamp_millis(), i64::MAX);
 }
 
-fn write_legacy_display(value: TimestampSeconds, output: &mut String) {
-    let datetime = chrono::DateTime::from_timestamp(value.as_seconds(), 0);
-    let rfc3339 = datetime.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+fn write_allocated_display(value: TimestampSeconds, output: &mut String) {
+    let datetime = Timestamp::from_second(value.as_seconds());
+    let rfc3339 = datetime
+        .unwrap_or_else(|_| Timestamp::now())
+        .display_with_offset(Offset::UTC)
+        .to_string();
     write!(output, "{rfc3339}").expect("String accepts all writes");
 }
 
@@ -117,25 +120,26 @@ fn measure_display_allocations(
 fn timestamp_seconds_display_preserves_rfc3339_bytes() {
     let value = TimestampSeconds::from_timestamp(1_700_000_000);
     let mut legacy = String::new();
-    write_legacy_display(value, &mut legacy);
+    write_allocated_display(value, &mut legacy);
     assert_eq!(value.to_string(), legacy);
     assert_eq!(legacy, "2023-11-14T22:13:20+00:00");
 
     for value in [
         TimestampSeconds::from_timestamp(-1),
         TimestampSeconds::from_timestamp(0),
-        TimestampSeconds::from_timestamp(253_402_300_800),
+        TimestampSeconds::from_timestamp(Timestamp::MAX.as_second()),
     ] {
-        let expected = chrono::DateTime::from_timestamp(value.as_seconds(), 0)
-            .expect("timestamp in chrono range")
-            .to_rfc3339();
+        let expected = Timestamp::from_second(value.as_seconds())
+            .expect("timestamp in Jiff range")
+            .display_with_offset(Offset::UTC)
+            .to_string();
         assert_eq!(value.to_string(), expected);
     }
 }
 
 #[test]
 fn timestamp_seconds_display_avoids_valid_timestamp_allocations() {
-    let legacy = measure_display_allocations("legacy_to_rfc3339", write_legacy_display);
+    let legacy = measure_display_allocations("allocated_rfc3339", write_allocated_display);
     let candidate = measure_display_allocations("direct_formatter", write_candidate_display);
     let _ = alloc_counter::emit_report(&legacy);
     let _ = alloc_counter::emit_report(&candidate);

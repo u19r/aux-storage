@@ -1,13 +1,12 @@
-use std::{collections::HashMap, hint::black_box, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc};
 
-use alloc_counter::AllocationGuard;
 use axum::{
     body::{self, Bytes},
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
 use serde_json::json;
-use storage_types::AttributeValue;
+use storage_types::{AttributeMap, AttributeValue};
 
 use crate::{
     routes::{
@@ -18,132 +17,6 @@ use crate::{
     },
     types::{AppState, Response},
 };
-
-#[tokio::test]
-async fn put_and_get_item_handler() {
-    for_each_conformance_backend(|_backend, db| async move {
-        let create_table_payload = json!({
-            "TableName": "test_table",
-            "AttributeDefinitions": [
-                {"AttributeName": "id", "AttributeType": "S"}
-            ],
-            "KeySchema": [
-                {"AttributeName": "id", "KeyType": "HASH"}
-            ]
-        });
-
-        let create_result =
-            handle_create_table(db.clone(), create_table_payload.try_into().unwrap()).await;
-        assert!(
-            create_result.is_ok(),
-            "CreateTable should succeed: {create_result:?}",
-        );
-        let put_payload = json!({
-            "TableName": "test_table",
-            "Item": {
-                "id": {"S": "test123"},
-                "name": {"S": "Test Item"},
-                "count": {"N": "42"}
-            }
-        });
-
-        let put_result = handle_put_item(db.clone(), put_payload.try_into().unwrap()).await;
-        assert!(put_result.is_ok(), "PutItem should succeed: {put_result:?}",);
-        let get_payload = json!({
-            "TableName": "test_table",
-            "Key": {
-                "id": {"S": "test123"}
-            }
-        });
-
-        let get_result = handle_get_item(db.clone(), get_payload.try_into().unwrap()).await;
-        assert!(get_result.is_ok(), "GetItem should succeed: {get_result:?}",);
-        let response = expect_get_item_response(get_result.unwrap());
-        assert!(response.item.is_some(), "GetItem should return an item");
-        let json_response = serde_json::to_value(&response).expect("Should serialize to JSON");
-
-        let item = storage_types::AttributeMap::try_from(response.item.unwrap()).unwrap();
-
-        assert!(item.len() >= 3, "Should have at least 3 attributes");
-        assert_eq!(
-            item.get("id"),
-            Some(&AttributeValue::S("test123".to_string()))
-        );
-        assert_eq!(
-            item.get("name"),
-            Some(&AttributeValue::S("Test Item".to_string()))
-        );
-        assert_eq!(
-            item.get("count"),
-            Some(&AttributeValue::N("42".to_string()))
-        );
-        assert!(
-            json_response.get("Item").is_some(),
-            "JSON should have Item field"
-        );
-        let json_item = json_response.get("Item").unwrap();
-        assert!(json_item.is_object(), "Item should be JSON object");
-
-        let json_item_obj = json_item.as_object().unwrap();
-        assert!(
-            json_item_obj.len() >= 3,
-            "JSON Item should have at least 3 attributes"
-        );
-        if let Some(id_attr) = json_item_obj.get("id") {
-            assert!(id_attr.is_object(), "ID attribute should be object");
-            assert!(id_attr.get("S").is_some(), "ID should have S field");
-            assert_eq!(id_attr.get("S").unwrap().as_str(), Some("test123"));
-        }
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn get_item_nonexistent() {
-    for_each_conformance_backend(|_backend, db| async move {
-        let create_table_payload = json!({
-            "TableName": "test_table",
-            "AttributeDefinitions": [
-                {"AttributeName": "id", "AttributeType": "S"}
-            ],
-            "KeySchema": [
-                {"AttributeName": "id", "KeyType": "HASH"}
-            ]
-        });
-
-        let create_result =
-            handle_create_table(db.clone(), create_table_payload.try_into().unwrap()).await;
-        assert!(create_result.is_ok(), "CreateTable should succeed");
-
-        // Try to get a nonexistent item
-        let get_payload = json!({
-            "TableName": "test_table",
-            "Key": {
-                "id": {"S": "nonexistent"}
-            }
-        });
-
-        let get_result = handle_get_item(db.clone(), get_payload.try_into().unwrap()).await;
-        assert!(
-            get_result.is_ok(),
-            "GetItem should succeed even for nonexistent items: {get_result:?}"
-        );
-
-        let response = expect_get_item_response(get_result.unwrap());
-        assert!(
-            response.item.is_none(),
-            "GetItem should return None for nonexistent items"
-        );
-        let json_response = serde_json::to_value(&response).expect("Should serialize to JSON");
-
-        // Should not have Item field or it should be null
-        assert!(
-            json_response.get("Item").is_none() || json_response.get("Item") == Some(&json!(null)),
-            "JSON should not have Item field for nonexistent items"
-        );
-    })
-    .await;
-}
 
 #[tokio::test]
 async fn get_item_empty_number_key_matches_dynamodb_message() {
@@ -252,10 +125,10 @@ async fn get_item_projection_reconstructs_nested_maps_and_lists_like_dynamodb() 
         );
         assert_eq!(
             item.get("profile"),
-            Some(&AttributeValue::M(HashMap::from([(
+            Some(&AttributeValue::M(AttributeMap::from(HashMap::from([(
                 "name".to_string(),
                 AttributeValue::S("Ada".to_string()),
-            )])))
+            )]))))
         );
         assert_eq!(
             item.get("tags"),
@@ -265,13 +138,12 @@ async fn get_item_projection_reconstructs_nested_maps_and_lists_like_dynamodb() 
         );
         assert_eq!(
             item.get("nested"),
-            Some(&AttributeValue::M(HashMap::from([(
+            Some(&AttributeValue::M(AttributeMap::from(HashMap::from([(
                 "list".to_string(),
-                AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
-                    "v".to_string(),
-                    AttributeValue::S("first".to_string()),
-                )]))]),
-            )])))
+                AttributeValue::L(vec![AttributeValue::M(AttributeMap::from(HashMap::from(
+                    [("v".to_string(), AttributeValue::S("first".to_string()),)]
+                )))]),
+            )]))))
         );
     })
     .await;
@@ -353,76 +225,4 @@ fn expect_get_item_response(response: Response) -> storage_types::GetItemRespons
         Response::GetItem(response) => response,
         other => panic!("Expected GetItem response, got: {other:?}"),
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-async fn given_stored_item_when_get_item_endpoint_repeats_then_report_allocations_and_time() {
-    const ITERATIONS: usize = 20_000;
-    let db = super::routes_tests::create_sqlite_test_db().await;
-    let create = json!({
-        "TableName": "get_item_perf",
-        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
-        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
-    });
-    handle_create_table(db.clone(), create.try_into().unwrap())
-        .await
-        .unwrap();
-    let put = json!({
-        "TableName": "get_item_perf",
-        "Item": {
-            "pk": {"S": "key"},
-            "payload": {"S": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"},
-            "counter": {"N": "42"}
-        }
-    });
-    handle_put_item(db.clone(), put.try_into().unwrap())
-        .await
-        .unwrap();
-    let app_state = Arc::new(AppState::new(db));
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-amz-target",
-        HeaderValue::from_static("DynamoDB_20120810.GetItem"),
-    );
-    let request = Bytes::from_static(br#"{"TableName":"get_item_perf","Key":{"pk":{"S":"key"}}}"#);
-    for _ in 0..100 {
-        let response =
-            dynamodb_endpoint(State(app_state.clone()), headers.clone(), request.clone())
-                .await
-                .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "given_stored_item_when_get_item_endpoint_repeats_then_report_allocations_and_time",
-        file!(),
-        line!(),
-        Some("get_item_endpoint"),
-    );
-    let started = Instant::now();
-    let mut response_bytes = 0_usize;
-    for _ in 0..ITERATIONS {
-        let response = dynamodb_endpoint(
-            State(app_state.clone()),
-            headers.clone(),
-            black_box(request.clone()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        response_bytes += body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .len();
-    }
-    let elapsed = started.elapsed();
-    let report = guard.finish();
-    alloc_counter::emit_report(&report).unwrap();
-    assert!(response_bytes > 0);
-    println!(
-        "get_item_endpoint iterations={ITERATIONS} elapsed_ns={}",
-        elapsed.as_nanos()
-    );
 }

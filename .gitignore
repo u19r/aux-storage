@@ -1,6 +1,5 @@
 stack_outputs_*
 target
-!/crates/regional-replication/src/journal/target/
 .vscode/*
 !.vscode/settings.json
 
@@ -17,6 +16,7 @@ generated.secrets.json
 *.rocksdb
 hyperfine-comparison-*
 profile.json.gz
+/lcov.info
 .cache/
 tmp/
 .foundationdb/

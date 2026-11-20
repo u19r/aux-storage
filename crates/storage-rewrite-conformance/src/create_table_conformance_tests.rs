@@ -130,3 +130,60 @@ create_table_case!(
     given_existing_name_when_create_table_runs_then_exact_error_and_original_table_match_aws,
     "400/duplicate_table_name.json"
 );
+
+// Validation rule from Cucumber "Attempt to create a table with invalid table
+// name": an empty name fails before any catalog access.
+create_table_case!(
+    given_empty_table_name_when_create_table_runs_then_exact_validation_and_no_table,
+    "local/empty_table_name.json"
+);
+
+// AWS behavioural suite
+// AWS behavioural:
+// check_create_table_gsi_key_not_in_attribute_definitions_rejected.py
+create_table_case!(
+    given_gsi_key_not_in_attribute_definitions_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_gsi_key_not_in_attribute_definitions_rejected.json"
+);
+// AWS behavioural: check_create_table_invalid_key_schema_fails.py
+create_table_case!(
+    given_range_key_without_definition_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_invalid_key_schema_fails.json"
+);
+// AWS behavioural:
+// check_create_table_keys_only_gsi_with_non_key_attributes_rejected.py
+create_table_case!(
+    given_keys_only_gsi_with_non_key_attributes_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_keys_only_gsi_with_non_key_attributes_rejected.json"
+);
+// AWS behavioural: check_create_table_rejects_malformed_requests.py
+create_table_case!(
+    given_gsi_include_without_non_key_attributes_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_rejects_malformed_requests.json#gsi_include_without_non_key_attributes"
+);
+// AWS behavioural: check_create_table_rejects_malformed_requests.py
+create_table_case!(
+    given_same_attribute_as_hash_and_range_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_rejects_malformed_requests.json#same_attribute_as_hash_and_range"
+);
+// AWS behavioural: check_create_table_rejects_malformed_requests.py
+create_table_case!(
+    given_stream_disabled_with_view_type_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_rejects_malformed_requests.json#stream_disabled_with_view_type"
+);
+// AWS behavioural: check_create_table_unused_attribute_definitions.py
+create_table_case!(
+    given_unused_attribute_definition_when_create_table_runs_then_exact_validation_and_no_table_match_aws,
+    "local/aws-behav/check_create_table_unused_attribute_definitions.json"
+);
+// AWS behavioural: check_gsi_key_attribute_must_be_scalar.py
+create_table_case!(
+    given_gsi_key_typed_list_when_create_table_runs_then_enum_validation_error_match_aws,
+    "local/aws-behav/check_gsi_key_attribute_must_be_scalar.json"
+);
+// AWS behavioural:
+// check_index_projection_attribute_budget_counts_a_name_once_per_index.py
+create_table_case!(
+    given_six_indexes_projecting_same_twenty_names_when_create_table_runs_then_projection_budget_error_match_aws,
+    "local/aws-behav/check_index_projection_attribute_budget_counts_a_name_once_per_index.json"
+);

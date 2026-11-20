@@ -636,6 +636,7 @@ async fn given_query_page_when_resumed_then_cursor_advances_the_same_invocation(
         seed_composite_table(&db, "paged").await;
         put_composite_item(&db, "paged", "acct", "a", "first").await;
         put_composite_item(&db, "paged", "acct", "b", "second").await;
+        put_composite_item(&db, "paged", "acct", "c", "third").await;
 
         let request = json!({
             "Nodes": [{
@@ -645,7 +646,7 @@ async fn given_query_page_when_resumed_then_cursor_advances_the_same_invocation(
                         "TableName": "paged",
                         "KeyConditionExpression": "pk = :pk",
                         "ExpressionAttributeValues": {":pk": {"S": "acct"}},
-                        "Limit": 1
+                        "Limit": 2
                     }
                 },
                 "Inputs": {},
@@ -657,7 +658,7 @@ async fn given_query_page_when_resumed_then_cursor_advances_the_same_invocation(
                 .await;
         assert_eq!(
             first["Nodes"][0]["Invocations"][0]["Result"]["Query"]["Count"],
-            1
+            2
         );
         assert_eq!(
             first["Nodes"][0]["Invocations"][0]["Result"]["Query"]["Items"][0]["sk"]["S"],
@@ -676,7 +677,7 @@ async fn given_query_page_when_resumed_then_cursor_advances_the_same_invocation(
         );
         assert_eq!(
             second["Nodes"][0]["Invocations"][0]["Result"]["Query"]["Items"][0]["sk"]["S"],
-            "b"
+            "c"
         );
         assert!(second.get("NextSequenceToken").is_none());
     })
@@ -689,16 +690,17 @@ async fn given_explicit_query_item_budget_when_resumed_then_optimized_frontier_a
         seed_composite_table(&db, "bounded_query").await;
         put_composite_item(&db, "bounded_query", "acct", "a", "first").await;
         put_composite_item(&db, "bounded_query", "acct", "b", "second").await;
+        put_composite_item(&db, "bounded_query", "acct", "c", "third").await;
 
         let request = json!({
-            "MaxRootItems": 1,
+            "MaxRootItems": 2,
             "Nodes": [{
                 "Name": "page",
                 "Operation": {"Query": {
                     "TableName": "bounded_query",
                     "KeyConditionExpression": "pk = :pk",
                     "ExpressionAttributeValues": {":pk": {"S": "acct"}},
-                    "Limit": 2
+                    "Limit": 3
                 }},
                 "Inputs": {},
                 "After": []
@@ -709,7 +711,7 @@ async fn given_explicit_query_item_budget_when_resumed_then_optimized_frontier_a
                 .await;
         assert_eq!(
             first["Nodes"][0]["Invocations"][0]["Result"]["Query"]["Count"],
-            1
+            2
         );
         let token = first["NextSequenceToken"]
             .as_str()
@@ -721,7 +723,7 @@ async fn given_explicit_query_item_budget_when_resumed_then_optimized_frontier_a
         let second = response_body(execute_read_sequence(app_state(db), resumed).await).await;
         assert_eq!(
             second["Nodes"][0]["Invocations"][0]["Result"]["Query"]["Items"][0]["sk"]["S"],
-            "b"
+            "c"
         );
         assert!(second.get("NextSequenceToken").is_none());
     })
@@ -778,6 +780,8 @@ async fn given_independent_query_pages_when_resumed_then_each_frontier_advances(
         seed_composite_table(&db, "parallel-pages").await;
         put_composite_item(&db, "parallel-pages", "acct-a", "a", "a-first").await;
         put_composite_item(&db, "parallel-pages", "acct-a", "b", "a-second").await;
+        put_composite_item(&db, "parallel-pages", "acct-a", "c", "a-third").await;
+        put_composite_item(&db, "parallel-pages", "acct-b", "c", "b-third").await;
         put_composite_item(&db, "parallel-pages", "acct-b", "a", "b-first").await;
         put_composite_item(&db, "parallel-pages", "acct-b", "b", "b-second").await;
 
@@ -789,7 +793,7 @@ async fn given_independent_query_pages_when_resumed_then_each_frontier_advances(
                         "TableName": "parallel-pages",
                         "KeyConditionExpression": "pk = :pk",
                         "ExpressionAttributeValues": {":pk": {"S": "acct-a"}},
-                        "Limit": 1
+                        "Limit": 2
                     }},
                     "Inputs": {},
                     "After": []
@@ -800,7 +804,7 @@ async fn given_independent_query_pages_when_resumed_then_each_frontier_advances(
                         "TableName": "parallel-pages",
                         "KeyConditionExpression": "pk = :pk",
                         "ExpressionAttributeValues": {":pk": {"S": "acct-b"}},
-                        "Limit": 1
+                        "Limit": 2
                     }},
                     "Inputs": {},
                     "After": []
@@ -819,11 +823,11 @@ async fn given_independent_query_pages_when_resumed_then_each_frontier_advances(
         let second = response_body(execute_read_sequence(app_state(db), resumed).await).await;
         assert_eq!(
             second["Nodes"][0]["Invocations"][0]["Result"]["Query"]["Items"][0]["sk"]["S"],
-            "b"
+            "c"
         );
         assert_eq!(
             second["Nodes"][1]["Invocations"][0]["Result"]["Query"]["Items"][0]["sk"]["S"],
-            "b"
+            "c"
         );
         assert!(second.get("NextSequenceToken").is_none());
     })
@@ -836,6 +840,7 @@ async fn given_iterated_query_pages_when_resumed_then_prior_invocations_are_not_
         seed_composite_table(&db, "iterated").await;
         put_composite_item(&db, "iterated", "acct-a", "a", "a-first").await;
         put_composite_item(&db, "iterated", "acct-a", "b", "a-second").await;
+        put_composite_item(&db, "iterated", "acct-a", "c", "a-third").await;
         put_composite_item(&db, "iterated", "acct-b", "a", "b-first").await;
         put_composite_item(&db, "iterated", "acct-b", "b", "b-second").await;
 
@@ -847,7 +852,7 @@ async fn given_iterated_query_pages_when_resumed_then_prior_invocations_are_not_
                     "TableName": "iterated",
                     "KeyConditionExpression": "pk = :pk",
                     "ExpressionAttributeValues": {":pk": {"S": "acct-a"}},
-                    "Limit": 2
+                    "Limit": 4
                 }},
                 "Inputs": {},
                 "After": []
@@ -858,7 +863,7 @@ async fn given_iterated_query_pages_when_resumed_then_prior_invocations_are_not_
                     "TableName": "iterated",
                     "KeyConditionExpression": "pk = :pk",
                     "ExpressionAttributeValues": {":pk": {"FromInput": "pk"}},
-                    "Limit": 1
+                    "Limit": 2
                 }},
                 "Inputs": {"pk": {
                     "From": {"Node": "parents", "Select": "$.Query.Items[*].pk"},
@@ -894,7 +899,7 @@ async fn given_iterated_query_pages_when_resumed_then_prior_invocations_are_not_
         assert_eq!(invocations[0]["Ordinal"], 0);
         assert_eq!(
             invocations[0]["Result"]["Query"]["Items"][0]["sk"]["S"],
-            "b"
+            "c"
         );
         assert_eq!(invocations[1]["Ordinal"], 1);
     })
@@ -1271,9 +1276,8 @@ async fn given_remote_gsi_missing_a_filter_attribute_when_read_sequence_executes
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let payload = response_body(response).await;
     assert!(
-        payload["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("does not project [private_note]")),
+        payload["message"].as_str().is_some_and(|message| message
+            .contains("does not project one or more filter attributes: [private_note]")),
         "{payload}"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -1306,7 +1310,7 @@ async fn remote_app_state(
         },
     ));
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let provider = storage::RemoteStorageProvider::new(RemoteStorageSettings {
+    let database = storage::DatabaseManager::new_for_test_with_remote(RemoteStorageSettings {
         endpoint_urls: vec![endpoint],
         region: None,
         tls: false,
@@ -1319,13 +1323,7 @@ async fn remote_app_state(
     })
     .await
     .unwrap();
-    (
-        app_state(Arc::new(
-            storage::DatabaseManager::new_with_mocks(Arc::new(provider)).unwrap(),
-        )),
-        server,
-        calls,
-    )
+    (app_state(Arc::new(database)), server, calls)
 }
 
 #[cfg(feature = "remote")]

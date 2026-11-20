@@ -44,7 +44,7 @@ impl ImmediateQueueWorker {
             .change_message_visibility(ChangeMessageVisibilityRequest {
                 queue_url: self.runtime.queue_url.clone(),
                 receipt_handle: message.receipt_handle.as_str().into(),
-                visibility_timeout: seconds,
+                visibility_timeout: seconds.into(),
             })
             .await
         {
@@ -152,6 +152,7 @@ impl ImmediateQueueWorker {
                 message_body: body.to_string(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             })
             .await;
         match published {
@@ -275,7 +276,7 @@ pub(super) fn immediate_job_receive_request(
     ReceiveMessageRequest {
         queue_url,
         max_number_of_messages: Some(1),
-        visibility_timeout: Some(visibility_timeout_secs),
+        visibility_timeout: Some(visibility_timeout_secs.into()),
         wait_time_seconds: Some(1),
         attribute_names: Some(vec![
             QUEUE_ATTRIBUTE_SENT_TIMESTAMP.to_string(),

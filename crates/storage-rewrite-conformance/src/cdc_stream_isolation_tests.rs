@@ -29,6 +29,7 @@ async fn given_neighboring_stream_table_names_when_one_is_deleted_then_other_str
                 )
                 .await?;
         }
+        store.wait_until_changes_are_readable().await;
         anyhow::ensure!(system_records(&store, 10).await?.len() == 2);
         store
             .operations
@@ -45,12 +46,17 @@ async fn given_neighboring_stream_table_names_when_one_is_deleted_then_other_str
                 .unwrap(),
             )
             .await?;
+        store.wait_until_changes_are_readable().await;
         let records = table_records(&store, &live).await?;
         anyhow::ensure!(records.len() == 2);
-        for (record, key) in records.iter().zip(["first", "second"]) {
-            anyhow::ensure!(serde_json::to_value(&record.item)? == json!({"pk": {"S": key}}));
+        let images = records
+            .iter()
+            .map(|record| serde_json::to_value(&record.item))
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in ["first", "second"] {
+            anyhow::ensure!(images.contains(&json!({"pk": {"S": key}})));
         }
-        let system = system_records(&store, 1).await?;
+        let system = super::cdc_stream_tests::system_records_with_count(&store, 1, 2).await?;
         anyhow::ensure!(system.len() == 2);
         anyhow::ensure!(
             system

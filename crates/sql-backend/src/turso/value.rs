@@ -7,7 +7,7 @@ pub(super) fn decode_row(row: &turso::Row, width: usize) -> StorageResult<SqlRow
     let mut cells = Vec::new();
     cells
         .try_reserve_exact(width)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for index in 0..width {
         cells.push(from_native_value(
             row.get_value(index).map_err(map_driver_error)?,

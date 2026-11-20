@@ -36,7 +36,10 @@ impl NodeExecution<'_> {
             invocations.push(ReadSequenceInvocationResult {
                 ordinal: ordinal as u32,
                 input_refs: binding.into_input_refs(),
-                result: ReadSequenceInvocationPayload::Get(GetItemResponse { item }),
+                result: ReadSequenceInvocationPayload::Get(GetItemResponse {
+                    item,
+                    consumed_capacity: None,
+                }),
             });
         }
         Ok(NodeOutcome {

@@ -17,17 +17,16 @@ use super::{
     read_expiration_candidates_in_attempt, read_expiration_target_in_attempt,
 };
 use crate::{
-    CatalogAttempt, DeleteItemAttempt, DescribeTimeToLiveAttempt, GetItemAttempt,
-    ListTablesAttempt, UpdateTimeToLiveAttempt, maintenance::MaintenancePort,
+    CatalogAttempt, ItemReadAttempt, ItemWriteAttempt, ListingAttempt, TtlPolicyAttempt,
+    maintenance::MaintenancePort,
 };
 
 pub trait ExpirationPort:
     CatalogAttempt
-    + DescribeTimeToLiveAttempt
-    + UpdateTimeToLiveAttempt
-    + ListTablesAttempt
-    + GetItemAttempt
-    + DeleteItemAttempt
+    + TtlPolicyAttempt
+    + ListingAttempt
+    + ItemReadAttempt
+    + ItemWriteAttempt
     + MaintenancePort
 {
     fn scan_expiration_index(
@@ -62,7 +61,7 @@ pub struct ExpirationAttempt<'a, P: ExpirationPort, S = OrdinaryExpiration> {
     pub(super) admission: S,
     pub(super) port: &'a mut P,
     pub(super) state: ExpirationAttemptState,
-    progress_fence: Option<P::ProgressFence>,
+    progress_fence: Option<crate::maintenance::ProgressFence>,
 }
 
 impl<'a, P: ExpirationPort> ExpirationAttempt<'a, P> {
@@ -187,7 +186,7 @@ impl<P: ExpirationPort, S: ExpirationEffectPolicy<P>> ExpirationTransaction
 
 async fn store_expiration_progress<P: ExpirationPort>(
     port: &mut P,
-    fence: Option<&P::ProgressFence>,
+    fence: Option<&crate::maintenance::ProgressFence>,
     write: ExpirationProgressWrite,
 ) -> StorageResult<StepResult<()>> {
     ExpirationAttemptState::validate_progress(&write)?;

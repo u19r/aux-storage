@@ -44,13 +44,13 @@ impl TryFrom<&DurableRecordKey> for DurableRecordKey {
         let mut suffix = Vec::new();
         namespace
             .try_reserve_exact(address.namespace.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         resource
             .try_reserve_exact(address.resource.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         suffix
             .try_reserve_exact(address.suffix.len())
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         namespace.push_str(&address.namespace);
         resource.extend_from_slice(&address.resource);
         suffix.extend_from_slice(&address.suffix);

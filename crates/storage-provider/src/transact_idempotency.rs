@@ -1,17 +1,22 @@
 //! Transact-write token encoding, validation, and expiry decisions.
 
+use scheduled_bg_jobs::store::StoreKey;
 use storage_types::{
     StorageError, StorageResult, TimestampMillis, TransactWriteItemsRequest,
     TransactWriteItemsResponse,
 };
 
-use crate::{
-    DynamoTransactWriteAttempt, SemanticDecision,
-    transact_request_identity::TransactRequestIdentity,
-};
+use crate::{ReceiptSlot, SemanticDecision, transact_request_identity::TransactRequestIdentity};
 
 /// Idempotency window for completed transact-write token receipts.
 pub const TRANSACT_WRITE_IDEMPOTENCY_WINDOW_MILLIS: i64 = 10 * 60 * 1000;
+
+/// Delay after the window before a receipt may be trimmed. A retry captured
+/// inside the window on one node can read the receipt only later: it still
+/// spends its Transaction budget (15 s by default, configurable) and commit
+/// grace (2 s), and node clocks differ. Five minutes covers that budget, the
+/// grace and a clock allowance, so such a retry always finds its receipt.
+pub const TRANSACT_RECEIPT_TRIM_DELAY_MILLIS: i64 = 5 * 60 * 1000;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,48 +24,22 @@ struct TransactReceipt<I> {
     request_identity: I,
     response: Vec<u8>,
     completed_at: TimestampMillis,
-    #[serde(default, skip_serializing_if = "ReceiptRetention::is_request_window")]
-    retention: ReceiptRetention,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ReceiptRetention {
-    #[default]
-    RequestWindow,
-    JobExecution,
-}
-
-impl ReceiptRetention {
-    fn is_request_window(&self) -> bool {
-        matches!(self, Self::RequestWindow)
-    }
-}
-
-impl<I> TransactReceipt<I> {
-    fn expired(&self, at: TimestampMillis) -> bool {
-        self.retention.is_request_window() && transact_write_token_expired(self.completed_at, at)
-    }
-}
-
-pub(crate) async fn find_transact_response<A: DynamoTransactWriteAttempt>(
-    attempt: &mut A,
+pub(crate) fn accept_transact_response(
     request: Option<&TransactTokenRequest>,
+    bytes: Option<Vec<u8>>,
     captured_at: TimestampMillis,
 ) -> StorageResult<SemanticDecision<Option<TransactWriteItemsResponse>>> {
-    let Some(request) = request else {
+    let (Some(request), Some(bytes)) = (request, bytes) else {
         return Ok(SemanticDecision::Accepted(None));
     };
-    let Some(bytes) = attempt.read_transact_receipt(request.token()).await? else {
-        return Ok(SemanticDecision::Accepted(None));
-    };
-    let mut receipt: TransactReceipt<Vec<u8>> = storage_types::storage_serde::from_bytes(&bytes)?;
-    if !request.matches_retention(&receipt.retention) {
-        return Err(StorageError::internal(
-            "transaction receipt retention differs from its execution",
-        ));
-    }
-    if receipt.expired(captured_at) {
+    let receipt: TransactReceipt<Vec<u8>> = storage_types::storage_serde::from_bytes(&bytes)?;
+    // A job-effect receipt lives exactly as long as its execution; only a
+    // request receipt has a time window.
+    if request.job_effect_key.is_none()
+        && transact_write_token_expired(receipt.completed_at, captured_at)
+    {
         return Ok(SemanticDecision::Accepted(None));
     }
     if TransactRequestIdentity::from_stored(&receipt.request_identity)? != request.identity {
@@ -68,46 +47,38 @@ pub(crate) async fn find_transact_response<A: DynamoTransactWriteAttempt>(
             StorageError::idempotent_parameter_mismatch(),
         ));
     }
-    let response = decode_token_response(&receipt.response)?;
-    let identity = request.identity.stored_bytes();
-    if !receipt.retention.is_request_window() && receipt.request_identity != identity.as_slice() {
-        receipt.request_identity = identity.as_slice().to_vec();
-        attempt
-            .write_transact_receipt(
-                request.token(),
-                storage_types::storage_serde::to_bytes(&receipt)?,
-            )
-            .await?;
-    }
-    Ok(SemanticDecision::Accepted(Some(response)))
+    decode_token_response(&receipt.response)
+        .map(|response| SemanticDecision::Accepted(Some(response)))
 }
 
-/// A request-window receipt is dead once its idempotency window closes;
-/// scheduled-job effect receipts live until their execution finishes.
+/// A request receipt is trimmable once its window and the trim delay have
+/// passed. Job-effect receipts are not in this table.
 pub(crate) fn transact_receipt_is_trimmable(
     bytes: &[u8],
     at: TimestampMillis,
 ) -> StorageResult<bool> {
     let receipt: TransactReceipt<Vec<u8>> = storage_types::storage_serde::from_bytes(bytes)?;
-    Ok(receipt.expired(at))
+    Ok(i128::from(at.timestamp_millis())
+        >= i128::from(receipt.completed_at.timestamp_millis())
+            + i128::from(TRANSACT_WRITE_IDEMPOTENCY_WINDOW_MILLIS)
+            + i128::from(TRANSACT_RECEIPT_TRIM_DELAY_MILLIS))
 }
 
-pub(crate) async fn find_job_effect_response<A: DynamoTransactWriteAttempt>(
+pub(crate) async fn find_job_effect_response<A: crate::DynamoTransactWriteAttempt>(
     attempt: &mut A,
     token: &str,
     authority: &crate::job_write_authority::JobWriteAuthority,
 ) -> StorageResult<Option<TransactWriteItemsResponse>> {
+    let key = authority.receipt_key(token)?;
     let Some(bytes) = attempt
-        .read_transact_receipt(&authority.receipt_key(token))
+        .read_transact_receipt(ReceiptSlot::JobEffect(&key))
         .await?
     else {
         return Ok(None);
     };
     let receipt: TransactReceipt<Vec<u8>> = storage_types::storage_serde::from_bytes(&bytes)?;
     let identity = TransactRequestIdentity::from_stored(&receipt.request_identity)?;
-    if !matches!(receipt.retention, ReceiptRetention::JobExecution)
-        || identity.execution() != Some(authority.execution_identity())
-    {
+    if identity.execution() != Some(authority.execution_identity()) {
         return Err(StorageError::internal(
             "invalid scheduled-job effect receipt",
         ));
@@ -127,7 +98,6 @@ pub(crate) fn encode_transact_receipt(
         request_identity: request.identity.stored_bytes().as_slice(),
         response,
         completed_at,
-        retention: request.retention(),
     })?;
     if bytes.len() > TRANSACT_RECEIPT_WRITE_BYTES {
         return Err(StorageError::internal(
@@ -144,8 +114,7 @@ pub const TRANSACT_RECEIPT_WRITE_BYTES: usize = storage_types::STORAGE_SERDE_ENC
     + b"{\"request_identity\":[],\"response\":[],\"completed_at\":}".len()
     + (crate::transact_request_identity::REQUEST_IDENTITY_BYTES * 4 - 1)
     + (2 * 4 - 1)
-    + 20
-    + b",\"retention\":{\"type\":\"job_execution\"}".len();
+    + 20;
 
 const _: () = assert!(
     TRANSACT_RECEIPT_WRITE_BYTES - storage_types::STORAGE_SERDE_ENCODED_PREFIX_LEN
@@ -156,6 +125,7 @@ const _: () = assert!(
 pub(crate) struct TransactTokenRequest {
     token: String,
     identity: TransactRequestIdentity,
+    job_effect_key: Option<StoreKey>,
 }
 
 impl TransactTokenRequest {
@@ -169,34 +139,26 @@ impl TransactTokenRequest {
                 Ok(Self {
                     token: token.clone(),
                     identity: TransactRequestIdentity::try_from_request(request)?,
+                    job_effect_key: None,
                 })
             })
             .transpose()
     }
 
-    pub(crate) fn token(&self) -> &str {
-        &self.token
-    }
-
-    fn retention(&self) -> ReceiptRetention {
-        if self.identity.execution().is_some() {
-            ReceiptRetention::JobExecution
-        } else {
-            ReceiptRetention::RequestWindow
+    pub(crate) fn slot(&self) -> ReceiptSlot<'_> {
+        match &self.job_effect_key {
+            Some(key) => ReceiptSlot::JobEffect(key),
+            None => ReceiptSlot::Request(&self.token),
         }
-    }
-
-    fn matches_retention(&self, retention: &ReceiptRetention) -> bool {
-        self.retention() == *retention
     }
 
     pub(crate) fn authorize_effect(
         &mut self,
         authority: &crate::job_write_authority::JobWriteAuthority,
-    ) {
-        self.token = authority.receipt_key(&self.token);
-        let execution = authority.execution_identity();
-        self.identity.bind_execution(execution);
+    ) -> StorageResult<()> {
+        self.job_effect_key = Some(authority.receipt_key(&self.token)?);
+        self.identity.bind_execution(authority.execution_identity());
+        Ok(())
     }
 }
 

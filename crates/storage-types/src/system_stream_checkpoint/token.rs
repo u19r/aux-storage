@@ -4,11 +4,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use utoipa::ToSchema;
 
-use super::{
-    CHECKPOINT_TOKEN_PREFIX, SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES, SystemStreamCheckpoint,
-    SystemStreamContractError,
+use super::{SystemStreamCheckpoint, SystemStreamContractError};
+use crate::{
+    TimestampMillis,
+    constants::{CHECKPOINT_TOKEN_PREFIX, SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES},
 };
-use crate::TimestampMillis;
 
 const CUTOFF_BYTES: usize = size_of::<i64>();
 

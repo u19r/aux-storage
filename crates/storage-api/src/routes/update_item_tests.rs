@@ -6,8 +6,8 @@ use storage_types::{AttributeValue, TableName, UpdateItemRequest, UpdateItemResp
 
 use crate::{
     routes::routes_tests::{
-        create_sqlite_test_db, default_conformance_backends, handle_create_table, handle_get_item,
-        handle_put_item, handle_update_item,
+        create_sqlite_test_db, create_string_key_table, default_conformance_backends,
+        handle_get_item, handle_put_item, handle_update_item,
     },
     types::Response,
 };
@@ -23,7 +23,7 @@ async fn given_missing_table_and_invalid_key_when_update_runs_then_table_error_w
     .await
     .expect_err("missing table must fail first");
     assert_eq!(error.status_code, 400);
-    assert!(error.message.contains("MissingUpdateTable"), "{error:?}");
+    assert_eq!(error.message, "Requested resource not found");
 }
 
 #[tokio::test]
@@ -75,6 +75,7 @@ fn update_item_response_serialization() {
 
     let response = UpdateItemResponse {
         attributes: Some(attributes.into()),
+        consumed_capacity: None,
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -679,22 +680,7 @@ fn case(
 }
 
 async fn create_hash_table(db: std::sync::Arc<DatabaseManager>, table_name: &str) {
-    handle_create_table(
-        db,
-        json!({
-            "TableName": table_name,
-            "AttributeDefinitions": [
-                {"AttributeName": "pk", "AttributeType": "S"}
-            ],
-            "KeySchema": [
-                {"AttributeName": "pk", "KeyType": "HASH"}
-            ]
-        })
-        .try_into()
-        .expect("create table request"),
-    )
-    .await
-    .expect("create hash table");
+    create_string_key_table(db.as_ref(), table_name, "pk", None).await;
 }
 
 async fn put_deep_return_value_item(db: std::sync::Arc<DatabaseManager>, pk: &str) {
@@ -793,22 +779,5 @@ fn list_with_second_a(second_a: &str) -> Value {
 }
 
 async fn create_composite_table(db: std::sync::Arc<DatabaseManager>, table_name: &str) {
-    handle_create_table(
-        db,
-        json!({
-            "TableName": table_name,
-            "AttributeDefinitions": [
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"}
-            ],
-            "KeySchema": [
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "sk", "KeyType": "RANGE"}
-            ]
-        })
-        .try_into()
-        .expect("create table request"),
-    )
-    .await
-    .expect("create composite table");
+    create_string_key_table(db.as_ref(), table_name, "pk", Some("sk")).await;
 }

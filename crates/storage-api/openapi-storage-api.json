@@ -27,8 +27,8 @@
           "required": true
         },
         "responses": {
-          "404": {
-            "description": "Pubsub route is not enabled in this binary"
+          "200": {
+            "description": "SNS-compatible response"
           }
         }
       }
@@ -38,6 +38,8 @@
         "tags": [
           "crate::routes::queue"
         ],
+        "summary": "Dispatch queue operations.",
+        "description": "Dispatches SQS-compatible operations and the native JSON AmazonSQS.PublishMessage extension. PublishMessage accepts MessageId (a hyphenated UUID, excluding the nil UUID) and Message (a SendMessage request). Repeating an existing identity preserves its pending delivery, receipt, visibility, expiry and checkpoint. Different body or attributes conflict. A missing or expired delivery can be recovered from its retained source intent.",
         "operationId": "queue_endpoint",
         "requestBody": {
           "content": {
@@ -50,8 +52,67 @@
           "required": true
         },
         "responses": {
-          "404": {
-            "description": "Queue route is not enabled in this binary"
+          "200": {
+            "description": "SQS-compatible response; PublishMessage returns the retained message identity and message checksums"
+          },
+          "400": {
+            "description": "Invalid queue request or publication identity reused with different immutable content"
+          },
+          "503": {
+            "description": "Storage or admission unavailable; follow Retry-After"
+          }
+        }
+      }
+    },
+    "/queue/{account}/{queue_name}": {
+      "post": {
+        "tags": [
+          "crate::routes::queue"
+        ],
+        "summary": "Dispatch queue operations posted to a queue URL.",
+        "description": "The same operations as `/queue`. A request with no QueueUrl member acts on the queue of the path. A QueueUrl member wins over the path. A path account other than the configured account answers AWS.SimpleQueueService.NonExistentQueue.",
+        "operationId": "queue_url_endpoint",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "The configured 12-digit account",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{12}$"
+            }
+          },
+          {
+            "name": "queue_name",
+            "in": "path",
+            "description": "The queue name",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,80}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SQS-compatible response"
+          },
+          "400": {
+            "description": "Invalid queue request, or no such queue"
+          },
+          "503": {
+            "description": "Storage or admission unavailable; follow Retry-After"
           }
         }
       }
@@ -62,7 +123,7 @@
           "crate::routes::dynamodb"
         ],
         "summary": "Execute a DynamoDB-compatible storage operation.",
-        "description": "Sends a DynamoDB-compatible JSON-RPC request through the storage API using the `x-amz-target` header. `DynamoDB_20120810.QuerySourcePage` is an Aux extension, not a standard DynamoDB operation. It accepts a snake_case QueryTableRequest and runs the same query as the Rust query_table method, but returns each item together with its decoded storage key (ItemKey). The key contains table/index identity and partition/sort key values, not raw backend key bytes or SQL row locations. Both methods return evaluated item/byte counts and a continuation token. projection_expression applies to returned items; an index query returns its stored projection without fetching complete base-table items. Use query_table for ordinary item reads, query_table_stored_entity for automatic typed entity identity checks, or QuerySourcePage when code needs the storage key separately from item attributes. It requires an Aux server; AWS DynamoDB does not implement it. The Aux action `DynamoDB_20120810.GetCanonicalHistory` supports source discovery, scoped canonical views, native checkpoints and causal delivery on configured regional services. Its typed history request uses snake_case fields and rejects unknown fields; cursors remain bound to their serving receiver and selection.",
+        "description": "Sends a DynamoDB-compatible JSON-RPC request through the storage API using the `x-amz-target` header. `DynamoDB_20120810.QuerySourcePage` is an Aux extension, not a standard DynamoDB operation. It accepts a snake_case QueryTableRequest and runs the same query as the Rust query_table method, but returns each item together with its decoded storage key (ItemKey). The key contains table/index identity and partition/sort key values, not raw backend key bytes or SQL row locations. Both methods return evaluated item/byte counts and a continuation token. projection_expression applies to returned items; an index query returns its stored projection without fetching complete base-table items. Use query_table for ordinary item reads, query_table_stored_entity for automatic typed entity identity checks, or QuerySourcePage when code needs the storage key separately from item attributes. It requires an Aux server; AWS DynamoDB does not implement it.",
         "operationId": "dynamodb_endpoint",
         "parameters": [
           {
@@ -133,8 +194,8 @@
             }
           }
         },
-        "x-aux-internal": true,
-        "x-aux-audience": "internal_private"
+        "x-aux-audience": "internal_private",
+        "x-aux-internal": true
       }
     }
   },

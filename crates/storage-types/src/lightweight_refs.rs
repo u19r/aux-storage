@@ -484,7 +484,8 @@ impl From<KeyOwned> for EntityKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum AttributeValueRef<'a> {
     S(&'a str),
     N(&'a str),
@@ -521,7 +522,8 @@ impl<'a> ExprNameRef<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ExprValueRef<'a> {
     pub placeholder: &'a str,
     pub value: AttributeValueRef<'a>,

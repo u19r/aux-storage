@@ -48,7 +48,34 @@ pub(super) async fn put_value(store: &TestStore, table: &TableName, key: &str, v
             .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("put failed: {:?}; {error:#?}", error.as_ref()));
+}
+
+pub(super) async fn find_populated_shard(store: &TestStore, arn: &str) -> String {
+    let shards = describe_shards(store, arn).await;
+    // PostgreSQL can acknowledge a write before its stream publication
+    // advances.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            for shard in &shards {
+                let start = iterator(store, arn, &shard.shard_id, "TRIM_HORIZON", None).await;
+                let page = store
+                    .operations
+                    .get_records(GetRecordsRequest {
+                        shard_iterator: start,
+                        limit: Some(100),
+                    })
+                    .await
+                    .unwrap();
+                if !page.records.is_empty() {
+                    return shard.shard_id.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("acknowledged stream did not become published")
 }
 
 pub(super) async fn describe_shards(store: &TestStore, arn: &str) -> Vec<storage_types::Shard> {
@@ -127,9 +154,21 @@ async fn given_all_dynamodb_views_when_history_is_paged_then_exact_predecessors_
                 .await
                 .unwrap();
             put_value(&store, &table, "item", "v3").await;
+            store.wait_until_changes_are_readable().await;
             let shards = describe_shards(&store, &arn).await;
-            assert_eq!(shards.len(), 1);
-            let shard = &shards[0].shard_id;
+            assert_eq!(
+                shards.len(),
+                store
+                    .stream_operations
+                    .system_stream_lineage_catalog(
+                        store.stream_operations.system_stream_scope().await.unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .len()
+            );
+            let populated_shard = find_populated_shard(&store, &arn).await;
+            let shard = &populated_shard;
             assert_eq!(shard.len(), 64);
             let origin = iterator(&store, &arn, shard, "TRIM_HORIZON", None).await;
             let first = read_published_records(
@@ -233,6 +272,7 @@ async fn given_all_dynamodb_views_when_history_is_paged_then_exact_predecessors_
                 .unwrap();
             assert!(idle.records.is_empty());
             put_value(&store, &table, "item", "v4").await;
+            store.wait_until_changes_are_readable().await;
             let tail = read_published_records(
                 &store,
                 GetRecordsRequest {
@@ -244,15 +284,30 @@ async fn given_all_dynamodb_views_when_history_is_paged_then_exact_predecessors_
             .await;
             assert_eq!(tail.records.len(), 1);
             assert_eq!(tail.records[0].event_name, "MODIFY");
-            let snapshots = store
-                .operations
-                .get_stream_records(GetStreamRecordsRequest::table(table, None, Some(10)))
-                .await
-                .unwrap();
-            assert_eq!(snapshots.records().len(), 5);
-            assert!(snapshots.records()[2].item.is_none());
+            let mut snapshots = Vec::new();
+            let mut checkpoint = None;
+            for page_index in 0..6 {
+                let page = store
+                    .operations
+                    .get_stream_records(GetStreamRecordsRequest::table(
+                        table.clone(),
+                        checkpoint,
+                        Some(10),
+                    ))
+                    .await
+                    .unwrap();
+                checkpoint = page.last_evaluated_key().map(str::to_owned);
+                let empty = page.records().is_empty();
+                snapshots.extend(page.into_parts().0);
+                if empty {
+                    break;
+                }
+                assert!(page_index < 5, "table history cursor made no progress");
+            }
+            assert_eq!(snapshots.len(), 5);
+            assert!(snapshots[2].item.is_none());
             assert_eq!(
-                serde_json::to_value(&snapshots.records()[3].item).unwrap()["value"]["S"],
+                serde_json::to_value(&snapshots[3].item).unwrap()["value"]["S"],
                 "v3"
             );
         }
@@ -272,6 +327,7 @@ async fn given_source_split_when_table_pages_resume_then_each_lane_is_read_once_
     let outcome = AssertUnwindSafe(async {
         let (table, arn) = create_stream_table(&store, "NEW_AND_OLD_IMAGES").await;
         put_value(&store, &table, "parent", "before").await;
+        store.wait_until_changes_are_readable().await;
         let before = store
             .operations
             .get_stream_records(GetStreamRecordsRequest::table(
@@ -282,16 +338,23 @@ async fn given_source_split_when_table_pages_resume_then_each_lane_is_read_once_
             .await
             .unwrap();
         let mut checkpoint = before.last_evaluated_key().unwrap().to_owned();
-        let old_shard = describe_shards(&store, &arn).await.remove(0).shard_id;
+        let initial_shards = describe_shards(&store, &arn).await;
+        let old_shard = find_populated_shard(&store, &arn).await;
         let scope = store.stream_operations.system_stream_scope().await.unwrap();
-        let parent = store
+        let entries = store
             .stream_operations
             .system_stream_lineage_catalog(scope.clone())
             .await
-            .unwrap()
-            .into_iter()
-            .find(|lane| !lane.sealed())
             .unwrap();
+        let catalog =
+            stream_provider::SystemStreamLineageCatalog::try_new(scope.clone(), entries).unwrap();
+        let key: storage_types::KeyAttributes =
+            serde_json::from_value(json!({"pk": {"S": "parent"}})).unwrap();
+        let request = super::test_support::hash_table_request(table.clone());
+        let route =
+            stream_provider::DynamoMutationRoute::try_new(&table, &request.key_schema, &key)
+                .unwrap();
+        let parent = catalog.writer_lineage(route.routing_key()).unwrap().clone();
         let children = ["table-left", "table-right"].map(|id| {
             SystemStreamSplitChild::try_new(
                 SystemStreamLineage::try_new(
@@ -321,6 +384,7 @@ async fn given_source_split_when_table_pages_resume_then_each_lane_is_read_once_
         for key in 0..32 {
             put_value(&store, &table, &format!("child-{key:02}"), "after").await;
         }
+        store.wait_until_changes_are_readable().await;
         let mut seen = BTreeSet::new();
         for page in 0..33 {
             let next = store
@@ -347,14 +411,14 @@ async fn given_source_split_when_table_pages_resume_then_each_lane_is_read_once_
         }
         assert_eq!(seen.len(), 32);
         let shards = describe_shards(&store, &arn).await;
-        assert_eq!(shards.len(), 3);
-        assert_eq!(
-            shards
-                .iter()
-                .filter(|shard| shard.parent_shard_id.as_deref() == Some(&old_shard))
-                .count(),
-            2
-        );
+        assert_eq!(shards.len(), initial_shards.len() + 2);
+        let children = shards
+            .iter()
+            .filter_map(|shard| shard.parent_shard_id.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0], &old_shard);
+        assert_eq!(children[1], &old_shard);
         let mut standard_count = 0;
         for shard in &shards {
             let start = iterator(&store, &arn, &shard.shard_id, "TRIM_HORIZON", None).await;
@@ -370,7 +434,9 @@ async fn given_source_split_when_table_pages_resume_then_each_lane_is_read_once_
                 assert!(page.next_shard_iterator.is_none());
                 assert_eq!(page.records.len(), 1);
             } else {
-                assert!(!page.records.is_empty());
+                if shard.parent_shard_id.is_some() {
+                    assert!(!page.records.is_empty());
+                }
                 assert!(page.next_shard_iterator.is_some());
             }
             standard_count += page.records.len();
@@ -407,6 +473,7 @@ async fn given_untrimmed_expired_prefix_when_fresh_table_reader_pages_then_it_sk
         for key in 0..7 {
             put_value(&store, &table, &format!("expired-{key}"), "old").await;
         }
+        store.wait_until_changes_are_readable().await;
         let before = store
             .operations
             .get_stream_records(GetStreamRecordsRequest::table(table.clone(), None, Some(1)))
@@ -415,6 +482,7 @@ async fn given_untrimmed_expired_prefix_when_fresh_table_reader_pages_then_it_sk
         let old_checkpoint = before.last_evaluated_key().unwrap().to_owned();
         store.advance_time(Duration::from_secs(49 * 3600));
         put_value(&store, &table, "retained", "new").await;
+        store.wait_until_changes_are_readable().await;
         let mut checkpoint = None;
         let mut seen = 0;
         for _ in 0..5 {
@@ -451,6 +519,7 @@ async fn given_untrimmed_expired_prefix_when_fresh_table_reader_pages_then_it_sk
             storage_types::StorageEnum::HistoryUnavailable
         ));
         put_value(&store, &table, "missed", "must-report-gap").await;
+        store.wait_until_changes_are_readable().await;
         store.advance_time(Duration::from_secs(49 * 3600));
         let error = store
             .operations
@@ -477,9 +546,16 @@ async fn given_large_dynamodb_events_when_page_reaches_one_mib_then_omitted_even
     let outcome = AssertUnwindSafe(async {
         let (table, arn) = create_stream_table(&store, "NEW_IMAGE").await;
         for key in 0..4 {
-            put_value(&store, &table, &format!("key-{key}"), &"x".repeat(380_000)).await;
+            put_value(
+                &store,
+                &table,
+                "item",
+                &format!("{key}{}", "x".repeat(380_000)),
+            )
+            .await;
         }
-        let shard = describe_shards(&store, &arn).await.remove(0).shard_id;
+        store.wait_until_changes_are_readable().await;
+        let shard = find_populated_shard(&store, &arn).await;
         let start = iterator(&store, &arn, &shard, "TRIM_HORIZON", None).await;
         let first = store
             .operations
@@ -505,13 +581,15 @@ async fn given_large_dynamodb_events_when_page_reaches_one_mib_then_omitted_even
             .iter()
             .chain(&second.records)
             .map(|record| {
-                serde_json::to_value(&record.dynamodb.keys).unwrap()["pk"]["S"]
+                serde_json::to_value(&record.dynamodb).unwrap()["NewImage"]["value"]["S"]
                     .as_str()
+                    .unwrap()
+                    .get(..1)
                     .unwrap()
                     .to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(values, ["key-0", "key-1", "key-2", "key-3"]);
+        assert_eq!(values, ["0", "1", "2", "3"]);
         let idle = store
             .operations
             .get_records(GetRecordsRequest {
@@ -577,20 +655,18 @@ async fn given_ttl_removal_when_stream_is_read_then_only_remove_has_top_level_se
             )
             .await?;
         let policy = store
-            .ttl_sweep_repository
+            .maintenance
             .read_ttl_sweep_policy(&table)
             .await?
             .unwrap();
         let now = store.now();
         let input = storage_provider::TtlSweepPageInput::try_new("ttl", now, 100, None)?;
         let command = storage_provider::TtlSweepPageCommand::try_new(policy, input, now)?;
-        let swept = store
-            .ttl_sweep_repository
-            .execute_ttl_sweep_page(command)
-            .await?;
+        let swept = store.maintenance.execute_ttl_sweep_page(command).await?;
         anyhow::ensure!(swept.deleted_items == 1);
-        let shards = describe_shards(&store, &arn).await;
-        let token = iterator(&store, &arn, &shards[0].shard_id, "TRIM_HORIZON", None).await;
+        store.wait_until_changes_are_readable().await;
+        let populated_shard = find_populated_shard(&store, &arn).await;
+        let token = iterator(&store, &arn, &populated_shard, "TRIM_HORIZON", None).await;
         let response = read_published_records(
             &store,
             GetRecordsRequest {
@@ -616,7 +692,7 @@ async fn given_ttl_removal_when_stream_is_read_then_only_remove_has_top_level_se
 }
 
 #[tokio::test]
-async fn given_existing_stream_when_disabled_then_reenable_cannot_change_history_view()
+async fn given_disabled_stream_when_reenabled_with_another_view_then_new_view_applies()
 -> anyhow::Result<()> {
     let store = TestStore::new().await;
     let result = async {
@@ -627,7 +703,9 @@ async fn given_existing_stream_when_disabled_then_reenable_cannot_change_history
         let response = store.operations.update_table(serde_json::from_value(json!({
             "TableName": table, "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "OLD_IMAGE"}
         }))?).await;
-        anyhow::ensure!(response.is_err(), "existing history view was changed");
+        // AWS accepts a view-type change once the stream is disabled (P13).
+        let view = response?.table_description.stream_specification.unwrap().stream_view_type;
+        anyhow::ensure!(view == Some(storage_types::StreamViewType::OldImage));
         Ok(())
     }.await;
     store.finish().await;
@@ -635,7 +713,7 @@ async fn given_existing_stream_when_disabled_then_reenable_cannot_change_history
 }
 
 #[tokio::test]
-async fn given_implicit_stream_view_when_disabled_and_reenabled_then_default_view_remains_immutable()
+async fn given_implicit_stream_view_when_disabled_and_reenabled_without_view_then_default_view_remains()
 -> anyhow::Result<()> {
     let store = TestStore::new().await;
     let result = async {
@@ -645,11 +723,10 @@ async fn given_implicit_stream_view_when_disabled_and_reenabled_then_default_vie
         store.operations.create_table(request).await?;
         put_value(&store, &table, "item", "original").await;
         let request = json!({"TableName": table, "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}});
-        anyhow::ensure!(store.operations.update_table(serde_json::from_value(request.clone())?).await.is_err());
+        anyhow::ensure!(store.operations.update_table(serde_json::from_value(request)?).await.is_err());
         store.operations.update_table(serde_json::from_value(json!({
             "TableName": table, "StreamSpecification": {"StreamEnabled": false}
         }))?).await?;
-        anyhow::ensure!(store.operations.update_table(serde_json::from_value(request)?).await.is_err());
         let response = store.operations.update_table(serde_json::from_value(json!({
             "TableName": table, "StreamSpecification": {"StreamEnabled": true}
         }))?).await?;
@@ -658,4 +735,117 @@ async fn given_implicit_stream_view_when_disabled_and_reenabled_then_default_vie
     }.await;
     store.finish().await;
     result
+}
+
+#[tokio::test]
+async fn given_legal_binary_image_pairs_when_get_records_is_paged_then_logical_sizes_and_exclusive_pages_hold()
+ {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use storage_types::{AttributeMap, AttributeValue, WireItem};
+
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let images = (0..4)
+            .map(|_| {
+                let payload = (0..396_000)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect::<Vec<_>>();
+                [
+                    ("pk".to_owned(), AttributeValue::S("item".to_owned())),
+                    (
+                        "payload".to_owned(),
+                        AttributeValue::B(STANDARD.encode(payload)),
+                    ),
+                ]
+                .into_iter()
+                .collect::<AttributeMap>()
+            })
+            .collect::<Vec<_>>();
+        for view in ["KEYS_ONLY", "NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES"] {
+            let (table, arn) = create_stream_table(&store, view).await;
+            for image in &images {
+                store
+                    .operations
+                    .put_item(PutItemRequest::new(
+                        table.clone(),
+                        WireItem::try_from(image).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            store.wait_until_changes_are_readable().await;
+            let shard = find_populated_shard(&store, &arn).await;
+            let mut token = iterator(&store, &arn, &shard, "TRIM_HORIZON", None).await;
+            let mut sequences = BTreeSet::new();
+            let mut ordinal = 0;
+            while ordinal < images.len() {
+                let page = read_published_records(
+                    &store,
+                    GetRecordsRequest {
+                        shard_iterator: token,
+                        limit: None,
+                    },
+                    1,
+                )
+                .await;
+                // Native byte pages may stop before the public logical data
+                // budget.
+                if view == "NEW_AND_OLD_IMAGES" {
+                    assert_eq!(page.records.len(), 1);
+                }
+                assert!(
+                    page.records
+                        .iter()
+                        .map(|record| record.dynamodb.size_bytes)
+                        .sum::<u64>()
+                        <= 1024 * 1024
+                );
+                for record in page.records {
+                    assert!(sequences.insert(record.dynamodb.sequence_number.clone()));
+                    assert_eq!(
+                        record.event_name,
+                        if ordinal == 0 { "INSERT" } else { "MODIFY" }
+                    );
+                    let expected_old = (ordinal > 0
+                        && matches!(view, "OLD_IMAGE" | "NEW_AND_OLD_IMAGES"))
+                    .then(|| &images[ordinal - 1]);
+                    let expected_new = matches!(view, "NEW_IMAGE" | "NEW_AND_OLD_IMAGES")
+                        .then(|| &images[ordinal]);
+                    assert_eq!(record.dynamodb.old_image.as_ref(), expected_old);
+                    assert_eq!(record.dynamodb.new_image.as_ref(), expected_new);
+                    // pk name + "item" = 6; each image adds payload name +
+                    // 396,000 raw bytes.
+                    let expected_bytes = 6
+                        + (396_013
+                            * (u64::from(expected_old.is_some())
+                                + u64::from(expected_new.is_some())));
+                    assert_eq!(record.dynamodb.size_bytes, expected_bytes);
+                    ordinal += 1;
+                }
+                token = page.next_shard_iterator.unwrap();
+            }
+            assert_eq!(ordinal, images.len());
+            let end = store
+                .operations
+                .get_records(GetRecordsRequest {
+                    shard_iterator: token,
+                    limit: None,
+                })
+                .await
+                .unwrap();
+            assert!(end.records.is_empty());
+        }
+    })
+    .catch_unwind()
+    .await;
+    store.finish().await;
+    if let Err(payload) = outcome {
+        resume_unwind(payload);
+    }
 }

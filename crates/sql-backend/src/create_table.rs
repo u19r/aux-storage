@@ -30,9 +30,12 @@ impl<A: SqlAttempt, L: SqlLayout> CreateTableAttempt for SqlCatalogAttempt<'_, A
         &mut self,
         table: &StoredTableInfo,
         _: Self::LayoutSeed,
+        regional: Option<std::sync::Arc<storage_types::RegionalBinding>>,
     ) -> StorageResult<Option<Self::Identity>> {
         let history_id = TableHistoryId::from(uuid::Uuid::now_v7());
-        let inserted = self.insert_table_layout(table, history_id).await?;
+        let inserted = self
+            .insert_table_layout(table, history_id, regional)
+            .await?;
         Ok(inserted.then_some(history_id))
     }
 
@@ -62,11 +65,13 @@ impl<A: SqlAttempt, L: SqlLayout> CreateTableAttempt for SqlCatalogAttempt<'_, A
         Ok(initial_gsi_incarnation(*identity, index))
     }
 
-    fn register_gsis(
+    async fn register_gsis(
         &mut self,
         _identity: &Self::Identity,
         builds: Vec<GsiBuild<()>>,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        register_gsi_builds(self.attempt, self.engine, builds)
+    ) -> StorageResult<()> {
+        // The shared CreateTable owner registers active builds
+        // (GsiBuild::new_active); insert_layout stored the same phase.
+        register_gsi_builds(self.attempt, self.engine, builds).await
     }
 }

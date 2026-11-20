@@ -20,9 +20,9 @@ impl MockFailure {
     fn error(self) -> StorageError {
         match self {
             Self::NativeIo => StorageError::internal("SQLite native operation failed"),
-            Self::BusyTransaction => StorageEnum::TransactionConflict {
-                message: "SQLite transaction was busy or locked".to_owned(),
-            }
+            Self::BusyTransaction => StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(
+                storage_types::ConflictCause::Logical("SQLite transaction was busy or locked"),
+            ))
             .into(),
         }
     }
@@ -111,10 +111,7 @@ async fn given_batch_get_provider_failure_when_read_sequence_runs_then_trace_omi
 
     assert_eq!(calls, 1);
     observed.assert_database_calls_exact(&[("read_sequence.batch_get_item", 1)]);
-    assert_eq!(
-        observed.result.to_string(),
-        "DynamoDB could not process your request."
-    );
+    assert_eq!(observed.result.class(), storage_types::ErrorClass::Internal);
     observed.assert_only_event_exact(
         Level::WARN,
         &[
@@ -143,8 +140,8 @@ async fn given_query_provider_failure_when_read_sequence_runs_then_trace_omits_i
     assert_eq!(calls, 1);
     observed.assert_database_calls_exact(&[("read_sequence.query_table", 1)]);
     assert_eq!(
-        observed.result.to_string(),
-        "Operation was rejected because there is an ongoing transaction for the item."
+        observed.result.attempt_kind(),
+        Some(storage_types::AttemptKind::Conflict)
     );
     observed.assert_only_event_exact(
         Level::WARN,
@@ -165,10 +162,7 @@ async fn given_provider_io_failure_when_read_sequence_runs_then_metric_and_trace
 
     assert_eq!(calls, 1);
     observed.assert_database_calls_exact(&[("read_sequence.get_item", 1)]);
-    assert_eq!(
-        observed.result.to_string(),
-        "DynamoDB could not process your request."
-    );
+    assert_eq!(observed.result.class(), storage_types::ErrorClass::Internal);
     assert!(
         matches!(observed.result.to_enum(), StorageEnum::InternalServerError { message }
         if message == "SQLite native operation failed")
@@ -191,8 +185,8 @@ async fn given_sqlite_busy_failure_when_read_sequence_runs_then_trace_distinguis
     assert_eq!(calls, 1);
     observed.assert_database_calls_exact(&[("read_sequence.get_item", 1)]);
     assert_eq!(
-        observed.result.to_string(),
-        "Operation was rejected because there is an ongoing transaction for the item."
+        observed.result.attempt_kind(),
+        Some(storage_types::AttemptKind::Conflict)
     );
     observed.assert_only_event_exact(
         Level::WARN,
@@ -221,12 +215,12 @@ async fn given_background_read_failure_when_tasks_run_then_each_observation_has_
     foreground.assert_database_calls_exact(&[("read_sequence.get_item", 1)]);
     background.assert_database_calls_exact(&[("read_sequence.get_item", 1)]);
     assert_eq!(
-        foreground.result.to_string(),
-        "DynamoDB could not process your request."
+        foreground.result.class(),
+        storage_types::ErrorClass::Internal
     );
     assert_eq!(
-        background.result.to_string(),
-        "Operation was rejected because there is an ongoing transaction for the item."
+        background.result.attempt_kind(),
+        Some(storage_types::AttemptKind::Conflict)
     );
     foreground.assert_only_event_exact(
         Level::WARN,

@@ -2,8 +2,6 @@ pub mod dynamodb;
 mod dynamodb_metrics;
 #[cfg(any(test, feature = "internal-test-routes"))]
 pub mod internal;
-#[cfg(any(feature = "queue", feature = "pubsub"))]
-mod messaging_admission;
 pub mod pubsub;
 pub mod queue;
 
@@ -61,11 +59,11 @@ mod update_item_tests;
 #[cfg(test)]
 mod update_table_tests;
 
-#[cfg(test)]
-pub mod routes_tests;
+#[cfg(all(test, feature = "sqlite"))]
+mod update_table_replica_tests;
 
 #[cfg(test)]
-mod dynamodb_stage_tests;
+pub mod routes_tests;
 
 #[cfg(test)]
 mod internal_tests;

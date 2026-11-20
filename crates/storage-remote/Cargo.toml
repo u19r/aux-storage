@@ -9,13 +9,15 @@ license.workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = ["storage-provider/test-support", "storage-types/test-support"]
+
 [dependencies]
 async-trait = { workspace = true }
 aws-sigv4-signing = { workspace = true }
 base64 = { workspace = true }
 bg-job-store = { path = "../bg-job-store" }
 bytes = { workspace = true }
-futures-util = { workspace = true }
 http = { workspace = true }
 http-request = { workspace = true }
 httpdate = { workspace = true }
@@ -25,11 +27,9 @@ rand = { workspace = true }
 scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-sha2 = { workspace = true }
 storage-common = { path = "../storage-common" }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types" }
-stream = { path = "../stream", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -38,6 +38,8 @@ alloc-counter = { workspace = true }
 httpmock = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 storage-observability-test-support = { path = "../storage-observability-test-support" }
+storage-provider = { path = "../storage-provider", features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "test-util"] }
 uuid = { workspace = true }
 

@@ -51,17 +51,6 @@ impl<T> Observation<T> {
         Self::assert_event_exact(&self.events[0], level, expected);
     }
 
-    pub fn assert_only_warning_or_error_exact(&self, level: Level, expected: &[(&str, &str)]) {
-        assert!(matches!(level, Level::WARN | Level::ERROR));
-        let failures: Vec<_> = self
-            .events
-            .iter()
-            .filter(|event| matches!(event.level, Level::WARN | Level::ERROR))
-            .collect();
-        assert_eq!(failures.len(), 1, "captured events: {:?}", self.events);
-        Self::assert_event_exact(failures[0], level, expected);
-    }
-
     fn assert_event_exact(event: &TraceRecord, level: Level, expected: &[(&str, &str)]) {
         let actual_fields: BTreeMap<_, _> = event
             .fields

@@ -61,9 +61,15 @@ impl MantissaDigits {
         exponent: i64,
     ) -> Result<ParsedDynamodbNumber, DynamodbNumberError> {
         if self.significant == 0 {
+            // A zero keeps its written exponent so a range check can refuse
+            // one past the supported magnitudes.
             return Ok(ParsedDynamodbNumber {
                 negative: false,
-                adjusted_exponent: 0,
+                adjusted_exponent: i32::try_from(exponent).unwrap_or(if exponent > 0 {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }),
                 digits: self.digits,
                 is_zero: true,
             });
@@ -78,7 +84,11 @@ impl MantissaDigits {
             .and_then(|value| value.checked_add(self.trailing_zeroes))
             .and_then(|value| value.checked_sub(1))
             .and_then(|value| i32::try_from(value).ok())
-            .ok_or(DynamodbNumberError::AdjustedExponentOutOfRange)?;
+            .ok_or(if exponent > 0 {
+                DynamodbNumberError::Overflow
+            } else {
+                DynamodbNumberError::Underflow
+            })?;
         Ok(ParsedDynamodbNumber {
             negative,
             adjusted_exponent: adjusted,

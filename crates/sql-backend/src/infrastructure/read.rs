@@ -60,7 +60,7 @@ pub(super) async fn load_records<A: SqlAttempt>(
     let mut records = Vec::new();
     records
         .try_reserve_exact(keys.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for chunk in keys.chunks(INFRASTRUCTURE_POINT_LOAD_KEYS) {
         // SQL rows include current keys; their logical bytes are already
         // reserved.
@@ -90,7 +90,7 @@ fn decode_load_page(
     let mut records = Vec::new();
     records
         .try_reserve_exact(keys.len())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     records.resize_with(keys.len(), || None);
     for row in page.rows {
         let record = codec::decode_record(row)?;
@@ -98,9 +98,10 @@ fn decode_load_page(
         let bytes = record.bytes.len();
         let count = try_place_value(keys, &mut records, |key, record| key == &record.key, record)
             .map_err(|error| match error.as_ref() {
-            storage_types::StorageEnum::InfrastructureResult(
-                InfrastructureResultKind::NativeCapacityRejected,
-            ) => error,
+            storage_types::StorageEnum::Attempt(storage_types::AttemptFailure::Capacity {
+                kind: storage_types::CapacityKind::NativeLimit,
+                ..
+            }) => error,
             _ => invalid_result(),
         })?;
         let bytes = bytes.checked_mul(count).ok_or_else(invalid_result)?;

@@ -35,7 +35,7 @@ pub(crate) fn derive_wire_attribute_decode_impl(input: TokenStream) -> TokenStre
     } else {
         quote! {
             raw.parse::<Self>()
-                .map_err(|err| storage::types::StorageError::internal(&format!("invalid {field} field: {err}")))
+                .map_err(|_| storage::types::StorageError::internal(&format!("invalid {field} field")))
         }
     };
 

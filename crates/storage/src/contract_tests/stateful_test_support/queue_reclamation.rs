@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use queue_provider::{MessageId, Queue, QueueMessage, ReceiptHandle};
+use queue_provider::{MESSAGE_ID_LEN, MessageId, Queue, QueueMessage, ReceiptHandle};
 use storage_types::{DurationSeconds, StorageError, StorageResult, TimestampMillis};
 
 use super::{StatefulTestBackend, models::QueueReclamationFixtureTarget};
@@ -13,7 +13,8 @@ impl StatefulTestBackend {
             .database
             .as_ref()
             .expect("fixture database is open")
-            .initialization_queue_provider()
+            .messaging_store(crate::messaging::MessagingLane::Caller)
+            .map(|store| store.queue)
             .ok_or_else(|| StorageError::unsupported("queue provider was not selected"))?;
         let queue = provider
             .create_queue(Queue {
@@ -21,10 +22,11 @@ impl StatefulTestBackend {
                 queue_url: format!("https://queue.example.test/000000000000/{queue_name}"),
                 attributes: HashMap::new(),
                 created_at: TimestampMillis::now(),
+                ..Default::default()
             })
             .await
             .map_err(|error| StorageError::internal(&error.to_string()))?;
-        let message_id = MessageId::from_bytes([7; 12]);
+        let message_id = MessageId::from_bytes([7; MESSAGE_ID_LEN]);
         provider
             .send_message(queue_message(&queue.queue_url, message_id, FIRST_BODY))
             .await
@@ -33,10 +35,11 @@ impl StatefulTestBackend {
             .receive_messages(
                 &queue.queue_url,
                 1,
-                DurationSeconds::from(30),
-                DurationSeconds::from(0),
+                Some(DurationSeconds::from(30)),
+                Some(DurationSeconds::from(0)),
             )
             .await
+            .map(|received| received.messages)
             .map_err(|error| StorageError::internal(&error.to_string()))?;
         let message = received
             .into_iter()
@@ -81,7 +84,8 @@ impl StatefulTestBackend {
         self.database
             .as_ref()
             .expect("fixture database is open")
-            .initialization_queue_provider()
+            .messaging_store(crate::messaging::MessagingLane::Caller)
+            .map(|store| store.queue)
             .ok_or_else(|| StorageError::unsupported("queue provider was not selected"))?
             .send_message(queue_message(&queue_url, message_id, body))
             .await
@@ -110,15 +114,17 @@ impl StatefulTestBackend {
             .database
             .as_ref()
             .expect("fixture database is open")
-            .initialization_queue_provider()
+            .messaging_store(crate::messaging::MessagingLane::Caller)
+            .map(|store| store.queue)
             .ok_or_else(|| StorageError::unsupported("queue provider was not selected"))?
             .receive_messages(
                 &queue_url,
                 1,
-                DurationSeconds::from(30),
-                DurationSeconds::from(0),
+                Some(DurationSeconds::from(30)),
+                Some(DurationSeconds::from(0)),
             )
             .await
+            .map(|received| received.messages)
             .map_err(|error| StorageError::internal(&error.to_string()))?;
         Ok(received.pop().map(|message| message.body))
     }
@@ -135,5 +141,6 @@ fn queue_message(queue_url: &str, message_id: MessageId, body: &str) -> QueueMes
         receipt_handle: None,
         created_at: now,
         visibility_timestamp: Some(now),
+        ..Default::default()
     }
 }

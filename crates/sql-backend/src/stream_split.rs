@@ -14,6 +14,7 @@ use crate::{
 pub(crate) async fn read_split_state<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
+    parent: &storage_types::SystemStreamLineageId,
     operation_id: &SystemStreamSplitOperationId,
 ) -> StorageResult<(SystemStreamHistory, Option<SystemStreamSplitReceipt>)> {
     let receipt = SqlStatement::new(
@@ -29,7 +30,7 @@ pub(crate) async fn read_split_state<A: SqlAttempt>(
         .query_batch_protected(
             vec![
                 (
-                    history_statement(engine, crate::stream_history::HistoryRead::Reader),
+                    history_statement(engine, crate::stream_history::HistoryRead::Split(parent)),
                     ReadProtection::Snapshot,
                 ),
                 (receipt, ReadProtection::Snapshot),
@@ -57,51 +58,46 @@ pub(crate) async fn read_split_state<A: SqlAttempt>(
 pub(crate) async fn write_split<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
-    receipt: &SystemStreamSplitReceipt,
+    plan: &stream_provider::SystemStreamSplitPlan,
 ) -> StorageResult<()> {
+    let stream_provider::SystemStreamSplitPlan::KnownEnd(receipt) = plan else {
+        return Err(unavailable());
+    };
     let split = &receipt.split;
     let scope = split.source_scope();
     let parent = split.sealed_parent();
     let generation = i64::try_from(scope.generation()).map_err(|_| unavailable())?;
     let sealed_after = i64::try_from(receipt.sealed_after_offset).map_err(|_| unavailable())?;
-    if engine.engine() == SqlEngine::Postgres {
-        attempt
-            .execute(SqlStatement::new(
-                crate::sql_template::sql_template!(
-                    engine,
-                    "UPDATE "["sys_system_stream_sequences"],
-                    " SET next_offset = $1 WHERE scope_key = 'system' AND shard_id = $2"
-                ),
-                vec![
-                    SqlValue::Integer(sealed_after),
-                    SqlValue::Text(parent.shard_id().as_str().to_owned()),
-                ],
-            ))
-            .await?;
+    let mut parent_check = String::new();
+    let mut parent_params = vec![
+        SqlValue::Integer(sealed_after),
+        SqlValue::Text(parent.shard_id().as_str().to_owned()),
+        SqlValue::Text(parent.lineage_id().as_str().to_owned()),
+    ];
+    if engine.engine() != SqlEngine::Postgres {
+        parent_check = format!(
+            " AND EXISTS (SELECT 1 FROM {} WHERE scope_key = 'system' AND shard_id = {} AND \
+             next_offset = {})",
+            engine.relation_name("sys_system_stream_sequences"),
+            engine.engine().placeholder(4),
+            engine.engine().placeholder(5),
+        );
+        parent_params.extend([
+            SqlValue::Text(parent.shard_id().as_str().to_owned()),
+            SqlValue::Integer(sealed_after),
+        ]);
     }
     let mut writes = vec![SqlStatement::new(
         format!(
-            "UPDATE {relation_sys_system_stream_lineage} SET sealed = TRUE, sealed_after_offset = \
-             {} WHERE scope_key = 'system' AND shard_id = {} AND lineage_id = {} AND sealed = \
-             FALSE AND sealed_after_offset IS NULL AND EXISTS (SELECT 1 FROM \
-             {relation_sys_system_stream_sequences} WHERE scope_key = 'system' AND shard_id = {} \
-             AND next_offset = {})",
+            "UPDATE {} SET sealed = TRUE, sealed_after_offset = {} WHERE scope_key = 'system' AND \
+             shard_id = {} AND lineage_id = {} AND sealed = FALSE AND sealed_after_offset IS \
+             NULL{parent_check}",
+            engine.relation_name("sys_system_stream_lineage"),
             engine.engine().placeholder(1),
             engine.engine().placeholder(2),
             engine.engine().placeholder(3),
-            engine.engine().placeholder(4),
-            engine.engine().placeholder(5),
-            relation_sys_system_stream_lineage = engine.relation_name("sys_system_stream_lineage"),
-            relation_sys_system_stream_sequences =
-                engine.relation_name("sys_system_stream_sequences"),
         ),
-        vec![
-            SqlValue::Integer(sealed_after),
-            SqlValue::Text(parent.shard_id().as_str().to_owned()),
-            SqlValue::Text(parent.lineage_id().as_str().to_owned()),
-            SqlValue::Text(parent.shard_id().as_str().to_owned()),
-            SqlValue::Integer(sealed_after),
-        ],
+        parent_params,
     )];
     for child in split.children() {
         let lineage = child.lineage();
@@ -125,6 +121,9 @@ pub(crate) async fn write_split<A: SqlAttempt>(
                 SqlValue::Integer(initial),
             ],
         ));
+        if engine.engine() == SqlEngine::Postgres {
+            continue;
+        }
         writes.push(SqlStatement::new(
             format!(
                 "INSERT INTO {relation_sys_system_stream_sequences} (scope_key, shard_id, \
@@ -154,9 +153,9 @@ pub(crate) async fn write_split<A: SqlAttempt>(
         ],
     ));
     // Publish a topology change without changing the scope incarnation.
-    // The split's data-table fence drains prior writers before the tail read.
-    // Later writers observe the new route after acquiring their compatible
-    // fence.
+    // The exclusive scope-table lock drains prior writers before the parent
+    // tail read. Later writers observe the new route after acquiring their
+    // compatible lock.
     writes.push(SqlStatement::new(
         format!(
             "UPDATE {relation_sys_system_stream_scope} SET scope_id = scope_id WHERE scope_key = \

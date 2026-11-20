@@ -1,7 +1,7 @@
 use storage_types::{
-    KeyAttributes, StorageEnum, StorageError, StorageResult, TableName, TransactEncodeItem,
+    KeyAttributes, StorageError, StorageResult, TableName, TransactEncodeItem,
     TransactEncodePutRequest, TransactUpdateRequest, TransactWriteItemsEncodeRequest,
-    TryIntoWireItem, context::WrappedError as _, single_table_entity::SingleTableEntity,
+    TryIntoWireItem, single_table_entity::SingleTableEntity,
 };
 
 use super::{
@@ -143,7 +143,7 @@ impl CappedEntityCreateOutcome {
     }
 
     fn has_other_condition_failure(&self, error: &StorageError) -> bool {
-        let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+        let Some(reasons) = error.cancellation_reasons() else {
             return false;
         };
         (0..reasons.len()).any(|index| {
@@ -157,7 +157,7 @@ impl CappedEntityCreateOutcome {
 fn prepare_entity_create<T>(table: &TableName, item: &T) -> StorageResult<TransactEncodeItem>
 where T: SingleTableEntity + TryIntoWireItem {
     let item = storage_types::single_table_entity::to_wire_entity(item)
-        .map_err(|error| StorageError::internal(&error.to_string()))?;
+        .map_err(|_| StorageError::internal("entity wire encode failed"))?;
     Ok(TransactEncodeItem {
         put: Some(TransactEncodePutRequest {
             table_name: table.clone(),

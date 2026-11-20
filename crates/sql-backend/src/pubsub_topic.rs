@@ -3,7 +3,7 @@
 use std::num::NonZeroU32;
 
 use pubsub_provider::{TopicArn, TopicIncarnation, TopicPage, TopicRecord};
-use storage_types::{ReadProtection, StorageEnum, StorageError, StorageResult, storage_serde};
+use storage_types::{MissExpectation, ReadProtection, StorageError, StorageResult, storage_serde};
 
 use crate::{
     SqlAttempt, SqlLayout, SqlRow, SqlStatement, SqlValue, constants::PUBSUB_CATALOG_READ_BYTES,
@@ -31,11 +31,11 @@ pub(crate) async fn read_topics<A: SqlAttempt>(
     engine: impl SqlLayout,
     protection: ReadProtection,
     arns: Vec<TopicArn>,
-) -> StorageResult<Vec<Option<TopicRecord>>> {
+) -> StorageResult<storage_types::Exact<Option<TopicRecord>>> {
     let statements = arns
         .iter()
         .map(|arn| {
-            SqlStatement::new(
+            let statement = SqlStatement::new(
                 format!(
                     "SELECT topic_arn, incarnation, row_blob FROM {relation_sys_pubsub_topics} \
                      WHERE topic_arn = {}",
@@ -43,34 +43,28 @@ pub(crate) async fn read_topics<A: SqlAttempt>(
                     relation_sys_pubsub_topics = engine.relation_name("sys_pubsub_topics"),
                 ),
                 vec![SqlValue::Text(arn.to_string())],
-            )
+            );
+            (statement, protection)
         })
         .collect();
     let pages = native
-        .query_batch(statements, protection, PUBSUB_CATALOG_READ_BYTES)
+        .query_batch_protected_exact(statements, PUBSUB_CATALOG_READ_BYTES)
         .await?;
-    if pages.len() != arns.len() {
-        return Err(StorageError::internal("SQL topic batch count differs"));
-    }
-    pages
-        .into_iter()
-        .zip(arns)
-        .map(|(page, arn)| {
-            if page.more || page.rows.len() > 1 {
-                return Err(StorageError::internal(
-                    "SQL topic lookup returned multiple rows",
-                ));
-            }
-            let record = page.rows.into_iter().next().map(decode_row).transpose()?;
-            if record
-                .as_ref()
-                .is_some_and(|record| record.topic.topic_arn != arn)
-            {
-                return Err(StorageError::internal("SQL topic batch identity differs"));
-            }
-            Ok(record)
-        })
-        .collect()
+    pages.try_zip_map(arns, |arn, page| {
+        if page.more || page.rows.len() > 1 {
+            return Err(StorageError::internal(
+                "SQL topic lookup returned multiple rows",
+            ));
+        }
+        let record = page.rows.into_iter().next().map(decode_row).transpose()?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.topic.topic_arn != arn)
+        {
+            return Err(StorageError::internal("SQL topic batch identity differs"));
+        }
+        Ok(record)
+    })
 }
 
 pub(crate) async fn write_topic<A: SqlAttempt>(
@@ -190,9 +184,12 @@ fn expect_one(changed: u64) -> StorageResult<()> {
     if changed == 1 {
         Ok(())
     } else {
-        Err(StorageEnum::TransactionConflict {
-            message: "SQL topic changed during write".to_owned(),
-        }
-        .into())
+        Err(StorageError::write_miss(
+            "pubsub_topic",
+            MissExpectation::Rows {
+                expected: 1,
+                found: changed,
+            },
+        ))
     }
 }

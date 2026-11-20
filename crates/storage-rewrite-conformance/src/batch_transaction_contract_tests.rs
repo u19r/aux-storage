@@ -196,9 +196,9 @@ async fn given_mixed_transact_verbs_when_check_moves_then_identity_and_rollback_
                     anyhow::bail!("expected ordered transaction cancellation, got {error:?}");
                 };
                 anyhow::ensure!(
-                    reasons
-                        .get(failed_ordinal)
-                        .is_some_and(|reason| reason.contains("ConditionalCheckFailed")),
+                    reasons.get(failed_ordinal).is_some_and(
+                        storage_types::CancellationReason::is_conditional_check_failed
+                    ),
                     "missing cancellation reason at ordinal {failed_ordinal}: {reasons:?}"
                 );
                 Ok::<(), anyhow::Error>(())
@@ -857,7 +857,7 @@ async fn given_batch_with_missing_table_when_run_then_fails_and_existing_preserv
             .err()
             .ok_or_else(|| anyhow::anyhow!("batch with missing table unexpectedly succeeded"))?;
         anyhow::ensure!(
-            !error.is_retryable_write(),
+            !error.class().is_retryable(),
             "missing-table batch failure must not be classified retryable"
         );
         let kept = fixture

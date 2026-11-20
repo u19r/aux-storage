@@ -1,4 +1,4 @@
-use std::{hint::black_box, time::Instant};
+use std::hint::black_box;
 
 use alloc_counter::AllocationGuard;
 use storage_types::TimestampMillis;
@@ -89,34 +89,5 @@ fn given_duplicate_receipt_entropies_when_validating_then_the_existing_error_is_
     assert_eq!(
         input.aws_query_message(),
         "receive message receipt-handle entropy supply contains duplicates"
-    );
-}
-
-#[test]
-#[ignore = "manual CPU probe; run with --ignored --nocapture"]
-fn receive_entropy_validation_cpu_probe() {
-    let entropy = unique_entropy();
-    let legacy_started = Instant::now();
-    let mut legacy_checksum = false;
-    for _ in 0..100_000 {
-        legacy_checksum ^= legacy_hash_set_validation(&entropy);
-    }
-    let legacy_elapsed = legacy_started.elapsed();
-
-    let candidate_started = Instant::now();
-    let mut candidate_checksum = false;
-    for _ in 0..100_000 {
-        candidate_checksum ^= entropy
-            .iter()
-            .enumerate()
-            .all(|(index, value)| !entropy[..index].iter().any(|previous| previous == value));
-    }
-    let candidate_elapsed = candidate_started.elapsed();
-    println!(
-        "hash_set elapsed_ns={} bounded_linear_scan elapsed_ns={} reduction_pct={:.2} \
-         checksum={legacy_checksum}/{candidate_checksum}",
-        legacy_elapsed.as_nanos(),
-        candidate_elapsed.as_nanos(),
-        (1.0 - candidate_elapsed.as_nanos() as f64 / legacy_elapsed.as_nanos() as f64) * 100.0,
     );
 }

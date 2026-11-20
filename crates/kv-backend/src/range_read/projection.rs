@@ -6,12 +6,12 @@ use storage_types::{BoundTableInfo, ItemKey, LogicalItemSize, StorageResult};
 use super::decode::{decode_range_entry, range_evidence};
 use crate::item_read::HydratedPrimaryItem;
 
-pub(super) enum RangeContent {
+pub(crate) enum RangeContent {
     Primary(Box<HydratedPrimaryItem>),
     Projection(Box<crate::gsi::DecodedProjection>),
 }
 
-pub(super) trait RangeProjection {
+pub(crate) trait RangeProjection {
     type Item: Send;
 
     fn decode(
@@ -22,7 +22,7 @@ pub(super) trait RangeProjection {
     ) -> StorageResult<(Self::Item, ItemKey, LogicalItemSize)>;
 }
 
-pub(super) struct PublicImage;
+pub(crate) struct PublicImage;
 
 impl RangeProjection for PublicImage {
     type Item = RangeReadItem;
@@ -65,7 +65,6 @@ impl RangeProjection for PrimaryState {
         let (key, size) = range_evidence(table, bound, physical, &stored.item)?;
         let observation = ItemWriteObservation::Live {
             stored: Box::new(stored),
-            revision: primary.revision,
             provenance: primary.provenance,
             ttl_epoch: primary.ttl_epoch,
         };
@@ -93,12 +92,11 @@ impl RangeProjection for GsiState {
                 "GSI state lacks hydrated content",
             ));
         };
-        let crate::gsi::DecodedProjection { image, revision } = *projection;
+        let crate::gsi::DecodedProjection { image } = *projection;
         let (key, size) = range_evidence(table, bound, physical, &image)?;
         let row = storage_provider::GsiProjectionRow {
             key: key.clone(),
             image,
-            revision,
         };
         Ok((row, key, size))
     }

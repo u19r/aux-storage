@@ -1,37 +1,24 @@
 //! Physical task admission and progress inside one Sql catalog attempt.
 
-use serde::{Serialize, de::DeserializeOwned};
-use storage_provider::maintenance::MaintenancePort;
+use serde::de::DeserializeOwned;
+use storage_provider::maintenance::{MaintenancePort, ProgressWrite};
 use storage_types::{
-    Revision, StorageResult,
+    StorageResult,
     maintenance::{MaintenanceKind, TargetIncarnation, TaskProgress},
 };
 
-use super::{read_admission, write_progress};
+use super::{read_admission, store_progress};
 use crate::{SqlAttempt, SqlLayout, catalog::SqlCatalogAttempt};
 
 impl<A: SqlAttempt, L: SqlLayout> MaintenancePort for SqlCatalogAttempt<'_, A, L> {
-    type ProgressFence = ();
-
-    async fn load_task_admission<P: DeserializeOwned + Send>(
+    async fn load_task_record<P: DeserializeOwned + Send>(
         &mut self,
         kind: MaintenanceKind,
-    ) -> StorageResult<(
-        TargetIncarnation,
-        Option<TaskProgress<P>>,
-        Self::ProgressFence,
-    )> {
-        let (identity, progress) = read_admission(self.attempt, self.engine, kind).await?;
-        Ok((identity, progress, ()))
+    ) -> StorageResult<(TargetIncarnation, Option<TaskProgress<P>>)> {
+        read_admission(self.attempt, self.engine, kind).await
     }
 
-    async fn store_task_progress<P: Serialize + Send>(
-        &mut self,
-        kind: MaintenanceKind,
-        _: &Self::ProgressFence,
-        expected: Option<Revision>,
-        next: TaskProgress<P>,
-    ) -> StorageResult<()> {
-        write_progress(self.attempt, self.engine, kind, expected, next).await
+    async fn store_task_progress_write(&mut self, write: ProgressWrite) -> StorageResult<()> {
+        store_progress(self.attempt, self.engine, write).await
     }
 }

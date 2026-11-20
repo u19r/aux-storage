@@ -77,15 +77,5 @@ fn patch_schema_json(root: &mut Value) {
         {
             field.insert("default".to_string(), Value::Null);
         }
-
-        // 2) Cap jitter_percent maximum to 100.
-        if let Some(jobs) = defs.get_mut("Jobs").and_then(|v| v.as_object_mut())
-            && let Some(props) = jobs.get_mut("properties").and_then(|v| v.as_object_mut())
-            && let Some(jitter) = props
-                .get_mut("jitter_percent")
-                .and_then(|v| v.as_object_mut())
-        {
-            jitter.insert("maximum".to_string(), serde_json::json!(100));
-        }
     }
 }

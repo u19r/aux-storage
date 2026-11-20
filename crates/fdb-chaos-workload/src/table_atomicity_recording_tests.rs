@@ -4,9 +4,9 @@ use super::table_atomicity_recording::FailureDisposition;
 
 #[test]
 fn given_known_aborted_native_request_when_classified_then_it_requires_no_side_effects() {
-    let error: StorageError = StorageEnum::TransactionConflict {
-        message: "FoundationDB transaction conflict (code 1078)".into(),
-    }
+    let error: StorageError = StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(
+        storage_types::ConflictCause::Logical("FoundationDB transaction conflict (code 1078)"),
+    ))
     .into();
     assert_eq!(
         FailureDisposition::from(&error),
@@ -16,7 +16,7 @@ fn given_known_aborted_native_request_when_classified_then_it_requires_no_side_e
 
 #[test]
 fn given_lost_commit_acknowledgment_when_classified_then_both_outcomes_stay_possible() {
-    let error = StorageError::sync_submission_ambiguous(None, "lost acknowledgment");
+    let error = StorageError::commit_unknown("lost acknowledgment");
     assert_eq!(
         FailureDisposition::from(&error),
         FailureDisposition::Unknown

@@ -1,11 +1,12 @@
 use std::{
     future::{Future, IntoFuture, poll_fn},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
 
 use axum::{Router, http::HeaderValue};
-use config::{self, StorageApiLaunchConfig, Tracing};
+use config::{self, StorageApiLaunchConfig};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use storage_types::{StorageEnum, StorageError, StorageResult, context::WrappedError as _};
 use tokio::{net::TcpListener, runtime::Builder, signal, sync::oneshot, task::JoinHandle};
@@ -22,7 +23,7 @@ use crate::{
     MetricsEndpointConfig,
     config_watch::spawn as spawn_config_watch,
     constants::{PROMETHEUS_LATENCY_MS_BUCKETS, PROMETHEUS_UPKEEP_INTERVAL},
-    runtime_config::{ensure_backend_matches, resolve_filter, storage_config_from_backends},
+    runtime_config::{require_local_connections, resolve_filter},
 };
 
 async fn await_shutdown_signal(grace: Duration) {
@@ -69,19 +70,38 @@ async fn await_shutdown_signal(grace: Duration) {
 }
 
 pub fn run() -> StorageResult<()> {
-    let launch = StorageApiLaunchConfig::from_args(std::env::args_os())
-        .map_err(|err| StorageError::internal(&format!("Failed to load launch config: {err}")))?;
-    let tracing_cfg: Tracing = launch.effective.tracing.clone();
-    let (filter, source) = resolve_filter(&tracing_cfg);
+    let launch = StorageApiLaunchConfig::from_args(std::env::args_os()).map_err(|_| {
+        StorageError::internal("Failed to load launch config: configuration failed to load")
+    })?;
+    let runtime_features = launch.effective.config.root.features.runtime.clone();
+    require_tokio_console_build(&runtime_features)?;
+    let (filter, source) = resolve_filter(&launch.effective.config.root.features.tracing);
     println!("Using log filter (source: {source}): {filter}");
-    init_tracing(filter).map_err(|err| StorageError::internal(&err.to_string()))?;
+    init_tracing(filter, runtime_features.tokio_console)
+        .map_err(|err| StorageError::internal(&err.to_string()))?;
 
     let runtime = Builder::new_multi_thread()
-        .worker_threads(runtime_worker_threads())
+        .worker_threads(runtime_worker_threads(runtime_features.worker_threads))
         .enable_all()
         .build()
         .map_err(|err| StorageError::internal(&format!("tokio runtime: {err}")))?;
     runtime.block_on(async_main(launch))
+}
+
+pub(crate) fn require_tokio_console_build(runtime: &config::RuntimeFeatures) -> StorageResult<()> {
+    if runtime.tokio_console && !cfg!(feature = "tokio-console") {
+        return Err(StorageError::validation(
+            "features.runtime.tokio_console requires the tokio-console build feature",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_worker_threads(configured: Option<NonZeroUsize>) -> usize {
+    configured.map_or_else(
+        || std::thread::available_parallelism().map_or(1, usize::from),
+        NonZeroUsize::get,
+    )
 }
 
 async fn async_main(launch: StorageApiLaunchConfig) -> StorageResult<()> {
@@ -102,14 +122,6 @@ async fn async_main(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     Ok(())
 }
 
-fn runtime_worker_threads() -> usize {
-    std::env::var("STORAGE_API_WORKER_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
-}
-
 async fn run_service(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     let effective = launch.effective;
     if effective.enable_internal_helper_routes && !cfg!(feature = "internal-test-routes") {
@@ -118,26 +130,27 @@ async fn run_service(launch: StorageApiLaunchConfig) -> StorageResult<()> {
         ));
     }
     let config_arc = effective.config.clone();
+    let root = &config_arc.root;
 
     let config_manager = Some(Arc::new(config::runtime::SharedConfigManager::new(
         config_arc.clone(),
-    )) as Arc<dyn config::runtime::MutableConfigManager>);
+    )));
 
     println!("Starting DynamoDB Server Impersonation...");
     println!("Resolving storage backend configuration...");
 
-    let metrics_config = metrics_endpoint_config(&effective.metrics)
+    let metrics_config = metrics_endpoint_config(&root.features.metrics)
         .map_err(|err| StorageError::internal(&format!("failed to initialize metrics: {err}")))?;
     spawn_prometheus_upkeep(&metrics_config);
 
-    ensure_backend_matches(&effective.backends)?;
-    let storage_config = storage_config_from_backends(&effective.backends)?;
-    let effective_backend = storage_config.backend_type.clone();
-
-    println!("Storage backend: {effective_backend:?}");
+    let storage_runtime = storage::startup::RuntimeConfig::from_file(root)?;
+    require_local_connections(&storage_runtime.registry)?;
+    if let Some(backend) = storage_runtime.default_backend() {
+        println!("Storage backend: {backend:?}");
+    }
     println!("Initializing storage backend...");
 
-    let _config_reload_guard = if effective.enable_background_workers {
+    let _config_reload_guard = if root.features.runtime.enable_background_workers {
         if let (Some(path), Some(config_manager)) =
             (effective.config_watch_path.clone(), config_manager.clone())
         {
@@ -155,29 +168,10 @@ async fn run_service(launch: StorageApiLaunchConfig) -> StorageResult<()> {
         None
     };
 
-    tracing::info!(
-        target: "config",
-        roles = ?effective.root.roles,
-        "Loaded configuration"
-    );
-    let cors_layer = cors_layer(&effective.cors);
-    let database_job_intervals = storage::common::DatabaseJobIntervals {
-        gsi_backfill_interval_ms: storage::common::JobIntervalMillis(
-            effective.root.jobs.gsi_backfill_interval_ms,
-        ),
-        ..Default::default()
-    };
+    tracing::info!(target: "config", "Loaded configuration");
+    let cors_layer = cors_layer(&root.http.cors);
 
-    let db_manager = Arc::new(
-        storage::startup::database_manager_from_features(
-            &effective.root.features,
-            storage::DatabaseManagerRuntimeOptions::builder()
-                .enable_database_jobs(effective.enable_background_workers)
-                .database_job_intervals(database_job_intervals)
-                .build(),
-        )
-        .await?,
-    );
+    let db_manager = Arc::new(storage_runtime.open().await?);
     println!("Storage backend initialized.");
     let result = super::service_host::serve(
         Arc::clone(&db_manager),
@@ -260,9 +254,9 @@ where
     result
 }
 
-fn init_tracing(filter: EnvFilter) -> Result<(), TryInitError> {
+fn init_tracing(filter: EnvFilter, tokio_console: bool) -> Result<(), TryInitError> {
     #[cfg(feature = "tokio-console")]
-    if tokio_console_enabled() {
+    if tokio_console {
         tracing_subscriber::registry()
             .with(
                 console_subscriber::ConsoleLayer::builder()
@@ -285,6 +279,8 @@ fn init_tracing(filter: EnvFilter) -> Result<(), TryInitError> {
         );
         return Ok(());
     }
+    #[cfg(not(feature = "tokio-console"))]
+    let _ = tokio_console;
 
     tracing_subscriber::registry()
         .with(filter)
@@ -297,13 +293,6 @@ fn init_tracing(filter: EnvFilter) -> Result<(), TryInitError> {
                 .with_writer(std::io::stdout),
         )
         .try_init()
-}
-
-#[cfg(feature = "tokio-console")]
-fn tokio_console_enabled() -> bool {
-    std::env::var("STORAGE_API_TOKIO_CONSOLE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
 }
 
 fn metrics_endpoint_config(

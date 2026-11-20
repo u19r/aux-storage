@@ -49,13 +49,18 @@ impl RocksDb {
         path: &Path,
         probe: Option<Arc<dyn KvFaultProbe>>,
     ) -> HarnessResult<KvStore<RocksDbBackend>> {
-        let backend = RocksDbBackend::initialize(path.to_owned())?;
+        let backend = RocksDbBackend::initialize(
+            path.to_owned(),
+            storage_types::AttemptDeadlines::default(),
+            256,
+        )?;
         let backend = if let Some(probe) = probe {
             backend.with_fault_probe(probe)
         } else {
             backend
         };
-        let store = KvStore::initialize_format(backend).await?;
+        let store =
+            KvStore::initialize_format(backend, storage_types::InitialStreamLineages::ONE).await?;
         store.initialize_records(fixture::limits()?).await?;
         Ok(store)
     }

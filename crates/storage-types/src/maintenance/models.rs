@@ -8,7 +8,7 @@ use crate::{Revision, constants::MAX_TARGET_INCARNATION_BYTES};
 
 /// Opaque identity for one concrete table, index, stream or partition family.
 /// Reusing a display name requires a new value.
-#[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize)]
 pub struct TargetIncarnation(Vec<u8>);
 
 impl TryFrom<Vec<u8>> for TargetIncarnation {

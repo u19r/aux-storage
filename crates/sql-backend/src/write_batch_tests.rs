@@ -6,7 +6,6 @@ fn shape(engine: SqlEngine) -> UpsertShape {
         vec!["pk".to_owned(), "sk".to_owned(), "value".to_owned()],
         vec![false, engine == SqlEngine::Postgres, false],
         vec!["pk".to_owned(), "sk".to_owned()],
-        true,
     )
     .unwrap()
 }

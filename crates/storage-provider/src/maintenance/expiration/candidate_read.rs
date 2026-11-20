@@ -7,9 +7,9 @@ use super::{
     ExpirationCandidateBatch, ExpirationCandidateObservation, ExpirationCurrentObservation,
     ExpirationCurrentRead, ExpirationObservedItem,
 };
-use crate::GetItemAttempt;
+use crate::ItemReadAttempt;
 
-pub async fn read_expiration_candidates_in_attempt<A: GetItemAttempt>(
+pub async fn read_expiration_candidates_in_attempt<A: ItemReadAttempt>(
     attempt: &mut A,
     table: &BoundTableInfo,
     read: &ExpirationCurrentRead,
@@ -29,7 +29,7 @@ pub async fn read_expiration_candidates_in_attempt<A: GetItemAttempt>(
     })
 }
 
-pub async fn read_expiration_candidate_items_in_attempt<A: GetItemAttempt>(
+pub async fn read_expiration_candidate_items_in_attempt<A: ItemReadAttempt>(
     attempt: &mut A,
     table: &BoundTableInfo,
     batch: &ExpirationCandidateBatch,
@@ -40,11 +40,6 @@ pub async fn read_expiration_candidate_items_in_attempt<A: GetItemAttempt>(
         .map(|candidate| (table, &candidate.key))
         .collect::<Vec<_>>();
     let items = attempt.read_primary_pairs(&pairs).await?;
-    if items.len() != pairs.len() {
-        return Err(StorageError::internal(
-            "expiration candidate read count changed",
-        ));
-    }
     let present = items
         .into_iter()
         .enumerate()

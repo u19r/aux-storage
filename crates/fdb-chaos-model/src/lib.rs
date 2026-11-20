@@ -25,7 +25,7 @@ pub use gsi::{GsiEntry, GsiIndexModel};
 pub use history::{HistoryEvent, OperationHistory, OperationKind, OperationOutcome};
 pub use pubsub::{
     PublishAttempt, PublishAuditPhase, PublishDeliveryAudit, PublishIntentAudit, PublishOutcome,
-    check_publish_attempts, check_publish_progress,
+    QueueCopyAudit, check_publish_attempts, check_publish_progress, check_terminal_effects,
 };
 pub use shared_key::{
     SharedKeyAudit, SharedKeyCheckReport, SharedKeyRead, check_shared_key_audits,

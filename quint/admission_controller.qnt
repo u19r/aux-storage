@@ -11,6 +11,8 @@ module admission_controller {
     enabled: bool,
     minimum: int,
     maximum: int,
+    // Starting (bootstrap) limit that recovery climbs back to.
+    start: int,
   }
 
   type ControllerState = {
@@ -52,6 +54,9 @@ module admission_controller {
 
   pure def probeLimit(config, desiredLimit) =
     minInt(config.maximum, desiredLimit + maxInt(1, ((desiredLimit * 5) + 99) / 100))
+
+  pure def recoveryLimit(config, desiredLimit) =
+    minInt(config.start, maxInt(desiredLimit + 1, desiredLimit * 2))
 
   pure def normalBackoff(config, state) =
     state
@@ -156,27 +161,20 @@ module admission_controller {
           .with("emergencyClearWindows", emergencyClearWindows)
           .with("state", if (emergencyClearWindows >= 3) "recovering" else "emergency")
       } else {
-        // Recovering follows the same safe probe rules as Stable.
+        // Recovering regains the starting limit on any healthy window,
+        // saturated or idle. Probes resume from Stable.
+        val recovering = nextState.with("saturatedHealthyWindows", 0)
         if (sustainedCongestion) {
-          normalBackoff(config, nextState).with("saturatedHealthyWindows", 0)
-        } else if (isCongested) {
-          nextState.with("saturatedHealthyWindows", 0)
-        } else if (signals.saturated and signals.enoughSamples and signals.gradientHealthy) {
-          val saturatedHealthyWindows = nextState.saturatedHealthyWindows + 1
-          if (saturatedHealthyWindows >= 3 and signals.probeDue) {
-            nextState
-              .with("probePreviousLimit", nextState.desiredLimit)
-              .with("desiredLimit", probeLimit(config, nextState.desiredLimit))
-              .with("state", "probe")
-              .with("saturatedHealthyWindows", saturatedHealthyWindows)
-              .with("hasPreviousGoodput", true)
-          } else {
-            nextState.with("saturatedHealthyWindows", saturatedHealthyWindows)
-          }
-        } else if (not(signals.saturated)) {
-          nextState.with("saturatedHealthyWindows", 0)
+          normalBackoff(config, recovering)
+        } else if (not(isCongested) and signals.gradientHealthy) {
+          val grown = if (recovering.desiredLimit < config.start)
+            recoveryLimit(config, recovering.desiredLimit)
+          else recovering.desiredLimit
+          recovering
+            .with("desiredLimit", grown)
+            .with("state", if (grown >= config.start) "stable" else "recovering")
         } else {
-          nextState
+          recovering
         }
       }
     }
@@ -185,6 +183,7 @@ module admission_controller {
     enabled: true,
     minimum: 2,
     maximum: 8,
+    start: 8,
   }
 
   pure def initialState = {
@@ -330,6 +329,24 @@ module admission_controller {
     true.expect(
       transition(initialConfig.with("enabled", false), initialState, quietSignals).desiredLimit
         == initialConfig.maximum
+    )
+
+  run healthyIdleRecoveryRestoresStartingLimit =
+    true.expect(
+      transition(
+        initialConfig,
+        initialState.with("state", "recovering").with("desiredLimit", 2),
+        quietSignals
+      ) == initialState.with("state", "recovering").with("desiredLimit", 4)
+    )
+
+  run degradedRecoveryDoesNotGrow =
+    true.expect(
+      transition(
+        initialConfig,
+        initialState.with("state", "recovering").with("desiredLimit", 2),
+        quietSignals.with("gradientHealthy", false)
+      ).desiredLimit == 2
     )
 
   run zeroGoodputProbeBacksOff =

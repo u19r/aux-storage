@@ -1,6 +1,5 @@
-use std::{collections::HashMap, hint::black_box, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex};
 
-use alloc_counter::AllocationGuard;
 use pubsub_provider::{
     PublishRequest, PubsubError, PubsubMessageId, PubsubResult, Subscription, SubscriptionArn,
     SubscriptionConfirmation, SubscriptionProtocol, TopicArn,
@@ -9,7 +8,7 @@ use serde_json::Value;
 use storage_types::TimestampMillis;
 
 use crate::{
-    manager::PubsubDeliveryConfig,
+    delivery_config::PubsubDeliveryConfig,
     notification::{
         ConfirmationRenderContext, NotificationRenderContext, PubsubNotificationSignRequest,
         PubsubNotificationSigner, confirmation_body, confirmation_headers,
@@ -17,8 +16,6 @@ use crate::{
         notification_string_to_sign,
     },
 };
-
-const ITERATIONS: usize = 64;
 
 #[derive(Default)]
 struct RecordingSigner {
@@ -41,15 +38,6 @@ impl PubsubNotificationSigner for RecordingSigner {
     }
 }
 
-struct FixedSigner;
-
-impl PubsubNotificationSigner for FixedSigner {
-    fn sign(&self, request: PubsubNotificationSignRequest<'_>) -> PubsubResult<String> {
-        black_box(request.string_to_sign);
-        Ok("signature".to_string())
-    }
-}
-
 fn create_subscription() -> Subscription {
     Subscription {
         subscription_arn: SubscriptionArn::new(
@@ -60,6 +48,10 @@ fn create_subscription() -> Subscription {
         protocol: SubscriptionProtocol::Https,
         endpoint: "https://example.com/hook".to_string(),
         raw_message_delivery: false,
+        filter_policy: None,
+        filter_policy_scope: pubsub_provider::FilterPolicyScope::default(),
+        redrive_policy: None,
+        delivery_policy: None,
         confirmation: SubscriptionConfirmation::Confirmed,
         extra_json: Value::Null,
         created_at: TimestampMillis::from_timestamp(0),
@@ -191,79 +183,6 @@ fn given_signed_and_unsigned_confirmations_when_rendered_then_canonical_input_an
         })
         .is_err()
     );
-}
-
-#[test]
-fn given_notification_workloads_when_rendered_then_allocations_are_reported() {
-    let subscription = create_subscription();
-    let message_id = PubsubMessageId::new_from_string("message-id").unwrap();
-    let config = PubsubDeliveryConfig::default();
-    for (label, size, signed, attributes) in [
-        ("unsigned_1k", 1024, false, 0),
-        ("signed_1k", 1024, true, 0),
-        ("unsigned_256k", 262144, false, 0),
-        ("signed_256k", 262144, true, 0),
-        ("unsigned_1k_attrs", 1024, false, 10),
-        ("signed_1k_attrs", 1024, true, 10),
-        ("unsigned_256k_attrs", 262144, false, 10),
-        ("signed_256k_attrs", 262144, true, 10),
-    ] {
-        let request = PublishRequest {
-            topic_arn: subscription.topic_arn.clone(),
-            message: "x".repeat(size),
-            subject: (attributes > 0).then(|| "subject雪".to_string()),
-            message_attributes: (0..attributes)
-                .map(|n| (format!("attribute{n}"), "value雪".repeat(8).into()))
-                .collect(),
-        };
-        let guard = AllocationGuard::start(
-            module_path!(),
-            "notification_render",
-            file!(),
-            line!(),
-            Some(label),
-        );
-        for _ in 0..ITERATIONS {
-            black_box(
-                notification_body(NotificationRenderContext {
-                    request: &request,
-                    message_id: &message_id,
-                    subscription: &subscription,
-                    delivery_config: &config,
-                    signer: signed.then_some(&FixedSigner),
-                })
-                .unwrap(),
-            );
-            black_box(notification_headers(&message_id, &subscription, &request).unwrap());
-        }
-        let _ = alloc_counter::emit_report(&guard.finish());
-    }
-    for (label, signed) in [
-        ("confirmation_unsigned", false),
-        ("confirmation_signed", true),
-    ] {
-        let guard = AllocationGuard::start(
-            module_path!(),
-            "notification_render",
-            file!(),
-            line!(),
-            Some(label),
-        );
-        for _ in 0..ITERATIONS {
-            black_box(
-                confirmation_body(ConfirmationRenderContext {
-                    topic_arn: &subscription.topic_arn,
-                    message_id: &message_id,
-                    token: "token",
-                    delivery_config: &config,
-                    signer: signed.then_some(&FixedSigner),
-                })
-                .unwrap(),
-            );
-            black_box(confirmation_headers(&message_id, &subscription.topic_arn).unwrap());
-        }
-        let _ = alloc_counter::emit_report(&guard.finish());
-    }
 }
 
 #[test]

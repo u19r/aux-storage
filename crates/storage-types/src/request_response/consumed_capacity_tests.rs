@@ -1,76 +1,4 @@
-use std::hint::black_box;
-
-use alloc_counter::AllocationGuard;
-
-use crate::{ConsumedCapacity, ConsumedCapacityMetrics, TableName};
-
-fn capacity(size: usize) -> ConsumedCapacity {
-    ConsumedCapacity {
-        table_name: TableName::new("items"),
-        capacity_units: 0.5,
-        global_secondary_indexes: Some(
-            (0..size)
-                .map(|index| {
-                    (
-                        format!("index_{index}"),
-                        ConsumedCapacityMetrics {
-                            capacity_units: index as f64 + 0.5,
-                        },
-                    )
-                })
-                .collect(),
-        ),
-    }
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_capacity_map_sizes_when_constructed_cloned_or_serialized_then_report_cpu_and_allocations()
-{
-    for size in [0, 1, 4, 16, 32, 128] {
-        let fixture = capacity(size);
-        let bytes = serde_json::to_vec(&fixture).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<ConsumedCapacity>(&bytes).unwrap(),
-            fixture
-        );
-        report(&format!("capacity_{size}_construct"), || {
-            capacity(black_box(size))
-        });
-        report(&format!("capacity_{size}_clone"), || {
-            black_box(&fixture).clone()
-        });
-        report(&format!("capacity_{size}_serialize"), || {
-            serde_json::to_vec(black_box(&fixture)).unwrap()
-        });
-        report(&format!("capacity_{size}_deserialize"), || {
-            serde_json::from_slice::<ConsumedCapacity>(black_box(&bytes)).unwrap()
-        });
-    }
-}
-
-fn report<T>(label: &str, operation: impl Fn() -> T) {
-    for _ in 0..100 {
-        drop(black_box(operation()));
-    }
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "consumed_capacity",
-        file!(),
-        line!(),
-        Some(label),
-    );
-    let started = cpu_time::ProcessTime::now();
-    for _ in 0..10_000 {
-        drop(black_box(operation()));
-    }
-    let cpu = started.elapsed();
-    alloc_counter::emit_report(&guard.finish()).unwrap();
-    eprintln!(
-        "consumed_capacity label={label} iterations=10000 cpu_ns={}",
-        cpu.as_nanos()
-    );
-}
+use crate::ConsumedCapacity;
 
 #[test]
 fn given_capacity_wire_objects_when_decoded_then_preserve_names_values_and_duplicates() {
@@ -103,5 +31,46 @@ fn given_consumed_capacity_schema_when_generated_then_preserve_index_map_shape()
     assert_eq!(
         field,
         &serde_json::json!({"additionalProperties":{"$ref":"#/components/schemas/ConsumedCapacityMetrics"},"propertyNames":{"type":"string"},"type":["object","null"]})
+    );
+}
+
+#[test]
+fn given_no_capacity_request_when_rendering_tables_then_table_names_are_not_read() {
+    use crate::{CapacityUnitField, ReturnConsumedCapacity, TableName};
+
+    for mode in [None, Some(ReturnConsumedCapacity::None)] {
+        let tables = std::iter::from_fn(|| -> Option<&TableName> {
+            panic!("capacity names must not be read when no answer is requested")
+        });
+        assert!(
+            ConsumedCapacity::zero_for_tables(mode, CapacityUnitField::Plain, tables).is_none()
+        );
+    }
+}
+
+#[test]
+fn given_repeated_table_spellings_when_capacity_is_requested_then_zero_answers_keep_first_spelling()
+{
+    use crate::{CapacityUnitField, ReturnConsumedCapacity, TableName};
+
+    let names = [
+        TableName::new("a"),
+        TableName::new("arn:aws:dynamodb:us-east-1:123456789012:table/b"),
+        TableName::new("b"),
+    ];
+    let response = ConsumedCapacity::zero_for_tables(
+        Some(ReturnConsumedCapacity::Indexes),
+        CapacityUnitField::Read,
+        &names,
+    );
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        serde_json::json!([
+            {"TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/b",
+             "CapacityUnits": 0.0, "ReadCapacityUnits": 0.0,
+             "Table": {"CapacityUnits": 0.0, "ReadCapacityUnits": 0.0}},
+            {"TableName": "a", "CapacityUnits": 0.0, "ReadCapacityUnits": 0.0,
+             "Table": {"CapacityUnits": 0.0, "ReadCapacityUnits": 0.0}}
+        ])
     );
 }

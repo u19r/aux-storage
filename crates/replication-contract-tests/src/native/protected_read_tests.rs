@@ -293,7 +293,7 @@ where
         Err(error)
             if matches!(
                 error.as_ref(),
-                storage_types::StorageEnum::TransactionConflict { .. }
+                storage_types::StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(_))
             ) =>
         {
             // Serializable predicate dependencies can abort this native

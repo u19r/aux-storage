@@ -52,10 +52,10 @@ fn mapped_result_mismatch_reports_the_first_stable_difference() {
 
     assert_eq!(
         first_normalized_difference(&expected, &mapped),
+        // The report names the path only: workload output never prints item
+        // values.
         Some(
-            "\"query\"[0][0].\"payload\": expected Some(S(\"payload-a\")), mapped \
-             Some(S(\"wrong\"))"
-                .to_string()
+            "\"query\"[0][0].\"payload\": mapped value differs from the expected value".to_string()
         )
     );
 }
@@ -135,15 +135,15 @@ fn given_unclassified_native_failure_when_classified_then_it_is_not_retried() {
 
 #[test]
 fn given_native_settlements_when_classified_then_only_known_conflicts_are_retryable() {
-    let conflict = storage_types::StorageEnum::TransactionConflict {
-        message: "conflict".into(),
-    }
+    let conflict = storage_types::StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(
+        storage_types::ConflictCause::Logical("conflict"),
+    ))
     .into();
     assert!(matches!(
         OperationFailure::from_storage(conflict),
         OperationFailure::RetryableStorage(_)
     ));
-    let unknown = storage_types::StorageError::sync_submission_ambiguous(None, "unknown");
+    let unknown = storage_types::StorageError::commit_unknown("unknown");
     assert!(matches!(
         OperationFailure::from_storage(unknown),
         OperationFailure::Fatal(_)

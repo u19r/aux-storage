@@ -1,7 +1,4 @@
-use std::{
-    borrow::Borrow,
-    collections::{BTreeMap, HashMap},
-};
+use std::{borrow::Borrow, collections::BTreeMap};
 
 use super::string_template::bind_string_template;
 use crate::{
@@ -13,7 +10,8 @@ use crate::{
     read_sequence_string_template_name,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ResolvedInput {
     pub value: AttributeValue,
     pub reference: ReadSequenceInputReference,
@@ -283,6 +281,7 @@ fn bind_query_request(
         table_name: request.table_name.clone(),
         index_name: request.index_name.clone(),
         key_condition_expression: request.key_condition_expression.clone(),
+        key_conditions: request.key_conditions.clone(),
         attributes_to_get: request.attributes_to_get.clone(),
         conditional_operator: request.conditional_operator.clone(),
         filter_expression: request.filter_expression.clone(),
@@ -335,9 +334,9 @@ fn bind_value(
             .map(AttributeValue::L),
         AttributeValue::M(values) => values
             .iter()
-            .map(|(name, value)| Ok((name.clone(), bind_value(value, inputs)?)))
-            .collect::<Result<HashMap<_, _>, ReadSequenceValidationError>>()
-            .map(AttributeValue::M),
+            .map(|(name, value)| Ok((name.to_owned(), bind_value(value, inputs)?)))
+            .collect::<Result<Vec<_>, ReadSequenceValidationError>>()
+            .map(|entries| AttributeValue::M(crate::AttributeMap::from_distinct(entries))),
         _ => Ok(value.clone()),
     }
 }

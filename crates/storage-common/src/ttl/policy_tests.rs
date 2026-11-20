@@ -77,28 +77,32 @@ fn given_exhausted_policy_epoch_when_reenabled_then_transition_fails_closed() {
 }
 
 #[test]
-fn given_enabling_policy_when_sweep_completes_then_policy_becomes_enabled() {
-    let TtlPolicyChange::Enable(mut config) = change(true, None) else {
+fn given_enabling_policy_when_fill_activates_then_policy_becomes_enabled() {
+    let TtlPolicyChange::Enable(config) = change(true, None) else {
         panic!("enable");
     };
-    assert_eq!(config.status, TimeToLiveStatus::Enabling);
-
-    config
-        .complete_enabling_at(TimestampMillis::from_timestamp(2000))
+    let index = config.gsi_name.clone();
+    let activation = config
+        .activate_for_index(
+            TableName::new("policy"),
+            &index,
+            TimestampMillis::from_timestamp(2000),
+        )
         .unwrap();
-
-    assert_eq!(config.status, TimeToLiveStatus::Enabled);
+    assert_eq!(activation.expected.status, TimeToLiveStatus::Enabling);
+    assert_eq!(activation.activated.status, TimeToLiveStatus::Enabled);
     assert_eq!(
-        config.updated_at,
-        TimestampMillis::from_timestamp(2000),
-        "completion must publish the sweep timestamp"
+        activation.activated.updated_at,
+        TimestampMillis::from_timestamp(2000)
     );
-    config
-        .complete_enabling_at(TimestampMillis::from_timestamp(3000))
-        .unwrap();
-    assert_eq!(
-        config.updated_at,
-        TimestampMillis::from_timestamp(2000),
-        "an already-enabled policy is unchanged"
+    assert!(
+        activation
+            .activated
+            .activate_for_index(
+                TableName::new("policy"),
+                &index,
+                TimestampMillis::from_timestamp(3000)
+            )
+            .is_err()
     );
 }

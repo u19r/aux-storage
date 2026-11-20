@@ -20,6 +20,7 @@ fn queue_request(queue_name: &str, attributes: HashMap<String, String>) -> Queue
         queue_url: queue_base_url(queue_name),
         attributes,
         created_at: TimestampMillis::now(),
+        ..Default::default()
     }
 }
 
@@ -46,8 +47,9 @@ fn send_request(
         queue_provider::SendMessageRequest {
             queue_url: queue_url.to_string(),
             message_body: body.to_string(),
-            delay_seconds,
+            delay_seconds: delay_seconds.map(i64::from),
             message_attributes: None,
+            ..Default::default()
         },
         now,
     )
@@ -72,10 +74,11 @@ async fn receive_all(
         .receive_messages(
             queue_url,
             max,
-            DurationSeconds::from(30),
-            DurationSeconds::from(0),
+            Some(DurationSeconds::from(30)),
+            Some(DurationSeconds::from(0)),
         )
         .await
+        .map(|received| received.messages)
         .map_err(|err| anyhow::anyhow!("receive failed: {err:?}"))
 }
 
@@ -104,6 +107,7 @@ async fn given_message_when_send_receive_then_visible() -> anyhow::Result<()> {
                 queue_url: "http://localhost/000000000000/conformance".to_string(),
                 attributes: HashMap::new(),
                 created_at: TimestampMillis::now(),
+                ..Default::default()
             };
             let queue_url = fixture
                 .queue_operations
@@ -116,6 +120,7 @@ async fn given_message_when_send_receive_then_visible() -> anyhow::Result<()> {
                 message_body: "hello".to_string(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             };
             let message: QueueMessage = queue_message_for_send(send, fixture.now());
             let sent = fixture
@@ -128,10 +133,11 @@ async fn given_message_when_send_receive_then_visible() -> anyhow::Result<()> {
                 .receive_messages(
                     &queue_url,
                     1,
-                    storage_types::DurationSeconds::from(30),
-                    storage_types::DurationSeconds::from(0),
+                    Some(storage_types::DurationSeconds::from(30)),
+                    Some(storage_types::DurationSeconds::from(0)),
                 )
                 .await
+                .map(|received| received.messages)
                 .map_err(|err| anyhow::anyhow!("receive failed: {err:?}"))?;
             anyhow::ensure!(
                 received.len() == 1,
@@ -159,10 +165,11 @@ async fn given_message_when_send_receive_then_visible() -> anyhow::Result<()> {
                 .receive_messages(
                     &queue_url,
                     10,
-                    storage_types::DurationSeconds::from(30),
-                    storage_types::DurationSeconds::from(0),
+                    Some(storage_types::DurationSeconds::from(30)),
+                    Some(storage_types::DurationSeconds::from(0)),
                 )
                 .await
+                .map(|received| received.messages)
                 .map_err(|err| anyhow::anyhow!("lease probe failed: {err:?}"))?;
             anyhow::ensure!(
                 leased.is_empty(),
@@ -183,10 +190,11 @@ async fn given_message_when_send_receive_then_visible() -> anyhow::Result<()> {
                 .receive_messages(
                     &queue_url,
                     10,
-                    storage_types::DurationSeconds::from(0),
-                    storage_types::DurationSeconds::from(0),
+                    Some(storage_types::DurationSeconds::from(0)),
+                    Some(storage_types::DurationSeconds::from(0)),
                 )
                 .await
+                .map(|received| received.messages)
                 .map_err(|err| anyhow::anyhow!("drain probe failed: {err:?}"))?;
             anyhow::ensure!(drained.is_empty(), "deleted message still visible");
             Ok(())
@@ -348,8 +356,13 @@ async fn given_queues_when_list_and_get_by_name_then_routing_isolated() -> anyho
             anyhow::ensure!(missing_url.is_none(), "missing URL unexpectedly resolved");
             let all = fixture
                 .queue_operations
-                .list_queues(Some("route-"))
+                .list_queue_page(
+                    Some("route-"),
+                    None,
+                    queue_provider::MAX_LIST_QUEUES_RESULTS,
+                )
                 .await
+                .map(|(queues, _)| queues)
                 .map_err(|err| anyhow::anyhow!("list failed: {err:?}"))?;
             let urls: HashSet<String> = all.into_iter().map(|queue| queue.queue_url).collect();
             anyhow::ensure!(
@@ -358,8 +371,13 @@ async fn given_queues_when_list_and_get_by_name_then_routing_isolated() -> anyho
             );
             let only_a = fixture
                 .queue_operations
-                .list_queues(Some("route-a"))
+                .list_queue_page(
+                    Some("route-a"),
+                    None,
+                    queue_provider::MAX_LIST_QUEUES_RESULTS,
+                )
                 .await
+                .map(|(queues, _)| queues)
                 .map_err(|err| anyhow::anyhow!("list prefix-a failed: {err:?}"))?;
             anyhow::ensure!(
                 only_a.len() == 1 && only_a[0].queue_url == url_a,
@@ -611,8 +629,13 @@ async fn given_queue_when_delete_then_queue_and_messages_removed() -> anyhow::Re
             anyhow::ensure!(stored.is_none(), "delete left queue metadata");
             let listed = fixture
                 .queue_operations
-                .list_queues(Some("sqs-delete"))
+                .list_queue_page(
+                    Some("sqs-delete"),
+                    None,
+                    queue_provider::MAX_LIST_QUEUES_RESULTS,
+                )
                 .await
+                .map(|(queues, _)| queues)
                 .map_err(|err| anyhow::anyhow!("list after delete failed: {err:?}"))?;
             anyhow::ensure!(
                 listed.iter().all(|queue| queue.queue_url != queue_url),
@@ -627,10 +650,11 @@ async fn given_queue_when_delete_then_queue_and_messages_removed() -> anyhow::Re
                 .receive_messages(
                     &queue_url,
                     10,
-                    DurationSeconds::from(30),
-                    DurationSeconds::from(0),
+                    Some(DurationSeconds::from(30)),
+                    Some(DurationSeconds::from(0)),
                 )
                 .await
+                .map(|received| received.messages)
             {
                 Ok(messages) => {
                     anyhow::ensure!(messages.is_empty(), "deleted queue returned messages")
@@ -679,6 +703,7 @@ async fn given_queue_when_counts_observed_then_snapshot_splits_visible_leased_de
                     receipt_handle: None,
                     created_at: now,
                     visibility_timestamp: Some(now),
+                    ..Default::default()
                 })
                 .await
                 .map_err(|err| anyhow::anyhow!("send visible failed: {err:?}"))?;
@@ -734,27 +759,32 @@ async fn given_messages_when_concurrent_receives_then_each_claimed_once() -> any
             let first = fixture.queue_operations.receive_messages(
                 &queue_url,
                 4,
-                DurationSeconds::from(30),
-                DurationSeconds::from(0),
+                Some(DurationSeconds::from(30)),
+                Some(DurationSeconds::from(0)),
             );
             let second = fixture.queue_operations.receive_messages(
                 &queue_url,
                 4,
-                DurationSeconds::from(30),
-                DurationSeconds::from(0),
+                Some(DurationSeconds::from(30)),
+                Some(DurationSeconds::from(0)),
             );
             let third = fixture.queue_operations.receive_messages(
                 &queue_url,
                 4,
-                DurationSeconds::from(30),
-                DurationSeconds::from(0),
+                Some(DurationSeconds::from(30)),
+                Some(DurationSeconds::from(0)),
             );
             let (first, second, third) = tokio::join!(first, second, third);
             let first = first.map_err(|err| anyhow::anyhow!("first wave failed: {err:?}"))?;
             let second = second.map_err(|err| anyhow::anyhow!("second wave failed: {err:?}"))?;
             let third = third.map_err(|err| anyhow::anyhow!("third wave failed: {err:?}"))?;
             let mut unique = HashSet::new();
-            for message in first.iter().chain(&second).chain(&third) {
+            for message in first
+                .messages
+                .iter()
+                .chain(&second.messages)
+                .chain(&third.messages)
+            {
                 anyhow::ensure!(
                     unique.insert(message.message_id.clone()),
                     "duplicate claim: {}",
@@ -861,6 +891,7 @@ async fn given_messages_when_batch_send_delete_then_partial_errors_isolated() ->
                             message_body: body.to_string(),
                             delay_seconds: None,
                             message_attributes: None,
+                            ..Default::default()
                         },
                         now,
                     )

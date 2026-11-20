@@ -1,40 +1,11 @@
 use typed_builder::TypedBuilder;
 
 use crate::{
-    AllOld, AttributeMap, BatchWriteItemRequest, DeleteRequest, PutItemRequest, PutRequest,
-    ReturnConsumedCapacity, StorageError, StorageResult, TableName, TransactConditionCheckRequest,
-    TransactDeleteRequest, TransactPutRequest, TransactUpdateRequest, TransactWriteItem,
-    TransactWriteItemsRequest, VecMap, WireItem, WriteRequest, single_table_entity::WireEntity,
+    AttributeMap, BatchWriteItemRequest, DeleteRequest, PutRequest, ReturnConsumedCapacity,
+    TableName, TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
+    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, VecMap, WriteRequest,
+    single_table_entity::WireEntity,
 };
-
-#[derive(Debug, Clone)]
-pub struct PutItemEncodeRequest {
-    pub table_name: TableName,
-    pub item: WireItem,
-    pub indexers: Option<Vec<String>>,
-    pub condition_expression: Option<String>,
-    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
-    pub expression_attribute_values: Option<AttributeMap>,
-    pub return_values: Option<AllOld>,
-    pub return_old_on_condition_failure: bool,
-}
-
-impl TryFrom<PutItemEncodeRequest> for PutItemRequest {
-    type Error = StorageError;
-
-    fn try_from(encoded: PutItemEncodeRequest) -> StorageResult<Self> {
-        let mut request = Self::new(encoded.table_name, encoded.item);
-        request.indexers = encoded.indexers;
-        request.condition_expression = encoded.condition_expression;
-        request.expression_attribute_names = encoded.expression_attribute_names;
-        request.expression_attribute_values = encoded.expression_attribute_values;
-        request.return_values = encoded.return_values;
-        request.return_values_on_condition_check_failure = encoded
-            .return_old_on_condition_failure
-            .then(|| "ALL_OLD".to_string());
-        Ok(request)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteRetryPolicy {
@@ -80,7 +51,8 @@ impl WriteRetryPolicy {
 }
 
 #[allow(clippy::extra_unused_lifetimes)]
-#[derive(Debug, Clone, Default, TypedBuilder)]
+#[derive(Clone, Default, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct BatchWriteItemEncodeRequest {
     #[builder(!default, setter(!strip_option))]
@@ -89,14 +61,16 @@ pub struct BatchWriteItemEncodeRequest {
     pub return_item_collection_metrics: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, TypedBuilder)]
+#[derive(Clone, Default, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct EncodeWriteRequest {
     pub put_request: Option<EncodePutRequest>,
     pub delete_request: Option<DeleteRequest>,
 }
 
-#[derive(Debug, Clone, TypedBuilder)]
+#[derive(Clone, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct EncodePutRequest {
     #[builder(setter(!strip_option))]
     pub item: WireEntity,
@@ -166,7 +140,8 @@ impl TryFrom<BatchWriteItemRequest> for BatchWriteItemEncodeRequest {
 }
 
 #[allow(clippy::extra_unused_lifetimes)]
-#[derive(Debug, Clone, Default, TypedBuilder)]
+#[derive(Clone, Default, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct TransactWriteItemsEncodeRequest {
     #[builder(!default, setter(!strip_option))]
@@ -176,7 +151,8 @@ pub struct TransactWriteItemsEncodeRequest {
     pub return_item_collection_metrics: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, TypedBuilder)]
+#[derive(Clone, Default, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct TransactEncodeItem {
     pub put: Option<TransactEncodePutRequest>,
@@ -185,7 +161,8 @@ pub struct TransactEncodeItem {
     pub condition_check: Option<TransactConditionCheckRequest>,
 }
 
-#[derive(Debug, Clone, TypedBuilder)]
+#[derive(Clone, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct TransactEncodePutRequest {
     #[builder(!default, setter(!strip_option))]

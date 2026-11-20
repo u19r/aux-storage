@@ -4,12 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use storage_common::native_admission::{NativeAdmission, NativeAdmissionOutcome, NativeWork};
 use storage_types::{StorageError, StorageResult};
 
-use crate::{
-    RawOrderedJobStoreError,
-    native_admission::{NativeAdmission, NativeAdmissionOutcome, NativeWork},
-};
+use crate::RawOrderedJobStoreError;
 
 pub(super) enum NativeJobWait<R> {
     Settled(StorageResult<R>),

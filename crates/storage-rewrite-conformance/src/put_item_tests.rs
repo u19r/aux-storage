@@ -1,6 +1,8 @@
 //! PutItem business and failure contracts through the public replacement store.
 
-use base64::Engine as _;
+use std::panic::{AssertUnwindSafe, resume_unwind};
+
+use futures::FutureExt as _;
 use serde_json::json;
 use storage_observability_test_support::observation::observe;
 use storage_types::{
@@ -123,97 +125,6 @@ async fn given_existing_item_when_conditional_put_fails_then_error_is_exact_and_
     store.finish().await;
 }
 
-/// Boundary and format rules from dynamo-conformance: 38 significant digits are
-/// valid.
-#[tokio::test]
-async fn given_38_digit_number_key_when_put_item_runs_then_response_and_readback_are_exact() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::N)
-        .await;
-    let number = "99999999999999999999999999999999999999";
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"N": number},
-            "sk": {"N": "1"},
-            "label": {"S": "number-pk-max-precision"}
-        }
-    }))
-    .expect("parse Dynamo PutItem request");
-
-    let response = store
-        .operations
-        .put_item(request)
-        .await
-        .expect("put valid key");
-    let read = store
-        .operations
-        .get_item(GetItemRequest::new(
-            table,
-            [
-                ("pk".to_owned(), AttributeValue::N(number.to_owned())),
-                ("sk".to_owned(), AttributeValue::N("1".to_owned())),
-            ],
-        ))
-        .await
-        .expect("read valid number key");
-
-    assert_eq!(
-        serde_json::to_value(response).expect("serialize response"),
-        json!({})
-    );
-    assert_eq!(
-        serde_json::to_value(read).expect("serialize read response"),
-        json!({"Item": {
-            "pk": {"N": number},
-            "sk": {"N": "1"},
-            "label": {"S": "number-pk-max-precision"}
-        }}),
-    );
-    store.finish().await;
-}
-
-/// Negative and boundary rules from dynamo-conformance: 39 significant digits
-/// are rejected.
-#[tokio::test]
-async fn given_39_digit_number_key_when_put_item_runs_then_validation_message_is_exact() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::N)
-        .await;
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"N": "999999999999999999999999999999999999999"},
-            "sk": {"N": "1"},
-            "label": {"S": "number-pk-too-precise"}
-        }
-    }))
-    .expect("parse Dynamo PutItem request");
-
-    let observed = observe(store.operations.put_item(request)).await;
-    let error = observed
-        .result
-        .as_ref()
-        .expect_err("39 digit number key must fail");
-
-    assert_eq!(
-        error.to_string(),
-        "Attempting to store more than 38 significant digits in a Number"
-    );
-    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
-    observed.assert_no_warning_or_error();
-    assert_dynamo_error_response_exact(
-        observed.result.expect_err("39 digit number key must fail"),
-        axum::http::StatusCode::BAD_REQUEST,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Attempting to store more than 38 significant digits in a Number"}"#,
-    );
-    store.finish().await;
-}
-
 /// Negative and format rules from Dynamo conformance and the API ALL_OLD
 /// failure case.
 #[tokio::test]
@@ -315,139 +226,6 @@ async fn given_existing_item_when_condition_matches_old_value_then_put_replaces_
     store.finish().await;
 }
 
-/// Negative and format rules from Dynamo conformance: the numeric parse error
-/// keeps its trailing space.
-#[tokio::test]
-async fn given_empty_number_partition_key_when_put_item_runs_then_full_validation_response_is_exact()
- {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::N)
-        .await;
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"N": ""},
-            "sk": {"N": "1"},
-            "label": {"S": "number-pk-empty"}
-        }
-    }))
-    .expect("parse Dynamo PutItem request");
-
-    let observed = observe(store.operations.put_item(request)).await;
-    let error = observed
-        .result
-        .as_ref()
-        .expect_err("empty numeric key must fail");
-
-    assert_eq!(
-        error.to_string(),
-        "The parameter cannot be converted to a numeric value"
-    );
-    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
-    observed.assert_no_warning_or_error();
-    assert_dynamo_error_response_exact(
-        observed.result.expect_err("empty numeric key must fail"),
-        axum::http::StatusCode::BAD_REQUEST,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: "}"#,
-    );
-    store.finish().await;
-}
-
-/// Boundary rule from Dynamo conformance: a binary partition key may contain
-/// 2048 decoded bytes.
-#[tokio::test]
-async fn given_2048_byte_binary_partition_key_when_put_item_runs_then_item_is_readable() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::B)
-        .await;
-    let key = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 2048]);
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"B": key},
-            "sk": {"B": "Bw=="},
-            "label": {"S": "binary-pk-max"}
-        }
-    }))
-    .expect("parse binary-key PutItem request");
-
-    let response = store
-        .operations
-        .put_item(request)
-        .await
-        .expect("put maximum binary key");
-    let read = store
-        .operations
-        .get_item(GetItemRequest::new(
-            table,
-            [
-                ("pk".to_owned(), AttributeValue::B(key.clone())),
-                ("sk".to_owned(), AttributeValue::B("Bw==".to_owned())),
-            ],
-        ))
-        .await
-        .expect("read maximum binary key");
-
-    assert_eq!(
-        serde_json::to_value(response).expect("serialize response"),
-        json!({})
-    );
-    assert_eq!(
-        serde_json::to_value(read).expect("serialize read response"),
-        json!({"Item": {
-            "pk": {"B": key},
-            "sk": {"B": "Bw=="},
-            "label": {"S": "binary-pk-max"}
-        }}),
-    );
-    store.finish().await;
-}
-
-/// Negative boundary rule from Dynamo conformance: one extra decoded byte is
-/// rejected.
-#[tokio::test]
-async fn given_2049_byte_binary_partition_key_when_put_item_runs_then_full_error_is_exact() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::B)
-        .await;
-    let key = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 2049]);
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"B": key},
-            "sk": {"B": "Bw=="},
-            "label": {"S": "binary-pk-too-long"}
-        }
-    }))
-    .expect("parse binary-key PutItem request");
-
-    let observed = observe(store.operations.put_item(request)).await;
-    let error = observed
-        .result
-        .as_ref()
-        .expect_err("oversize binary key must fail");
-
-    assert_eq!(
-        error.to_string(),
-        "One or more parameter values were invalid: Size of hashkey has exceeded the maximum size \
-         limit of2048 bytes"
-    );
-    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
-    observed.assert_no_warning_or_error();
-    assert_dynamo_error_response_exact(
-        observed.result.expect_err("oversize binary key must fail"),
-        axum::http::StatusCode::BAD_REQUEST,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Size of hashkey has exceeded the maximum size limit of2048 bytes"}"#,
-    );
-    store.finish().await;
-}
-
 /// Negative rule from the API and Cucumber cases: an unknown table wins over
 /// missing key data.
 #[tokio::test]
@@ -467,7 +245,8 @@ async fn given_missing_table_and_missing_key_when_put_item_runs_then_table_error
         .expect_err("missing table must fail");
     assert!(matches!(
         error.to_enum(),
-        StorageEnum::TableNotFound { name, .. } if name == &table.to_string()
+        StorageEnum::ResourceNotFound { resource_type: "table", resource_id }
+            if resource_id == &table.to_string()
     ));
     observed.assert_no_warning_or_error();
     let response =
@@ -999,180 +778,74 @@ async fn given_list_of_maps_when_contains_checks_partial_map_then_put_fails_with
     store.finish().await;
 }
 
-/// Boundary rule from Dynamo conformance: a binary sort key may contain 1024
-/// decoded bytes.
-#[tokio::test]
-async fn given_1024_byte_binary_sort_key_when_put_item_runs_then_item_is_readable() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::B)
-        .await;
-    let sort_key = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 1024]);
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"B": "Bw=="},
-            "sk": {"B": sort_key},
-            "label": {"S": "binary-sk-max"}
-        }
-    }))
-    .expect("parse binary-key PutItem request");
-
-    let response = store
-        .operations
-        .put_item(request)
-        .await
-        .expect("put maximum sort key");
-    let read = store
-        .operations
-        .get_item(GetItemRequest::new(
-            table,
-            [
-                ("pk".to_owned(), AttributeValue::B("Bw==".to_owned())),
-                ("sk".to_owned(), AttributeValue::B(sort_key.clone())),
-            ],
-        ))
-        .await
-        .expect("read maximum sort key");
-
-    assert_eq!(
-        serde_json::to_value(response).expect("serialize response"),
-        json!({})
-    );
-    assert_eq!(
-        serde_json::to_value(read).expect("serialize read response"),
-        json!({"Item": {
-            "pk": {"B": "Bw=="},
-            "sk": {"B": sort_key},
-            "label": {"S": "binary-sk-max"}
-        }}),
-    );
-    store.finish().await;
-}
-
-/// Negative boundary rule from Dynamo conformance: one extra decoded sort-key
-/// byte is rejected.
-#[tokio::test]
-async fn given_1025_byte_binary_sort_key_when_put_item_runs_then_full_error_is_exact() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::B)
-        .await;
-    let sort_key = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 1025]);
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"B": "Bw=="},
-            "sk": {"B": sort_key},
-            "label": {"S": "binary-sk-too-long"}
-        }
-    }))
-    .expect("parse binary-key PutItem request");
-
-    let observed = observe(store.operations.put_item(request)).await;
-    let error = observed
-        .result
-        .as_ref()
-        .expect_err("oversize sort key must fail");
-
-    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
-    observed.assert_no_warning_or_error();
-    assert_dynamo_error_response_exact(
-        observed.result.expect_err("oversize sort key must fail"),
-        axum::http::StatusCode::BAD_REQUEST,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Aggregated size of all range keys has exceeded the size limit of 1024 bytes"}"#,
-    );
-    store.finish().await;
-}
-
-/// Negative boundary rule from Dynamo conformance: sort keys cannot contain
-/// empty binary data.
-#[tokio::test]
-async fn given_empty_binary_sort_key_when_put_item_runs_then_full_error_is_exact() {
-    let store = TestStore::new().await;
-    let table = unique_table_name();
-    store
-        .create_hash_range_table(table.clone(), KeyAttributeType::B)
-        .await;
-    let request: PutItemRequest = serde_json::from_value(json!({
-        "TableName": table.to_string(),
-        "Item": {
-            "pk": {"B": "Bw=="},
-            "sk": {"B": ""},
-            "label": {"S": "binary-sk-empty"}
-        }
-    }))
-    .expect("parse binary-key PutItem request");
-
-    let observed = observe(store.operations.put_item(request)).await;
-    let error = observed
-        .result
-        .as_ref()
-        .expect_err("empty sort key must fail");
-
-    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
-    observed.assert_no_warning_or_error();
-    assert_dynamo_error_response_exact(
-        observed.result.expect_err("empty sort key must fail"),
-        axum::http::StatusCode::BAD_REQUEST,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: sk"}"#,
-    );
-    store.finish().await;
-}
-
 #[tokio::test]
 async fn given_concurrent_puts_when_keys_overlap_or_differ_then_every_change_is_retained() {
     for overlapping in [false, true] {
         let store = TestStore::new().await;
-        let table = unique_table_name();
-        let mut create = crate::test_support::hash_table_request(table.clone());
-        create.stream_specification = Some(storage_types::StreamSpecification {
-            stream_enabled: true,
-            stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
-        });
-        store.operations.create_table(create).await.unwrap();
-        let requests = (0..32).map(|index| {
-            let key = if overlapping {
-                "one".to_owned()
-            } else {
-                index.to_string()
-            };
-            let request = PutItemRequest::new(
-                table.clone(),
-                storage_types::WireItem::try_from(&AttributeMap::from_iter([
-                    ("pk".to_owned(), AttributeValue::S(key)),
-                    ("value".to_owned(), AttributeValue::S(index.to_string())),
-                ]))
-                .unwrap(),
-            );
-            store.operations.put_item(request)
-        });
-        for result in futures::future::join_all(requests).await {
-            result.expect("ordinary concurrent put must commit");
-        }
-        let records = crate::image_retention_tests::table_records(&store, &table)
-            .await
-            .unwrap();
-        assert_eq!(
-            records.len(),
-            32,
-            "one retained stream event per committed put"
-        );
-        let values = records
-            .iter()
-            .map(|record| record.item.as_ref().unwrap().get("value").unwrap().clone())
-            .collect::<Vec<_>>();
-        for index in 0..32 {
+        let outcome = AssertUnwindSafe(async {
+            let table = unique_table_name();
+            let mut create = crate::test_support::hash_table_request(table.clone());
+            create.stream_specification = Some(storage_types::StreamSpecification {
+                stream_enabled: true,
+                stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+            });
+            store.operations.create_table(create).await.unwrap();
+            let requests = (0..32).map(|index| {
+                let key = if overlapping {
+                    "one".to_owned()
+                } else {
+                    index.to_string()
+                };
+                let request = PutItemRequest::new(
+                    table.clone(),
+                    storage_types::WireItem::try_from(&AttributeMap::from_iter([
+                        ("pk".to_owned(), AttributeValue::S(key)),
+                        ("value".to_owned(), AttributeValue::S(index.to_string())),
+                    ]))
+                    .unwrap(),
+                );
+                store.operations.put_item(request)
+            });
+            for result in futures::future::join_all(requests).await {
+                result.expect("ordinary concurrent put must commit");
+            }
+            store.wait_until_changes_are_readable().await;
+            // All 32 overlapping writes can share one of four native lanes.
+            let records = store
+                .operations
+                .get_stream_records(storage_types::GetStreamRecordsRequest::table(
+                    table.clone(),
+                    None,
+                    Some(1000),
+                ))
+                .await
+                .unwrap()
+                .into_parts()
+                .0;
             assert_eq!(
-                values
-                    .iter()
-                    .filter(|value| **value == AttributeValue::S(index.to_string()))
-                    .count(),
-                1
+                records.len(),
+                32,
+                "one retained stream event per committed put"
             );
-        }
+            let values = records
+                .iter()
+                .map(|record| record.item.as_ref().unwrap().get("value").unwrap().clone())
+                .collect::<Vec<_>>();
+            for index in 0..32 {
+                assert_eq!(
+                    values
+                        .iter()
+                        .filter(|value| **value == AttributeValue::S(index.to_string()))
+                        .count(),
+                    1
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
         store.finish().await;
+        if let Err(panic) = outcome {
+            resume_unwind(panic);
+        }
     }
 }

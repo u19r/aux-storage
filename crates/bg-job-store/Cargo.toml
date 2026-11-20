@@ -13,6 +13,7 @@ doctest = false
 [dependencies]
 bytes = { workspace = true }
 scheduled-bg-jobs = { workspace = true }
+storage-common = { path = "../storage-common" }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types" }
 

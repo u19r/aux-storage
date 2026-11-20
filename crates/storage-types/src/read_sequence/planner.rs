@@ -9,7 +9,8 @@ use crate::{
 /// sufficient to execute a read: retaining the validated operations here
 /// prevents a provider from reparsing the raw request or inventing a second
 /// interpretation of the graph.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ReadSequencePlan {
     pub nodes: Vec<ReadSequenceNode>,
     pub graph: ReadSequenceGraphPlan,

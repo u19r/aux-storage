@@ -9,3 +9,6 @@ mod writer;
 
 pub use attempt::RocksDbAttempt;
 pub use driver::RocksDbBackend;
+
+#[cfg(test)]
+mod driver_tests;

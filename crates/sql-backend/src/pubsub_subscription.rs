@@ -1,10 +1,13 @@
 //! One subscription row layout for SQLite, Turso, and Postgres.
 
+use std::num::NonZeroU32;
+
 use pubsub_provider::{
-    SubscriptionArn, SubscriptionIdentity, SubscriptionPage, SubscriptionPageRequest,
-    SubscriptionRecord, TopicIncarnation,
+    PendingSubscription, PendingSubscriptionCursor, PendingSubscriptionPage, SubscriptionArn,
+    SubscriptionIdentity, SubscriptionPage, SubscriptionPageRequest, SubscriptionRecord,
+    TopicIncarnation,
 };
-use storage_types::{ReadProtection, StorageEnum, StorageError, StorageResult, storage_serde};
+use storage_types::{MissExpectation, ReadProtection, StorageError, StorageResult, storage_serde};
 
 use crate::{
     SqlAttempt, SqlLayout, SqlRow, SqlStatement, SqlValue, constants::PUBSUB_CATALOG_READ_BYTES,
@@ -38,11 +41,13 @@ pub(crate) async fn initialize_pubsub_subscriptions<A: SqlAttempt>(
             " ON "["sys_pubsub_subscriptions"],
             "(topic_incarnation, subscription_arn)"
         ),
+        // Tokens are unique UUIDv7 text and non-NULL only while pending, so
+        // the pending subscriptions are one range of this index.
         crate::sql_template::sql_template!(
             engine,
-            "CREATE UNIQUE INDEX IF NOT EXISTS "["sys_pubsub_subscription_token"],
+            "CREATE UNIQUE INDEX IF NOT EXISTS "["sys_pubsub_subscription_pending_token"],
             " ON "["sys_pubsub_subscriptions"],
-            "(topic_incarnation, token)"
+            "(token)"
         ),
     ] {
         native.execute(SqlStatement::new(sql, vec![])).await?;
@@ -267,6 +272,63 @@ pub(crate) async fn read_subscription_page<A: SqlAttempt>(
     })
 }
 
+/// The pending-subscription page: binds (after token, limit + 1).
+pub(crate) fn pending_subscription_sql(engine: impl SqlLayout) -> String {
+    format!(
+        "{} WHERE token > {} ORDER BY token LIMIT {}",
+        select_columns(engine),
+        engine.engine().placeholder(1),
+        engine.engine().placeholder(2),
+    )
+}
+
+/// Pending subscriptions after `after` in token order, read at `Snapshot`.
+pub(crate) async fn read_pending_subscription_page<A: SqlAttempt>(
+    native: &mut A,
+    engine: impl SqlLayout,
+    after: Option<&PendingSubscriptionCursor>,
+    limit: NonZeroU32,
+) -> StorageResult<PendingSubscriptionPage> {
+    // Every token is longer than '', and a NULL token fails the comparison.
+    let after = match after {
+        Some(cursor) => String::from_utf8(cursor.0.clone())
+            .map_err(|_| StorageError::internal("SQL pending subscription cursor is not UTF-8"))?,
+        None => String::new(),
+    };
+    let sql = pending_subscription_sql(engine);
+    let page = native
+        .query(
+            SqlStatement::new(
+                sql,
+                vec![
+                    SqlValue::Text(after),
+                    SqlValue::Integer(i64::from(limit.get()) + 1),
+                ],
+            ),
+            ReadProtection::Snapshot,
+            PUBSUB_CATALOG_READ_BYTES,
+        )
+        .await?;
+    let more = page.more || page.rows.len() > limit.get() as usize;
+    let rows = page
+        .rows
+        .into_iter()
+        .take(limit.get() as usize)
+        .map(|row| {
+            let record = decode_row(row)?;
+            let token = record.subscription.confirmation.token().ok_or_else(|| {
+                StorageError::internal("SQL pending subscription row has no token")
+            })?;
+            Ok(PendingSubscription {
+                cursor: PendingSubscriptionCursor(token.as_bytes().to_vec()),
+                subscription_arn: record.subscription.subscription_arn.clone(),
+                created_at: record.subscription.created_at,
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(PendingSubscriptionPage { rows, more })
+}
+
 fn select_columns(engine: impl SqlLayout) -> std::borrow::Cow<'static, str> {
     crate::sql_template::sql_template!(
         engine,
@@ -338,9 +400,12 @@ fn expect_one(changed: u64) -> StorageResult<()> {
     if changed == 1 {
         Ok(())
     } else {
-        Err(StorageEnum::TransactionConflict {
-            message: "SQL subscription changed during write".to_owned(),
-        }
-        .into())
+        Err(StorageError::write_miss(
+            "pubsub_subscription",
+            MissExpectation::Rows {
+                expected: 1,
+                found: changed,
+            },
+        ))
     }
 }

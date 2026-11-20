@@ -25,7 +25,7 @@ pub(super) fn prepare_key_binds(
     let mut binds = Vec::new();
     binds
         .try_reserve_exact(count)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     binds.extend(encode_key(key)?);
     Ok(binds)
 }

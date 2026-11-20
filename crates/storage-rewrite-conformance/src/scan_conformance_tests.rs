@@ -14,8 +14,7 @@ use futures::FutureExt as _;
 use serde_json::{Value, json};
 use storage_observability_test_support::observation::observe;
 use storage_types::{
-    AttributeMap, CreateTableRequest, GetItemRequest, IndexName, KeyAttributes, PutItemRequest,
-    ScanRequest, TableName,
+    AttributeMap, GetItemRequest, IndexName, KeyAttributes, PutItemRequest, ScanRequest, TableName,
 };
 
 use super::test_support::{ConformanceFixtures, TestStore, unique_table_name};
@@ -26,42 +25,26 @@ fn load_fixture(source: &str) -> Value {
     FIXTURES.case(include_str!("../fixtures/scan_cases.jsonl"), source)
 }
 
-async fn create_fixture_table(store: &TestStore, kind: &str, table: TableName) {
-    if kind != "basic_with_gsi" {
-        store.create_conformance_table(kind, table).await;
-        return;
+fn sorted_by_pk(mut body: Value) -> Value {
+    if let Some(items) = body.get_mut("Items").and_then(Value::as_array_mut) {
+        items.sort_by_key(|item| item["pk"].to_string());
     }
-    let request = CreateTableRequest::try_from(json!({
-        "TableName": table.to_string(),
-        "AttributeDefinitions": [
-            {"AttributeName": "pk", "AttributeType": "S"},
-            {"AttributeName": "sk", "AttributeType": "S"},
-            {"AttributeName": "gsi_pk", "AttributeType": "S"},
-            {"AttributeName": "gsi_sk", "AttributeType": "S"}
-        ],
-        "KeySchema": [
-            {"AttributeName": "pk", "KeyType": "HASH"},
-            {"AttributeName": "sk", "KeyType": "RANGE"}
-        ],
-        "GlobalSecondaryIndexes": [{
-            "IndexName": "gsi1",
-            "KeySchema": [
-                {"AttributeName": "gsi_pk", "KeyType": "HASH"},
-                {"AttributeName": "gsi_sk", "KeyType": "RANGE"}
-            ],
-            "Projection": {"ProjectionType": "ALL"}
-        }],
-        "BillingMode": "PAY_PER_REQUEST"
-    }))
-    .unwrap();
-    store.operations.create_table(request).await.unwrap();
+    body
 }
 
 async fn assert_scan_case(store: &TestStore, case: &Value) {
     assert_eq!(case["operation"], "Scan", "fixture operation");
-    let table_kind = case["tables"][0].as_str().unwrap();
+    // A local case with `"tables": []` runs against no table (missing-table and
+    // empty-name rules).
+    let table_kind = case["tables"]
+        .as_array()
+        .unwrap()
+        .first()
+        .map(|kind| kind.as_str().unwrap());
     let table = TableName::new(case["request"]["TableName"].as_str().unwrap());
-    create_fixture_table(store, table_kind, table.clone()).await;
+    if let Some(kind) = table_kind {
+        store.create_conformance_table(kind, table.clone()).await;
+    }
 
     let preconditions = case["preconditions"].as_array().unwrap();
     for precondition in preconditions {
@@ -113,9 +96,11 @@ async fn assert_scan_case(store: &TestStore, case: &Value) {
         "{} returned {body}",
         case["source"]
     );
+    // Scan order across partitions is backend-defined, so compare the matching
+    // set.
     assert_eq!(
-        serde_json::to_string(&body).unwrap(),
-        serde_json::to_string(&case["expected"]["body"]).unwrap(),
+        serde_json::to_string(&sorted_by_pk(body)).unwrap(),
+        serde_json::to_string(&sorted_by_pk(case["expected"]["body"].clone())).unwrap(),
         "{}",
         case["source"],
     );
@@ -125,7 +110,10 @@ async fn assert_scan_case(store: &TestStore, case: &Value) {
         let item = &precondition["request"]["Item"];
         let mut key = serde_json::Map::new();
         key.insert("pk".to_owned(), item["pk"].clone());
-        key.insert("sk".to_owned(), item["sk"].clone());
+        // Hash-only AWS behavioural tables carry no sort key.
+        if let Some(sort_key) = item.get("sk") {
+            key.insert("sk".to_owned(), sort_key.clone());
+        }
         let read = store
             .operations
             .get_item(GetItemRequest::new(
@@ -379,7 +367,9 @@ async fn given_five_indexed_items_when_scan_gsi_pages_then_each_item_appears_onc
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = unique_table_name();
-        create_fixture_table(&store, "basic_with_gsi", table.clone()).await;
+        store
+            .create_conformance_table("basic_with_gsi", table.clone())
+            .await;
         for ordinal in 1..=5 {
             let request = PutItemRequest::try_from(json!({
                 "TableName": table.as_ref(),
@@ -473,3 +463,617 @@ async fn given_five_indexed_items_when_scan_gsi_pages_then_each_item_appears_onc
         resume_unwind(panic);
     }
 }
+
+// Negative rule from Cucumber "Scan non-existent table": a missing table is
+// ResourceNotFound.
+scan_case!(
+    given_missing_table_when_scan_runs_then_resource_not_found_is_exact,
+    "local/missing_table.json"
+);
+
+// Validation rule from Cucumber "Scan with empty table name".
+scan_case!(
+    given_empty_table_name_when_scan_runs_then_validation_is_exact,
+    "local/empty_table_name.json"
+);
+
+// DDB-PAR-4: `#l` -> `l[0]` reads the top-level `l[0]`; unaliased `l[0]` reads
+// the first list element.
+scan_case!(
+    given_bracket_alias_filter_when_scan_runs_then_top_level_attribute_matches,
+    "local/ddb-par-4/bracket_alias_filter_scan.json"
+);
+// token/near rule (dynamo-conformance cases).
+scan_case!(
+    given_unclosed_function_filter_when_scan_runs_then_eof_syntax_error,
+    "local/ddb-par-1/given_unclosed_function_filter_when_scan_runs_then_eof_syntax_error.json"
+);
+// AWS probe P1.
+scan_case!(
+    given_invalid_filter_text_when_scan_runs_then_syntax_error,
+    "local/ddb-par-1/given_invalid_filter_text_when_scan_runs_then_syntax_error.json"
+);
+// AWS probe P3.
+scan_case!(
+    given_unknown_character_filter_when_scan_runs_then_character_is_the_token,
+    "local/ddb-par-1/given_unknown_character_filter_when_scan_runs_then_character_is_the_token.\
+     json"
+);
+// AWS probe P9.
+scan_case!(
+    given_values_without_expression_when_scan_runs_then_only_with_expressions_error,
+    "local/ddb-par-1/\
+     given_values_without_expression_when_scan_runs_then_only_with_expressions_error.json"
+);
+scan_case!(
+    given_parenthesized_operand_comparison_when_scan_runs_then_filter_is_accepted,
+    "local/ddb-par-1/\
+     given_parenthesized_operand_comparison_when_scan_runs_then_filter_is_accepted.json"
+);
+// local text: AWS applies ScanFilter (probe P11); aux does not implement it.
+scan_case!(
+    given_scan_filter_when_scan_runs_then_legacy_parameter_is_rejected,
+    "local/ddb-par-2/given_scan_filter_when_scan_runs_then_legacy_parameter_is_rejected.json"
+);
+// AWS probe P11.
+scan_case!(
+    given_scan_filter_and_filter_expression_when_scan_runs_then_mixed_parameters_are_rejected,
+    "local/ddb-par-2/\
+     given_scan_filter_and_filter_expression_when_scan_runs_then_mixed_parameters_are_rejected.\
+     json"
+);
+
+// AWS behavioural suite
+// AWS behavioural:
+// check_ddb_frc_cross_type_string_operand_eq_empty_ne_everything.py
+scan_case!(
+    given_ddb_frc_cross_type_string_operand_eq_empty_ne_everything_same_type_n_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_frc_cross_type_string_operand_eq_empty_ne_everything.same_type_n_eq.json"
+);
+
+// AWS behavioural:
+// check_ddb_frc_cross_type_string_operand_eq_empty_ne_everything.py
+scan_case!(
+    given_ddb_frc_cross_type_string_operand_eq_empty_ne_everything_cross_type_s_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_frc_cross_type_string_operand_eq_empty_ne_everything.cross_type_s_eq.json"
+);
+
+// AWS behavioural:
+// check_ddb_frc_cross_type_string_operand_eq_empty_ne_everything.py
+scan_case!(
+    given_ddb_frc_cross_type_string_operand_eq_empty_ne_everything_cross_type_s_ne_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_ddb_frc_cross_type_string_operand_eq_empty_ne_everything.cross_type_s_ne.json"
+);
+
+// AWS behavioural: check_legacy_attributes_to_get_duplicate_name_rejected.py
+scan_case!(
+    given_legacy_attributes_to_get_duplicate_name_rejected_scan_duplicate_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_legacy_attributes_to_get_duplicate_name_rejected.scan_duplicate.json"
+);
+
+// AWS behavioural: check_legacy_attributes_to_get_duplicate_name_rejected.py
+scan_case!(
+    given_legacy_attributes_to_get_duplicate_name_rejected_scan_single_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_legacy_attributes_to_get_duplicate_name_rejected.scan_single_control.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+scan_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_scan_ssattr_lt_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.scan_ssattr_lt.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+scan_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_scan_ssattr_gt_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.scan_ssattr_gt.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+scan_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_scan_nsattr_lt_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.scan_nsattr_lt.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+scan_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_scan_nsattr_gt_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.scan_nsattr_gt.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+scan_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_scan_bsattr_lt_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.scan_bsattr_lt.json"
+);
+
+// AWS behavioural:
+// check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.
+// py
+scan_case!(
+    given_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected_scan_bsattr_gt_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_and_query_filter_ordering_comparison_on_a_set_attribute_rejected.scan_bsattr_gt.json"
+);
+
+// AWS behavioural:
+// check_scan_combined_filter_and_projection_does_not_reduce_consumed_capacity.
+// py
+scan_case!(
+    given_scan_combined_filter_and_projection_does_not_reduce_consumed_capacity_filter_and_projection_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_combined_filter_and_projection_does_not_reduce_consumed_capacity.filter_and_projection.json"
+);
+
+// AWS behavioural:
+// check_scan_exclusive_start_key_naming_an_attribute_outside_the_key_schema_rejected.
+// py
+scan_case!(
+    given_scan_exclusive_start_key_naming_an_attribute_outside_the_key_schema_rejected_extra_key_attribute_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_exclusive_start_key_naming_an_attribute_outside_the_key_schema_rejected.extra_key_attribute.json"
+);
+
+// AWS behavioural: check_scan_filter_begins_with_non_string_operand_rejected.py
+scan_case!(
+    given_scan_filter_begins_with_non_string_operand_rejected_empty_n_operand_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_begins_with_non_string_operand_rejected.empty_n_operand.json"
+);
+
+// AWS behavioural: check_scan_filter_begins_with_non_string_operand_rejected.py
+scan_case!(
+    given_scan_filter_begins_with_non_string_operand_rejected_empty_bool_operand_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_begins_with_non_string_operand_rejected.empty_bool_operand.json"
+);
+
+// AWS behavioural: check_scan_filter_begins_with_non_string_operand_rejected.py
+scan_case!(
+    given_scan_filter_begins_with_non_string_operand_rejected_populated_n_operand_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_begins_with_non_string_operand_rejected.populated_n_operand.json"
+);
+
+// AWS behavioural: check_scan_filter_begins_with_non_string_operand_rejected.py
+scan_case!(
+    given_scan_filter_begins_with_non_string_operand_rejected_populated_bool_operand_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_begins_with_non_string_operand_rejected.populated_bool_operand.json"
+);
+
+// AWS behavioural: check_scan_filter_begins_with_non_string_operand_rejected.py
+scan_case!(
+    given_scan_filter_begins_with_non_string_operand_rejected_populated_s_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_begins_with_non_string_operand_rejected.populated_s_control.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_between_binary_attribute_reversed_bounds_rejected.py
+scan_case!(
+    given_scan_filter_between_binary_attribute_reversed_bounds_rejected_reversed_bounds_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_between_binary_attribute_reversed_bounds_rejected.reversed_bounds.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_between_binary_attribute_reversed_bounds_rejected.py
+scan_case!(
+    given_scan_filter_between_binary_attribute_reversed_bounds_rejected_ascending_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_between_binary_attribute_reversed_bounds_rejected.ascending_control.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.py
+scan_case!(
+    given_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive_01_to_80_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.01_to_80.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.py
+scan_case!(
+    given_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive_80_to_ff_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.80_to_ff.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.py
+scan_case!(
+    given_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive_00_to_ff_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.00_to_ff.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.py
+scan_case!(
+    given_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive_01_to_7f_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_between_binary_attribute_unsigned_byte_order_inclusive.01_to_7f.json"
+);
+
+// AWS behavioural: check_scan_filter_binary_attribute_unsigned_byte_order.py
+scan_case!(
+    given_scan_filter_binary_attribute_unsigned_byte_order_greater_than_7f_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_binary_attribute_unsigned_byte_order.greater_than_7f.json"
+);
+
+// AWS behavioural: check_scan_filter_binary_attribute_unsigned_byte_order.py
+scan_case!(
+    given_scan_filter_binary_attribute_unsigned_byte_order_contains_00_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_binary_attribute_unsigned_byte_order.contains_00.json"
+);
+
+// AWS behavioural: check_scan_filter_binary_attribute_unsigned_byte_order.py
+scan_case!(
+    given_scan_filter_binary_attribute_unsigned_byte_order_begins_with_80_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_binary_attribute_unsigned_byte_order.begins_with_80.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_eq_and_contains_type_strict_across_s_n_b.py
+scan_case!(
+    given_scan_filter_eq_and_contains_type_strict_across_s_n_b_eq_n_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_eq_and_contains_type_strict_across_s_n_b.eq_n.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_eq_and_contains_type_strict_across_s_n_b.py
+scan_case!(
+    given_scan_filter_eq_and_contains_type_strict_across_s_n_b_eq_s_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_eq_and_contains_type_strict_across_s_n_b.eq_s.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_eq_and_contains_type_strict_across_s_n_b.py
+scan_case!(
+    given_scan_filter_eq_and_contains_type_strict_across_s_n_b_eq_b_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_eq_and_contains_type_strict_across_s_n_b.eq_b.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_eq_and_contains_type_strict_across_s_n_b.py
+scan_case!(
+    given_scan_filter_eq_and_contains_type_strict_across_s_n_b_contains_n_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_eq_and_contains_type_strict_across_s_n_b.contains_n.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_eq_and_contains_type_strict_across_s_n_b.py
+scan_case!(
+    given_scan_filter_eq_and_contains_type_strict_across_s_n_b_contains_s_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_eq_and_contains_type_strict_across_s_n_b.contains_s.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_eq_and_contains_type_strict_across_s_n_b.py
+scan_case!(
+    given_scan_filter_eq_and_contains_type_strict_across_s_n_b_contains_b_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_eq_and_contains_type_strict_across_s_n_b.contains_b.json"
+);
+
+// AWS behavioural: check_scan_filter_expression_le_ge_and_binary_begins_with.py
+scan_case!(
+    given_scan_filter_expression_le_ge_and_binary_begins_with_name_le_string_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_le_ge_and_binary_begins_with.name_le_string.json"
+);
+
+// AWS behavioural: check_scan_filter_expression_le_ge_and_binary_begins_with.py
+scan_case!(
+    given_scan_filter_expression_le_ge_and_binary_begins_with_score_le_number_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_le_ge_and_binary_begins_with.score_le_number.json"
+);
+
+// AWS behavioural: check_scan_filter_expression_le_ge_and_binary_begins_with.py
+scan_case!(
+    given_scan_filter_expression_le_ge_and_binary_begins_with_score_ge_number_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_le_ge_and_binary_begins_with.score_ge_number.json"
+);
+
+// AWS behavioural: check_scan_filter_expression_le_ge_and_binary_begins_with.py
+scan_case!(
+    given_scan_filter_expression_le_ge_and_binary_begins_with_blob_begins_with_01_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_le_ge_and_binary_begins_with.blob_begins_with_01.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_not_and_per_comparison_parens.py
+scan_case!(
+    given_scan_filter_expression_not_and_per_comparison_parens_not_grouped_bare_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_not_and_per_comparison_parens.not_grouped_bare.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_not_and_per_comparison_parens.py
+scan_case!(
+    given_scan_filter_expression_not_and_per_comparison_parens_not_grouped_both_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_not_and_per_comparison_parens.not_grouped_both.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_not_and_per_comparison_parens.py
+scan_case!(
+    given_scan_filter_expression_not_and_per_comparison_parens_per_comparison_and_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_not_and_per_comparison_parens.per_comparison_and.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.
+// py
+scan_case!(
+    given_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected_le_bool_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.le_bool.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.
+// py
+scan_case!(
+    given_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected_le_null_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.le_null.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.
+// py
+scan_case!(
+    given_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected_ge_bool_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.ge_bool.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.
+// py
+scan_case!(
+    given_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected_ge_null_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.ge_null.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.
+// py
+scan_case!(
+    given_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected_le_n_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_ordering_comparison_non_orderable_operand_rejected.le_n_control.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_redundant_nested_parens_rejected.py
+scan_case!(
+    given_scan_filter_expression_redundant_nested_parens_rejected_double_comparison_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_redundant_nested_parens_rejected.double_comparison.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_redundant_nested_parens_rejected.py
+scan_case!(
+    given_scan_filter_expression_redundant_nested_parens_rejected_double_not_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_redundant_nested_parens_rejected.double_not.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_redundant_nested_parens_rejected.py
+scan_case!(
+    given_scan_filter_expression_redundant_nested_parens_rejected_double_then_and_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_redundant_nested_parens_rejected.double_then_and.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_expression_redundant_nested_parens_rejected.py
+scan_case!(
+    given_scan_filter_expression_redundant_nested_parens_rejected_single_pair_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_expression_redundant_nested_parens_rejected.single_pair_control.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_in_string_and_numeric.py
+scan_case!(
+    given_scan_filter_legacy_in_string_and_numeric_status_in_strings_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_in_string_and_numeric.status_in_strings.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_in_string_and_numeric.py
+scan_case!(
+    given_scan_filter_legacy_in_string_and_numeric_score_in_numbers_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_in_string_and_numeric.score_in_numbers.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_numeric_decimal_negative.py
+scan_case!(
+    given_scan_filter_legacy_numeric_decimal_negative_le_025_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_numeric_decimal_negative.le_025.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_numeric_decimal_negative.py
+scan_case!(
+    given_scan_filter_legacy_numeric_decimal_negative_lt_025_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_numeric_decimal_negative.lt_025.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_numeric_decimal_negative.py
+scan_case!(
+    given_scan_filter_legacy_numeric_decimal_negative_ge_375_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_numeric_decimal_negative.ge_375.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_numeric_decimal_negative.py
+scan_case!(
+    given_scan_filter_legacy_numeric_decimal_negative_gt_025_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_numeric_decimal_negative.gt_025.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_numeric_decimal_negative.py
+scan_case!(
+    given_scan_filter_legacy_numeric_decimal_negative_between_negative_to_375_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_numeric_decimal_negative.between_negative_to_375.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_string_byte_order.py
+scan_case!(
+    given_scan_filter_legacy_string_byte_order_le_b_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_string_byte_order.le_B.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_string_byte_order.py
+scan_case!(
+    given_scan_filter_legacy_string_byte_order_lt_b_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_string_byte_order.lt_B.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_string_byte_order.py
+scan_case!(
+    given_scan_filter_legacy_string_byte_order_ge_z_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_string_byte_order.ge_Z.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_string_byte_order.py
+scan_case!(
+    given_scan_filter_legacy_string_byte_order_gt_b_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_string_byte_order.gt_B.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_string_byte_order.py
+scan_case!(
+    given_scan_filter_legacy_string_byte_order_between_b_and_z_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_string_byte_order.between_B_and_Z.json"
+);
+
+// AWS behavioural: check_scan_filter_legacy_string_byte_order.py
+scan_case!(
+    given_scan_filter_legacy_string_byte_order_contains_an_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_legacy_string_byte_order.contains_an.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_ne_and_not_contains_on_missing_attribute.py
+scan_case!(
+    given_scan_filter_ne_and_not_contains_on_missing_attribute_ne_hello_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_ne_and_not_contains_on_missing_attribute.ne_hello.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_ne_and_not_contains_on_missing_attribute.py
+scan_case!(
+    given_scan_filter_ne_and_not_contains_on_missing_attribute_not_contains_hel_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_ne_and_not_contains_on_missing_attribute.not_contains_hel.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_ne_and_not_contains_on_missing_attribute.py
+scan_case!(
+    given_scan_filter_ne_and_not_contains_on_missing_attribute_attribute_exists_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_ne_and_not_contains_on_missing_attribute.attribute_exists.json"
+);
+
+// AWS behavioural:
+// check_scan_filter_ne_and_not_contains_on_missing_attribute.py
+scan_case!(
+    given_scan_filter_ne_and_not_contains_on_missing_attribute_attribute_not_exists_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_ne_and_not_contains_on_missing_attribute.attribute_not_exists.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_s_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_s_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_parenthesized_size_s_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.parenthesized_size_s_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_b_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_b_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_parenthesized_size_b_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.parenthesized_size_b_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_ss_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_ss_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_parenthesized_size_ss_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.parenthesized_size_ss_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_l_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_l_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_parenthesized_size_l_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.parenthesized_size_l_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_m_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_m_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_parenthesized_size_m_eq_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.parenthesized_size_m_eq.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_of_number_greater_than_zero_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_of_number_greater_than_zero.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_size_of_number_equals_seven_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.size_of_number_equals_seven.json"
+);
+
+// AWS behavioural: check_scan_filter_size_covers_s_b_ss_l_m_not_n.py
+scan_case!(
+    given_scan_filter_size_covers_s_b_ss_l_m_not_n_number_equals_seven_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_scan_filter_size_covers_s_b_ss_l_m_not_n.number_equals_seven_control.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+scan_case!(
+    given_select_non_specific_values_reject_projection_expression_scan_all_attributes_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.scan_all_attributes.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+scan_case!(
+    given_select_non_specific_values_reject_projection_expression_scan_count_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.scan_count.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+scan_case!(
+    given_select_non_specific_values_reject_projection_expression_scan_all_projected_attributes_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.scan_all_projected_attributes.json"
+);
+
+// AWS behavioural:
+// check_select_non_specific_values_reject_projection_expression.py
+scan_case!(
+    given_select_non_specific_values_reject_projection_expression_scan_specific_control_when_scan_runs_then_aws_response_is_exact,
+    "local/aws-behav/check_select_non_specific_values_reject_projection_expression.scan_specific_control.json"
+);

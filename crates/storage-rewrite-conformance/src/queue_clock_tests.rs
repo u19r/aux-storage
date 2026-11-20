@@ -18,6 +18,7 @@ async fn given_a_message_past_retention_when_receive_runs_then_stale_message_is_
         queue_url: url.clone(),
         attributes: HashMap::from([("MessageRetentionPeriod".to_owned(), "60".to_owned())]),
         created_at: store.now(),
+        ..Default::default()
     };
     store
         .queue_operations
@@ -29,6 +30,7 @@ async fn given_a_message_past_retention_when_receive_runs_then_stale_message_is_
         message_body: "expires".to_owned(),
         delay_seconds: None,
         message_attributes: None,
+        ..Default::default()
     };
     let sent = observe(
         store
@@ -51,12 +53,18 @@ async fn given_a_message_past_retention_when_receive_runs_then_stale_message_is_
     let received = observe(store.queue_operations.receive_messages(
         &url,
         1,
-        DurationSeconds::from(30),
-        DurationSeconds::from(0),
+        Some(DurationSeconds::from(30)),
+        Some(DurationSeconds::from(0)),
     ))
     .await;
     received.assert_no_warning_or_error();
-    assert!(received.result.expect("receive after expiry").is_empty());
+    assert!(
+        received
+            .result
+            .expect("receive after expiry")
+            .messages
+            .is_empty()
+    );
     let after = store
         .queue_operations
         .get_queue_with_message_counts(&url)
@@ -80,6 +88,7 @@ async fn given_deleted_message_when_new_message_is_sent_then_only_new_generation
             queue_url: url.clone(),
             attributes: HashMap::new(),
             created_at: store.now(),
+            ..Default::default()
         })
         .await
         .expect("create queue");
@@ -92,6 +101,7 @@ async fn given_deleted_message_when_new_message_is_sent_then_only_new_generation
                     message_body: body.to_owned(),
                     delay_seconds: None,
                     message_attributes: None,
+                    ..Default::default()
                 },
                 store.now(),
             ))
@@ -102,10 +112,11 @@ async fn given_deleted_message_when_new_message_is_sent_then_only_new_generation
             .receive_messages(
                 &url,
                 10,
-                DurationSeconds::from(30),
-                DurationSeconds::from(0),
+                Some(DurationSeconds::from(30)),
+                Some(DurationSeconds::from(0)),
             )
             .await
+            .map(|received| received.messages)
             .expect("receive current generation");
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].body, body);
@@ -125,10 +136,11 @@ async fn given_deleted_message_when_new_message_is_sent_then_only_new_generation
                     .receive_messages(
                         &url,
                         10,
-                        DurationSeconds::from(30),
-                        DurationSeconds::from(0),
+                        Some(DurationSeconds::from(30)),
+                        Some(DurationSeconds::from(0)),
                     )
                     .await
+                    .map(|received| received.messages)
                     .expect("deleted generation stays absent after visibility expiry")
                     .is_empty()
             );

@@ -5,10 +5,7 @@ use storage_provider::{
 };
 use storage_types::{BoundTableInfo, StorageError, StorageResult, storage_serde};
 
-use crate::{
-    SqlAttempt, SqlLayout, SqlStatement, SqlValue, catalog::SqlCatalogAttempt,
-    gsi::read_gsi_readiness,
-};
+use crate::{SqlAttempt, SqlLayout, SqlStatement, SqlValue, catalog::SqlCatalogAttempt};
 
 impl<A: SqlAttempt, L: SqlLayout> DeleteTableAttempt for SqlCatalogAttempt<'_, A, L> {
     async fn load_external_cleanup_requirement(
@@ -51,9 +48,7 @@ impl<A: SqlAttempt, L: SqlLayout> DeleteTableAttempt for SqlCatalogAttempt<'_, A
         let result = async {
             let name = &table.info.table_name;
             let engine = catalog.engine;
-            let (_, targets) =
-                read_gsi_readiness(catalog.attempt, engine, table, catalog.protection, None)
-                    .await?;
+            let targets = storage_provider::gsi_build_targets_from_catalog(table)?;
             if targets.len()
                 != table
                     .info
@@ -81,6 +76,16 @@ impl<A: SqlAttempt, L: SqlLayout> DeleteTableAttempt for SqlCatalogAttempt<'_, A
                     "DELETE FROM {relation_sys_gsi_name_locks} WHERE table_id = {}",
                     engine.engine().placeholder(1),
                     relation_sys_gsi_name_locks = engine.relation_name("sys_gsi_name_locks"),
+                ),
+                vec![SqlValue::Text(
+                    uuid::Uuid::from_bytes(*table.history_id.as_ref()).to_string(),
+                )],
+            ));
+            statements.push(SqlStatement::new(
+                format!(
+                    "DELETE FROM {relation_table_jobs} WHERE table_id = {}",
+                    engine.engine().placeholder(1),
+                    relation_table_jobs = engine.relation_name("table_jobs"),
                 ),
                 vec![SqlValue::Text(
                     uuid::Uuid::from_bytes(*table.history_id.as_ref()).to_string(),
@@ -129,7 +134,7 @@ impl<A: SqlAttempt, L: SqlLayout> DeleteTableAttempt for SqlCatalogAttempt<'_, A
                 ],
             ));
             let expected_count = statements.len();
-            let counts = catalog.attempt.execute_batch(statements).await?;
+            let counts = catalog.execute_catalog_change(name, statements).await?;
             if counts.len() != expected_count
                 || counts[expected_count - 2] != 1
                 || counts.last() != Some(&1)

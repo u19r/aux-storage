@@ -32,8 +32,11 @@ impl<A: KvAttempt> CreateTableAttempt for KvCatalogAttempt<'_, A> {
         &mut self,
         table: &StoredTableInfo,
         seed: Self::LayoutSeed,
+        regional: Option<std::sync::Arc<storage_types::RegionalBinding>>,
     ) -> StorageResult<Option<Self::Identity>> {
-        self.insert_table_layout(table, seed).map(Some)
+        self.insert_table_layout(table, seed, regional)
+            .await
+            .map(Some)
     }
 
     fn table_history_id(&self, identity: &Self::Identity) -> storage_types::TableHistoryId {
@@ -72,11 +75,13 @@ impl<A: KvAttempt> CreateTableAttempt for KvCatalogAttempt<'_, A> {
         )))
     }
 
-    fn register_gsis(
+    async fn register_gsis(
         &mut self,
         identity: &Self::Identity,
         builds: Vec<GsiBuild<()>>,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        register_gsi_builds(self.attempt, identity, builds)
+    ) -> StorageResult<()> {
+        // The shared CreateTable owner registers active builds
+        // (GsiBuild::new_active); insert_layout stored the same phase.
+        register_gsi_builds(self.attempt, identity, builds).await
     }
 }

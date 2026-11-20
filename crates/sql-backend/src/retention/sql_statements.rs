@@ -163,3 +163,13 @@ pub(super) fn delete_marker(
     }
     SqlStatement::new(sql, binds)
 }
+
+/// Observe assigned transactions visible to the connection's role without
+/// assigning an ID.
+pub(super) fn oldest_assigned_transaction_age() -> SqlStatement {
+    SqlStatement::new(
+        "SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - xact_start) * 1000), 0)::bigint FROM \
+         pg_catalog.pg_stat_activity WHERE backend_xid IS NOT NULL AND pid <> pg_backend_pid()",
+        vec![],
+    )
+}

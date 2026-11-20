@@ -25,11 +25,11 @@ impl GsiTableUpdatePlan {
             return Err(StorageError::validation("table must be ACTIVE to update"));
         }
         let mut next_table = table.clone();
-        let attribute_definitions_changed =
+        let mut attribute_definitions_changed =
             Self::merge_attribute_definitions(&mut next_table, request)?;
         Self::validate_updates(&next_table, updates)?;
         let lifecycle = Self::lifecycle(updates);
-        Self::apply_metadata(&mut next_table, lifecycle.as_ref())?;
+        attribute_definitions_changed |= Self::apply_metadata(&mut next_table, lifecycle.as_ref())?;
         Ok(Self {
             next_table,
             lifecycle,
@@ -50,7 +50,7 @@ impl GsiTableUpdatePlan {
     fn apply_metadata(
         table: &mut StoredTableInfo,
         lifecycle: Option<&GsiLifecycleAction>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<bool> {
         match lifecycle {
             Some(GsiLifecycleAction::Create(create)) => table
                 .global_secondary_indexes
@@ -65,10 +65,13 @@ impl GsiTableUpdatePlan {
                 if indexes.is_empty() {
                     table.global_secondary_indexes = None;
                 }
+                // AWS keeps the deleted index's AttributeDefinitions (ddbpar5b
+                // gsi_delete_deleting); aux has no later completion step to
+                // prune them.
             }
             None => {}
         }
-        Ok(())
+        Ok(false)
     }
 
     fn merge_attribute_definitions(
@@ -133,19 +136,43 @@ impl GsiTableUpdatePlan {
         table: &StoredTableInfo,
         updates: &[GlobalSecondaryIndexUpdate],
     ) -> StorageResult<()> {
+        for (position, update) in updates.iter().enumerate() {
+            let name = Self::update_index_name(update);
+            if let Some(name) = name
+                && updates[..position]
+                    .iter()
+                    .any(|earlier| Self::update_index_name(earlier) == Some(name))
+            {
+                return Err(StorageError::validation(format!(
+                    "One or more parameter values were invalid: Only one global secondary index \
+                     update per index is allowed simultaneously. Index: {name}"
+                )));
+            }
+        }
         let lifecycle_count = updates
             .iter()
             .filter(|update| update.create.is_some() || update.delete.is_some())
             .count();
         if lifecycle_count > 1 {
-            return Err(StorageError::validation(
-                "at most one GSI create or delete is allowed per update",
+            return Err(StorageError::from(
+                storage_types::StorageEnum::LimitExceeded {
+                    message: storage_types::ONE_ONLINE_INDEX_MESSAGE.to_owned(),
+                },
             ));
         }
         for update in updates {
             Self::validate_update(table, update)?;
         }
         Ok(())
+    }
+
+    fn update_index_name(update: &GlobalSecondaryIndexUpdate) -> Option<&IndexName> {
+        update
+            .create
+            .as_ref()
+            .map(|create| &create.index_name)
+            .or_else(|| update.update.as_ref().map(|update| &update.index_name))
+            .or_else(|| update.delete.as_ref().map(|delete| &delete.index_name))
     }
 
     fn validate_update(
@@ -172,10 +199,9 @@ impl GsiTableUpdatePlan {
         storage_types::validate_index_name(&create.index_name, "IndexName")
             .map_err(StorageError::validation)?;
         if Self::contains(table, &create.index_name) {
-            return Err(StorageError::validation(format!(
-                "GSI '{}' already exists",
-                create.index_name
-            )));
+            return Err(StorageError::validation(
+                "Attempting to create an index which already exists",
+            ));
         }
         if table
             .global_secondary_indexes
@@ -217,10 +243,12 @@ impl GsiTableUpdatePlan {
                 .iter()
                 .any(|definition| definition.attribute_name == key.attribute_name)
             {
-                return Err(StorageError::validation(format!(
-                    "GSI key attribute '{}' is not defined",
-                    key.attribute_name
-                )));
+                return Err(StorageError::validation(
+                    storage_types::undefined_index_keys_message(
+                        &create.key_schema,
+                        &table.attribute_definitions,
+                    ),
+                ));
             }
             match key.key_type {
                 KeyType::Hash if has_hash => {
@@ -242,10 +270,7 @@ impl GsiTableUpdatePlan {
         if Self::contains(table, index_name) {
             return Ok(());
         }
-        Err(StorageError::validation(format!(
-            "GSI '{}' does not exist",
-            index_name
-        )))
+        Err(StorageError::index_not_found(index_name, &table.table_name))
     }
 
     fn contains(table: &StoredTableInfo, index_name: &IndexName) -> bool {

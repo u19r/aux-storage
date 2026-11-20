@@ -67,6 +67,7 @@ fn make_table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
@@ -100,16 +101,16 @@ fn ttl_index_key_parses_timestamp_and_token() {
     item.insert("sk".to_string(), AttributeValue::S("beta".to_string()));
     let token = TtlIndexKeyToken::from_item(&table_info, &item).unwrap();
 
-    let table_name = &table_info.table_name;
     let ttl_seconds = 1_700_000_000_i64;
-    let key = TtlIndexKey::new(ttl_seconds, token.clone()).encode(table_name);
-    let prefix = TtlIndexKey::prefix(table_name);
+    let key = TtlIndexKey::new(ttl_seconds, token.clone())
+        .encode_ordered_bytes()
+        .unwrap();
 
-    let parsed = TtlIndexKey::parse(&key, &prefix).expect("parsed");
+    let parsed = TtlIndexKey::decode_ordered_bytes(key.clone()).expect("parsed");
     let (parsed_ttl_seconds, parsed_token): (i64, String) = parsed.clone().into();
     assert_eq!(parsed_ttl_seconds, ttl_seconds);
     assert_eq!(parsed_token, token.as_ref());
-    assert_eq!(parsed.encode(table_name), key);
+    assert_eq!(parsed.encode_ordered_bytes().unwrap(), key);
 }
 
 #[test]
@@ -126,9 +127,8 @@ fn ttl_index_key_builds_from_item() {
     let ttl_index_key = TtlIndexKey::for_item(&table_info, "ttl", &item)
         .expect("ttl key should build")
         .expect("ttl value should be present");
-    let encoded = ttl_index_key.encode(&table_info.table_name);
-    let parsed =
-        TtlIndexKey::parse(&encoded, &TtlIndexKey::prefix(&table_info.table_name)).expect("parse");
+    let encoded = ttl_index_key.encode_ordered_bytes().unwrap();
+    let parsed = TtlIndexKey::decode_ordered_bytes(encoded.clone()).expect("parse");
     let parsed_parts: (i64, String) = parsed.into();
     let expected_parts: (i64, String) = ttl_index_key.into();
 
@@ -225,6 +225,7 @@ fn ttl_policy_activation_rejects_wrong_index_state_and_time() {
 fn ttl_cursor_serialization_rejects_unknown_fields() {
     let cursor = TtlMaintenanceCursor::try_from("opaque-token").unwrap();
     let checkpoint = TtlMaintenanceCheckpoint {
+        revision: storage_types::Revision::INITIAL,
         cursor: Some(cursor),
     };
     let encoded = storage_types::storage_serde::to_bytes(&checkpoint).expect("encode checkpoint");
@@ -248,17 +249,25 @@ fn ttl_cursor_serialization_rejects_unknown_fields() {
 }
 
 #[test]
-fn given_ttl_tokens_when_encoding_then_persisted_bytes_and_normalization_are_exact() {
-    let table = TableName::new("Token /表.Table-_");
+fn given_signed_expiry_and_tokens_when_encoding_then_order_and_round_trip_are_exact() {
+    let mut previous = None;
     for timestamp in [i64::MIN, -1, 0, 1, 1_700_000_000, i64::MAX] {
-        for token in ["a".to_string(), "token/é\0".repeat(128)] {
-            let expected =
-                format!("__ttl-index/Token.Table-_/{:020}/{token}", timestamp.max(0)).into_bytes();
-            assert_eq!(
-                TtlIndexKey::new(timestamp, token.clone().into()).encode(&table),
-                expected
-            );
+        for token in ["a", "aa", "b", "é", "表"] {
+            let key = TtlIndexKey::new(timestamp, token.to_owned().into());
+            let encoded = key.encode_ordered_bytes().unwrap();
+            let mut expected = timestamp.to_be_bytes().to_vec();
+            expected[0] ^= 0x80;
+            expected.extend_from_slice(token.as_bytes());
+            assert_eq!(encoded, expected);
+            assert!(TtlIndexKey::decode_ordered_bytes(encoded.clone()).unwrap() == key);
+            if let Some(previous) = previous {
+                assert!(previous < encoded);
+            }
+            previous = Some(encoded);
         }
+    }
+    for invalid in [vec![], vec![0; 8], vec![0xff; 9]] {
+        assert!(TtlIndexKey::decode_ordered_bytes(invalid).is_err());
     }
 }
 
@@ -334,10 +343,14 @@ fn given_changed_wire_ttl_when_planning_index_writes_then_delete_precedes_upsert
         ("ttl".to_string(), AttributeValue::N("20".to_string())),
     ]))
     .expect("new wire item");
-    let mut writes =
-        TtlIndexWriteBatch::for_wire_items(&table, Some(&config), Some(&old_item), Some(&new_item))
-            .expect("TTL write plan")
-            .into_iter();
+    let mut writes = TtlIndexWriteBatch::for_wire_items(
+        &table,
+        Some(&config.binding()),
+        Some(&old_item),
+        Some(&new_item),
+    )
+    .expect("TTL write plan")
+    .into_iter();
     let Some(TtlIndexWrite::Delete(old_key)) = writes.next() else {
         panic!("first TTL write must delete the old key");
     };
@@ -370,10 +383,14 @@ fn given_changed_attribute_ttl_when_planning_index_writes_then_delete_precedes_u
         ("sk".to_string(), AttributeValue::S("range".to_string())),
         ("ttl".to_string(), AttributeValue::N("20".to_string())),
     ]);
-    let mut writes =
-        TtlIndexWriteBatch::for_items(&table, Some(&config), Some(&old_item), Some(&new_item))
-            .expect("TTL write plan")
-            .into_iter();
+    let mut writes = TtlIndexWriteBatch::for_items(
+        &table,
+        Some(&config.binding()),
+        Some(&old_item),
+        Some(&new_item),
+    )
+    .expect("TTL write plan")
+    .into_iter();
     let Some(TtlIndexWrite::Delete(old_key)) = writes.next() else {
         panic!("first TTL write must delete the old key");
     };
@@ -401,8 +418,9 @@ fn given_same_attribute_ttl_when_planning_index_writes_then_plan_is_empty() {
         ("sk".to_string(), AttributeValue::S("range".to_string())),
         ("ttl".to_string(), AttributeValue::N("10".to_string())),
     ]);
-    let batch = TtlIndexWriteBatch::for_items(&table, Some(&config), Some(&item), Some(&item))
-        .expect("TTL write plan");
+    let batch =
+        TtlIndexWriteBatch::for_items(&table, Some(&config.binding()), Some(&item), Some(&item))
+            .expect("TTL write plan");
     assert!(batch.is_empty());
     let batch =
         TtlIndexWriteBatch::for_items(&table, None, Some(&item), None).expect("TTL write plan");
@@ -433,7 +451,7 @@ fn given_ttl_token_workloads_when_measuring_then_all_owner_paths_complete() {
         let wire = storage_types::WireItem::try_from(&item).unwrap();
         let token = TtlIndexKeyToken::from_item(&table, &item).unwrap();
         let typed = TtlIndexKey::new(1_700_000_000, token.clone());
-        let expected_key = typed.encode(&table.table_name);
+        let expected_key = typed.encode_ordered_bytes().unwrap();
         let key_map = token.parse_key_map(&table).unwrap();
         assert_eq!(key_map.get("pk"), item.get("pk"));
         assert_eq!(key_map.get("sk"), item.get("sk"));
@@ -442,7 +460,7 @@ fn given_ttl_token_workloads_when_measuring_then_all_owner_paths_complete() {
         assert_eq!(
             TtlIndexKey::for_wire_item(&table, "ttl", &wire)
                 .unwrap()
-                .map(|key| key.encode(&table.table_name)),
+                .map(|key| key.encode_ordered_bytes().unwrap()),
             Some(expected_key)
         );
         for operation in [
@@ -463,7 +481,7 @@ fn given_ttl_token_workloads_when_measuring_then_all_owner_paths_complete() {
             for _ in 0..ITERATIONS {
                 match operation {
                     "encode" => {
-                        black_box(typed.encode(&table.table_name));
+                        black_box(typed.encode_ordered_bytes().unwrap());
                     }
                     "token_item" => {
                         black_box(TtlIndexKeyToken::from_item(&table, &item).unwrap());
@@ -478,7 +496,7 @@ fn given_ttl_token_workloads_when_measuring_then_all_owner_paths_complete() {
                         black_box(
                             TtlIndexKey::for_wire_item(&table, "ttl", &wire)
                                 .unwrap()
-                                .map(|key| key.encode(&table.table_name)),
+                                .map(|key| key.encode_ordered_bytes().unwrap()),
                         );
                     }
                     _ => unreachable!(),
@@ -526,27 +544,33 @@ fn given_prepared_new_ttl_when_old_image_is_observed_then_keys_match_and_policy_
     };
     for new in [None, Some("10"), Some("20"), Some("invalid")] {
         let new = image(new);
-        let prepared = crate::PreparedTtlPut::try_new(&table, Some(&config), &new).unwrap();
+        let prepared =
+            crate::PreparedTtlPut::try_new(&table, Some(&config.binding()), &new).unwrap();
         for old in [
             None,
             Some(image(None)),
             Some(image(Some("10"))),
             Some(image(Some("20"))),
         ] {
-            let expected =
-                TtlIndexWriteBatch::for_wire_items(&table, Some(&config), old.as_ref(), Some(&new))
-                    .unwrap();
+            let expected = TtlIndexWriteBatch::for_wire_items(
+                &table,
+                Some(&config.binding()),
+                old.as_ref(),
+                Some(&new),
+            )
+            .unwrap();
             assert_eq!(
-                keys(prepared.finish(Some(&config), old.as_ref()).unwrap()),
+                keys(
+                    prepared
+                        .finish(Some(&config.binding()), old.as_ref())
+                        .unwrap()
+                ),
                 keys(expected)
             );
         }
         let mut changed = config.clone();
-        changed.policy_generation = changed.policy_generation.next().unwrap();
-        assert!(prepared.finish(Some(&changed), None).is_err());
-        changed = config.clone();
         changed.attribute_name = "other_ttl".to_owned();
-        assert!(prepared.finish(Some(&changed), None).is_err());
+        assert!(prepared.finish(Some(&changed.binding()), None).is_err());
         assert!(prepared.finish(None, None).is_err());
     }
     let disabled = crate::PreparedTtlPut::try_new(&table, None, &image(Some("10"))).unwrap();
@@ -556,5 +580,5 @@ fn given_prepared_new_ttl_when_old_image_is_observed_then_keys_match_and_policy_
             .unwrap()
             .is_empty()
     );
-    assert!(disabled.finish(Some(&config), None).is_err());
+    assert!(disabled.finish(Some(&config.binding()), None).is_err());
 }

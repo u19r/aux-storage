@@ -10,7 +10,7 @@ pub struct DurationSeconds(u32);
 impl DurationSeconds {
     #[must_use]
     pub fn time_from_now(&self) -> TimestampMillis {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = crate::ambient::now_millis();
         TimestampMillis::from_timestamp(now + i64::from(self.0) * 1000)
     }
 }

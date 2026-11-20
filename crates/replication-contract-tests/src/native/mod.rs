@@ -5,8 +5,6 @@ mod commit_hold;
 pub mod fixture;
 #[cfg(test)]
 mod fixture_tests;
-#[cfg(test)]
-mod format_tests;
 #[cfg(feature = "native-foundationdb")]
 pub mod foundationdb;
 #[cfg(test)]

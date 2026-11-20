@@ -1,14 +1,10 @@
-use async_trait::async_trait;
 use storage_backfill::{GsiBuild, GsiBuildTarget};
 use storage_types::{
-    IndexName, IndexStatus, StorageResult, SystemStreamCheckpoint, SystemStreamPosition,
-    SystemStreamScope, TableName, maintenance::TargetIncarnation,
+    IndexName, IndexStatus, SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope,
+    TableName, context::WrappedError as _, maintenance::TargetIncarnation,
 };
 
-use crate::{
-    GsiIndexReadiness, GsiReadinessRecord, GsiReadinessSnapshot,
-    maintenance::GsiLifecycleRepository,
-};
+use crate::{GsiIndexReadiness, GsiReadinessRecord, GsiReadinessSnapshot};
 
 fn target(index_name: &IndexName, incarnation: u8) -> GsiBuildTarget {
     GsiBuildTarget {
@@ -67,39 +63,40 @@ fn given_duplicate_gsi_incarnations_when_readiness_snapshot_is_created_then_it_i
     );
 }
 
-struct ReadinessRepository;
-
-#[async_trait]
-impl GsiLifecycleRepository for ReadinessRepository {
-    async fn read_gsi_readiness_records(
-        &self,
-        table_name: &TableName,
-        index_names: &[IndexName],
-    ) -> StorageResult<Vec<GsiReadinessRecord>> {
-        Ok(index_names
-            .iter()
-            .map(|index_name| GsiReadinessRecord {
-                table_name: table_name.clone(),
-                index_name: index_name.clone(),
-                readiness: GsiIndexReadiness {
-                    index_status: IndexStatus::Active,
-                    backfilling: false,
-                },
-            })
-            .collect())
-    }
-}
-
-#[tokio::test]
-async fn lifecycle_repository_uses_shared_readiness_selection() {
+#[test]
+fn given_one_active_record_when_selecting_then_readiness_is_active_and_not_backfilling() {
+    let table_name = TableName::new("orders");
     let index_name = IndexName::new("by-status");
-    let readiness = ReadinessRepository
-        .read_gsi_index_readiness(&TableName::new("orders"), std::slice::from_ref(&index_name))
-        .await
-        .expect("shared readiness selection");
+    let readiness = GsiReadinessSnapshot::from(vec![GsiReadinessRecord {
+        table_name,
+        index_name: index_name.clone(),
+        readiness: GsiIndexReadiness {
+            index_status: IndexStatus::Active,
+            backfilling: false,
+        },
+    }])
+    .select(std::slice::from_ref(&index_name))
+    .expect("shared readiness selection");
 
     assert_eq!(readiness.len(), 1);
     assert_eq!(readiness[0].0, index_name);
     assert!(matches!(readiness[0].1.index_status, IndexStatus::Active));
     assert!(!readiness[0].1.backfilling);
+}
+
+// AWS P13: a Query on a CREATING GSI is answered as if the index were absent.
+#[test]
+fn given_creating_index_when_queried_then_aws_missing_index_text() {
+    let index_name = IndexName::new("hidx");
+    let error = GsiReadinessSnapshot::from(GsiBuild::<String>::new(
+        target(&index_name, 1),
+        checkpoint(),
+    ))
+    .require_queryable(&index_name)
+    .expect_err("a building index rejects queries");
+    assert!(matches!(
+        error.to_enum(),
+        storage_types::StorageEnum::Validation { message, .. }
+            if message == "The table does not have the specified index: hidx"
+    ));
 }

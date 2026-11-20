@@ -11,7 +11,7 @@ use super::{
     ExpirationCandidateObservation, ExpirationIndexLocator, ExpirationPagePlan, ExpirationPolicy,
     ExpirationScanRead,
 };
-use crate::{CatalogAttempt, DescribeTimeToLiveAttempt};
+use crate::{CatalogAttempt, TtlPolicyAttempt};
 
 /// Physical reads and writes lent by one native attempt. Policy and page
 /// decisions stay here, so SQL and KV only lower the same typed operations.
@@ -115,7 +115,7 @@ pub async fn read_direct_expiration_policy_in_attempt<A>(
     bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(TtlConfigRecord, Arc<BoundTableInfo>)>>
 where
-    A: CatalogAttempt + DescribeTimeToLiveAttempt,
+    A: CatalogAttempt + TtlPolicyAttempt,
 {
     let Some(stamp) = attempt.read_catalog_stamp(table_name).await? else {
         return Ok(None);
@@ -229,7 +229,7 @@ impl DirectExpirationPageWrite {
         observation: ExpirationCandidateObservation,
     ) -> StorageResult<Self> {
         let DirectExpirationCandidateRead {
-            mut config,
+            config,
             table_info,
             table_name,
             batch,
@@ -239,10 +239,7 @@ impl DirectExpirationPageWrite {
         let deletions = batch.plan_deletions(observation)?;
         let deleted_items = u64::try_from(deletions.items.len())
             .map_err(|_| StorageError::internal("expiration deletion count exceeds u64"))?;
-        config.checkpoint.cursor = next_cursor.clone();
-        if next_cursor.is_none() {
-            config.complete_enabling_at(captured_at)?;
-        }
+        let config = crate::TtlCheckpointChange::try_new(config, next_cursor.clone())?;
         Ok(Self {
             config,
             table_info,
@@ -302,7 +299,7 @@ impl<P: super::ExpirationPort, S: super::ExpirationEffectPolicy<P>> DirectExpira
                 .deletions
                 .prepare_deletions(port, &self.admission, Arc::clone(&table), write.captured_at)
                 .await?;
-            port.write_ttl_config(&table, write.config).await
+            port.write_ttl_checkpoint(&table, write.config).await
         }
         .await;
         settlement.complete(result)

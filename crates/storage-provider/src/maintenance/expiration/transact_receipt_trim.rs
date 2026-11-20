@@ -9,8 +9,10 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use scheduled_bg_jobs::{ExecutionContext, HandlerFuture, JobHandler, JobOutcome, Timestamp};
 use storage_types::{StorageError, StorageResult, TimestampMillis};
 
-use super::{ExpirationPort, ExpirationRepository};
-use crate::transact_idempotency::transact_receipt_is_trimmable;
+use super::ExpirationPort;
+use crate::{
+    maintenance::MaintenanceOperations, transact_idempotency::transact_receipt_is_trimmable,
+};
 
 /// One stored receipt, addressed by its token and guarded by its exact bytes.
 pub struct TransactReceiptRow {
@@ -48,15 +50,21 @@ pub async fn trim_transact_receipts_page<P: ExpirationPort>(
 }
 
 const TRIM_PAGE_LIMIT: NonZeroU32 = NonZeroU32::MIN.saturating_add(99);
+/// A trim page is never cut short by bytes: `next` is set only for a full page.
+/// 64 bytes cover the token (at most 36) and per-row framing.
+const _: () = assert!(
+    crate::TRANSACT_RECEIPT_PAGE_BYTES.get()
+        >= TRIM_PAGE_LIMIT.get() as usize * (crate::TRANSACT_RECEIPT_WRITE_BYTES + 64)
+);
 
 pub struct TransactReceiptTrimHandler {
-    repository: Arc<dyn ExpirationRepository>,
+    repository: Arc<dyn MaintenanceOperations>,
     interval: Duration,
 }
 
 impl TransactReceiptTrimHandler {
     pub fn try_new(
-        repository: Arc<dyn ExpirationRepository>,
+        repository: Arc<dyn MaintenanceOperations>,
         interval: Duration,
     ) -> StorageResult<Self> {
         if interval.is_zero() {

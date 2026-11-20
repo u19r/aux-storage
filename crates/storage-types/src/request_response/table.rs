@@ -1,38 +1,68 @@
-use chrono::{DateTime, Utc};
+use jiff::{Timestamp, civil::DateTime, tz::Offset};
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 use utoipa::ToSchema;
 
 use crate::{
     AttributeDefinition, BoundTableInfo, GlobalSecondaryIndex, IndexName, KeySchemaElement,
-    MaxIndexers, MultiRegionConsistency, Projection, ReplicaDescription, StorageError,
-    StorageResult, StoredTableInfo, StreamRetentionDuration, StreamSpecification, TableName,
-    TableStatus, TableStreamIdentity, TimestampMillis, TimestampSecondsFractional,
+    MaxIndexers, MultiRegionConsistency, PairState, Projection, ReplicaDescription, ReplicaStatus,
+    StorageError, StorageResult, StoredTableInfo, StreamRetentionDuration, StreamSpecification,
+    TableName, TableStatus, TableStreamIdentity, TimestampMillis, TimestampSecondsFractional,
 };
 
-/// Derive the stable stream identifiers returned with table responses.
+/// The stream identifiers returned with table responses: present only while
+/// the stream is enabled.
 pub fn latest_stream_metadata(
     table_name: &TableName,
-    identity: TableStreamIdentity,
+    identity: Option<TableStreamIdentity>,
     stream_specification: Option<&StreamSpecification>,
 ) -> (Option<String>, Option<String>) {
-    if !stream_specification.is_some_and(|specification| specification.stream_enabled) {
+    let Some(identity) = identity
+        .filter(|_| stream_specification.is_some_and(|specification| specification.stream_enabled))
+    else {
         return (None, None);
-    }
-
+    };
     let (stream_arn, stream_label) = stream_identity(table_name, identity);
     (Some(stream_arn), Some(stream_label))
 }
 
-/// Construct the stable identity after the caller has established that its
-/// table stream is enabled.
+const STREAM_LABEL_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
+
+/// The ARN and label of one stream enable. The AWS label is the enable's ISO
+/// timestamp and nothing else; the store issues each enable a later stamp, so
+/// the ARN names one enable of one incarnation.
 pub fn stream_identity(table_name: &TableName, identity: TableStreamIdentity) -> (String, String) {
-    let created_at = DateTime::<Utc>::from(identity.created_at).format("%Y-%m-%dT%H:%M:%S%.3f");
-    let id = uuid::Uuid::from_bytes(*identity.history_id.as_ref());
-    let stream_label = format!("{created_at}-{}", id.simple());
+    let stream_label = Timestamp::from(identity.enabled_at)
+        .strftime(STREAM_LABEL_FORMAT)
+        .to_string();
     let stream_arn =
         format!("arn:aws:dynamodb:us-east-1:123456789012:table/{table_name}/stream/{stream_label}");
     (stream_arn, stream_label)
+}
+
+/// The enable stamp a stream label names; `None` for another format.
+pub fn stream_label_enabled_at(label: &str) -> Option<TimestampMillis> {
+    DateTime::strptime(STREAM_LABEL_FORMAT, label)
+        .and_then(|time| Offset::UTC.to_timestamp(time))
+        .ok()
+        .map(TimestampMillis::from)
+}
+
+/// The table a stream ARN names. The table's current stream identity must
+/// still reproduce the whole ARN for a stream request to succeed.
+pub fn stream_arn_table_name(arn: &str) -> StorageResult<TableName> {
+    let invalid = || {
+        StorageError::from(crate::StorageEnum::ResourceNotFound {
+            resource_type: "stream",
+            resource_id: String::new(),
+        })
+    };
+    let (_, suffix) = arn.split_once(":table/").ok_or_else(invalid)?;
+    let (table_name, label) = suffix.split_once("/stream/").ok_or_else(invalid)?;
+    if table_name.is_empty() || label.is_empty() {
+        return Err(invalid());
+    }
+    Ok(TableName::new(table_name))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
@@ -200,7 +230,6 @@ impl CreateTableRequest {
                 crate::serde_types::validate_index_key_schema(
                     &index.key_schema,
                     &self.attribute_definitions,
-                    "GSI KeySchema",
                 )
                 .map_err(StorageError::validation)?;
             }
@@ -230,6 +259,12 @@ impl CreateTableRequest {
             table_size_bytes: 0,
             item_count: 0,
             stream_specification: self.stream_specification.clone(),
+            // The create attempt raises this above the store's stream clock.
+            stream_enabled_at: self
+                .stream_specification
+                .as_ref()
+                .is_some_and(|specification| specification.stream_enabled)
+                .then_some(created_at),
             table_stream_duration,
             deletion_protection_enabled: self.deletion_protection_enabled.unwrap_or(false),
         })
@@ -369,20 +404,6 @@ pub struct TableDescription {
     #[serde(rename = "Replicas", skip_serializing_if = "Option::is_none")]
     pub replicas: Option<Vec<ReplicaDescription>>,
 
-    /// Installed regional configuration owner; absent for ordinary local
-    /// tables.
-    #[cfg(feature = "regional")]
-    #[serde(
-        rename = "AuxConfigurationPrimaryRegion",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[schema(
-        min_length = 1,
-        max_length = 64,
-        pattern = "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
-    )]
-    pub aux_configuration_primary_region: Option<String>,
-
     #[serde(
         rename = "MultiRegionConsistency",
         skip_serializing_if = "Option::is_none"
@@ -394,73 +415,133 @@ impl TableDescription {
     #[must_use]
     pub fn from_bound_table_info(bound: BoundTableInfo, table_status: TableStatus) -> Self {
         let identity = bound.stream_identity();
+        let history_id = bound.history_id;
+        let replicas = bound.binding.regional.as_deref().map(|binding| {
+            vec![ReplicaDescription {
+                region_name: binding.peer_name.clone(),
+                replica_status: match binding.state {
+                    PairState::Seeding | PairState::Joining => ReplicaStatus::Creating,
+                    PairState::Active => ReplicaStatus::Active,
+                    PairState::Leaving => ReplicaStatus::Deleting,
+                },
+                replica_status_description: None,
+                replica_inaccessible_date_time: None,
+            }]
+        });
+        let multi_region_consistency = replicas.as_ref().map(|_| MultiRegionConsistency::Eventual);
         let mut table_info = StoredTableInfo::from(bound);
         if !table_info.has_enabled_stream()
             && let Some(spec) = &mut table_info.stream_specification
         {
             spec.stream_enabled = false;
         }
-        let indexes_are_active = matches!(&table_status, TableStatus::Active);
         let (latest_stream_arn, latest_stream_label) = latest_stream_metadata(
             &table_info.table_name,
             identity,
             table_info.stream_specification.as_ref(),
         );
+        let table_arn = format!(
+            "arn:aws:dynamodb:us-east-1:123456789012:table/{}",
+            table_info.table_name
+        );
+        let indexes = GsiDescriptionContext {
+            table_arn: &table_arn,
+            table_status: &table_status,
+        };
+        let global_secondary_indexes = table_info
+            .global_secondary_indexes
+            .map(|stored| indexes.describe(stored))
+            .filter(|indexes| !indexes.is_empty());
+        // AWS lists attribute definitions in name order.
+        let mut attribute_definitions = table_info.attribute_definitions;
+        attribute_definitions.sort_by(|left, right| left.attribute_name.cmp(&right.attribute_name));
         Self {
             table_name: table_info.table_name.clone(),
-            table_id: uuid::Uuid::from_bytes(*identity.history_id.as_ref()).to_string(),
+            table_id: uuid::Uuid::from_bytes(*history_id.as_ref()).to_string(),
             table_status,
             created_at: table_info.created_at.into(),
-            attribute_definitions: table_info.attribute_definitions,
+            attribute_definitions,
             key_schema: table_info.key_schema,
             max_indexers: table_info.max_indexers,
             table_size_bytes: table_info.table_size_bytes,
             item_count: table_info.item_count,
-            table_arn: format!(
-                "arn:aws:dynamodb:us-east-1:123456789012:table/{}",
-                table_info.table_name
-            ),
+            table_arn,
+            // Capacity is intentionally unsupported: every table reports the
+            // fixed on-demand summary and no throughput.
             billing_mode_summary: Some(BillingModeSummary {
                 billing_mode: Some(BillingMode::PayPerRequest),
                 last_update_to_pay_per_request_date_time: None,
             }),
-            global_secondary_indexes: table_info
-                .global_secondary_indexes
-                .map(|indexes| global_secondary_index_descriptions(indexes, indexes_are_active))
-                .filter(|indexes| !indexes.is_empty()),
+            global_secondary_indexes,
             local_secondary_indexes: None,
             provisioned_throughput: None,
             stream_specification: table_info.stream_specification,
             latest_stream_arn,
             latest_stream_label,
             deletion_protection_enabled: table_info.deletion_protection_enabled,
-            replicas: None,
-            #[cfg(feature = "regional")]
-            aux_configuration_primary_region: None,
-            multi_region_consistency: None,
+            replicas,
+            multi_region_consistency,
         }
     }
 }
 
-fn global_secondary_index_descriptions(
-    indexes: Vec<GlobalSecondaryIndex>,
-    indexes_are_active: bool,
-) -> Vec<GlobalSecondaryIndexDescription> {
-    indexes
-        .into_iter()
-        .filter(|index| !index.index_name.is_ttl_index())
-        .map(|index| GlobalSecondaryIndexDescription {
+struct GsiDescriptionContext<'a> {
+    table_arn: &'a str,
+    table_status: &'a TableStatus,
+}
+
+impl GsiDescriptionContext<'_> {
+    /// Catalog readiness later replaces `IndexStatus` and `Backfilling` where
+    /// an index is still being built.
+    fn describe(&self, indexes: Vec<GlobalSecondaryIndex>) -> Vec<GlobalSecondaryIndexDescription> {
+        let index_status = match self.table_status {
+            TableStatus::Creating => Some(IndexStatus::Creating),
+            TableStatus::Active => Some(IndexStatus::Active),
+            _ => None,
+        };
+        indexes
+            .into_iter()
+            .filter(|index| !index.index_name.is_ttl_index())
+            .map(|index| self.describe_one(index, index_status.clone()))
+            .collect()
+    }
+
+    fn describe_one(
+        &self,
+        index: GlobalSecondaryIndex,
+        index_status: Option<IndexStatus>,
+    ) -> GlobalSecondaryIndexDescription {
+        GlobalSecondaryIndexDescription {
+            index_arn: Some(format!("{}/index/{}", self.table_arn, index.index_name)),
             index_name: index.index_name,
             key_schema: index.key_schema,
             projection: index.projection,
-            index_status: indexes_are_active.then_some(IndexStatus::Active),
-            backfilling: indexes_are_active.then_some(false),
+            index_status,
+            backfilling: None,
             provisioned_throughput: None,
-            index_size_bytes: None,
-            item_count: None,
-            index_arn: None,
-        })
-        .collect()
+            index_size_bytes: Some(0),
+            item_count: Some(0),
+        }
+    }
+}
+
+impl TableDescription {
+    /// Show an index that this request deletes as `DELETING`. The delete is
+    /// applied before the response, so the stored table no longer lists the
+    /// index; DescribeTable afterwards shows it gone.
+    pub fn show_deleting_index(&mut self, index: GlobalSecondaryIndex) {
+        if index.index_name.is_ttl_index() {
+            return;
+        }
+        let context = GsiDescriptionContext {
+            table_arn: &self.table_arn,
+            table_status: &self.table_status,
+        };
+        let described = context.describe_one(index, Some(IndexStatus::Deleting));
+        self.global_secondary_indexes
+            .get_or_insert_with(Vec::new)
+            .push(described);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -544,7 +625,6 @@ pub struct CreateGlobalSecondaryIndex {
 impl From<CreateGlobalSecondaryIndex> for GlobalSecondaryIndex {
     fn from(value: CreateGlobalSecondaryIndex) -> Self {
         Self {
-            capture_for_build: false,
             index_name: value.index_name,
             key_schema: value.key_schema,
             projection: value.projection,
@@ -560,7 +640,7 @@ pub struct LocalSecondaryIndex {
     pub projection: Projection,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum IndexStatus {
     Creating,
@@ -664,7 +744,85 @@ pub struct DeleteTableRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeleteTableResponse {
     #[serde(rename = "TableDescription")]
-    pub table_description: TableDescription,
+    pub table_description: DeletedTableDescription,
+}
+
+/// The description DeleteTable returns. AWS answers `DELETING` and leaves out
+/// `AttributeDefinitions`, `KeySchema` and `CreationDateTime` (P13 DeleteTable
+/// probe).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeletedTableDescription {
+    #[serde(rename = "TableName")]
+    pub table_name: TableName,
+
+    #[serde(rename = "TableId")]
+    pub table_id: String,
+
+    #[serde(rename = "TableStatus")]
+    pub table_status: TableStatus,
+
+    #[serde(rename = "MaxIndexers", default)]
+    pub max_indexers: MaxIndexers,
+
+    #[serde(rename = "TableSizeBytes")]
+    pub table_size_bytes: u64,
+
+    #[serde(rename = "ItemCount")]
+    pub item_count: u64,
+
+    #[serde(rename = "TableArn")]
+    pub table_arn: String,
+
+    #[serde(rename = "BillingModeSummary", skip_serializing_if = "Option::is_none")]
+    pub billing_mode_summary: Option<BillingModeSummary>,
+
+    #[serde(
+        rename = "GlobalSecondaryIndexes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub global_secondary_indexes: Option<Vec<GlobalSecondaryIndexDescription>>,
+
+    #[serde(
+        rename = "ProvisionedThroughput",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provisioned_throughput: Option<ProvisionedThroughputDescription>,
+
+    #[serde(
+        rename = "StreamSpecification",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_specification: Option<StreamSpecification>,
+
+    #[serde(rename = "LatestStreamArn", skip_serializing_if = "Option::is_none")]
+    pub latest_stream_arn: Option<String>,
+
+    #[serde(rename = "LatestStreamLabel", skip_serializing_if = "Option::is_none")]
+    pub latest_stream_label: Option<String>,
+
+    #[serde(rename = "DeletionProtectionEnabled", default)]
+    pub deletion_protection_enabled: bool,
+}
+
+impl From<TableDescription> for DeletedTableDescription {
+    fn from(description: TableDescription) -> Self {
+        Self {
+            table_name: description.table_name,
+            table_id: description.table_id,
+            table_status: description.table_status,
+            max_indexers: description.max_indexers,
+            table_size_bytes: description.table_size_bytes,
+            item_count: description.item_count,
+            table_arn: description.table_arn,
+            billing_mode_summary: description.billing_mode_summary,
+            global_secondary_indexes: description.global_secondary_indexes,
+            provisioned_throughput: description.provisioned_throughput,
+            stream_specification: description.stream_specification,
+            latest_stream_arn: description.latest_stream_arn,
+            latest_stream_label: description.latest_stream_label,
+            deletion_protection_enabled: description.deletion_protection_enabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

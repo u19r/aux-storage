@@ -138,12 +138,19 @@ async fn verify_claim_scope(store: ScheduledJobStore) {
 #[tokio::test]
 async fn given_memory_sqlite_jobs_in_distinct_namespaces_when_driven_then_actual_claim_scope_is_preserved()
  {
-    let backend = sql_backend::sqlite::SqliteBackend::initialize(":memory:")
-        .await
-        .expect("memory SQLite");
-    let store = sql_backend::SqlStore::initialize_schema(backend)
-        .await
-        .expect("ordinary SQLite store");
+    let backend = sql_backend::sqlite::SqliteBackend::initialize(
+        ":memory:",
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .expect("memory SQLite");
+    let store = sql_backend::SqlStore::initialize_schema(
+        backend,
+        storage_types::InitialStreamLineages::ONE,
+        true,
+    )
+    .await
+    .expect("ordinary SQLite store");
     verify_claim_scope(
         store
             .scheduled_job_store(Default::default())
@@ -162,11 +169,16 @@ async fn given_rocksdb_jobs_in_distinct_namespaces_when_driven_then_actual_claim
         .as_nanos();
     let directory =
         std::env::temp_dir().join(format!("job-context-{}-{nonce}", std::process::id()));
-    let backend =
-        kv_backend::rocksdb::RocksDbBackend::initialize(directory.clone()).expect("RocksDB");
-    let store = kv_backend::KvStore::initialize_format(backend)
-        .await
-        .expect("ordinary KV store");
+    let backend = kv_backend::rocksdb::RocksDbBackend::initialize(
+        directory.clone(),
+        storage_types::AttemptDeadlines::default(),
+        256,
+    )
+    .expect("RocksDB");
+    let store =
+        kv_backend::KvStore::initialize_format(backend, storage_types::InitialStreamLineages::ONE)
+            .await
+            .expect("ordinary KV store");
     verify_claim_scope(
         store
             .scheduled_job_store(Default::default())

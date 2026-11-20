@@ -43,6 +43,7 @@ pub fn scheduled_job_capabilities(
         max_range_bytes: nonzero(SCHEDULED_JOB_MAX_TRANSACTION_BYTES)?,
         max_transaction_duration,
     })
+    .map(StoreCapabilities::with_effect_receipt_groups)
     .map_err(|_| StorageError::internal("invalid scheduled-job capabilities"))
 }
 

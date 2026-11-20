@@ -3,12 +3,12 @@
 
 use std::num::NonZeroU64;
 
-use storage_types::{SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope};
+use storage_types::{StorageEnum, SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope};
 
 use super::{
     SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamHistoryObservation,
     SystemStreamHistoryPage, SystemStreamHistoryRecord, SystemStreamLineage,
-    SystemStreamLineageCatalog,
+    SystemStreamLineageCatalog, lineage_frontier_high,
 };
 
 fn history() -> SystemStreamHistory {
@@ -63,7 +63,7 @@ fn given_versionstamped_history_when_capturing_high_then_exact_commit_ordinals_s
             position.with_versionstamp(stamp).unwrap()
         })
         .collect::<Vec<_>>();
-    let history = history().with_commit_ordering(positions.clone());
+    let history = history().with_commit_ordering(positions.clone(), NonZeroU64::new(9).unwrap());
     assert!(history.uses_commit_versionstamps());
     assert_eq!(history.capture_high().unwrap().frontier(), positions);
 }
@@ -75,16 +75,29 @@ fn given_child_baseline_seven_when_parent_drains_then_children_start_at_seven() 
     let current = checkpoint(vec![position("root", 1)]);
     let parent = history.plan_page(&current, &high, 2).unwrap();
     assert_eq!(parent.as_ref().len(), 1);
-    assert_eq!(parent.as_ref()[0].limit, 1);
+    assert_eq!(parent.as_ref()[0].limit, 2);
     let current = finish(&parent, vec![vec![record("root", 2)]]).unwrap();
     let children = history.plan_page(&current, &high, 2).unwrap();
-    assert_eq!(children.as_ref().len(), 1);
+    assert_eq!(children.as_ref().len(), 2);
     assert_eq!(children.as_ref()[0].after, position("left", 6));
-    let current = finish(&children, vec![vec![record("left", 7), record("left", 8)]]).unwrap();
-    assert!(current.frontier().contains(&position("right", 6)));
-    let right = history.plan_page(&current, &high, 2).unwrap();
-    assert_eq!(right.as_ref()[0].after, position("right", 6));
-    let current = finish(&right, vec![vec![record("right", 7)]]).unwrap();
+    assert_eq!(children.as_ref()[1].after, position("right", 6));
+    let observations = children
+        .as_ref()
+        .iter()
+        .zip([record("left", 7), record("right", 7)])
+        .map(|(read, record)| SystemStreamHistoryObservation {
+            read,
+            records: vec![record],
+            retired_through: None,
+        })
+        .collect::<Vec<_>>();
+    let current = children
+        .finish_bounded(&observations, &[true, false])
+        .unwrap();
+    assert!(current.frontier().contains(&position("right", 7)));
+    let left = history.plan_page(&current, &high, 2).unwrap();
+    assert_eq!(left.as_ref()[0].after, position("left", 7));
+    let current = finish(&left, vec![vec![record("left", 8)]]).unwrap();
     assert_eq!(current, high);
     assert!(
         history
@@ -243,7 +256,7 @@ fn given_wrong_read_boundary_when_records_match_then_page_is_rejected() {
     let high = checkpoint(vec![position("root", 2)]);
     let plan = history.plan_page(&current, &high, 1).unwrap();
     let wrong_read = super::SystemStreamHistoryRead {
-        ordering: super::SystemStreamHistoryOrdering::Contiguous,
+        ordering: super::SystemStreamHistoryOrdering::SparseNumeric,
         after: position("root", 1),
         through: 3,
         initial_sequence: NonZeroU64::MIN,
@@ -344,7 +357,7 @@ fn sparse_history() -> SystemStreamHistory {
         }],
     )
     .unwrap()
-    .with_sparse_numeric_ordering(vec![position("root", 90)])
+    .with_sparse_numeric_ordering(vec![position("root", 90)], NonZeroU64::new(91).unwrap())
 }
 
 #[test]
@@ -431,5 +444,166 @@ fn given_sparse_history_when_rows_repeat_or_cross_high_then_reject_page() {
             )
             .is_err()
         );
+    }
+}
+
+#[test]
+fn given_native_history_when_child_start_exceeds_next_possible_event_then_split_is_rejected() {
+    use super::{SystemStreamSplitChild, SystemStreamSplitOperationId, SystemStreamSplitRequest};
+    let make_request = |history: &SystemStreamHistory, initial| {
+        let parent = history
+            .as_ref()
+            .iter()
+            .find(|lineage| !lineage.sealed())
+            .unwrap()
+            .clone();
+        let children = ["new-left", "new-right"].map(|id| {
+            SystemStreamSplitChild::try_new(
+                SystemStreamLineage::try_new(
+                    id,
+                    format!("{id}-lineage"),
+                    Some(parent.lineage_id().as_str().to_owned()),
+                    false,
+                )
+                .unwrap(),
+                initial,
+            )
+            .unwrap()
+        });
+        SystemStreamSplitRequest::try_new(
+            history.as_ref().source_scope().clone(),
+            parent,
+            children,
+            SystemStreamSplitOperationId::try_new("child-start-test").unwrap(),
+        )
+        .unwrap()
+    };
+    for uses_versionstamps in [false, true] {
+        let base = history();
+        let frontiers = base.capture_high().unwrap().frontier().to_vec();
+        let minimum = NonZeroU64::new(9).unwrap();
+        let native = if uses_versionstamps {
+            base.with_commit_ordering(frontiers, minimum)
+        } else {
+            base.with_sparse_numeric_ordering(frontiers, minimum)
+        };
+        for initial in [1, 9] {
+            assert!(native.plan_split(&make_request(&native, initial)).is_ok());
+        }
+        assert!(matches!(
+            native.plan_split(&make_request(&native, 10)),
+            Err(storage_types::SystemStreamContractError::InvalidChildStart)
+        ));
+    }
+    let counter = history();
+    assert!(
+        counter
+            .plan_split(&make_request(&counter, u64::MAX - 1))
+            .is_ok()
+    );
+}
+
+#[test]
+fn given_native_positions_when_page_budget_is_one_then_least_advanced_lineage_is_read() {
+    for versionstamped in [false, true] {
+        let lineages = ["left", "right"].map(|id| {
+            SystemStreamLineage::try_new(format!("{id}-shard"), id, None, false).unwrap()
+        });
+        let bounds = lineages
+            .iter()
+            .map(|lineage| SystemStreamHistoryBounds {
+                lineage_id: lineage.lineage_id().clone(),
+                initial_sequence: NonZeroU64::MIN,
+                next_sequence: NonZeroU64::new(20).unwrap(),
+                sealed_after: None,
+            })
+            .collect();
+        let base = SystemStreamHistory::try_new(
+            SystemStreamLineageCatalog::try_new(
+                SystemStreamScope::try_new("history-test", 1).unwrap(),
+                lineages.to_vec(),
+            )
+            .unwrap(),
+            bounds,
+        )
+        .unwrap();
+        let offsets = [("left", 8, 2_u8), ("right", 8, 1_u8)];
+        let positions = offsets
+            .into_iter()
+            .map(|(lineage, version, ordinal)| {
+                let current_position = position(lineage, version);
+                if versionstamped {
+                    let mut stamp = [0; 12];
+                    stamp[..8].copy_from_slice(&version.to_be_bytes());
+                    stamp[11] = ordinal;
+                    current_position.with_versionstamp(stamp).unwrap()
+                } else {
+                    position(lineage, version - u64::from(ordinal == 1))
+                }
+            })
+            .collect::<Vec<_>>();
+        let current = checkpoint(positions.clone());
+        let high = checkpoint(
+            ["left", "right"]
+                .map(|lineage| {
+                    let position = position(lineage, 9);
+                    if versionstamped {
+                        let mut stamp = [0; 12];
+                        stamp[..8].copy_from_slice(&9_u64.to_be_bytes());
+                        stamp[11] = 3;
+                        position.with_versionstamp(stamp).unwrap()
+                    } else {
+                        position
+                    }
+                })
+                .to_vec(),
+        );
+        if !versionstamped {
+            let page = base.plan_page(&current, &high, 1).unwrap();
+            assert_eq!(page.as_ref()[0].after.lineage_id().as_str(), "left");
+        }
+        let native = if versionstamped {
+            base.with_commit_ordering(high.frontier().to_vec(), NonZeroU64::new(9).unwrap())
+        } else {
+            base.with_sparse_numeric_ordering(high.frontier().to_vec(), NonZeroU64::new(9).unwrap())
+        };
+        let page = native.plan_page(&current, &high, 1).unwrap();
+        assert_eq!(page.as_ref().len(), 1);
+        assert_eq!(page.as_ref()[0].after.lineage_id().as_str(), "right");
+        assert_eq!(page.as_ref()[0].limit, 1);
+    }
+}
+
+#[test]
+fn given_lineage_bounds_then_frontier_follows_shared_rule() {
+    let n = |value: u64| NonZeroU64::new(value).unwrap();
+    let ok = [
+        // Live: clamped into the lineage range.
+        (5, 10, None, 3, 4),
+        (5, 10, None, 7, 6),
+        (5, 10, None, 12, 9),
+        (5, 10, None, 10, 9),
+        // Sealed: ends at its stored end, inside `[initial, next]`.
+        (5, 10, Some(8), 3, 7),
+        (5, 10, Some(5), 3, 4),
+        (5, 10, Some(10), 3, 9),
+    ];
+    for (initial, next, sealed, upper, expected) in ok {
+        let frontier = lineage_frontier_high(n(initial), n(next), sealed, upper);
+        assert!(
+            matches!(frontier, Ok(value) if value == expected),
+            "initial {initial}, next {next}, sealed {sealed:?}, upper {upper}"
+        );
+    }
+    let unavailable = [
+        (5, 10, Some(4), 3),
+        (5, 10, Some(11), 3),
+        (11, 10, None, 10),
+    ];
+    for (initial, next, sealed, upper) in unavailable {
+        let Err(error) = lineage_frontier_high(n(initial), n(next), sealed, upper) else {
+            panic!("initial {initial}, next {next}, sealed {sealed:?}, upper {upper}");
+        };
+        assert!(matches!(error.as_ref(), StorageEnum::HistoryUnavailable));
     }
 }

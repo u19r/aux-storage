@@ -1,19 +1,15 @@
 use std::sync::Arc;
 
 use bg_job_store::ScheduledJobStore;
-use storage_provider::{
-    DynamoOperations, ListChangeIndexMarkersRequest, StorageStreamOperations,
-    SystemStreamTrimRepository, TableReclaimRepository, TtlSweepRepository,
-    maintenance::GsiLifecycleRepository,
-};
+use storage_provider::{DynamoOperations, StorageStreamOperations};
 use storage_types::{
     KeyAttributes, StorageError, StorageResult, StoredTableInfo, TableName, VecMap,
 };
 
 use crate::{
-    admission::{AdmissionClass, AdmissionController, AdmissionPermit, AdmissionRegistry},
+    admission::{AdmissionClass, AdmissionController, AdmissionPermit},
+    connection::Connection,
     database_manager::constants::ROUTED_DEFAULT_CONNECTION_ID,
-    maintenance_runtime::MaintenanceRuntime,
 };
 
 #[derive(Clone)]
@@ -39,31 +35,56 @@ pub struct ResolvedGetItem {
 
 pub struct DatabaseManager {
     pub(super) point_reads: std::sync::OnceLock<Arc<crate::point_read::PointReadSource>>,
-    pub(super) dynamo: Arc<dyn DynamoOperations>,
-    pub(super) stream: Option<Arc<dyn StorageStreamOperations>>,
-    pub(super) scheduled_job_store: Option<ScheduledJobStore>,
-
-    pub(super) gsi_lifecycle_repository: Option<Arc<dyn GsiLifecycleRepository>>,
-    pub(super) maintenance_runtimes: Vec<MaintenanceRuntime>,
+    /// The registry default connection. The synthetic route id `default`
+    /// resolves to it.
+    pub(super) default_connection: Connection,
+    /// Every other configured connection, keyed by registry id.
+    pub(super) named_connections: VecMap<String, Connection>,
     pub(super) background_services:
         tokio::sync::Mutex<super::service_shutdown::BackgroundServiceState>,
-    pub(super) system_stream_trim_repository: Option<Arc<dyn SystemStreamTrimRepository>>,
-    pub(super) table_reclaim_repository: Option<Arc<dyn TableReclaimRepository>>,
-    pub(super) ttl_sweep_repository: Option<Arc<dyn TtlSweepRepository>>,
-    pub(super) queue_provider: Option<Arc<dyn queue_provider::QueueOperations>>,
-    pub(super) pubsub_provider: Option<Arc<dyn pubsub_provider::PubsubProvider>>,
-    pub(super) delivery_providers: Option<crate::provider_bundle::DeliveryProviders>,
-    pub(super) dynamo_registry: VecMap<String, Arc<dyn DynamoOperations>>,
-    pub(super) admission_registry: AdmissionRegistry,
     pub(super) single_table_mode: bool,
 }
 
 impl DatabaseManager {
-    /// Return the bootstrapped native job store for the default physical
-    /// connection. Remote and mock providers do not supply a native store.
+    /// The one connection resolver: the registry id, else the synthetic route
+    /// id `default` names the default connection.
+    pub(crate) fn connection(&self, connection_id: &str) -> StorageResult<&Connection> {
+        if connection_id == self.default_connection.id {
+            return Ok(&self.default_connection);
+        }
+        if let Some(connection) = self.named_connections.get(connection_id) {
+            return Ok(connection);
+        }
+        if connection_id == ROUTED_DEFAULT_CONNECTION_ID {
+            return Ok(&self.default_connection);
+        }
+        Err(StorageError::validation(format!(
+            "storage connection '{connection_id}' is not configured"
+        )))
+    }
+
+    pub(super) fn connections(&self) -> impl Iterator<Item = &Connection> {
+        std::iter::once(&self.default_connection).chain(self.named_connections.values())
+    }
+
+    /// The regional service of one native connection, when its regional file is
+    /// configured.
+    pub(crate) fn regional_service(
+        &self,
+        connection_id: &str,
+    ) -> Option<&Arc<crate::regional::RegionalService>> {
+        self.connection(connection_id)
+            .ok()?
+            .regional
+            .as_ref()
+            .map(|attachment| &attachment.service)
+    }
+
+    /// The scheduled job store of the default connection. Always `Some`; the
+    /// `Option` stays so aux-fn callers do not change in this package.
     #[must_use]
     pub fn scheduled_job_store(&self) -> Option<ScheduledJobStore> {
-        self.scheduled_job_store.clone()
+        Some(self.default_connection.jobs.clone())
     }
 
     pub(super) const fn single_table_mode_enabled(&self) -> bool {
@@ -74,21 +95,7 @@ impl DatabaseManager {
         &self,
         connection_id: &str,
     ) -> StorageResult<&AdmissionController> {
-        self.admission_registry
-            .for_connection(connection_id)
-            // `default` is the stable synthetic route id used by the
-            // single-backend API. A named connection registry may declare a
-            // different physical default, so use that controller when no
-            // literal `default` connection exists.
-            .or_else(|| {
-                (connection_id == ROUTED_DEFAULT_CONNECTION_ID)
-                    .then(|| self.admission_registry.default_controller())
-            })
-            .ok_or_else(|| {
-                StorageError::validation(format!(
-                    "storage connection '{connection_id}' is not configured"
-                ))
-            })
+        Ok(&self.connection(connection_id)?.admission)
     }
 
     /// Acquire a foreground permit for an externally owned admission interval.
@@ -117,8 +124,10 @@ impl DatabaseManager {
         Fut: std::future::Future<Output = StorageResult<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let dynamo = self.dynamo_for_connection(connection_id)?;
-        self.admission_controller_for_connection(connection_id)?
+        let connection = self.connection(connection_id)?;
+        let dynamo = Arc::clone(&connection.dynamo);
+        connection
+            .admission
             .settle_foreground(class, || operation(dynamo))
             .await
     }
@@ -133,7 +142,7 @@ impl DatabaseManager {
         Fut: std::future::Future<Output = StorageResult<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let dynamo = self.dynamo_for_connection(connection_id)?;
+        let dynamo = Arc::clone(&self.connection(connection_id)?.dynamo);
         self.run_scoped_control(connection_id, move || operation(dynamo))
             .await
     }
@@ -150,25 +159,10 @@ impl DatabaseManager {
     {
         self.admission_controller_for_connection(connection_id)?
             .settle_native(
-                storage_provider::native_admission::NativeWork::Recovery,
+                storage_common::native_admission::NativeWork::Recovery,
                 operation,
             )
             .await
-    }
-
-    fn dynamo_for_connection(
-        &self,
-        connection_id: &str,
-    ) -> StorageResult<Arc<dyn DynamoOperations>> {
-        self.dynamo_registry
-            .get(connection_id)
-            .or_else(|| (connection_id == ROUTED_DEFAULT_CONNECTION_ID).then_some(&self.dynamo))
-            .cloned()
-            .ok_or_else(|| {
-                StorageError::validation(format!(
-                    "storage connection '{connection_id}' is not configured"
-                ))
-            })
     }
 
     pub async fn run_stream_admitted<F, Fut, T>(
@@ -182,8 +176,10 @@ impl DatabaseManager {
         Fut: std::future::Future<Output = StorageResult<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let stream = self.stream_for_connection(connection_id)?;
-        self.admission_controller_for_connection(connection_id)?
+        let connection = self.connection(connection_id)?;
+        let stream = connection.stream()?;
+        connection
+            .admission
             .settle_foreground(class, || operation(stream))
             .await
     }
@@ -198,20 +194,9 @@ impl DatabaseManager {
         Fut: std::future::Future<Output = StorageResult<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let stream = self.stream_for_connection(connection_id)?;
+        let stream = self.connection(connection_id)?.stream()?;
         self.run_scoped_control(connection_id, move || operation(stream))
             .await
-    }
-
-    fn stream_for_connection(
-        &self,
-        connection_id: &str,
-    ) -> StorageResult<Arc<dyn StorageStreamOperations>> {
-        self.stream
-            .as_ref()
-            .filter(|_| connection_id == ROUTED_DEFAULT_CONNECTION_ID)
-            .cloned()
-            .ok_or_else(|| StorageError::unsupported("stream operations are unavailable"))
     }
 
     /// Append a TestUtil record to one accepted immutable table incarnation.
@@ -269,36 +254,6 @@ impl DatabaseManager {
         .await
     }
 
-    #[cfg(not(feature = "regional"))]
-    pub async fn read_canonical_history_response(
-        &self,
-        _payload: serde_json::Value,
-    ) -> StorageResult<super::CanonicalHistoryResponse> {
-        Err(StorageError::unsupported(
-            "Canonical regional history is unavailable",
-        ))
-    }
-
-    /// Read change-index markers through the same bounded range-read lane as
-    /// other provider reads.
-    pub async fn list_change_index_markers(
-        &self,
-        request: ListChangeIndexMarkersRequest,
-    ) -> StorageResult<Vec<storage_provider::ChangeIndexMarker>> {
-        self.run_dynamo_admitted(
-            ROUTED_DEFAULT_CONNECTION_ID,
-            AdmissionClass::RangeRead,
-            |provider| async move {
-                let database_call =
-                    metrics_facade::begin_database_call("list_change_index_markers");
-                let result = provider.list_change_index_markers(request).await;
-                drop(database_call);
-                result
-            },
-        )
-        .await
-    }
-
     #[must_use]
     pub fn admission_controller(&self, connection_id: &str) -> Option<AdmissionController> {
         self.admission_controller_for_connection(connection_id)
@@ -308,12 +263,14 @@ impl DatabaseManager {
 
     #[must_use]
     pub fn default_admission_controller(&self) -> AdmissionController {
-        self.admission_registry.default_controller().clone()
+        self.default_connection.admission.clone()
     }
 
     #[must_use]
     pub fn fixed_ingress_limit(&self) -> usize {
-        self.admission_registry.fixed_ingress_limit()
+        crate::admission::fixed_ingress_limit(
+            self.connections().map(|connection| &connection.admission),
+        )
     }
 
     pub async fn resolve_storage_operation(
@@ -326,37 +283,24 @@ impl DatabaseManager {
         })
     }
 
+    /// The queue and pubsub store values of the default connection in
+    /// `lane`; `None` for a remote connection. Customer values take one
+    /// admission permit per native attempt.
     #[must_use]
-    pub fn initialization_queue_provider(
+    pub fn messaging_store(
         &self,
-    ) -> Option<Arc<dyn queue_provider::QueueOperations>> {
-        self.queue_provider.clone()
+        lane: crate::messaging::MessagingLane,
+    ) -> Option<crate::messaging::MessagingStore> {
+        self.default_messaging_stores()
+            .map(|stores| stores.lane(lane))
     }
 
-    /// Scheduled delivery yields to queued foreground work on the selected
-    /// connection.
-    pub fn initialization_delivery_pubsub_provider(
-        &self,
-    ) -> Option<Arc<dyn pubsub_provider::PubsubProvider>> {
-        self.delivery_providers
+    /// Every messaging lane of the default connection, the delivery lane
+    /// included (`MessagingServices`).
+    pub(crate) fn default_messaging_stores(&self) -> Option<&crate::messaging::MessagingStores> {
+        self.default_connection
+            .native
             .as_ref()
-            .map(|providers| Arc::clone(&providers.pubsub))
-    }
-
-    /// Background SQS sends use the same connection as delivery claims and
-    /// receipts.
-    pub fn initialization_delivery_queue_provider(
-        &self,
-    ) -> Option<Arc<dyn queue_provider::QueueOperations>> {
-        self.delivery_providers
-            .as_ref()
-            .map(|providers| Arc::clone(&providers.queue))
-    }
-
-    #[must_use]
-    pub fn initialization_pubsub_provider(
-        &self,
-    ) -> Option<Arc<dyn pubsub_provider::PubsubProvider>> {
-        self.pubsub_provider.clone()
+            .map(|native| &native.messaging)
     }
 }

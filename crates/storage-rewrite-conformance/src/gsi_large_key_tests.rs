@@ -60,7 +60,7 @@ async fn given_maximum_binary_keys_and_chunked_images_when_paged_overwritten_and
             let mut advanced = 0;
             for _ in 0..1000 {
                 match fixture
-                    .table_reclaim_repository
+                    .maintenance
                     .reclaim_table_page()
                     .await?
                 {
@@ -71,7 +71,7 @@ async fn given_maximum_binary_keys_and_chunked_images_when_paged_overwritten_and
             anyhow::ensure!(advanced > 0, "old wide projections require reclamation");
             anyhow::ensure!(
                 fixture
-                    .table_reclaim_repository
+                    .maintenance
                     .reclaim_table_page()
                     .await?
                     == TableReclaimStep::Complete

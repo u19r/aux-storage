@@ -2,7 +2,7 @@ use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ItemKeyError, SerializesToKey, StreamItemId, StreamName, TableName};
+use crate::{ItemKeyError, SerializesToKey};
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamKey(Vec<u8>);
@@ -11,16 +11,6 @@ impl StreamKey {
     #[must_use]
     pub fn new(name: &[u8]) -> Self {
         Self(name.to_vec())
-    }
-
-    #[must_use]
-    pub fn for_system_stream(stream_item_id: &StreamItemId) -> Self {
-        &StreamName::system_table_stream() + stream_item_id
-    }
-
-    #[must_use]
-    pub fn for_table_stream(table_name: &TableName, stream_item_id: &StreamItemId) -> Self {
-        &StreamName::table_stream(table_name) + stream_item_id
     }
 }
 

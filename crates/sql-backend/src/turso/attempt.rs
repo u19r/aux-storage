@@ -1,12 +1,15 @@
-use std::num::NonZeroUsize;
-#[cfg(feature = "fault-injection")]
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
-use storage_types::StorageResult;
+use storage_common::{
+    native_attempt_lifecycle::AttemptLifecycle,
+    native_observer::{CommitBoundary, observe_commit_boundary},
+    native_outcome::{NativeCommitError, classify_commit},
+};
+use storage_types::{AttemptDeadline, AttemptPhase, StorageError, StorageResult};
 use tokio::sync::OwnedMutexGuard;
 
 use super::{
-    error::{map_commit_error, map_driver_error, unknown_settlement},
+    error::{commit_error, map_driver_error},
     statements,
 };
 use crate::{AttemptMode, ReadProtection, SqlAttempt, SqlQueryPage, SqlStatement};
@@ -16,7 +19,7 @@ pub struct TursoAttempt {
     settlement: storage_types::NativeAttemptSettlement,
     connection: OwnedMutexGuard<turso::Connection>,
     mode: AttemptMode,
-    #[cfg(feature = "fault-injection")]
+    /// `None` in production.
     fault_probe: Option<Arc<dyn crate::SqlFaultProbe>>,
 }
 
@@ -24,26 +27,40 @@ impl TursoAttempt {
     pub(super) fn new(
         connection: OwnedMutexGuard<turso::Connection>,
         execution: (AttemptMode, Option<storage_types::NativeWorkLimits>),
-        #[cfg(feature = "fault-injection")] fault_probe: Option<Arc<dyn crate::SqlFaultProbe>>,
+        fault_probe: Option<Arc<dyn crate::SqlFaultProbe>>,
     ) -> Self {
         let (mode, limits) = execution;
         Self {
             settlement: storage_types::NativeAttemptSettlement::new(limits),
             connection,
             mode,
-            #[cfg(feature = "fault-injection")]
             fault_probe,
         }
     }
 
     async fn restore_clean(&self) -> StorageResult<()> {
         if !self.connection.is_autocommit().map_err(map_driver_error)? {
-            self.connection
-                .execute("ROLLBACK", ())
-                .await
-                .map_err(map_driver_error)?;
+            let native = async {
+                self.connection
+                    .execute("ROLLBACK", ())
+                    .await
+                    .map_err(map_driver_error)
+            };
+            let native = crate::fault_injection::settlement_wave(
+                self.fault_probe.as_deref(),
+                "ROLLBACK",
+                crate::SqlNativeEvent::Rollback,
+                native,
+            );
+            native.await?;
         }
         Ok(())
+    }
+
+    /// FIN-b: a busy BEGIN on this connection waits at most until `deadline`.
+    pub(super) fn bound_busy_wait(&self, deadline: &AttemptDeadline) -> StorageResult<()> {
+        let busy = crate::backend::local_busy_wait(deadline)?;
+        self.connection.busy_timeout(busy).map_err(map_driver_error)
     }
 
     pub(super) async fn begin(&self) -> StorageResult<()> {
@@ -55,53 +72,99 @@ impl TursoAttempt {
             AttemptMode::ReadOnly => "BEGIN",
             AttemptMode::ReadWrite | AttemptMode::ReadWriteItems => "BEGIN IMMEDIATE",
         };
-        self.connection
-            .execute(sql, ())
-            .await
-            .map_err(map_driver_error)?;
+        let native = async {
+            self.connection
+                .execute(sql, ())
+                .await
+                .map_err(map_driver_error)
+        };
+        let native = crate::fault_injection::settlement_wave(
+            self.fault_probe.as_deref(),
+            sql,
+            crate::SqlNativeEvent::Begin,
+            native,
+        );
+        native.await?;
         Ok(())
     }
 
-    pub(super) async fn commit(&self) -> StorageResult<()> {
+    pub(super) async fn commit(
+        &self,
+        deadline: AttemptDeadline,
+        lifecycle: &AttemptLifecycle,
+    ) -> StorageResult<()> {
         if let Err(error) = self.require_settlement() {
             self.rollback().await?;
             return Err(error);
         }
-        #[cfg(feature = "fault-injection")]
-        if let Err(error) = crate::SqlCommitBoundary::BeforeCommit
-            .observe(self.fault_probe.as_deref())
-            .await
+        if let Some(observer) = lifecycle.observer()
+            && let Err(error) =
+                observe_commit_boundary(observer, CommitBoundary::BeforeCommit, self.mode).await
         {
             self.rollback().await?;
             return Err(error);
         }
-        match self.connection.execute("COMMIT", ()).await {
-            Ok(_) => {
-                #[cfg(feature = "fault-injection")]
-                crate::SqlCommitBoundary::AfterDurableAcknowledgement
-                    .observe(self.fault_probe.as_deref())
-                    .await?;
-                Ok(())
-            }
+        // The one commit-submission point. A read commits nothing and keeps
+        // only the Settle deadline check.
+        let ticket = if self.mode == AttemptMode::ReadOnly {
+            deadline
+                .require_remaining(AttemptPhase::Settle)
+                .map(|()| None)
+        } else {
+            lifecycle.submit_commit(&deadline).map(Some)
+        };
+        let ticket = match ticket {
+            Ok(ticket) => ticket,
             Err(error) => {
-                let classified = map_commit_error(error);
-                self.restore_clean().await.map_err(|_| {
-                    unknown_settlement("Turso commit and rollback were not acknowledged")
-                })?;
-                Err(classified)
+                self.rollback().await?;
+                return Err(error);
             }
+        };
+        let native = async {
+            self.connection
+                .execute("COMMIT", ())
+                .await
+                .map_err(commit_error)
+        };
+        let native = crate::fault_injection::settlement_wave(
+            self.fault_probe.as_deref(),
+            "COMMIT",
+            crate::SqlNativeEvent::Commit,
+            native,
+        );
+        let answer = match native.await {
+            Ok(_) => Ok(()),
+            Err(classified) => match self.restore_clean().await {
+                Ok(()) => Err(classified),
+                Err(_) => Err(NativeCommitError::Unproven {
+                    reason: "Turso commit and rollback were not acknowledged",
+                    cause: None,
+                }),
+            },
+        };
+        match ticket {
+            Some(ticket) => ticket.settle(answer),
+            None => answer.map_err(|error| classify_commit(false, error)),
+        }?;
+        if let Some(observer) = lifecycle.observer() {
+            observe_commit_boundary(
+                observer,
+                CommitBoundary::AfterDurableAcknowledgement,
+                self.mode,
+            )
+            .await?;
         }
+        Ok(())
     }
 
     pub(super) async fn rollback(&self) -> StorageResult<()> {
         self.restore_clean()
             .await
-            .map_err(|_| unknown_settlement("Turso rollback was not acknowledged"))
+            .map_err(|_| StorageError::commit_unknown("Turso rollback was not acknowledged"))
     }
 }
 
 impl SqlAttempt for TursoAttempt {
-    #[cfg(feature = "fault-injection")]
     fn fault_probe(&self) -> Option<&dyn crate::SqlFaultProbe> {
         self.fault_probe.as_deref()
     }
@@ -130,7 +193,6 @@ impl SqlAttempt for TursoAttempt {
                 &self.connection,
                 statement,
                 max_bytes,
-                #[cfg(feature = "fault-injection")]
                 self.fault_probe.as_deref(),
             )
             .await
@@ -161,7 +223,6 @@ impl SqlAttempt for TursoAttempt {
                 &self.connection,
                 queries,
                 max_bytes,
-                #[cfg(feature = "fault-injection")]
                 self.fault_probe.as_deref(),
             )
             .await
@@ -181,13 +242,7 @@ impl SqlAttempt for TursoAttempt {
         let result = async {
             statement.charge_work(&self.settlement)?;
             self.mode.require_write()?;
-            statements::execute(
-                &self.connection,
-                statement,
-                #[cfg(feature = "fault-injection")]
-                self.fault_probe.as_deref(),
-            )
-            .await
+            statements::execute(&self.connection, statement, self.fault_probe.as_deref()).await
         }
         .await;
         let result = result.and_then(|count| {
@@ -205,20 +260,14 @@ impl SqlAttempt for TursoAttempt {
                 statement.charge_work(&self.settlement)?;
             }
             self.mode.require_write()?;
-            statements::execute_batch(
-                &self.connection,
-                writes,
-                #[cfg(feature = "fault-injection")]
-                self.fault_probe.as_deref(),
-            )
-            .await
+            statements::execute_batch(&self.connection, writes, self.fault_probe.as_deref()).await
         }
         .await;
         let result = result.and_then(|counts| {
             let bytes = counts
                 .len()
                 .checked_mul(std::mem::size_of::<u64>())
-                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .ok_or(storage_types::AttemptFailure::CAPACITY)?;
             self.settlement.charge_data(bytes)?;
             Ok(counts)
         });

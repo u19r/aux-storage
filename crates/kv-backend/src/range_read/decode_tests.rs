@@ -8,11 +8,12 @@ use storage_types::{
 };
 
 use super::decode::range_evidence;
-use crate::{catalog::KvTableIdentity, constants::PRIMARY_ITEM_KEY_PREFIX_BYTES};
+use crate::constants::PRIMARY_ITEM_KEY_PREFIX_BYTES;
 
 pub(super) fn table() -> BoundTableInfo {
     BoundTableInfo {
-        history_id: uuid::Uuid::from_bytes([1; 16]).into(),
+        binding: Default::default(),
+        history_id: 1u32.into(),
         info: Arc::new(StoredTableInfo {
             table_name: TableName::new("items"),
             table_status: TableStatus::Active,
@@ -30,6 +31,7 @@ pub(super) fn table() -> BoundTableInfo {
             table_size_bytes: 0,
             item_count: 0,
             stream_specification: None,
+            stream_enabled_at: None,
             table_stream_duration: Default::default(),
             deletion_protection_enabled: false,
         }),
@@ -56,16 +58,7 @@ fn given_a_physical_primary_key_when_range_image_disagrees_then_content_is_rejec
         &AttributeMap::from_iter([("pk".into(), AttributeValue::S("owned".into()))]),
     )
     .unwrap();
-    let identity = KvTableIdentity {
-        table_id: 1,
-        revision: std::num::NonZeroU64::new(1).unwrap(),
-        table_name: table.table_name.clone(),
-        indexes: Vec::new(),
-        index_id_high_water: 0,
-        deleted: false,
-        external_cleanup_required: false,
-    };
-    let physical = super::key_layout::physical_item_key(&identity, &table, &bound, &key).unwrap();
+    let physical = super::key_layout::physical_item_key(&table, &bound, &key).unwrap();
     let valid = WireItem::dynamo_json(br#"{"pk":{"S":"owned"}}"#.to_vec());
     assert!(range_evidence(&table, &bound, &physical, &valid).is_ok());
     for bytes in [

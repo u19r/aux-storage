@@ -15,25 +15,10 @@ DynamoDB-compatible global secondary indexes are normally eventually consistent.
 
 It is intended for systems that want the DynamoDB data model and API shape, but need read-after-write behavior for secondary indexes.
 
-### How to Enable It
+### Availability
 
-Immediate consistency GSIs are enabled at the aux-storage service level:
-
-```bash
-storage-api --storage foundationdb --overrides 'features.backends.foundationdb.immediate_gsi_consistency=true'
-```
-
-From a source checkout, the same launch shape is:
-
-```bash
-cargo run -p storage-api --bin storage-api -- --storage foundationdb --overrides 'features.backends.foundationdb.immediate_gsi_consistency=true'
-```
-
-Use the equivalent deployment setting if your environment wraps `storage-api`
-behind a service manager, container entrypoint, or platform-specific config.
-
-After the service is running in immediate-consistency mode, application requests
-use normal DynamoDB API calls. No per-request extension field is required.
+No setting enables it. Every provider stages each active GSI projection in the same native transaction as the
+item write, so a query through an active GSI sees the write as soon as the write returns.
 
 ### Example: Create a Table with a GSI
 

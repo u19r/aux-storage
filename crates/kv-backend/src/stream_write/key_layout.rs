@@ -21,7 +21,7 @@ pub fn item_key(stream_name: &StreamName, id: StreamItemId) -> StorageResult<Vec
 
 pub fn item_row_prefix(stream_name: &StreamName) -> StorageResult<Vec<u8>> {
     if let Some(history) = stream_name.table_history_id()? {
-        let mut key = table_history_row_prefix(history);
+        let mut key = table_history_row_prefix(history)?;
         let namespace = history.stream_prefix();
         append_segment(&mut key, &stream_name.as_ref()[namespace.len()..])?;
         return Ok(key);
@@ -33,10 +33,12 @@ pub fn item_row_prefix(stream_name: &StreamName) -> StorageResult<Vec<u8>> {
 
 /// History identity precedes variable-length names so reclamation uses one
 /// bounded range.
-pub(crate) fn table_history_row_prefix(history: storage_types::TableHistoryId) -> Vec<u8> {
-    let mut key = crate::constants::TABLE_HISTORY_ROW_PREFIX.to_vec();
-    key.extend_from_slice(history.as_ref());
-    key
+fn table_history_row_prefix(history: storage_types::TableHistoryId) -> StorageResult<Vec<u8>> {
+    Ok(crate::table_key_layout::table_stream_prefix(
+        crate::catalog::table_id_from_history(history)?,
+        crate::table_key_layout::TableStreamFamily::AppendRow,
+    )
+    .to_vec())
 }
 
 pub(crate) fn read_segment(bytes: &[u8]) -> StorageResult<(&[u8], &[u8])> {
@@ -94,32 +96,31 @@ pub(crate) fn retired_key(position: &SystemStreamPosition) -> Vec<u8> {
     key
 }
 
-pub(crate) fn table_record_prefix(history: storage_types::TableHistoryId) -> Vec<u8> {
-    let mut key = crate::constants::SYSTEM_STREAM_TABLE_PREFIX.to_vec();
-    key.extend_from_slice(history.as_ref());
-    key
+pub(crate) fn table_entry_prefix(history: storage_types::TableHistoryId) -> StorageResult<Vec<u8>> {
+    Ok(crate::table_key_layout::table_stream_prefix(
+        crate::catalog::table_id_from_history(history)?,
+        crate::table_key_layout::TableStreamFamily::Entry,
+    )
+    .to_vec())
 }
 
-pub(crate) fn table_record_source_key(
-    history: storage_types::TableHistoryId,
-    key: &[u8],
-) -> StorageResult<Vec<u8>> {
-    let prefix = table_record_prefix(history);
-    let suffix = key
-        .strip_prefix(prefix.as_slice())
-        .filter(|suffix| !suffix.is_empty())
-        .ok_or_else(|| StorageError::internal("System history index has another table ID"))?;
-    let mut key = SYSTEM_STREAM_RECORD_PREFIX.to_vec();
-    key.extend_from_slice(suffix);
-    Ok(key)
-}
-
-pub(crate) fn table_record_key(
+/// Table incarnation owns the entry range; feed keys contain only its ID.
+pub(crate) fn entry_prefix(
     history: storage_types::TableHistoryId,
     position: &SystemStreamPosition,
 ) -> StorageResult<Vec<u8>> {
-    let mut key = table_record_prefix(history);
-    let record = record_key(position)?;
-    key.extend_from_slice(&record[SYSTEM_STREAM_RECORD_PREFIX.len()..]);
+    let mut key = table_entry_prefix(history)?;
+    let source = record_prefix(position);
+    key.extend_from_slice(&source[SYSTEM_STREAM_RECORD_PREFIX.len()..]);
+    Ok(key)
+}
+
+pub(crate) fn entry_key(
+    history: storage_types::TableHistoryId,
+    position: &SystemStreamPosition,
+) -> StorageResult<Vec<u8>> {
+    let mut key = entry_prefix(history, position)?;
+    let source = record_key(position)?;
+    key.extend_from_slice(&source[record_prefix(position).len()..]);
     Ok(key)
 }

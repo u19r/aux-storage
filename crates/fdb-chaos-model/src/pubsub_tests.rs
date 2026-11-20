@@ -522,3 +522,84 @@ fn given_unobserved_unknown_attempt_when_intent_appears_then_progress_retains_ac
         BTreeSet::from([attempt.message_id])
     );
 }
+
+fn copy(attempt: &PublishAttempt, subscription: &str) -> crate::pubsub::QueueCopyAudit {
+    crate::pubsub::QueueCopyAudit {
+        message_id: attempt.message_id.clone(),
+        subscription_arn: subscription.to_owned(),
+    }
+}
+
+#[test]
+fn given_drained_publication_when_effects_audited_then_one_copy_for_delivered_subscription_only() {
+    use crate::pubsub::check_terminal_effects;
+    let delivered = BTreeSet::from(["arn:subscription:a".to_owned()]);
+    let acknowledged = make_attempt(PublishOutcome::Acknowledged);
+    let one = [copy(&acknowledged, "arn:subscription:a")];
+    assert!(
+        check_terminal_effects(
+            std::slice::from_ref(&acknowledged),
+            &[],
+            &[],
+            &delivered,
+            &one
+        )
+        .is_ok()
+    );
+    let error = check_terminal_effects(
+        std::slice::from_ref(&acknowledged),
+        &[],
+        &[],
+        &delivered,
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("queue copies [0, 0], expected [1, 0]"),
+        "{error}"
+    );
+    let twice = [one[0].clone(), one[0].clone()];
+    assert!(
+        check_terminal_effects(
+            std::slice::from_ref(&acknowledged),
+            &[],
+            &[],
+            &delivered,
+            &twice
+        )
+        .is_err()
+    );
+    let failed = [copy(&acknowledged, "arn:subscription:b")];
+    assert!(
+        check_terminal_effects(
+            std::slice::from_ref(&acknowledged),
+            &[],
+            &[],
+            &delivered,
+            &failed
+        )
+        .is_err()
+    );
+    let remaining = make_deliveries(&acknowledged);
+    assert!(
+        check_terminal_effects(
+            std::slice::from_ref(&acknowledged),
+            &[],
+            &remaining,
+            &delivered,
+            &one
+        )
+        .unwrap_err()
+        .contains("remains after the drain")
+    );
+
+    let unknown = make_attempt(PublishOutcome::Unknown);
+    assert!(
+        check_terminal_effects(std::slice::from_ref(&unknown), &[], &[], &delivered, &[]).is_ok()
+    );
+    assert!(
+        check_terminal_effects(std::slice::from_ref(&unknown), &[], &[], &delivered, &one).is_ok()
+    );
+    let rejected = make_attempt(PublishOutcome::Rejected);
+    assert!(check_terminal_effects(&[rejected], &[], &[], &delivered, &one).is_err());
+}

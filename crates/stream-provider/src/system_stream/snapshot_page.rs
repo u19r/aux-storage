@@ -1,8 +1,7 @@
 //! Snapshot visibility and byte admission preserve raw source progress.
 
 use storage_types::{
-    ItemHistoryPointer, StorageEnum, StorageError, StorageResult, StreamRecord,
-    SystemStreamCheckpoint, TimestampMillis,
+    StorageEnum, StorageError, StorageResult, StreamRecord, SystemStreamCheckpoint, TimestampMillis,
 };
 
 use super::{
@@ -10,11 +9,8 @@ use super::{
     SystemStreamHistoryRecord, page_preparation::PreparedSystemStreamPage,
 };
 use crate::{
-    ItemHistoryImages, StreamAttempt, SystemStreamHistoryReadPage,
-    constants::{
-        SYSTEM_HISTORY_READ_BYTES, SYSTEM_HISTORY_WINDOW_MILLIS,
-        SYSTEM_STREAM_PAGE_ENVELOPE_RESERVE_BYTES,
-    },
+    SystemStreamHistoryReadPage,
+    constants::{SYSTEM_HISTORY_WINDOW_MILLIS, SYSTEM_STREAM_PAGE_ENVELOPE_RESERVE_BYTES},
 };
 
 pub(super) struct SystemSnapshotPage<'a> {
@@ -25,17 +21,6 @@ pub(super) struct SystemSnapshotPage<'a> {
     more: Vec<bool>,
     encoded_bytes: usize,
     initial_visibility_cutoff: TimestampMillis,
-}
-
-enum SnapshotRow {
-    Skipped(SystemStreamHistoryRecord),
-    Visible(SystemStreamHistoryRecord),
-}
-
-struct PreparedSnapshotRows {
-    rows: Vec<SnapshotRow>,
-    pointers: Vec<ItemHistoryPointer>,
-    more: bool,
 }
 
 impl<'a> SystemSnapshotPage<'a> {
@@ -55,9 +40,8 @@ impl<'a> SystemSnapshotPage<'a> {
         }
     }
 
-    pub(super) async fn include_pages<A: StreamAttempt>(
+    pub(super) fn include_pages(
         &mut self,
-        attempt: &mut A,
         reads: &'a [SystemStreamHistoryRead],
         pages: Vec<SystemStreamHistoryReadPage>,
     ) -> StorageResult<bool> {
@@ -65,16 +49,15 @@ impl<'a> SystemSnapshotPage<'a> {
             return Err(history_unavailable());
         }
         for (read, page) in reads.iter().zip(pages) {
-            if self.include_page(attempt, read, page).await? {
+            if self.include_page(read, page)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    async fn include_page<A: StreamAttempt>(
+    fn include_page(
         &mut self,
-        attempt: &mut A,
         read: &'a SystemStreamHistoryRead,
         page: SystemStreamHistoryReadPage,
     ) -> StorageResult<bool> {
@@ -89,31 +72,39 @@ impl<'a> SystemSnapshotPage<'a> {
             return Err(history_unavailable());
         }
         let retired_through = page.retired_through.clone();
-        let prepared = self.prepare_rows(page)?;
-        let resolved = crate::resolve_item_history(
-            attempt,
-            &prepared.pointers,
-            ItemHistoryImages::Snapshot,
-            SYSTEM_HISTORY_READ_BYTES,
-        )
-        .await?;
-        let mut values = resolved.into_iter();
-        let mut observations = Vec::with_capacity(prepared.rows.len());
-        let mut more = prepared.more;
-        for row in prepared.rows {
-            let observation = match row {
-                SnapshotRow::Skipped(observation) => observation,
-                SnapshotRow::Visible(observation) => {
-                    let resolved = values.next().ok_or_else(history_unavailable)?;
-                    if let Some(resolved) = resolved
-                        && !self.include_record(StreamRecord::try_from(&resolved)?)?
-                    {
+        let mut observations = Vec::with_capacity(page.records.len());
+        let mut more = page.more;
+        for (record, state) in page.records {
+            let observation = SystemStreamHistoryRecord {
+                position: record.position.clone(),
+            };
+            if &record.source_scope != self.plan.expanded_checkpoint().scope() {
+                return Err(history_unavailable());
+            }
+            if let Some(storage_types::TableHistoryState::Active(schema)) = state {
+                if schema.source_table_name.as_str() != record.source_table_name.as_ref() {
+                    return Err(history_unavailable());
+                }
+                if self.is_visible(record.entry.created_at())? && record.entry.is_public() {
+                    let item = record
+                        .entry
+                        .new_image()
+                        .map(|image| image.item.to_attribute_map())
+                        .transpose()?;
+                    let public = StreamRecord {
+                        cursor: None,
+                        source_table_name: Some(record.source_table_name),
+                        keys: record.entry.keys().clone(),
+                        sequence_number: record.position.offset().as_str().to_owned(),
+                        item,
+                        system_position: Some(record.position),
+                    };
+                    if !self.include_record(public)? {
                         more = true;
                         break;
                     }
-                    observation
                 }
-            };
+            }
             observations.push(observation);
         }
         if more && observations.is_empty() {
@@ -126,51 +117,7 @@ impl<'a> SystemSnapshotPage<'a> {
             records: observations,
         });
         self.more.push(more);
-        Ok(
-            short && (read.ordering == super::SystemStreamHistoryOrdering::Contiguous || more)
-                || self.records.len() == self.prepared.request.limit() as usize,
-        )
-    }
-
-    fn prepare_rows(
-        &self,
-        page: SystemStreamHistoryReadPage,
-    ) -> StorageResult<PreparedSnapshotRows> {
-        if page.records.len() != page.observations.len() {
-            return Err(history_unavailable());
-        }
-        let mut prepared = PreparedSnapshotRows {
-            rows: Vec::new(),
-            pointers: Vec::new(),
-            more: page.more,
-        };
-        let mut admitted = 0_usize;
-        for (record, observation) in page.records.into_iter().zip(page.observations) {
-            if record.position() != &observation.position {
-                return Err(history_unavailable());
-            }
-            record.require_scope(self.plan.expanded_checkpoint().scope())?;
-            let Some(pointer) = record.pointer() else {
-                prepared.rows.push(SnapshotRow::Skipped(observation));
-                continue;
-            };
-            if !self.is_visible(record.created_at())? {
-                prepared.rows.push(SnapshotRow::Skipped(observation));
-                continue;
-            }
-            let bytes = pointer.record_bytes()
-                + crate::StreamRowValue::history_envelope_bytes(pointer.metadata().address())?;
-            admitted = admitted
-                .checked_add(bytes)
-                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            if admitted > SYSTEM_HISTORY_READ_BYTES.get() {
-                prepared.more = true;
-                break;
-            }
-            prepared.pointers.push(pointer.clone());
-            prepared.rows.push(SnapshotRow::Visible(observation));
-        }
-        Ok(prepared)
+        Ok(short && more || self.records.len() == self.prepared.request.limit() as usize)
     }
 
     fn is_visible(&self, created_at: TimestampMillis) -> StorageResult<bool> {

@@ -17,7 +17,7 @@ use super::test_support::{TestStore, assert_dynamo_error_response_exact};
 async fn given_explicit_table_appends_when_deleted_then_old_id_access_is_revoked_and_peer_is_preserved()
  {
     use storage_types::TableHistoryTarget;
-    use stream_provider::{CursorName, CursorPosition, StreamAppendOperationId, StreamKind};
+    use stream_provider::{CursorName, CursorPosition, StreamAppendOperationId};
 
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
@@ -33,16 +33,18 @@ async fn given_explicit_table_appends_when_deleted_then_old_id_access_is_revoked
         }
         let operation = StreamAppendOperationId::fresh();
         for target in &targets {
-            store
+            let item = store
                 .stream_operations
                 .append_table_item(operation, target.clone(), b"payload")
                 .await
                 .unwrap();
-            let kind = StreamKind::Table(target.history_id.append_stream_name());
+            // Postgres readers pass only transactions known complete.
+            store.wait_until_user_item_is_readable(item).await;
+            let kind = target.history_id.append_stream_name();
             store
                 .stream_operations
                 .create_cursor(
-                    kind.clone(),
+                    kind.clone().into(),
                     CursorName::new("reader"),
                     CursorPosition::Head,
                 )
@@ -50,7 +52,7 @@ async fn given_explicit_table_appends_when_deleted_then_old_id_access_is_revoked
                 .unwrap();
             let page = store
                 .stream_operations
-                .read_forward(kind, None, 10)
+                .read_forward(kind.into(), None, 10)
                 .await
                 .unwrap();
             assert_eq!(page.items.len(), 1);
@@ -75,25 +77,25 @@ async fn given_explicit_table_appends_when_deleted_then_old_id_access_is_revoked
             })
             .await
             .unwrap();
-        let kind = StreamKind::Table(old.history_id.append_stream_name());
+        let kind = old.history_id.append_stream_name();
         assert!(
             store
                 .stream_operations
-                .read_forward(kind.clone(), None, 10)
+                .read_forward(kind.clone().into(), None, 10)
                 .await
                 .is_err()
         );
         assert!(
             store
                 .stream_operations
-                .get_cursor(kind.clone(), CursorName::new("reader"))
+                .get_cursor(kind.clone().into(), CursorName::new("reader"))
                 .await
                 .is_err()
         );
         assert!(
             store
                 .stream_operations
-                .create_cursor(kind, CursorName::new("late"), CursorPosition::Head)
+                .create_cursor(kind.into(), CursorName::new("late"), CursorPosition::Head)
                 .await
                 .is_err()
         );
@@ -105,20 +107,14 @@ async fn given_explicit_table_appends_when_deleted_then_old_id_access_is_revoked
                 .is_err()
         );
         for _ in 0..100 {
-            if store
-                .table_reclaim_repository
-                .reclaim_table_page()
-                .await
-                .unwrap()
-                == TableReclaimStep::Complete
-            {
+            if store.maintenance.reclaim_table_page().await.unwrap() == TableReclaimStep::Complete {
                 break;
             }
         }
-        let peer = StreamKind::Table(targets[1].history_id.append_stream_name());
+        let peer = targets[1].history_id.append_stream_name();
         let page = store
             .stream_operations
-            .read_forward(peer.clone(), None, 10)
+            .read_forward(peer.clone().into(), None, 10)
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
@@ -126,7 +122,7 @@ async fn given_explicit_table_appends_when_deleted_then_old_id_access_is_revoked
         assert!(
             store
                 .stream_operations
-                .get_cursor(peer, CursorName::new("reader"))
+                .get_cursor(peer.into(), CursorName::new("reader"))
                 .await
                 .unwrap()
                 .is_some()
@@ -152,9 +148,6 @@ async fn given_a_table_with_an_item_when_deleted_and_recreated_then_old_data_is_
         .unwrap();
         store.operations.put_item(put).await.unwrap();
         super::table_stream_eligibility_tests::set_stream(&store, &table, true)
-            .await
-            .unwrap();
-        super::table_stream_eligibility_tests::finish_initialization(&store, &table)
             .await
             .unwrap();
         let create_index = UpdateTableRequest::try_from(json!({
@@ -259,23 +252,14 @@ async fn given_a_table_with_an_item_when_deleted_and_recreated_then_old_data_is_
         store.operations.put_item(replacement).await.unwrap();
         let mut advanced = 0;
         for _ in 0..1000 {
-            match store
-                .table_reclaim_repository
-                .reclaim_table_page()
-                .await
-                .unwrap()
-            {
+            match store.maintenance.reclaim_table_page().await.unwrap() {
                 TableReclaimStep::Advanced => advanced += 1,
                 TableReclaimStep::Complete => break,
             }
         }
         assert!(advanced > 0, "deleted table should have reclaim work");
         assert_eq!(
-            store
-                .table_reclaim_repository
-                .reclaim_table_page()
-                .await
-                .unwrap(),
+            store.maintenance.reclaim_table_page().await.unwrap(),
             TableReclaimStep::Complete,
             "deleted table reclaim must finish within a bounded number of pages"
         );

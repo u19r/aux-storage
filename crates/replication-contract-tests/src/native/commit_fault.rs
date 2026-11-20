@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::future::BoxFuture;
 use storage_provider::DynamoPort;
-use storage_types::{AttemptMode, StorageError, StorageResult};
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass, StorageError, StorageResult};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NativeCommitBoundary {
@@ -52,8 +52,13 @@ impl NativeCommitFault {
     /// probe is armed.
     pub async fn arm_publication<P: DynamoPort + 'static>(&self, port: &P) -> StorageResult<()> {
         let before = self.observations.load(Ordering::Acquire);
-        port.with_dynamo_attempt(AttemptMode::ReadOnly, |_| Box::pin(async { Ok(()) }))
-            .await?;
+        storage_provider::DynamoPort::with_attempt(
+            port,
+            AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead)
+                .start(port.attempt_deadlines()),
+            |_| Box::pin(async { Ok(()) }),
+        )
+        .await?;
         let inspections = self.observations.load(Ordering::Acquire) - before;
         assert!(inspections <= 1);
         self.interruptions.store(0, Ordering::Release);
@@ -103,6 +108,7 @@ impl sql_backend::SqlFaultProbe for NativeCommitFault {
     fn at_commit_boundary(
         &self,
         boundary: sql_backend::SqlCommitBoundary,
+        _mode: storage_types::AttemptMode,
     ) -> BoxFuture<'_, StorageResult<()>> {
         self.interrupt_commit(match boundary {
             sql_backend::SqlCommitBoundary::BeforeCommit => NativeCommitBoundary::BeforeCommit,
@@ -122,6 +128,7 @@ impl kv_backend::KvFaultProbe for NativeCommitFault {
     fn at_commit_boundary(
         &self,
         boundary: kv_backend::KvCommitBoundary,
+        _mode: storage_types::AttemptMode,
     ) -> BoxFuture<'_, StorageResult<()>> {
         self.interrupt_commit(match boundary {
             kv_backend::KvCommitBoundary::BeforeCommit => NativeCommitBoundary::BeforeCommit,

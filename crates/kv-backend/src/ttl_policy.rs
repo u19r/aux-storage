@@ -1,61 +1,72 @@
-//! Compact KV record for the Dynamo TTL policy.
+//! KV record of the Dynamo TTL policy and its sweep checkpoint.
+//!
+//! The writer-visible part of the policy (attribute and status) is in the
+//! catalog binding: a policy change stores this record and the binding in
+//! one catalog change, which changes the stamp. The record under
+//! `ttl_config_key` holds the full policy and the sweep checkpoint; no writer
+//! reads it, and a checkpoint-only write changes no stamp (W6 A15).
 
-use storage_provider::{DescribeTimeToLiveAttempt, TtlConfigRecord, UpdateTimeToLiveAttempt};
-use storage_types::{BoundTableInfo, StorageError, StorageResult, storage_serde};
+use storage_provider::{TtlConfigRecord, TtlPolicyAttempt};
+use storage_types::{BoundTableInfo, StorageResult, storage_serde};
 
-use crate::{KvAttempt, KvMutation, catalog::KvCatalogAttempt, constants::TTL_CONFIG_FAMILY};
+use crate::{
+    KvAttempt, KvMutation,
+    catalog::{KvCatalogAttempt, table_id_from_history},
+};
 
 pub(crate) fn ttl_config_key(table_id: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(5);
-    key.push(TTL_CONFIG_FAMILY);
-    key.extend_from_slice(&table_id.to_be_bytes());
-    key
+    crate::table_key_layout::table_prefix(
+        table_id,
+        crate::table_key_layout::TableSubFamily::TtlConfig,
+    )
+    .to_vec()
 }
 
-impl<A: KvAttempt> DescribeTimeToLiveAttempt for KvCatalogAttempt<'_, A> {
+impl<A: KvAttempt> TtlPolicyAttempt for KvCatalogAttempt<'_, A> {
     async fn read_ttl_configs(
         &mut self,
         tables: &[&BoundTableInfo],
-    ) -> StorageResult<Vec<Option<TtlConfigRecord>>> {
+    ) -> StorageResult<storage_types::Exact<Option<TtlConfigRecord>>> {
         if tables.is_empty() {
-            return Ok(Vec::new());
+            return Ok(storage_types::Exact::empty());
         }
         let keys = tables
             .iter()
-            .map(|table| {
-                self.identity_for(&table.info.table_name)
-                    .map(|identity| ttl_config_key(identity.table_id))
-            })
+            .map(|table| table_id_from_history(table.history_id).map(ttl_config_key))
             .collect::<StorageResult<Vec<_>>>()?;
-        let values = self.attempt.get_batch(keys, self.protection).await?;
-        if values.len() != tables.len() {
-            return Err(StorageError::internal(
-                "KV TTL policy observation count differs",
-            ));
-        }
-        values
-            .into_iter()
-            .map(|value| {
-                value
-                    .map(|bytes| storage_serde::from_bytes(&bytes))
-                    .transpose()
-            })
-            .collect()
+        let values = self.attempt.get_batch_exact(keys, self.protection).await?;
+        values.try_map(|value| {
+            value
+                .map(|bytes| storage_serde::from_bytes(&bytes))
+                .transpose()
+        })
     }
-}
 
-impl<A: KvAttempt> UpdateTimeToLiveAttempt for KvCatalogAttempt<'_, A> {
     async fn write_ttl_config(
         &mut self,
         table: &BoundTableInfo,
         config: TtlConfigRecord,
     ) -> StorageResult<()> {
-        let identity = self.identity_for(&table.info.table_name)?.clone();
+        let identity = self.load_table_identity(table).await?;
         let key = ttl_config_key(identity.table_id);
         let value = storage_serde::to_bytes(&config)?;
         self.attempt.stage(vec![KvMutation::Put { key, value }])?;
-        self.replace_table_layout(table, identity, table.info.as_ref().clone())
+        let binding = storage_types::TableBinding {
+            ttl: Some(config.binding()),
+            ..self.current_binding(table)
+        };
+        self.replace_table_layout(table, identity, table.info.as_ref().clone(), binding)
             .await?;
         Ok(())
+    }
+
+    async fn write_ttl_checkpoint(
+        &mut self,
+        table: &BoundTableInfo,
+        change: storage_provider::TtlCheckpointChange,
+    ) -> StorageResult<()> {
+        let key = ttl_config_key(table_id_from_history(table.history_id)?);
+        let value = storage_serde::to_bytes(&change.next)?;
+        self.attempt.stage(vec![KvMutation::Put { key, value }])
     }
 }

@@ -7,55 +7,51 @@ use infrastructure_provider::physical_attempt::PhysicalRecordOperation;
 use storage_types::{SemanticDecision, StorageResult, StreamItemId, TimestampMillis};
 
 use crate::{
-    CommittedUserStreamRead, CursorName, CursorPage, CursorPosition, NativeStreamRead,
-    ReadDirection, Stream, StreamAttempt, StreamCursor, StreamCursorRead, StreamError,
-    StreamPartitioningMode, StreamReadRequest, StreamRowKind, StreamRowReadKind,
-    accept_cursor_creation, accept_cursor_page, prepare_cursor_advance,
+    CursorName, CursorPage, CursorPosition, ReadDirection, Stream, StreamAddress, StreamAttempt,
+    StreamCursor, StreamCursorRead, StreamError, StreamPartitioningMode, StreamReadRequest,
+    StreamRowReadKind, accept_cursor_creation, accept_cursor_page, prepare_cursor_advance,
 };
 
 /// This is a short-lived borrow, not a transaction opener or durable owner.
 /// Consuming methods keep the selected stream, layout and native attempt
 /// together. A cursor operation cannot accidentally read another stream.
-pub struct StreamCursorOperation<'native, A, R = NativeStreamRead> {
+pub struct StreamCursorOperation<'native, A> {
     attempt: &'native mut A,
-    stream: StreamRowKind,
+    stream: storage_types::StreamName,
     partitioning_mode: StreamPartitioningMode,
-    read: R,
+    read: StreamCursorRead,
 }
 
 impl<'native, A: StreamAttempt> StreamCursorOperation<'native, A> {
-    /// Ordinary callers resolve the catalog once on this native attempt.
-    pub async fn load(attempt: &'native mut A, stream: StreamRowKind) -> StorageResult<Self> {
-        let partitioning_mode = {
+    /// Ordinary callers resolve the addressed stream once on this native
+    /// attempt.
+    pub async fn load(attempt: &'native mut A, address: StreamAddress) -> StorageResult<Self> {
+        let (stream, partitioning_mode) = {
             let mut settlement = PhysicalRecordOperation::new(attempt);
-            let result =
-                crate::stream_kind::resolve_stream_layout(settlement.as_mut(), &stream).await;
+            let result = crate::stream_kind::resolve_stream(settlement.as_mut(), &address).await;
             settlement.complete(result)?
         };
         Ok(Self {
             attempt,
             stream,
             partitioning_mode,
-            read: NativeStreamRead,
+            read: StreamCursorRead::Native,
         })
     }
 
     /// The caller must bind the original user catalog and its complete
     /// committed application snapshot on this same native attempt.
-    pub fn from_committed_stream(
-        attempt: &'native mut A,
-        stream: Stream,
-    ) -> StreamCursorOperation<'native, A, CommittedUserStreamRead> {
-        StreamCursorOperation {
+    pub fn from_committed_stream(attempt: &'native mut A, stream: Stream) -> Self {
+        Self {
             attempt,
-            stream: StreamRowKind::User(stream.internal_id),
+            stream: stream.internal_id,
             partitioning_mode: stream.partitioning_mode,
-            read: CommittedUserStreamRead,
+            read: StreamCursorRead::CommittedUser,
         }
     }
 }
 
-impl<A: StreamAttempt, R: StreamCursorRead> StreamCursorOperation<'_, A, R> {
+impl<A: StreamAttempt> StreamCursorOperation<'_, A> {
     pub async fn create(
         self,
         name: CursorName,
@@ -73,14 +69,14 @@ impl<A: StreamAttempt, R: StreamCursorRead> StreamCursorOperation<'_, A, R> {
             let position = match position {
                 CursorPosition::Head => StreamItemId::default(),
                 CursorPosition::Tail => {
-                    read_tail(attempt, &self.stream, self.partitioning_mode, &self.read).await?
+                    read_tail(attempt, &self.stream, self.partitioning_mode, self.read).await?
                 }
             };
             attempt
                 .write_cursor(
                     StreamCursor {
                         name,
-                        stream_name: self.stream.into_value(),
+                        stream_name: self.stream,
                         position,
                         created_at: captured_at,
                     },
@@ -181,11 +177,11 @@ fn missing_cursor<T>(name: &CursorName) -> SemanticDecision<T> {
     SemanticDecision::Rejected(StreamError::cursor_not_found(name.as_str()).into_storage_error())
 }
 
-async fn read_tail<A: StreamAttempt, R: StreamCursorRead>(
+async fn read_tail<A: StreamAttempt>(
     attempt: &mut A,
-    stream: &StreamRowKind,
+    stream: &storage_types::StreamName,
     partitioning_mode: StreamPartitioningMode,
-    read: &R,
+    read: StreamCursorRead,
 ) -> StorageResult<StreamItemId> {
     let request = StreamReadRequest {
         partitioning_mode,

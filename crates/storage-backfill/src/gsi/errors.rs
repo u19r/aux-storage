@@ -74,16 +74,3 @@ impl From<GsiRecordError> for StorageError {
         Self::internal(&error.to_string())
     }
 }
-
-impl From<super::GsiFailureReason> for StorageError {
-    fn from(reason: super::GsiFailureReason) -> Self {
-        match reason {
-            super::GsiFailureReason::HistoryUnavailable => {
-                storage_types::StorageEnum::HistoryUnavailable.into()
-            }
-            super::GsiFailureReason::ProjectionConflict => {
-                Self::internal("GSI projection conflicts with its source revision")
-            }
-        }
-    }
-}

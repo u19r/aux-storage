@@ -4,24 +4,19 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 edition = "2024"
-repository = "https://github.com/u19r/aux-storage"
-readme = "README.md"
-description = "Storage, queue, and pubsub compatible services and libraries."
-keywords = ["storage", "queue", "pubsub", "sqlite"]
-categories = []
 license = "BUSL-1.1"
 
 [workspace.dependencies]
-cpu-time = "1.0.0"
 ############################################
 # rust-random
-rand = "0.10.3"
+rand = "0.10.4"
 
 ############################################
 # tokio-rs
 axum = "0.8.9"
+deadpool = { version = "0.13.1", default-features = false, features = ["managed"] }
 deadpool-postgres = "0.14.2"
 rustls = "0.23.46"
 rustls-native-certs = "0.8.5"
@@ -38,8 +33,7 @@ futures-util = "0.3.34"
 
 ############################################
 # hyperium
-bytes = "1.12.1"
-concurrent-queue = "2.5.0"
+bytes = "1.12.2"
 http = "1.5.0"
 httpdate = "1.0.3"
 tower-http = { version = "0.7.1", features = ["catch-panic", "cors"] }
@@ -49,19 +43,18 @@ tower-http = { version = "0.7.1", features = ["catch-panic", "cors"] }
 md5 = "0.8.1"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
+serde_path_to_error = "0.1.20"
 sha2 = "0.11.1"
 url = "2.5.8"
 
 ############################################
 # awslabs
-aws-config = "1.13.0"
+aws-config = "1.13.3"
 aws-credential-types = "1.3.1"
-aws-sdk-dynamodb = { version = "1.136.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sns = { version = "1.121.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sqs = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sigv4 = "1.6.4"
-aws-smithy-runtime-api = "1.19.2"
-aws-smithy-types = "1.9.1"
+aws-sdk-dynamodb = { version = "1.140.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sns = { version = "1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1.122.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-types = "1.9.4"
 
 ############################################
 # dtolnay
@@ -70,8 +63,7 @@ async-trait = "0.1.92"
 inventory = "0.3.25"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
-self_cell = "1.3.0"
-syn = { version = "3.0.9", features = ["full"] }
+syn = { version = "3.0.10", features = ["full"] }
 thiserror = "2.0.21"
 
 ############################################
@@ -80,8 +72,8 @@ base64 = "0.23.1"
 hex = "0.4.3"
 
 ############################################
-# chrono-rs
-chrono = { version = "0.4.45", features = ["clock", "serde"] }
+# BurntSushi
+jiff = { version = "0.2.46", features = ["js", "serde"] }
 
 ############################################
 # cucumber-rs
@@ -97,11 +89,12 @@ rocksdb = { version = "0.25.0", features = ["multi-threaded-cf"] }
 
 ############################################
 # clap-rs
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 
 ############################################
 # uuid-rs
-uuid = { version = "1.29.0", features = ["serde", "v4", "v5", "v7"] }
+uuid = { version = "1.29.3", features = ["serde", "v4", "v5", "v7"] }
+xmlparser = "0.13.6"
 
 ############################################
 # idanarye
@@ -110,55 +103,48 @@ typed-builder = "0.23.2"
 
 ############################################
 # Other / standalone
-base32 = "0.5.1"
 cargo_metadata = "0.23.1"
 # Keep the native client, tuple codec, and simulation API on one upstream revision.
 foundationdb = { version = "0.11.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "9c91ad4fc84836a51f6544ea7c60c784f4d9b6f3" }
 foundationdb-simulation = { version = "0.3.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "9c91ad4fc84836a51f6544ea7c60c784f4d9b6f3" }
 foundationdb-tuple = { version = "0.11.0", git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "9c91ad4fc84836a51f6544ea7c60c784f4d9b6f3" }
-hostname = "0.4.2"
 httpmock = "0.9.0"
-ipnet = "2.12.2"
-jsonschema = { version = "0.60.2", default-features = false, features = ["resolve-file"] }
-lz4_flex = "0.14.0"
+jsonschema = { version = "0.61.2", default-features = false, features = ["resolve-file"] }
+lz4_flex = "0.14.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
-notify = "8.2.1"
+notify = "8.2.2"
 proptest = "1.12.0"
 quint-connect = "=0.1.2"
 rust_decimal = "1.43.0"
 schemars = "1.2.3"
-smallvec = { version = "1.16.4", features = ["serde"] }
-toml = "1.1.8"
-tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
-turso = { version = "0.8.3", default-features = false }
-utoipa = { version = "6.0.0", features = ["axum_extras", "chrono", "uuid"] }
-xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+smallvec = { version = "1.16.6", features = ["serde"] }
+toml = "1.2.1"
+turso = { version = "0.8.4", default-features = false }
+utoipa = { version = "6.0.0", features = ["axum_extras", "uuid"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 
 ############################################
-# Shared crates use the local aux-common checkout.
-alloc-counter = { package = "alloc-counter", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-alloc-counter-macros = { package = "alloc-counter-macros", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-aws-sigv4-signing = { package = "aws-sigv4-signing", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-http-request = { package = "http-request", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-lru-ttl-cache = { package = "lru-ttl-cache", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-metrics-facade = { package = "metrics-facade", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-opt-loop-probe = { package = "opt-loop-probe", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
+# Shared crates are pinned to a public aux-common revision.
+alloc-counter = { package = "alloc-counter", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+aws-sigv4-signing = { package = "aws-sigv4-signing", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+http-request = { package = "http-request", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+lru-ttl-cache = { package = "lru-ttl-cache", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+metrics-facade = { package = "metrics-facade", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+opt-loop-probe = { package = "opt-loop-probe", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
 
 # Scheduled jobs use the shared aux-common contract; storage owns provider adapters.
-bg-jobs-tokio = { package = "bg-jobs-tokio", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-scheduled-bg-jobs = { package = "bg-jobs", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
-scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", git = "https://github.com/u19r/aux-common", rev = "d5d2bd38f8fb1419de8bb6758934da2557731b79" }
+bg-jobs-tokio = { package = "bg-jobs-tokio", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+scheduled-bg-jobs = { package = "bg-jobs", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
 
 ############################################
 # Local path dependencies
 infrastructure-provider = { path = "crates/infrastructure-provider" }
-replication-provider = { path = "crates/replication-provider" }
-replication-types = { path = "crates/replication-types" }
 storage-types = { path = "crates/storage-types" }
 tokio-rusqlite = { path = "vended/tokio-rusqlite" }
 
-rusqlite = { version = "0.41.1", features = ["backup", "bundled", "hooks", "uuid"] }
+rusqlite = { version = "0.43.0", features = ["backup", "bundled", "hooks"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

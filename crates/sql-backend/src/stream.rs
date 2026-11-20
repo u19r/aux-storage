@@ -1,14 +1,13 @@
 //! One SQL stream attempt shared by catalog and row operations.
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use futures::future::BoxFuture;
-use storage_provider::DynamoTableStreamAttempt;
-use storage_types::{AttemptMode, StorageResult, StreamItemId, StreamName};
+use storage_types::{AttemptRequest, StorageResult, StreamItemId, StreamName};
 use stream_provider::{
     CursorName, StreamAttempt, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem,
     StreamPartitioningSupport, StreamPort, StreamReadKind, StreamReadRequest, StreamReadResult,
-    StreamRowKind, StreamRowPage, StreamRowValue, SystemStreamHistoryReadPage,
+    StreamRowPage, StreamRowValue, SystemStreamHistoryReadPage,
 };
 
 use crate::{
@@ -90,6 +89,7 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
 
     fn read_system_split_state(
         &mut self,
+        parent: &storage_types::SystemStreamLineageId,
         operation_id: &stream_provider::SystemStreamSplitOperationId,
     ) -> impl Future<
         Output = StorageResult<(
@@ -97,12 +97,12 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
             Option<stream_provider::SystemStreamSplitReceipt>,
         )>,
     > + Send {
-        stream_split::read_split_state(self.attempt, self.engine, operation_id)
+        stream_split::read_split_state(self.attempt, self.engine, parent, operation_id)
     }
 
     fn write_system_split(
         &mut self,
-        receipt: &stream_provider::SystemStreamSplitReceipt,
+        receipt: &stream_provider::SystemStreamSplitPlan,
     ) -> impl Future<Output = StorageResult<()>> + Send {
         stream_split::write_split(self.attempt, self.engine, receipt)
     }
@@ -137,14 +137,14 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
 
     fn read_cursor(
         &mut self,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
         cursor_name: &CursorName,
     ) -> impl Future<Output = StorageResult<Option<StreamCursor>>> + Send {
         stream_cursor::read_cursor(
             self.attempt,
             self.engine,
             self.protection,
-            stream.value(),
+            stream,
             cursor_name,
         )
     }
@@ -159,90 +159,33 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
 
     fn delete_cursor(
         &mut self,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
         cursor_name: &CursorName,
     ) -> impl Future<Output = StorageResult<()>> + Send {
-        stream_cursor::delete_cursor(self.attempt, self.engine, stream.value(), cursor_name)
-    }
-}
-
-impl<A: SqlAttempt, L: SqlLayout> DynamoTableStreamAttempt for SqlCatalogAttempt<'_, A, L> {}
-
-impl<B: SqlBackend + 'static> StreamPort for SqlStore<B> {
-    type Attempt<'native>
-        = SqlCatalogAttempt<'native, B::Attempt>
-    where Self: 'native;
-
-    type AppendCapture = stream_provider::NoTableAppendCapture;
-
-    fn table_append_capture(&self) -> Self::AppendCapture {
-        stream_provider::NoTableAppendCapture
+        stream_cursor::delete_cursor(self.attempt, self.engine, stream, cursor_name)
     }
 
-    fn partitioning_support(&self) -> StreamPartitioningSupport {
-        <Self::Attempt<'_> as StreamAttempt>::PARTITIONING_SUPPORT
-    }
-
-    fn with_stream_attempt<R, F>(
-        &self,
-        mode: AttemptMode,
-        operation: F,
-    ) -> impl Future<Output = StorageResult<R>> + Send
-    where
-        R: Send + 'static,
-        F: for<'native, 'borrow> FnOnce(
-                &'borrow mut Self::Attempt<'native>,
-            ) -> BoxFuture<'borrow, StorageResult<R>>
-            + Send
-            + 'static,
-    {
-        let engine = self.backend.engine();
-        self.backend.with_attempt(mode, move |native| {
-            Box::pin(async move {
-                let mut attempt = SqlCatalogAttempt::new(native, engine, mode.read_protection());
-                let result = operation(&mut attempt).await?;
-                Ok(result)
-            })
-        })
-    }
-    fn with_topology_attempt<R, F>(
-        &self,
-        operation: F,
-    ) -> impl Future<Output = StorageResult<R>> + Send
-    where
-        R: Send + 'static,
-        F: for<'native, 'borrow> FnOnce(
-                &'borrow mut Self::Attempt<'native>,
-            ) -> BoxFuture<'borrow, StorageResult<R>>
-            + Send
-            + 'static,
-    {
-        let engine = self.backend.engine();
-        self.backend.with_data_attempt(
-            AttemptMode::ReadWrite,
-            crate::SqlDataAccess::Exclusive,
-            move |native| {
-                Box::pin(async move {
-                    let mut attempt = SqlCatalogAttempt::new(
-                        native,
-                        engine,
-                        storage_types::ReadProtection::Conflict,
-                    );
-                    let result = operation(&mut attempt).await?;
-                    Ok(result)
-                })
-            },
+    async fn load_table_history_states(
+        &mut self,
+        histories: &[storage_types::TableHistoryId],
+    ) -> StorageResult<Vec<Option<storage_types::TableHistoryState>>> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = stream_read::load_history_table_states(
+            catalog.attempt,
+            catalog.engine,
+            catalog.protection,
+            histories,
         )
+        .await;
+        operation.complete(result)
     }
-}
 
-impl<A: SqlAttempt, L: SqlLayout> stream_provider::SystemHistoryReadAttempt
-    for SqlCatalogAttempt<'_, A, L>
-{
     async fn load_system_retired_frontiers(
         &mut self,
         origins: &[storage_types::SystemStreamPosition],
-    ) -> StorageResult<Vec<Option<storage_types::SystemStreamPosition>>> {
+    ) -> StorageResult<storage_types::Exact<Option<storage_types::SystemStreamPosition>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -277,5 +220,80 @@ impl<A: SqlAttempt, L: SqlLayout> stream_provider::SystemHistoryReadAttempt
         )
         .await;
         settlement.complete(result)
+    }
+
+    fn load_trim_receipts(
+        &mut self,
+        operation: &stream_provider::SystemStreamTrimOperationId,
+        sequences: &[u64],
+    ) -> impl Future<
+        Output = StorageResult<
+            storage_types::Exact<Option<stream_provider::SystemStreamTrimPageReceipt>>,
+        >,
+    > + Send {
+        crate::stream_trim::load_receipts(self.attempt, self.engine, operation, sequences)
+    }
+
+    fn scan_trim_records(
+        &mut self,
+        starts: &[storage_types::SystemStreamPosition],
+    ) -> impl Future<Output = StorageResult<(Vec<stream_provider::SystemStreamTrimRecord>, bool)>> + Send
+    {
+        crate::stream_trim::scan_records(self.attempt, self.engine, starts)
+    }
+
+    fn apply_trim_page(
+        &mut self,
+        _selected: &[stream_provider::SystemStreamTrimRecord],
+        frontiers: &[storage_types::SystemStreamPosition],
+        receipt: &stream_provider::SystemStreamTrimPageReceipt,
+    ) -> impl Future<Output = StorageResult<()>> + Send {
+        crate::stream_trim::apply_page(self.attempt, self.engine, frontiers, receipt)
+    }
+}
+
+impl<B: SqlBackend + 'static> StreamPort for SqlStore<B> {
+    type Attempt<'native>
+        = SqlCatalogAttempt<'native, B::Attempt>
+    where Self: 'native;
+
+    type AppendCapture = stream_provider::NoTableAppendCapture;
+
+    fn table_append_capture(&self) -> Self::AppendCapture {
+        stream_provider::NoTableAppendCapture
+    }
+
+    fn partitioning_support(&self) -> StreamPartitioningSupport {
+        <Self::Attempt<'_> as StreamAttempt>::PARTITIONING_SUPPORT
+    }
+
+    fn with_attempt<R, F>(
+        &self,
+        request: AttemptRequest,
+        step: F,
+    ) -> impl Future<Output = StorageResult<R>> + Send
+    where
+        R: Send + 'static,
+        F: for<'native, 'borrow> FnOnce(
+                &'borrow mut Self::Attempt<'native>,
+            ) -> BoxFuture<'borrow, StorageResult<R>>
+            + Send
+            + 'static,
+    {
+        let request = request.with_default_scope(storage_types::AttemptScope::Data);
+        let backend = Arc::clone(&self.backend);
+        let engine = backend.engine();
+        let attempt = async move {
+            backend
+                .with_attempt(request, move |native| {
+                    Box::pin(async move {
+                        let mut attempt = SqlCatalogAttempt::new(native, engine, request);
+                        let result = step(&mut attempt).await?;
+                        Ok(result)
+                    })
+                })
+                .await
+        };
+        self.admission.settle(request, attempt)
     }
 }

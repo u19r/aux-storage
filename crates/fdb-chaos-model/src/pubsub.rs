@@ -199,3 +199,89 @@ fn check_attempt_acceptance(
         _ => Ok(()),
     }
 }
+
+/// One message found in a destination queue after the drain, attributed to
+/// its publication and subscription.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct QueueCopyAudit {
+    pub message_id: String,
+    pub subscription_arn: String,
+}
+
+/// Terminal records are deleted (W3 design 1.5), so the end state is proved
+/// by effects: after the drain no delivery record remains, each subscription
+/// in `delivered_subscriptions` holds exactly one copy of every accepted
+/// publication, and every other subscription holds none. An unknown attempt
+/// either has every effect of an accepted one or none of them.
+pub fn check_terminal_effects(
+    attempts: &[PublishAttempt],
+    intents: &[PublishIntentAudit],
+    deliveries: &[PublishDeliveryAudit],
+    delivered_subscriptions: &BTreeSet<String>,
+    copies: &[QueueCopyAudit],
+) -> Result<(), String> {
+    if let Some(delivery) = deliveries.first() {
+        return Err(format!(
+            "delivery record {} remains after the drain",
+            delivery.record_id
+        ));
+    }
+    let known: BTreeSet<&str> = attempts
+        .iter()
+        .map(|attempt| attempt.message_id.as_str())
+        .collect();
+    if let Some(copy) = copies
+        .iter()
+        .find(|copy| !known.contains(copy.message_id.as_str()))
+    {
+        return Err(format!("unexpected queue copy of {}", copy.message_id));
+    }
+    for attempt in attempts {
+        let count = |subscription: &str| {
+            copies
+                .iter()
+                .filter(|copy| {
+                    copy.message_id == attempt.message_id && copy.subscription_arn == subscription
+                })
+                .count()
+        };
+        let observed: Vec<usize> = attempt
+            .subscription_arns
+            .iter()
+            .map(|subscription| count(subscription))
+            .collect();
+        let expected: Vec<usize> = attempt
+            .subscription_arns
+            .iter()
+            .map(|subscription| usize::from(delivered_subscriptions.contains(subscription)))
+            .collect();
+        let none = vec![0; observed.len()];
+        let has_intent = intents
+            .iter()
+            .any(|intent| intent.message_id == attempt.message_id);
+        let accepted = match attempt.outcome {
+            PublishOutcome::Acknowledged => true,
+            PublishOutcome::Rejected => false,
+            // Unknown: all effects or none; a kept intent is recoverable work.
+            PublishOutcome::Unknown => observed != none || has_intent,
+        };
+        if attempt.outcome == PublishOutcome::Acknowledged && has_intent {
+            return Err(format!(
+                "publish {}: acknowledged intent was not materialized",
+                attempt.message_id
+            ));
+        }
+        let wanted = if accepted && !has_intent {
+            &expected
+        } else {
+            &none
+        };
+        if &observed != wanted {
+            return Err(format!(
+                "publish {}: queue copies {observed:?}, expected {wanted:?}",
+                attempt.message_id
+            ));
+        }
+    }
+    Ok(())
+}

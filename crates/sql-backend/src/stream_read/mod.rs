@@ -1,9 +1,8 @@
-mod history_entry;
-mod history_index;
-mod history_metadata;
+mod table_catalog;
+pub(crate) use table_catalog::load_history_table_states;
 #[cfg(all(test, feature = "sqlite"))]
-mod history_metadata_tests;
-mod history_namespace;
+mod baseline_tests;
+mod history_index;
 mod read;
 pub(crate) mod row;
 mod sql_statements;

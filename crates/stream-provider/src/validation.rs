@@ -1,0 +1,99 @@
+//! Request validation for user streams and cursors, before any I/O.
+
+use storage_types::UserStreamName;
+
+use crate::{
+    CursorName, StreamError, StreamResult, StreamValidationKind,
+    constants::{
+        CURSOR_NAME_ALLOWED_MIDDLE_CHARS, MAX_CURSOR_NAME_LEN, MAX_STREAM_NAME_LEN,
+        MAX_STREAM_TTL_SECONDS, STREAM_NAME_ALLOWED_MIDDLE_CHARS,
+    },
+};
+
+pub(crate) fn validate_user_stream_name(name: &UserStreamName) -> StreamResult<()> {
+    let name = name.as_str();
+    validate_not_empty(name, "Stream name", MAX_STREAM_NAME_LEN)?;
+    validate_name_format(name, "Stream name", STREAM_NAME_ALLOWED_MIDDLE_CHARS)
+}
+
+pub(crate) fn validate_cursor_name(name: &CursorName) -> StreamResult<()> {
+    let name = name.as_str();
+    validate_not_empty(name, "Cursor name", MAX_CURSOR_NAME_LEN)?;
+    validate_name_format(name, "Cursor name", CURSOR_NAME_ALLOWED_MIDDLE_CHARS)
+}
+
+/// Validate that a string is not empty and meets length requirements
+pub(crate) fn validate_not_empty(
+    value: &str,
+    field_name: &str,
+    max_length: usize,
+) -> StreamResult<()> {
+    if value.is_empty() {
+        return Err(StreamError::validation_with_detail(
+            StreamValidationKind::EmptyName,
+            format_args!("{field_name} cannot be empty"),
+        ));
+    }
+
+    if value.len() > max_length {
+        return Err(StreamError::validation_with_detail(
+            StreamValidationKind::NameTooLong,
+            format_args!("{field_name} must not exceed {max_length} characters"),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate that a string starts and ends with alphanumeric characters
+/// and contains only allowed characters in the middle
+pub(crate) fn validate_name_format(
+    value: &str,
+    field_name: &str,
+    allowed_middle_chars: &[char],
+) -> StreamResult<()> {
+    for (i, ch) in value.char_indices() {
+        if i == 0 || i + ch.len_utf8() == value.len() {
+            // First and last characters must be alphanumeric
+            if !ch.is_alphanumeric() {
+                return Err(StreamError::validation_with_detail(
+                    StreamValidationKind::InvalidNameBoundary,
+                    format_args!("{field_name} must start and end with alphanumeric characters"),
+                ));
+            }
+        } else {
+            // Middle characters can be alphanumeric or in the allowed list
+            if !ch.is_alphanumeric() && !allowed_middle_chars.contains(&ch) {
+                let allowed_chars_str = allowed_middle_chars
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let allowed_suffix = if allowed_chars_str.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {allowed_chars_str}")
+                };
+                return Err(StreamError::validation_with_detail(
+                    StreamValidationKind::InvalidNameCharacters,
+                    format_args!(
+                        "{field_name} can only contain alphanumeric characters{allowed_suffix}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate TTL bounds (1 second to 1 year)
+pub(crate) fn validate_ttl_seconds(ttl_seconds: u32) -> StreamResult<()> {
+    if ttl_seconds == 0 || ttl_seconds > MAX_STREAM_TTL_SECONDS {
+        return Err(StreamError::validation_with_detail(
+            StreamValidationKind::InvalidTtl,
+            "TTL must be between 1 second and 1 year (31,536,000 seconds)",
+        ));
+    }
+    Ok(())
+}

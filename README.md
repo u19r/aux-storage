@@ -9,7 +9,7 @@ It can run as standalone services or be embedded by another Rust workspace. The 
 Build the workspace:
 
 ```bash
-cargo build --workspace
+just build
 ```
 
 Run the storage API locally with SQLite:
@@ -30,7 +30,7 @@ The DynamoDB-compatible endpoint is:
 POST http://127.0.0.1:3000/storage
 ```
 
-Queue and pubsub crates can be used directly as libraries or through their service binaries where enabled. The stream crate is a library.
+Queue and pubsub crates can be used directly as libraries or through their service binaries where enabled. User streams are served by `storage::DatabaseManager`.
 
 ## Storage API Configuration
 
@@ -90,9 +90,11 @@ Example SQLite config:
 ```
 
 `features.backends` is the single backend selector for all mounted `storage-api`
-surfaces. When `storage-api` is built with the `queue` and/or `pubsub` Cargo
-features, those services use the same backend object as `/storage`; there are no
-separate `queue.backend.*` or `pubsub.backend.*` selectors.
+surfaces. The `/queue` and `/pubsub` services use the same backend object as
+`/storage`; there are no separate `queue.backend.*` or `pubsub.backend.*` selectors.
+Both services are compiled in and off by default: set `queue.enabled` and `pubsub.enabled`
+to `true` to serve them (see `CONFIGURATION.md`). A backend without a queue or pubsub
+provider, such as the remote backend, fails startup when the matching switch is on.
 
 Example Postgres config using file interpolation:
 
@@ -120,7 +122,7 @@ startup errors. Object keys are not interpolated.
 Generate the schema with:
 
 ```bash
-cargo run -p config --bin config -- --write-schema crates/config/config.schema.json
+just config-schema
 ```
 
 Sensitive values include Postgres DSNs and remote credentials. Prometheus
@@ -155,6 +157,12 @@ The workspace is structured around backend features:
 
 Backend support varies by crate. Check each crate's `Cargo.toml` before enabling a feature in a downstream workspace.
 
+## Capacity and Billing
+
+Consumed capacity is intentionally unsupported. When a request asks for it, the response carries
+zero values. Billing mode and provisioned throughput are accepted and ignored. See
+[writing/dynamodb_parity.md](writing/dynamodb_parity.md).
+
 ## QuerySourcePage Extension
 
 `QuerySourcePage` is an Aux extension, not a standard DynamoDB API. It queries a table
@@ -168,10 +176,10 @@ It requires an Aux service; AWS DynamoDB does not implement this target.
 Both Rust methods use the same query execution path, key conditions, ordering, limits,
 consistency rules, and pagination. Their return values differ:
 
-| Method | Each entry in `page.items` | Page metadata |
-| --- | --- | --- |
-| `query_table` | Item attributes (`WireItem`) | Evaluated item count, evaluated bytes, last evaluated key, continuation token |
-| `query_source_page` | `{ key: ItemKey, item: WireItem }` | The same metadata |
+| Method              | Each entry in `page.items`         | Page metadata                                                                 |
+| ------------------- | ---------------------------------- | ----------------------------------------------------------------------------- |
+| `query_table`       | Item attributes (`WireItem`)       | Evaluated item count, evaluated bytes, last evaluated key, continuation token |
+| `query_source_page` | `{ key: ItemKey, item: WireItem }` | The same metadata                                                             |
 
 `projection_expression` applies to the returned item in both methods. `QuerySourcePage`
 does **not** guarantee unprojected items. Omit the expression to keep all attributes available
@@ -293,6 +301,25 @@ retained DynamoDB stream records. DynamoDB live-item TTL remains independent of 
 See [CONFIGURATION.md](CONFIGURATION.md#custom-stream-duration-extension) for request examples and
 [OBSERVABILITY.md](OBSERVABILITY.md#custom-stream-duration) for trim backlog guidance.
 
+## Recipes
+
+Run builds, tests and checks through `just`; `just --list` shows every recipe.
+Common recipes are `build`, `check`, `test`, `lint-check`, `style-fix`, `bdd`, `canary-smoke`
+and `config-schema`.
+`storage-recovery` runs the FoundationDB table export and restore tool (see `docs/table-recovery.md`).
+
+### FoundationDB simulation on macOS
+
+`just fdb-chaos-seed-range`, `fdb-chaos-run` and `fdb-chaos-determinism` need a Linux
+`fdbserver`. `just fdb-sim-linux <recipe> <args>` builds `docker/fdb-simulation.Dockerfile` under
+colima (`docker --context colima`) and runs `just <recipe> <args>` inside the container.
+It mounts the checkout at `/workspace`, `../aux-common` read-only, and named volumes for the
+Cargo registry, Cargo git cache and target directory. For example, the queue claim smoke gate over seeds 1 to 20:
+
+```bash
+just fdb-sim-linux fdb-chaos-seed-range queue_claim smoke 1 20
+```
+
 ## Embedding
 
 Downstream repositories should depend on these crates through path dependencies during local development:
@@ -301,7 +328,6 @@ Downstream repositories should depend on these crates through path dependencies 
 storage = { path = "../aux-storage/crates/storage" }
 storage-api = { path = "../aux-storage/crates/storage-api" }
 queue = { path = "../aux-storage/crates/queue" }
-stream = { path = "../aux-storage/crates/stream" }
 ```
 
 The same dependencies can later move to git revisions without changing the crate boundaries.

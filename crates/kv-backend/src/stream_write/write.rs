@@ -1,7 +1,7 @@
 //! Physical stream rows staged on the caller's native KV write attempt.
 
-use storage_types::{StorageError, StorageResult, StreamItemId, storage_serde};
-use stream_provider::{DynamoStreamWritePlan, StreamItem, StreamRowValue};
+use storage_types::{StorageError, StorageResult, StreamItemId};
+use stream_provider::{StreamItem, StreamRowValue};
 
 use super::key_layout::{item_row_key, record_key};
 use crate::{KvAttempt, KvMutation};
@@ -41,71 +41,51 @@ pub(crate) fn append_versionstamped_user_item<A: KvAttempt>(
 }
 
 pub(crate) fn dynamo_stream_mutations(
-    plan: DynamoStreamWritePlan,
+    (history_id, position): (
+        storage_types::TableHistoryId,
+        &storage_types::SystemStreamPosition,
+    ),
+    created_at: storage_types::TimestampMillis,
+    value: Vec<u8>,
 ) -> StorageResult<Vec<KvMutation>> {
-    let mut changes = Vec::with_capacity(4);
-    for row in plan.rows {
-        changes.push(KvMutation::Put {
-            key: item_row_key(row.value())?,
-            value: StreamRowValue::from_planned(row)?.to_bytes()?,
-        });
-    }
-    let history = plan
-        .record
-        .table_history_id()
-        .ok_or_else(|| StorageError::internal("New system history has no target"))?;
-    changes.push(KvMutation::Put {
-        key: super::key_layout::table_record_key(history, plan.record.position())?,
-        value: Vec::new(),
-    });
-    changes.push(KvMutation::Put {
-        key: record_key(plan.record.position())?,
-        value: storage_serde::to_bytes(&plan.record)?,
-    });
-    Ok(changes)
+    let reference = super::record::FeedReference::encode(history_id, created_at, &value)?;
+    Ok(vec![
+        KvMutation::Put {
+            key: super::key_layout::entry_key(history_id, position)?,
+            value,
+        },
+        KvMutation::Put {
+            key: record_key(position)?,
+            value: reference,
+        },
+    ])
 }
 
 pub(crate) fn stage_commit_ordered_dynamo<A: KvAttempt>(
     attempt: &mut A,
-    plan: DynamoStreamWritePlan,
+    (history_id, position): (
+        storage_types::TableHistoryId,
+        &storage_types::SystemStreamPosition,
+    ),
+    created_at: storage_types::TimestampMillis,
+    value: Vec<u8>,
 ) -> StorageResult<()> {
-    let position = plan.record.position();
     let stamp = position
         .offset()
         .versionstamp()
         .ok_or_else(|| StorageError::internal("Missing pending native position"))?;
     let ordinal = [stamp[10], stamp[11]];
-    let high_key = crate::stream_history::segmented_key(
-        crate::constants::SYSTEM_STREAM_SEQUENCE_PREFIX,
-        position.shard_id().as_str(),
-    )?;
-    attempt.stage_versionstamped_value(high_key, stamp.to_vec(), 0)?;
-    for (index, row) in plan.rows.into_iter().enumerate() {
-        let key = item_row_key(row.value())?;
-        let row = StreamRowValue::from_planned(row)?;
-        let offset = row.payload_offset()? + storage_types::ItemHistoryRecord::VERSIONSTAMP_OFFSET;
-        let value = row.to_bytes()?;
-        if index == 0 {
-            attempt.stage_versionstamped_value(key, value, offset)?;
-        } else {
-            attempt.stage_versionstamped_puts(vec![(
-                key[..key.len() - 12].to_vec(),
-                ordinal,
-                value,
-            )])?;
-        }
-    }
-    let history = plan
-        .record
-        .table_history_id()
-        .ok_or_else(|| StorageError::internal("New system history has no target"))?;
-    let index = super::key_layout::table_record_key(history, position)?;
+    let reference = super::record::FeedReference::encode(history_id, created_at, &value)?;
     attempt.stage_versionstamped_puts(vec![
+        (
+            super::key_layout::entry_prefix(history_id, position)?,
+            ordinal,
+            value,
+        ),
         (
             super::key_layout::record_prefix(position),
             ordinal,
-            storage_serde::to_bytes(&plan.record)?,
+            reference,
         ),
-        (index[..index.len() - 12].to_vec(), ordinal, Vec::new()),
     ])
 }

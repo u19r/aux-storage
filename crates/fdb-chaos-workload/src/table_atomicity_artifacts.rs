@@ -23,6 +23,11 @@ impl TableAtomicityWorkload {
                 root.display()
             )
         })?;
+        fs::write(
+            root.join("write-attempts.json"),
+            self.write_probe.report().to_string(),
+        )
+        .map_err(|error| error.to_string())?;
         let history = self
             .history
             .to_json_lines()

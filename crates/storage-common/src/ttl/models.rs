@@ -109,5 +109,6 @@ pub struct TtlSweepPageResult {
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtlMaintenanceCheckpoint {
+    pub revision: storage_types::Revision,
     pub cursor: Option<TtlMaintenanceCursor>,
 }

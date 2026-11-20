@@ -1,6 +1,6 @@
 //! Physical relations are selected only by immutable table/GSI identity.
 
-use storage_types::{IndexName, TableHistoryId, maintenance::TargetIncarnation};
+use storage_types::{BoundGsi, IndexName, TableHistoryId, maintenance::TargetIncarnation};
 
 use crate::SqlEngine;
 
@@ -13,22 +13,18 @@ impl SqlEngine {
         )
     }
 
+    /// The partial index of one GSI build on the item relation. Within the
+    /// Postgres 63-byte identifier limit: the index ID is never reused in a
+    /// table incarnation, and a rebuild gets a new build identity.
     #[must_use]
-    pub fn gsi_table_name(self, incarnation: &TargetIncarnation) -> String {
-        format!("gsi_{}", incarnation_hex(incarnation.as_ref()))
-    }
-
-    #[must_use]
-    pub fn ttl_table_name(self, history_id: TableHistoryId) -> String {
+    pub fn gsi_index_name(self, history_id: TableHistoryId, gsi: &BoundGsi) -> String {
+        let build = gsi.build.as_ref();
         format!(
-            "ttl_index_{}",
-            uuid::Uuid::from_bytes(*history_id.as_ref()).simple()
+            "gsi_{}_{}_{}",
+            uuid::Uuid::from_bytes(*history_id.as_ref()).simple(),
+            gsi.index_id,
+            incarnation_hex(build.get(..8).unwrap_or(build))
         )
-    }
-
-    #[must_use]
-    pub fn gsi_read_index_name(self, incarnation: &TargetIncarnation) -> String {
-        format!("live_{}", incarnation_hex(incarnation.as_ref()))
     }
 }
 

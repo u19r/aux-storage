@@ -7,71 +7,86 @@ use storage_types::{StorageError, StorageResult, storage_serde};
 
 use crate::{
     KvAttempt, KvEntry, KvMutation, KvRange, ReadProtection,
-    constants::{CATALOG_BYTES, QUEUE_NAME_PREFIX, QUEUE_URL_PREFIX},
+    constants::{CATALOG_BYTES, QUEUE_NAME_PREFIX},
     range::prefix_upper_bound,
 };
 
 pub(crate) async fn read_queue_by_name<A: KvAttempt>(
-    native: &mut A,
+    native: &A,
     protection: ReadProtection,
     name: &str,
 ) -> StorageResult<Option<QueueCatalogRecord>> {
     native
         .get(&name_key(name), protection)
         .await?
-        .map(|bytes| {
-            let record: QueueCatalogRecord = storage_serde::from_bytes(&bytes)?;
-            if record.queue.queue_name != name {
-                return Err(StorageError::internal("KV queue catalog name differs"));
-            }
-            Ok(record)
-        })
+        .map(|bytes| decode_named_value(&bytes, name))
         .transpose()
 }
 
-pub(crate) async fn read_queues_by_url<A: KvAttempt>(
+pub(crate) fn decode_named_value(bytes: &[u8], name: &str) -> StorageResult<QueueCatalogRecord> {
+    let record: QueueCatalogRecord = storage_serde::from_bytes(bytes)?;
+    if record.queue.queue_name != name {
+        return Err(StorageError::internal("KV queue catalog name differs"));
+    }
+    Ok(record)
+}
+
+/// The single catalog key of one queue name, as a range for a scan wave. The
+/// range holds at most that key; the limit of 2 keeps a native `more` flag at
+/// a full page from meaning anything here.
+pub(crate) fn queue_name_range(name: &str) -> KvRange {
+    let begin = name_key(name);
+    KvRange {
+        entry_bounds: None,
+        end: after_key(begin.clone()),
+        begin,
+        reverse: false,
+        limit: NonZeroU32::MIN.saturating_add(1),
+        max_bytes: CATALOG_BYTES,
+    }
+}
+
+pub(crate) fn decode_named_page(
+    page: crate::KvRangePage,
+    name: &str,
+) -> StorageResult<Option<QueueCatalogRecord>> {
+    if page.entries.len() > 1 {
+        return Err(StorageError::internal(
+            "KV queue catalog read is not unique",
+        ));
+    }
+    let record = page
+        .entries
+        .into_iter()
+        .next()
+        .map(decode_entry)
+        .transpose()?;
+    if record
+        .as_ref()
+        .is_some_and(|record| record.queue.queue_name != name)
+    {
+        return Err(StorageError::internal("KV queue catalog name differs"));
+    }
+    Ok(record)
+}
+
+/// The catalog rows of `names` in input order, in one native wave.
+pub(crate) async fn read_queues_by_name<A: KvAttempt>(
     native: &mut A,
     protection: ReadProtection,
-    urls: Vec<String>,
-) -> StorageResult<Vec<Option<QueueCatalogRecord>>> {
+    names: Vec<String>,
+) -> StorageResult<storage_types::Exact<Option<QueueCatalogRecord>>> {
     let values = native
-        .get_batch(urls.iter().map(|url| url_key(url)).collect(), protection)
+        .get_batch_exact(
+            names.iter().map(|name| name_key(name)).collect(),
+            protection,
+        )
         .await?;
-    let names = values
-        .into_iter()
-        .map(|value| {
-            value
-                .map(|bytes| {
-                    String::from_utf8(bytes).map_err(|_| {
-                        StorageError::internal("KV queue URL index has an invalid name")
-                    })
-                })
-                .transpose()
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
-    let keys = names.iter().flatten().map(|name| name_key(name)).collect();
-    let records = native.get_batch(keys, protection).await?;
-    let mut records = records.into_iter();
-    names
-        .into_iter()
-        .zip(urls)
-        .map(|(name, url)| {
-            let Some(name) = name else {
-                return Ok(None);
-            };
-            let bytes = records
-                .next()
-                .flatten()
-                .ok_or_else(|| StorageError::internal("KV queue URL index has no catalog row"))?;
-            let record: QueueCatalogRecord = storage_serde::from_bytes(&bytes)?;
-            if record.queue.queue_name != name || record.queue.queue_url != url {
-                return Err(StorageError::internal(
-                    "KV queue URL index differs from catalog row",
-                ));
-            }
-            Ok(Some(record))
-        })
-        .collect()
+    values.try_zip_map(names, |name, value| {
+        value
+            .map(|bytes| decode_named_value(&bytes, &name))
+            .transpose()
+    })
 }
 
 pub(crate) async fn read_queue_page<A: KvAttempt>(
@@ -125,32 +140,21 @@ pub(crate) async fn write_queue_record<A: KvAttempt>(
     record: QueueCatalogRecord,
     _expected: Option<QueueIncarnation>,
 ) -> StorageResult<()> {
-    // The shared decision read name and URL under conflict protection; the
-    // native commit validates those observations before publishing both keys.
-    native.stage(vec![
-        KvMutation::Put {
-            key: name_key(&record.queue.queue_name),
-            value: storage_serde::to_bytes(&record)?,
-        },
-        KvMutation::Put {
-            key: url_key(&record.queue.queue_url),
-            value: record.queue.queue_name.as_bytes().to_vec(),
-        },
-    ])
+    // The shared decision read the name key under conflict protection; the
+    // native commit validates that observation before publishing the key.
+    native.stage(vec![KvMutation::Put {
+        key: name_key(&record.queue.queue_name),
+        value: storage_serde::to_bytes(&record)?,
+    }])
 }
 
 pub(crate) async fn delete_queue_record<A: KvAttempt>(
     native: &mut A,
     record: QueueCatalogRecord,
 ) -> StorageResult<()> {
-    native.stage(vec![
-        KvMutation::Delete {
-            key: name_key(&record.queue.queue_name),
-        },
-        KvMutation::Delete {
-            key: url_key(&record.queue.queue_url),
-        },
-    ])
+    native.stage(vec![KvMutation::Delete {
+        key: name_key(&record.queue.queue_name),
+    }])
 }
 
 fn decode_entry(entry: KvEntry) -> StorageResult<QueueCatalogRecord> {
@@ -167,12 +171,8 @@ fn decode_entry(entry: KvEntry) -> StorageResult<QueueCatalogRecord> {
     Ok(record)
 }
 
-fn name_key(name: &str) -> Vec<u8> {
+pub(crate) fn name_key(name: &str) -> Vec<u8> {
     [QUEUE_NAME_PREFIX, name.as_bytes()].concat()
-}
-
-fn url_key(url: &str) -> Vec<u8> {
-    [QUEUE_URL_PREFIX, url.as_bytes()].concat()
 }
 
 fn after_key(mut key: Vec<u8>) -> Vec<u8> {

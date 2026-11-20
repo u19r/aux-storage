@@ -1,162 +1,12 @@
 //! SQL GSI discovery, source, and destination-state reads.
 
-use storage_backfill::{GsiBuildTarget, GsiPageLimit, GsiProjectionKey};
+use storage_backfill::{GsiBuildTarget, GsiPageLimit};
 use storage_types::{
-    AttributeName, AttributeValue, BoundTableInfo, GlobalSecondaryIndex, IndexName, ItemKey,
-    KeyAttributeType, KeyAttributes, KeySchemaElement, StorageError, StorageResult,
-    StoredTableInfo, TableHistoryId, maintenance::TargetIncarnation,
+    AttributeName, AttributeValue, BoundTableInfo, ItemKey, KeyAttributeType, KeyAttributes,
+    KeySchemaElement, StorageError, StorageResult,
 };
 
-use super::key::BoundProjectionKey;
 use crate::{SqlEngine, SqlLayout, SqlStatement, SqlValue, item_read::encode_key_value};
-
-pub(in crate::gsi) fn projection_state_statement(
-    engine: impl SqlLayout,
-    table: &StoredTableInfo,
-    index: &GlobalSecondaryIndex,
-    keys: &[&GsiProjectionKey],
-    incarnation: &TargetIncarnation,
-) -> StorageResult<SqlStatement> {
-    render_projection_state(
-        engine,
-        ProjectionStateQuery {
-            table,
-            index,
-            keys,
-            incarnation,
-        },
-        "g.__aux_item_version",
-    )
-}
-
-pub(in crate::gsi) struct ProjectionStateQuery<'a> {
-    pub table: &'a StoredTableInfo,
-    pub index: &'a GlobalSecondaryIndex,
-    pub keys: &'a [&'a GsiProjectionKey],
-    pub incarnation: &'a TargetIncarnation,
-}
-
-fn render_projection_state(
-    engine: impl SqlLayout,
-    query: ProjectionStateQuery<'_>,
-    columns_sql: &str,
-) -> StorageResult<SqlStatement> {
-    let ProjectionStateQuery {
-        table,
-        index,
-        keys,
-        incarnation,
-    } = query;
-    let count = index
-        .key_schema
-        .len()
-        .checked_add(table.key_schema.len())
-        .and_then(|count| count.checked_add(1))
-        .and_then(|count| count.checked_mul(keys.len()))
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut binds = Vec::new();
-    binds
-        .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut values = crate::statement::SqlText::default();
-    let mut columns = None;
-    for (ordinal, key) in keys.iter().enumerate() {
-        let mut bound = BoundProjectionKey::try_new(engine, table, index, key)?;
-        match &columns {
-            Some(expected) if expected != &bound.columns => {
-                return Err(StorageError::internal(
-                    "SQL GSI projection columns differ within page",
-                ));
-            }
-            None => columns = Some(std::mem::take(&mut bound.columns)),
-            _ => {}
-        }
-        values.append(format_args!("{}", if ordinal == 0 { "" } else { ", " }))?;
-        bound.append_request_row(engine, ordinal, &mut binds, &mut values)?;
-    }
-    let columns = columns.ok_or_else(|| StorageError::internal("GSI state page is empty"))?;
-    let physical = engine.gsi_table_name(incarnation);
-    let sql = projection_state_sql(&physical, columns_sql, &columns, &values.finish()?)?;
-    Ok(SqlStatement::new(sql, binds))
-}
-
-fn projection_state_sql(
-    physical: &str,
-    columns_sql: &str,
-    columns: &[String],
-    values: &str,
-) -> StorageResult<String> {
-    let mut sql = crate::statement::SqlText::default();
-    sql.append(format_args!("WITH requested(ordinal, "))?;
-    for ordinal in 0..columns.len() {
-        sql.append(format_args!(
-            "{}k{ordinal}",
-            if ordinal == 0 { "" } else { ", " }
-        ))?;
-    }
-    sql.append(format_args!(
-        ") AS (VALUES {values}) SELECT requested.ordinal, g.__aux_tombstone, {columns_sql} FROM \
-         requested LEFT JOIN \"{physical}\" AS g ON "
-    ))?;
-    for (ordinal, column) in columns.iter().enumerate() {
-        sql.append(format_args!(
-            "{}g.\"{column}\" = requested.k{ordinal}",
-            if ordinal == 0 { "" } else { " AND " }
-        ))?;
-    }
-    sql.append(format_args!(" ORDER BY requested.ordinal"))?;
-    sql.finish()
-}
-
-pub(in crate::gsi) fn ttl_projection_state_statement(
-    engine: impl SqlLayout,
-    keys: &[&GsiProjectionKey],
-    history_id: TableHistoryId,
-) -> StorageResult<SqlStatement> {
-    let count = keys
-        .len()
-        .checked_mul(3)
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut binds = Vec::new();
-    binds
-        .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut sql = crate::statement::SqlText::default();
-    sql.append(format_args!(
-        "WITH requested(ordinal, ttl_value, key_token) AS (VALUES "
-    ))?;
-    for (ordinal, key) in keys.iter().enumerate() {
-        let ttl = key
-            .ttl_index_key
-            .as_ref()
-            .ok_or_else(|| StorageError::internal("TTL projection key is missing"))?;
-        let (value, token): (i64, &str) = ttl.into();
-        let observed = i64::try_from(ordinal)
-            .map_err(|_| StorageError::internal("TTL state ordinal exceeds SQL range"))?;
-        sql.append(format_args!(
-            "{}(CAST(",
-            if ordinal == 0 { "" } else { ", " }
-        ))?;
-        sql.append_parameter(engine.engine(), binds.len() + 1, false)?;
-        sql.append(format_args!(" AS BIGINT), CAST("))?;
-        sql.append_parameter(engine.engine(), binds.len() + 2, false)?;
-        sql.append(format_args!(" AS BIGINT), "))?;
-        sql.append_parameter(engine.engine(), binds.len() + 3, false)?;
-        sql.append(format_args!(")"))?;
-        binds.extend([
-            SqlValue::Integer(observed),
-            SqlValue::Integer(value),
-            SqlValue::try_from(crate::row_view::SqlValueRef::Text(token))?,
-        ]);
-    }
-    let physical = engine.ttl_table_name(history_id);
-    sql.append(format_args!(
-        ") SELECT requested.ordinal, CASE WHEN g.key_token IS NULL THEN NULL ELSE 0 END, \
-         CAST(NULL AS BIGINT) FROM requested LEFT JOIN \"{physical}\" AS g ON g.ttl_value = \
-         requested.ttl_value AND g.key_token = requested.key_token ORDER BY requested.ordinal"
-    ))?;
-    Ok(SqlStatement::new(sql.finish()?, binds))
-}
 
 pub(in crate::gsi) fn scan_source_statement(
     engine: impl SqlLayout,
@@ -164,6 +14,34 @@ pub(in crate::gsi) fn scan_source_statement(
     after: Option<&KeyAttributes>,
     limit: GsiPageLimit,
 ) -> StorageResult<SqlStatement> {
+    render_source_scan(
+        engine,
+        ScanSourceStatement {
+            table,
+            after,
+            limit,
+            index: None,
+        },
+    )
+}
+
+pub(in crate::gsi) struct ScanSourceStatement<'a> {
+    pub table: &'a BoundTableInfo,
+    pub after: Option<&'a KeyAttributes>,
+    pub limit: GsiPageLimit,
+    pub index: Option<&'a storage_types::BoundGsi>,
+}
+
+pub(in crate::gsi) fn render_source_scan(
+    engine: impl SqlLayout,
+    source: ScanSourceStatement<'_>,
+) -> StorageResult<SqlStatement> {
+    let ScanSourceStatement {
+        table,
+        after,
+        limit,
+        index,
+    } = source;
     let columns = KeySchemaElement::ordered(&table.info.key_schema)
         .map(|element| {
             (
@@ -200,10 +78,24 @@ pub(in crate::gsi) fn scan_source_statement(
         .collect::<Vec<_>>()
         .join(", ");
     let physical = engine.item_table_name(table.history_id);
+    let mut extra = String::new();
+    if let Some(index) = index {
+        if engine.engine() == SqlEngine::Postgres {
+            extra.push_str(", ctid::text, xmin::text");
+        }
+        for column in &index.columns {
+            let name = crate::item_schema::key_column_identifier(column);
+            if engine.engine() == SqlEngine::Postgres && column.kind == KeyAttributeType::N {
+                extra.push_str(&format!(", CAST(\"{name}\" AS TEXT)"));
+            } else {
+                extra.push_str(&format!(", \"{name}\""));
+            }
+        }
+    }
     Ok(SqlStatement::new(
         format!(
-            "SELECT item_value, __aux_revision, {physical_keys} FROM \"{physical}\" \
-             {where_clause} ORDER BY {order} LIMIT {}",
+            "SELECT item_value, {physical_keys}{extra} FROM \"{physical}\" {where_clause} ORDER \
+             BY {order} LIMIT {}",
             engine.engine().placeholder(binds.len()),
         ),
         binds,
@@ -256,7 +148,7 @@ pub(in crate::gsi) fn candidate_statement(
         engine,
         "SELECT table_id, table_name, index_name, incarnation, phase, state FROM "
             ["sys_gsi_builds"],
-        " WHERE phase IN ('scanning', 'catching-up')"
+        " WHERE phase IN ('filling', 'building', 'scanning', 'catching-up')"
     )
     .into_owned();
     let mut values = Vec::new();
@@ -289,54 +181,5 @@ pub(in crate::gsi) fn candidate_binding_statement(
             SqlValue::Blob(target.history_id.as_ref().to_vec()),
             SqlValue::Text(target.index_name.to_string()),
         ],
-    )
-}
-
-fn gsi_catalog_statement(
-    engine: impl SqlLayout,
-    table: &BoundTableInfo,
-    requested: Option<&IndexName>,
-    columns: &str,
-) -> SqlStatement {
-    let mut sql = format!(
-        "SELECT {columns} FROM {relation_sys_gsi_builds} WHERE table_id = {}",
-        engine.engine().placeholder(1),
-        relation_sys_gsi_builds = engine.relation_name("sys_gsi_builds"),
-    );
-    let mut values = vec![SqlValue::Blob(table.history_id.as_ref().to_vec())];
-    if let Some(index) = requested {
-        sql.push_str(&format!(
-            " AND index_name = {}",
-            engine.engine().placeholder(2)
-        ));
-        values.push(SqlValue::Text(index.to_string()));
-    }
-    sql.push_str(" ORDER BY index_name");
-    SqlStatement::new(sql, values)
-}
-
-pub(in crate::gsi) fn gsi_status_statement(
-    engine: impl SqlLayout,
-    table: &BoundTableInfo,
-    requested: Option<&IndexName>,
-) -> SqlStatement {
-    gsi_catalog_statement(
-        engine,
-        table,
-        requested,
-        "table_id, table_name, index_name, incarnation, phase",
-    )
-}
-
-pub(in crate::gsi) fn gsi_build_statement(
-    engine: impl SqlLayout,
-    table: &BoundTableInfo,
-    requested: Option<&IndexName>,
-) -> SqlStatement {
-    gsi_catalog_statement(
-        engine,
-        table,
-        requested,
-        "table_id, table_name, index_name, incarnation, phase, state",
     )
 }

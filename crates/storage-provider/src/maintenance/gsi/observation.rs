@@ -1,6 +1,6 @@
-//! One observation and transition decision for scheduled and direct GSI work.
+//! Protected source pages are the sole authority for backfill effects.
 use storage_backfill::{
-    GsiBuild, GsiChange, GsiObservation, GsiPageLimit, GsiReadRequest, GsiScanPageEnd,
+    GsiActive, GsiBuild, GsiChange, GsiPageLimit, GsiProjectionWriteBatch, GsiState,
 };
 use storage_types::{StorageError, StorageResult};
 
@@ -11,69 +11,21 @@ pub(super) async fn evaluate<Transaction: GsiBuildTransaction>(
     build: &GsiBuild<Transaction::Cursor>,
     limit: GsiPageLimit,
 ) -> StorageResult<GsiChange<Transaction::Cursor>> {
-    let read = build
-        .read_request(limit)
-        .map_err(|error| StorageError::internal(&error.to_string()))?;
-    match Box::pin(read_observation(transaction, build, read)).await {
-        Ok(observation) => build
-            .decide_next_change(observation)
-            .map_err(|error| StorageError::internal(&error.to_string())),
-        Err(error)
-            if matches!(
-                error.as_ref(),
-                storage_types::StorageEnum::HistoryUnavailable
-            ) =>
-        {
-            Ok(build.block_unavailable_history())
+    match &build.state {
+        GsiState::Filling(scan) => {
+            let page = transaction
+                .read_gsi_scan(&build.target, scan.after.as_ref(), limit)
+                .await?;
+            build
+                .advance_protected_page(page)
+                .map_err(|error| StorageError::internal(&error.to_string()))
         }
-        Err(error) => Err(error),
+        GsiState::Building(state) => Ok(GsiChange::Persist {
+            projections: GsiProjectionWriteBatch::default(),
+            next_state: GsiState::Active(GsiActive {
+                cursor: state.low.clone(),
+            }),
+        }),
+        GsiState::Active(_) => Err(StorageError::internal("Active GSI has no build work")),
     }
-}
-
-async fn read_observation<Transaction: GsiBuildTransaction>(
-    transaction: &mut Transaction,
-    build: &GsiBuild<Transaction::Cursor>,
-    read: GsiReadRequest<&Transaction::Cursor>,
-) -> StorageResult<GsiObservation<Transaction::Cursor>> {
-    Ok(match read {
-        GsiReadRequest::Scan { after, limit } => {
-            read_scan(transaction, build, after, limit).await?
-        }
-        GsiReadRequest::CatchUp {
-            after,
-            through,
-            limit,
-        } => GsiObservation::Stream(
-            transaction
-                .read_gsi_catch_up(&build.target, after, through, limit)
-                .await?,
-        ),
-        GsiReadRequest::InspectActivation {
-            required_from,
-            through,
-        } => GsiObservation::Activation(
-            transaction
-                .read_gsi_activation(&build.target, required_from, through)
-                .await?,
-        ),
-    })
-}
-
-async fn read_scan<Transaction: GsiBuildTransaction>(
-    transaction: &mut Transaction,
-    build: &GsiBuild<Transaction::Cursor>,
-    after: Option<&Transaction::Cursor>,
-    limit: GsiPageLimit,
-) -> StorageResult<GsiObservation<Transaction::Cursor>> {
-    let observation = transaction
-        .read_gsi_scan(&build.target, after, limit)
-        .await?;
-    if !build.target.index_name.is_ttl_index()
-        && let GsiScanPageEnd::Complete(high) = &observation.end
-    {
-        transaction
-            .validate_gsi_frontier(build.state.required_stream_history(), high)
-            .await?;
-    }
-    Ok(GsiObservation::Scan(observation))
 }

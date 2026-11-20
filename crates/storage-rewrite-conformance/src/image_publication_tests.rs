@@ -2,14 +2,13 @@
 
 use serde_json::json;
 use storage_types::{
-    AttributeMap, AttributeValue, BatchWriteItemRequest, DeleteItemRequest, ItemHistoryPointer,
-    PutItemRequest, TableName, TableStreamSequence, storage_serde,
+    AttributeMap, AttributeValue, BatchWriteItemRequest, DeleteItemRequest, PutItemRequest,
+    TableName,
 };
-use stream_provider::StreamRowKind;
 
 use super::{
     gsi_workflow_tests::table_request,
-    image_retention_tests::{table_records, table_stream},
+    image_retention_tests::{canonical_history_reads, table_records},
     test_support::TestStore,
 };
 
@@ -49,9 +48,9 @@ async fn given_mixed_writes_when_extension_history_is_read_then_each_snapshot_is
                 .collect::<String>();
             let item = json!({"pk": {"S": "key"}, "gsi_pk": {"S": format!("group-{step}")},
                 "gsi_sk": {"S": "key"}, "payload": {"S": payload},
-                "number": {"N": format!("{step}.00")},
-                "numbers": {"NS": ["1700000000", "1.00"]},
-                "nested": {"M": {"zero": {"N": "-0.00"}}}});
+                "number": {"N": format!("{step}")},
+                "numbers": {"NS": ["1700000000", "1"]},
+                "nested": {"M": {"zero": {"N": "0"}}}});
             expected.push(Some(serde_json::from_value(item.clone())?));
             if step == 1 || step == 4 {
                 let response = fixture
@@ -81,72 +80,29 @@ async fn given_mixed_writes_when_extension_history_is_read_then_each_snapshot_is
                     .await?;
             }
         }
+        fixture.wait_until_changes_are_readable().await;
         let records = table_records(&fixture, &table).await?;
-        let pointers = fixture
-            .stream_operations
-            .read_forward(table_stream(&fixture, &table).await?, None, 10)
-            .await?;
-        anyhow::ensure!(
-            records.len() == 5 && pointers.items.len() == 5,
-            "one pointer and public record per committed mutation"
-        );
-        let mut previous = None;
-        for (ordinal, (record, row)) in records.iter().zip(&pointers.items).enumerate() {
+        let arn = fixture
+            .operations
+            .describe_table(storage_types::DescribeTableRequest {
+                table_name: table.clone(),
+            })
+            .await?
+            .table
+            .latest_stream_arn
+            .unwrap();
+        let standard = super::table_history_retention_tests::read_standard(&fixture, &arn).await?;
+        anyhow::ensure!(records.len() == 5 && standard.len() == 5);
+        for (ordinal, (record, event)) in records.iter().zip(&standard).enumerate() {
             anyhow::ensure!(record.item == expected[ordinal]);
-            let encoded = serde_json::to_value(record)?;
-            anyhow::ensure!(encoded.get("OldImage").is_none() && encoded.get("NewImage").is_none());
+            anyhow::ensure!(event.dynamodb.new_image == expected[ordinal]);
             anyhow::ensure!(
-                record.system_position.is_none(),
-                "table records must not fabricate system positions"
+                event.dynamodb.old_image
+                    == ordinal
+                        .checked_sub(1)
+                        .and_then(|index| expected[index].clone())
             );
-            anyhow::ensure!(
-                record.sequence_number == TableStreamSequence::from(row.id).to_string()
-            );
-            let pointer: ItemHistoryPointer = storage_serde::from_bytes(&row.data)?;
-            let version = pointer.metadata().version();
-            anyhow::ensure!(previous.is_none_or(|previous| version > previous));
-            let history = fixture
-                .stream_operations
-                .read_backward(
-                    StreamRowKind::Item(
-                        pointer
-                            .metadata()
-                            .address()
-                            .physical_stream_name()
-                            .expect("valid history address"),
-                    ),
-                    Some(storage_types::StreamItemId::from(version).increment()),
-                    2,
-                )
-                .await?;
-            anyhow::ensure!(
-                history.items.first().map(|image| image.id)
-                    == Some(storage_types::StreamItemId::from(version))
-            );
-            if let Some(previous) = previous {
-                anyhow::ensure!(
-                    history.items.get(1).map(|image| image.id)
-                        == Some(storage_types::StreamItemId::from(previous))
-                );
-            }
-            for (image, expected) in history.items.iter().zip([
-                expected[ordinal].as_ref(),
-                ordinal
-                    .checked_sub(1)
-                    .and_then(|index| expected[index].as_ref()),
-            ]) {
-                let actual: Option<AttributeMap> =
-                    if image.data_type == stream_provider::StreamDataType::DeleteMarker {
-                        None
-                    } else {
-                        Some(storage_serde::from_bytes(&image.data)?)
-                    };
-                anyhow::ensure!(
-                    actual.as_ref() == expected,
-                    "durable image differs from committed mutation"
-                );
-            }
-            previous = Some(version);
+            anyhow::ensure!(record.system_position.is_none());
         }
         Ok(())
     }
@@ -201,43 +157,35 @@ async fn given_declared_indexers_and_different_payload_sizes_when_stream_is_read
             }
             expected.push((total, old, new));
         }
+        fixture.wait_until_changes_are_readable().await;
         let records = table_records(&fixture, &table).await?;
-        let pointers = fixture
-            .stream_operations
-            .read_forward(table_stream(&fixture, &table).await?, None, 100)
-            .await?;
-        anyhow::ensure!(records.len() == 6 && pointers.items.len() == 6);
+        let reads = canonical_history_reads(&fixture, &table).await?;
+        let pages = (fixture.canonical_history_read)(reads).await?;
+        let entries = pages
+            .iter()
+            .flat_map(|page| &page.entries)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(records.len() == 6 && entries.len() == 6);
         for (total, old, new) in expected {
-            let record = records
-                .iter()
-                .find(|record| record.item.as_ref() == Some(&new))
-                .ok_or_else(|| anyhow::anyhow!("public stream omitted boundary {total}"))?;
             anyhow::ensure!(
                 records
                     .iter()
-                    .any(|candidate| candidate.item.as_ref() == Some(&old))
+                    .any(|record| record.item.as_ref() == Some(&new)),
+                "public stream omitted boundary {total}"
             );
-            let row = pointers
-                .items
+            let entry = entries
                 .iter()
-                .find(|row| TableStreamSequence::from(row.id).to_string() == record.sequence_number)
-                .ok_or_else(|| anyhow::anyhow!("public record has no durable pointer"))?;
-            let pointer: ItemHistoryPointer = storage_serde::from_bytes(&row.data)?;
-            let images = fixture
-                .stream_operations
-                .read_backward(
-                    StreamRowKind::Item(pointer.metadata().address().physical_stream_name()?),
-                    Some(
-                        storage_types::StreamItemId::from(pointer.metadata().version()).increment(),
-                    ),
-                    2,
-                )
-                .await?;
-            anyhow::ensure!(images.items.len() == 2);
-            for (image, expected) in images.items.iter().zip([&new, &old]) {
-                let actual: AttributeMap = storage_serde::from_bytes(&image.data)?;
-                anyhow::ensure!(actual == *expected);
-            }
+                .find(|entry| {
+                    entry.entry.new_image().is_some_and(|image| {
+                        image.item.to_attribute_map().ok().as_ref() == Some(&new)
+                    })
+                })
+                .ok_or_else(|| anyhow::anyhow!("missing canonical image"))?;
+            let new_image = entry.entry.new_image().unwrap();
+            let old_image = entry.entry.old_image().unwrap();
+            anyhow::ensure!(new_image.item.to_attribute_map()? == new);
+            anyhow::ensure!(old_image.item.to_attribute_map()? == old);
+            anyhow::ensure!(new_image.indexers == ["payload"] && old_image.indexers == ["payload"]);
         }
         Ok(())
     }

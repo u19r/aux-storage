@@ -3,7 +3,10 @@ use std::str::FromStr;
 use alloc_counter::AllocationGuard;
 use rust_decimal::Decimal;
 
-use crate::numeric::{SortableNumeric, SortableVec, calculate_magnitude};
+use crate::numeric::{
+    SortableNumeric, calculate_magnitude, decode_decimal, decode_numeric, encode_decimal,
+    sortable_from_numeric_str,
+};
 
 fn legacy_calculate_magnitude(decimal: Decimal) -> i32 {
     if decimal.is_zero() {
@@ -93,8 +96,8 @@ fn sortable_numeric_magnitude_avoids_format_allocations() {
 fn encode_decode_zero() {
     let zero = Decimal::ZERO;
 
-    let encoded = zero.encode();
-    let decoded = Decimal::decode(&encoded).unwrap();
+    let encoded = encode_decimal(&zero);
+    let decoded = decode_decimal(&encoded).unwrap();
 
     assert_eq!(zero, decoded);
 }
@@ -103,8 +106,8 @@ fn encode_decode_zero() {
 fn encode_decode_zero_negative() {
     let zero = Decimal::new(-0, 0);
 
-    let encoded = zero.encode();
-    let decoded = Decimal::decode(&encoded).unwrap();
+    let encoded = encode_decimal(&zero);
+    let decoded = decode_decimal(&encoded).unwrap();
 
     assert_eq!(zero, decoded);
 }
@@ -121,8 +124,8 @@ fn encode_decode_positive_integers() {
     ];
 
     for original in test_cases {
-        let encoded = original.encode();
-        let decoded = Decimal::decode(&encoded).unwrap();
+        let encoded = encode_decimal(&original);
+        let decoded = decode_decimal(&encoded).unwrap();
 
         let diff = (original - decoded).abs();
         assert!(
@@ -144,8 +147,8 @@ fn encode_decode_negative_integers() {
     ];
 
     for original in test_cases {
-        let encoded = original.encode();
-        let decoded = Decimal::decode(&encoded).unwrap();
+        let encoded = encode_decimal(&original);
+        let decoded = decode_decimal(&encoded).unwrap();
 
         let diff = (original - decoded).abs();
         assert!(
@@ -166,8 +169,8 @@ fn encode_decode_decimals() {
     ];
 
     for original in test_cases {
-        let encoded = original.encode();
-        let decoded = Decimal::decode(&encoded).unwrap();
+        let encoded = encode_decimal(&original);
+        let decoded = decode_decimal(&encoded).unwrap();
 
         let diff = (original - decoded).abs();
 
@@ -192,7 +195,10 @@ fn sort_order_preservation() {
         Decimal::from(1_239),         // 1239
     ];
 
-    let mut encoded_pairs: Vec<_> = test_cases.iter().map(|&d| (d, d.encode())).collect();
+    let mut encoded_pairs: Vec<_> = test_cases
+        .iter()
+        .map(|&d| (d, encode_decimal(&d)))
+        .collect();
 
     // Sort by encoded bytes (lexicographic order)
     encoded_pairs.sort_by(|a, b| a.1.cmp(&b.1));
@@ -215,11 +221,11 @@ fn sort_order_preservation() {
 
 #[test]
 fn binary_order() {
-    let smallest = Decimal::new(-100_000, 0).encode();
-    let first = Decimal::new(-1000, 0).encode();
-    let second = Decimal::new(-100, 0).encode();
-    let third = Decimal::new(10, 0).encode();
-    let forth = Decimal::new(100_000, 0).encode();
+    let smallest = encode_decimal(&Decimal::new(-100_000, 0));
+    let first = encode_decimal(&Decimal::new(-1000, 0));
+    let second = encode_decimal(&Decimal::new(-100, 0));
+    let third = encode_decimal(&Decimal::new(10, 0));
+    let forth = encode_decimal(&Decimal::new(100_000, 0));
 
     let mut sorted = [
         second.clone(),
@@ -250,7 +256,10 @@ fn sort_order_with_many_values() {
         Decimal::new(999_999, 0),  // 999999
     ];
 
-    let mut encoded_pairs: Vec<_> = test_cases.iter().map(|&d| (d, d.encode())).collect();
+    let mut encoded_pairs: Vec<_> = test_cases
+        .iter()
+        .map(|&d| (d, encode_decimal(&d)))
+        .collect();
 
     // Sort by encoded bytes
     encoded_pairs.sort_by(|a, b| a.1.cmp(&b.1));
@@ -268,9 +277,9 @@ fn scaling_factor_selection() {
     let medium_number = Decimal::from(42);
     let large_number = Decimal::new(1_234_567_890_123_456_789i64, 9);
 
-    let small_encoded = small_number.encode();
-    let medium_encoded = medium_number.encode();
-    let large_encoded = large_number.encode();
+    let small_encoded = encode_decimal(&small_number);
+    let medium_encoded = encode_decimal(&medium_number);
+    let large_encoded = encode_decimal(&large_number);
 
     // Extract scale indices from the header bytes (least significant 4 bits)
     let small_scale = (small_encoded[0] & 0b0000_1111) as usize;
@@ -290,10 +299,10 @@ fn variable_length_encoding() {
     let large = Decimal::from(16384); // Will need 3 bytes in variable encoding
     let chonky = Decimal::from(-200_097_152); // Will need 4 bytes in variable encoding
 
-    let small_encoded = small.encode();
-    let medium_encoded = medium.encode();
-    let large_encoded = large.encode();
-    let chonky_encoded = chonky.encode();
+    let small_encoded = encode_decimal(&small);
+    let medium_encoded = encode_decimal(&medium);
+    let large_encoded = encode_decimal(&large);
+    let chonky_encoded = encode_decimal(&chonky);
 
     // Larger numbers should generally use more bytes
     // (though scaling factors can affect this)
@@ -307,7 +316,7 @@ fn number_less_than_char() {
     let num = Decimal::from(50);
     let char_a = b'A'; // ASCII 65
 
-    let num_encoded = num.encode();
+    let num_encoded = encode_decimal(&num);
 
     // Ensure that the encoded number is lexicographically less than 'A'
     assert!(num_encoded < vec![char_a]);
@@ -316,8 +325,8 @@ fn number_less_than_char() {
 #[test]
 fn sortable_numeric_roundtrip() {
     let s = "12345.6789";
-    let sortable = <Decimal as SortableVec>::from_numeric_str(s).unwrap();
-    let dec = <Decimal as SortableVec>::decode_numeric(&sortable).unwrap();
+    let sortable = sortable_from_numeric_str(s).unwrap();
+    let dec = decode_numeric(&sortable).unwrap();
     assert_eq!(dec, Decimal::from_str(s).unwrap());
 }
 
@@ -326,7 +335,7 @@ fn sortable_numeric_order() {
     let nums = ["1", "2", "10", "11", "99", "100", "1000.5"]; // numeric ascending
     let mut enc: Vec<_> = nums
         .iter()
-        .map(|n| (<Decimal as SortableVec>::from_numeric_str(n).unwrap(), *n))
+        .map(|n| (sortable_from_numeric_str(n).unwrap(), *n))
         .collect();
     enc.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let sorted: Vec<&str> = enc.into_iter().map(|(_, n)| n).collect();
@@ -340,7 +349,7 @@ fn sortable_numeric_descending_helper() {
     let nums = ["1", "2", "10", "11", "99", "100", "1000.5"]; // numeric ascending
     let asc: Vec<_> = nums
         .iter()
-        .map(|n| (<Decimal as SortableVec>::from_numeric_str(n).unwrap(), *n))
+        .map(|n| (sortable_from_numeric_str(n).unwrap(), *n))
         .collect();
     let desc: Vec<_> = nums
         .iter()

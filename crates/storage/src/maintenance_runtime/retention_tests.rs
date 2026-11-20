@@ -6,19 +6,23 @@ use scheduled_bg_jobs::{
     runtime::MonotonicDeadline,
 };
 use storage_common::{DatabaseJobIntervals, StorageJob};
-use storage_provider::{DynamoOperations, StreamRetentionRepository};
+use storage_provider::{DynamoOperations, MaintenanceOperations};
 use storage_types::TimestampMillis;
 
 use super::catalog::MaintenanceJobCatalog;
-use crate::StorageProviderBundle;
 
 #[tokio::test]
 async fn given_pending_history_when_the_job_yields_then_cleanup_resumes_at_its_next_deadline() {
     let store = Arc::new(
         sql_backend::SqlStore::initialize_schema(
-            sql_backend::sqlite::SqliteBackend::initialize(":memory:")
-                .await
-                .unwrap(),
+            sql_backend::sqlite::SqliteBackend::initialize(
+                ":memory:",
+                storage_types::AttemptDeadlines::default(),
+            )
+            .await
+            .unwrap(),
+            storage_types::InitialStreamLineages::ONE,
+            true,
         )
         .await
         .unwrap(),
@@ -57,16 +61,15 @@ async fn given_pending_history_when_the_job_yields_then_cleanup_resumes_at_its_n
         Timestamp::from_millis(now.timestamp_millis()),
         MonotonicDeadline::ZERO,
     ));
-    let bundle =
-        StorageProviderBundle::try_from_initialized_store(store.clone(), Default::default())
-            .unwrap();
+    let bundle = crate::InitializedStore::native(store.clone()).caller_maintenance();
     let catalog = MaintenanceJobCatalog::try_new(
         bundle.maintenance.unwrap(),
-        bundle.table_reclaim_repository,
         DatabaseJobIntervals::default(),
         Timestamp::from_millis(now.timestamp_millis()),
+        None,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     let runtime = runtime_builder(
         bundle.scheduled_job_store,
         catalog,

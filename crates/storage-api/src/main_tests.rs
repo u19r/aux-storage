@@ -5,7 +5,8 @@ use storage_types::{StorageEnum, StorageError, context::WrappedError as _};
 use tokio::net::TcpListener;
 
 use crate::service::{
-    poll_server_with_readiness, run_after_listener_ready, spawn_http_server, stop_http_server,
+    poll_server_with_readiness, run_after_listener_ready, runtime_worker_threads,
+    spawn_http_server, stop_http_server,
 };
 
 #[tokio::test]
@@ -22,7 +23,7 @@ async fn deferred_startup_runs_after_server_is_actively_polled() {
             !server_task.is_finished(),
             "listener readiness must be observed while server task is serving"
         );
-        events.lock().expect("event lock").push("learner_join");
+        events.lock().expect("event lock").push("ready_check");
         Ok(())
     })
     .await
@@ -30,7 +31,7 @@ async fn deferred_startup_runs_after_server_is_actively_polled() {
 
     assert_eq!(
         *events.lock().expect("event lock"),
-        ["constructed", "learner_join"]
+        ["constructed", "ready_check"]
     );
     stop_http_server(server_task, server_shutdown).await;
 }
@@ -72,7 +73,7 @@ async fn failed_deferred_startup_stops_server_before_returning_error() {
         spawn_http_server(listener, Router::new(), Duration::from_secs(1));
 
     let error = run_after_listener_ready(server_ready, async {
-        Err(StorageError::internal("learner join failed"))
+        Err(StorageError::internal("readiness check failed"))
     })
     .await
     .expect_err("deferred startup failure");
@@ -81,4 +82,33 @@ async fn failed_deferred_startup_stops_server_before_returning_error() {
         StorageEnum::InternalServerError { .. }
     ));
     stop_http_server(server_task, server_shutdown).await;
+}
+
+#[test]
+fn given_configured_worker_threads_when_runtime_is_sized_then_the_setting_wins() {
+    assert_eq!(runtime_worker_threads(std::num::NonZeroUsize::new(3)), 3);
+    assert_eq!(
+        runtime_worker_threads(None),
+        std::thread::available_parallelism().map_or(1, usize::from)
+    );
+}
+
+#[cfg(not(feature = "tokio-console"))]
+#[test]
+fn given_tokio_console_without_its_feature_when_starting_then_rejected() {
+    let error = crate::service::require_tokio_console_build(&config::RuntimeFeatures {
+        tokio_console: true,
+        ..Default::default()
+    })
+    .expect_err("console needs its build feature");
+
+    assert!(
+        error
+            .to_string()
+            .contains("features.runtime.tokio_console requires the tokio-console build feature"),
+        "{error}"
+    );
+    assert!(
+        crate::service::require_tokio_console_build(&config::RuntimeFeatures::default()).is_ok()
+    );
 }

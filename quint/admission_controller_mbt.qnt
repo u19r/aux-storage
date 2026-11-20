@@ -38,6 +38,7 @@ module admission_controller_mbt {
       enabled: mbtEnabled,
       minimum: 2,
       maximum: 8,
+      start: 8,
     }
     val current = {
       desiredLimit: desiredLimit,

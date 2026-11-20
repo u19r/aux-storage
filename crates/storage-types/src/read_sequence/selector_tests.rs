@@ -5,7 +5,7 @@ use crate::{AttributeMap, AttributeValue, ParsedReadSequenceSelector, ReadSequen
 #[test]
 fn given_supported_item_paths_when_evaluating_borrowed_then_owned_semantics_match() {
     let item = selector_item();
-    let root = AttributeValue::M(item.clone().into());
+    let root = AttributeValue::M(item.clone());
 
     for raw in [
         "$",
@@ -27,7 +27,7 @@ fn given_supported_item_paths_when_evaluating_borrowed_then_owned_semantics_matc
 #[test]
 fn given_type_mismatch_when_evaluating_borrowed_then_error_semantics_match() {
     let item = selector_item();
-    let root = AttributeValue::M(item.clone().into());
+    let root = AttributeValue::M(item.clone());
     let selector =
         ParsedReadSequenceSelector::parse(&ReadSequenceSelector("$.pk.values".to_string()))
             .expect("parse selector");
@@ -45,13 +45,13 @@ fn selector_item() -> AttributeMap {
         ("pk".to_string(), AttributeValue::S("tenant#1".to_string())),
         (
             "nested".to_string(),
-            AttributeValue::M(HashMap::from([(
+            AttributeValue::M(AttributeMap::from(HashMap::from([(
                 "values".to_string(),
                 AttributeValue::L(vec![
                     AttributeValue::S("first".to_string()),
                     AttributeValue::S("second".to_string()),
                 ]),
-            )])),
+            )]))),
         ),
         (
             "tags".to_string(),

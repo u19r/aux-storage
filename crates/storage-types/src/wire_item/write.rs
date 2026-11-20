@@ -10,7 +10,9 @@ use super::{
     text::{AttributeNames, BorrowedText},
 };
 use crate::{
-    AttributeMap, AttributeValue, LogicalItemSize, StorageError, StorageResult, dynamodb_limits,
+    AttributeMap, AttributeValue, LogicalItemSize, StorageError, StorageResult,
+    attribute_value::{ATTRIBUTE_VALUE_EMPTY_MESSAGE, ATTRIBUTE_VALUE_MULTIPLE_MESSAGE},
+    dynamodb_limits,
 };
 
 impl WireItem {
@@ -18,8 +20,6 @@ impl WireItem {
         match self {
             Self::DynamoJson { data } => String::from_utf8(data.clone())
                 .map_err(|_| StorageError::internal("wire item JSON is not UTF-8")),
-            Self::LocalSplit { .. } => serde_json::to_string(&super::dynamo_json::ItemRef(self))
-                .map_err(|error| StorageError::internal(&error.to_string())),
         }
     }
 
@@ -30,7 +30,6 @@ impl WireItem {
             Self::DynamoJson { data } => {
                 inspect_write_item::<false>(data, field).map(|(size, _)| size)
             }
-            Self::LocalSplit { .. } => self.logical_size().map_err(|error| error.to_string()),
         }
     }
 
@@ -43,62 +42,8 @@ impl WireItem {
                 let data = replace_write_attributes(data, &replacements)?;
                 Ok((Self::dynamo_json(data), size))
             }
-            Self::LocalSplit {
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            } => normalize_split_item(primary_key, secondary_key, non_key_attributes_blob),
         }
     }
-}
-
-fn normalize_split_item(
-    mut primary_key: super::WireItemKeyAttributes,
-    mut secondary_key: Option<super::WireItemKeyAttributes>,
-    mut non_key_attributes_blob: Option<Vec<u8>>,
-) -> StorageResult<(WireItem, LogicalItemSize)> {
-    let size = {
-        let entries = super::item::canonical_key_entries(&primary_key, secondary_key.as_ref());
-        let key_size =
-            LogicalItemSize::try_from_entries_with_field(entries.iter().copied(), "Item")?;
-        let names = entries
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<smallvec::SmallVec<[&str; 4]>>();
-        let (blob, residual_size) =
-            normalize_residual_blob(non_key_attributes_blob.take(), &names)?;
-        non_key_attributes_blob = blob;
-        LogicalItemSize::try_from(u64::from(key_size) + residual_size)?
-    };
-    for (_, value) in
-        super::item::canonical_key_entries_mut(&mut primary_key, secondary_key.as_mut())
-    {
-        dynamodb_limits::normalize_attribute_value_numbers_for_write(value);
-    }
-    let item = WireItem::LocalSplit {
-        primary_key,
-        secondary_key,
-        non_key_attributes_blob,
-    };
-    Ok((
-        WireItem::dynamo_json(item.dynamo_json_bytes()?.into_owned()),
-        size,
-    ))
-}
-
-fn normalize_residual_blob(
-    blob: Option<Vec<u8>>,
-    excluded_names: &[&str],
-) -> StorageResult<(Option<Vec<u8>>, u64)> {
-    let Some(blob) = blob else {
-        return Ok((None, 0));
-    };
-    if blob.is_empty() {
-        return Ok((Some(blob), 0));
-    }
-    let (size, replacements) = inspect_write_attributes::<true>(&blob, "Item", excluded_names)
-        .map_err(StorageError::validation)?;
-    replace_write_attributes(blob, &replacements).map(|blob| (Some(blob), size))
 }
 
 fn replace_write_attributes(data: Vec<u8>, replacements: &AttributeMap) -> StorageResult<Vec<u8>> {
@@ -160,8 +105,24 @@ pub(crate) fn inspect_write_attributes<const NORMALIZE: bool>(
         error: &mut error,
     }
     .deserialize(&mut deserializer);
-    let result = result.map_err(|parse| error.unwrap_or_else(|| parse.to_string()))?;
-    deserializer.end().map_err(|error| error.to_string())?;
+    let result = result.map_err(|parse| {
+        error.unwrap_or_else(|| {
+            format!(
+                "{:?} at {}:{}",
+                parse.classify(),
+                parse.line(),
+                parse.column()
+            )
+        })
+    })?;
+    deserializer.end().map_err(|error| {
+        format!(
+            "{:?} at {}:{}",
+            error.classify(),
+            error.line(),
+            error.column()
+        )
+    })?;
     Ok(result)
 }
 
@@ -202,7 +163,15 @@ impl<'de, const NORMALIZE: bool> Visitor<'de> for WriteVisitor<'_, NORMALIZE> {
                 map.next_value::<IgnoredAny>()?;
                 continue;
             }
-            let value = map.next_value::<WriteAttribute<'de>>()?;
+            let value = map
+                .next_value::<WriteAttribute<'de>>()
+                .inspect_err(|error| {
+                    if let Some(message) =
+                        crate::attribute_value::attribute_value_arity_message(&error.to_string())
+                    {
+                        *self.error = Some(message.to_owned());
+                    }
+                })?;
             let attribute_size = inspect_attribute::<NORMALIZE>(value, name.0.as_ref(), self.field);
             let (value_size, replacement) = attribute_size.map_err(|error| {
                 *self.error = Some(error.clone());
@@ -224,7 +193,7 @@ fn inspect_attribute<const NORMALIZE: bool>(
     name: &str,
     field: &str,
 ) -> Result<(u64, Option<AttributeValue>), String> {
-    dynamodb_limits::validate_attribute_name(name, || format!("{field} attribute name"))?;
+    dynamodb_limits::validate_item_attribute_name(name, || format!("{field} attribute name"))?;
     match value {
         WriteAttribute::String(text) => Ok(((name.len() + text.len()) as u64, None)),
         WriteAttribute::Number(number) => inspect_number::<NORMALIZE>(&number, name),
@@ -290,7 +259,7 @@ impl<'de> Visitor<'de> for AttributeVisitor {
     where M: MapAccess<'de> {
         let tag = map
             .next_key::<BorrowedText<'de>>()?
-            .ok_or_else(|| M::Error::custom("AttributeValue must have exactly one field"))?;
+            .ok_or_else(|| M::Error::custom(ATTRIBUTE_VALUE_EMPTY_MESSAGE))?;
         let value = if tag.0 == "S" {
             WriteAttribute::String(map.next_value::<BorrowedText<'de>>()?.0)
         } else if tag.0 == "N" {
@@ -301,9 +270,7 @@ impl<'de> Visitor<'de> for AttributeVisitor {
             )?)
         };
         if map.next_key::<BorrowedText<'de>>()?.is_some() {
-            return Err(M::Error::custom(
-                "AttributeValue must have exactly one field",
-            ));
+            return Err(M::Error::custom(ATTRIBUTE_VALUE_MULTIPLE_MESSAGE));
         }
         Ok(value)
     }

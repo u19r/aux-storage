@@ -20,5 +20,5 @@ mod scheduled_job_store_tests;
 
 pub use provider::{
     RemoteStorageProvider, build_scheduled_job_store, connect_scheduled_job_store,
-    validate_scheduled_job_http_endpoints,
+    connect_timeout_for, validate_scheduled_job_http_endpoints,
 };

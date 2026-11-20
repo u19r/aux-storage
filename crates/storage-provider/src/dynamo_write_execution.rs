@@ -1,32 +1,15 @@
 //! One protected native attempt for primary, index, TTL and eligible history
 //! effects.
 
-use storage_types::{BoundTableInfo, ItemProvenance, ItemRevision, StorageResult, TimestampMillis};
-use stream_provider::{
-    DynamoMutationRoute, LogicalSystemStreamMutation, LogicalSystemStreamMutationInput,
+use storage_types::{
+    BoundTableInfo, ItemProvenance, RegionalMark, StorageError, StorageResult, TimestampMillis,
 };
+use stream_provider::{DynamoMutationRoute, StreamEntryInput};
 
-use crate::{AcceptedDeleteItem, AcceptedUpsert, DeleteItemAttempt, UpsertAttempt};
-
-pub(crate) struct PreparedItemHistory {
-    route: DynamoMutationRoute,
-    image: storage_types::VerifiedWireItem,
-}
-
-impl PreparedItemHistory {
-    pub(crate) fn try_new(
-        table: &BoundTableInfo,
-        key: &storage_types::KeyAttributes,
-        item: &storage_types::WireItem,
-    ) -> StorageResult<Option<Self>> {
-        prepare_history_route(table, key)?
-            .map(|route| {
-                let image = route.verify_item(item.clone())?;
-                Ok(Self { route, image })
-            })
-            .transpose()
-    }
-}
+use crate::{
+    AcceptedDeleteItem, AcceptedUpsert, DeleteCause, ItemWriteAttempt,
+    regional_write::{self, WriteAdmission},
+};
 
 pub(crate) fn prepare_history_route(
     table: &BoundTableInfo,
@@ -40,40 +23,67 @@ pub(crate) fn prepare_history_route(
 }
 
 pub struct UpsertResponseImages {
-    pub new_item: storage_types::WireItem,
+    pub new_item: storage_types::VerifiedWireItem<std::sync::Arc<storage_types::WireItem>>,
     pub old_item: Option<storage_types::WireItem>,
 }
 
-pub async fn prepare_accepted_upsert<A: UpsertAttempt>(
+fn missing_route() -> StorageError {
+    StorageError::internal("a paired table write has no stream route")
+}
+
+pub async fn prepare_accepted_upsert<A: ItemWriteAttempt>(
     attempt: &mut A,
     mut item: AcceptedUpsert,
     created_at: TimestampMillis,
-    provenance: ItemProvenance,
 ) -> StorageResult<UpsertResponseImages> {
+    item.regional = match regional_write::admit(
+        item.table.binding.regional.as_deref(),
+        &item.table.table_name,
+        DeleteCause::Customer,
+    )? {
+        WriteAdmission::Unpaired => None,
+        WriteAdmission::Paired(local) => Some(regional_write::local_upsert(
+            local,
+            item.old_provenance.as_ref(),
+            item.old_marker,
+            created_at,
+        )?),
+    };
+    let provenance = item
+        .regional
+        .map_or_else(ItemProvenance::default, |effect| {
+            ItemProvenance::regional(effect.order)
+        });
+    let mark = item
+        .regional
+        .map(|effect| RegionalMark::origin(effect.order));
+    if mark.is_some() && item.history_route.is_none() {
+        return Err(missing_route());
+    }
     let mut settlement =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
     let result = async {
-        let policy = attempt.prepare_item_write(&item.table).await?;
-        let ttl = item.ttl_effects(policy.as_ref())?;
-        let effects =
-            item.primary_effects_at_least(ItemRevision::initial(), provenance, ttl.epoch())?;
+        attempt.prepare_item_write(&item.table).await?;
+        let mut ttl = item.ttl_effects()?;
+        let writes = ttl.take_writes();
+        let effects = ttl.metadata(provenance);
         attempt
-            .prepare_primary_upsert(&item, &effects, ttl.into_writes())
+            .prepare_primary_upsert(&item, &effects, writes)
             .await?;
-        if let Some(history) = item.history.take() {
-            item.capture_history(attempt, history, effects.revision(), created_at)
+        if item.regional.is_some_and(|effect| effect.clear_marker) {
+            attempt.stage_regional_marker(&item.table, &item.key, None)?;
+        }
+        if let Some(route) = item.history_route.take() {
+            item.capture_history(attempt, route, created_at, mark)
                 .await?;
         }
         let gsi = item.prepared_gsi.finish(
             &item.gsi_lifecycle,
             &item.table.info,
             item.old_item.as_deref(),
-            effects.revision(),
         )?;
-        attempt
-            .prepare_gsi_writes(&item.table, &effects, gsi)
-            .await?;
+        attempt.prepare_gsi_writes(&item.table, gsi).await?;
         Ok(UpsertResponseImages {
             new_item: item.new_item,
             old_item: item.old_item.map(storage_types::WireItem::from),
@@ -83,140 +93,118 @@ pub async fn prepare_accepted_upsert<A: UpsertAttempt>(
     settlement.complete(result)
 }
 
-pub async fn prepare_accepted_delete<A: DeleteItemAttempt>(
+pub async fn prepare_accepted_delete<A: ItemWriteAttempt>(
     attempt: &mut A,
-    item: &AcceptedDeleteItem,
+    item: &mut AcceptedDeleteItem,
     created_at: TimestampMillis,
-    provenance: ItemProvenance,
 ) -> StorageResult<()> {
+    item.regional = match regional_write::admit(
+        item.table.binding.regional.as_deref(),
+        &item.table.table_name,
+        item.cause,
+    )? {
+        WriteAdmission::Unpaired => None,
+        WriteAdmission::Paired(local) => regional_write::local_delete(
+            local,
+            item.cause,
+            item.old_provenance.as_ref(),
+            item.old_marker,
+            created_at,
+        )?,
+    };
+    if item.old_item.is_none() && item.regional.is_none() {
+        return Ok(());
+    }
+    let item = &*item;
+    let mark = item
+        .regional
+        .map(|effect| RegionalMark::origin(effect.marker.order));
+    if mark.is_some() && item.history_route.is_none() {
+        return Err(missing_route());
+    }
     let mut settlement =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
     let result = async {
-        let policy = attempt.prepare_item_write(&item.table).await?;
-        let ttl = item.ttl_writes(policy.as_ref())?;
-        let effects = item.primary_effects_at_least(ItemRevision::initial(), provenance)?;
-        if item.old_item.is_some() {
+        attempt.prepare_item_write(&item.table).await?;
+        if item.old_item.is_none() {
+            // P2: an absent-key delete of a paired table stores its marker and
+            // a hidden entry.
+            let (Some(effect), Some(mark), Some(route)) =
+                (item.regional, mark, item.history_route.as_ref())
+            else {
+                return Err(missing_route());
+            };
+            let entry = StreamEntryInput::hidden(&item.table, route, created_at, mark)?;
             attempt
-                .prepare_gsi_writes(&item.table, &effects, item.gsi_writes(effects.revision())?)
+                .prepare_logical_stream_write(&item.table, entry, route.routing_key())
                 .await?;
-            if let Some(route) = &item.history_route {
-                item.capture_history(attempt, route, effects.revision(), created_at)
-                    .await?;
-            }
+            return attempt.stage_regional_marker(&item.table, &item.key, Some(effect.marker));
         }
-        attempt.stage_primary_delete(item, &effects, ttl)
+        let ttl = item.ttl_writes()?;
+        attempt
+            .prepare_gsi_writes(&item.table, item.gsi_writes()?)
+            .await?;
+        if let Some(route) = &item.history_route {
+            item.capture_history(attempt, route, created_at, mark)
+                .await?;
+        }
+        attempt.stage_primary_delete(item, ttl)?;
+        if let Some(effect) = item.regional {
+            attempt.stage_regional_marker(&item.table, &item.key, Some(effect.marker))?;
+        }
+        Ok(())
     }
     .await;
     settlement.complete(result)
 }
 
 impl AcceptedUpsert {
-    async fn capture_history(
+    pub(crate) async fn capture_history(
         &self,
         attempt: &mut impl crate::DynamoStreamWriteAttempt,
-        history: PreparedItemHistory,
-        revision: ItemRevision,
+        route: DynamoMutationRoute,
         created_at: TimestampMillis,
+        mark: Option<RegionalMark>,
     ) -> StorageResult<()> {
-        let PreparedItemHistory { route, image } = history;
-        crate::AcceptedMutationRef::Upsert(self)
-            .capture_initial_predecessor(attempt)
-            .await?;
-        let mutation = LogicalSystemStreamMutation::try_from(LogicalSystemStreamMutationInput {
-            history_id: self.table.history_id,
-            route: &route,
-            item: Some(image),
-            old_item: self.old_item.as_ref(),
-            previous_version: self
-                .old_item
+        let entry = StreamEntryInput::try_new(
+            &self.table,
+            &route,
+            Some((&self.new_item, &self.declaration)),
+            self.old_item
                 .as_ref()
-                .and(self.old_revision)
-                .map(|revision| storage_types::ItemStreamVersion::new(revision.get())),
-            indexers: self.declaration.names(),
-            item_stream_version: storage_types::ItemStreamVersion::new(revision.get()),
+                .map(|old| (old, self.old_indexers.as_slice())),
             created_at,
-            user_identity: None,
-        })?;
-        let publication = attempt.reserve_stream_position(route.routing_key()).await?;
+            None,
+        )?
+        .with_regional(mark);
         attempt
-            .prepare_logical_stream_write(&self.table, mutation, publication)
+            .prepare_logical_stream_write(&self.table, entry, route.routing_key())
             .await
     }
 }
 
 impl AcceptedDeleteItem {
-    async fn capture_history(
+    pub(crate) async fn capture_history(
         &self,
         attempt: &mut impl crate::DynamoStreamWriteAttempt,
         route: &DynamoMutationRoute,
-        revision: ItemRevision,
         created_at: TimestampMillis,
+        mark: Option<RegionalMark>,
     ) -> StorageResult<()> {
-        crate::AcceptedMutationRef::Delete(self)
-            .capture_initial_predecessor(attempt)
-            .await?;
-        let mutation = LogicalSystemStreamMutation::try_from(LogicalSystemStreamMutationInput {
-            history_id: self.table.history_id,
+        let entry = StreamEntryInput::try_new(
+            &self.table,
             route,
-            item: None,
-            old_item: self.old_item.as_ref(),
-            previous_version: self
-                .old_item
+            None,
+            self.old_item
                 .as_ref()
-                .and(self.old_revision)
-                .map(|revision| storage_types::ItemStreamVersion::new(revision.get())),
-            indexers: &[],
-            item_stream_version: storage_types::ItemStreamVersion::new(revision.get()),
+                .map(|old| (old, self.old_indexers.as_slice())),
             created_at,
-            user_identity: self.user_identity.clone(),
-        })?;
-        let publication = attempt.reserve_stream_position(route.routing_key()).await?;
+            self.user_identity.clone(),
+        )?
+        .with_regional(mark);
         attempt
-            .prepare_logical_stream_write(&self.table, mutation, publication)
+            .prepare_logical_stream_write(&self.table, entry, route.routing_key())
             .await
-    }
-}
-
-impl crate::AcceptedMutationRef<'_> {
-    async fn capture_initial_predecessor(
-        &self,
-        attempt: &mut impl crate::DynamoStreamWriteAttempt,
-    ) -> StorageResult<()> {
-        let table = self.table();
-        if table.info.table_status != storage_types::TableStatus::Updating
-            && table.info.has_public_stream_request()
-        {
-            return Ok(());
-        }
-        let (key, old, revision, indexers) = match self {
-            Self::Upsert(item) => (
-                &item.key,
-                &item.old_item,
-                item.old_revision,
-                &item.old_indexers,
-            ),
-            Self::Delete(item) => (
-                &item.key,
-                &item.old_item,
-                item.old_revision,
-                &item.old_indexers,
-            ),
-        };
-        let Some((item, revision)) = old.as_ref().zip(revision) else {
-            return Ok(());
-        };
-        let anchor = crate::table_stream_initialization::capture::ItemHistoryAnchor {
-            key,
-            item,
-            revision,
-            indexers,
-        };
-        crate::table_stream_initialization::capture::ensure_item_history_anchors(
-            attempt,
-            table,
-            &[anchor],
-        )
-        .await
     }
 }

@@ -10,7 +10,8 @@ use crate::{
     WireItem,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct PutItemRequest {
     pub table_name: TableName,
@@ -39,12 +40,12 @@ pub struct PutItemRequest {
     #[builder(default)]
     pub expression_attribute_values: Option<AttributeMap>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
@@ -103,10 +104,14 @@ pub enum AllOld {
     AllOld,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PutItemResponse {
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
     pub attributes: Option<AttributeMap>,
+
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    pub consumed_capacity: Option<crate::ConsumedCapacity>,
 }
 
 impl PutItemResponse {
@@ -125,18 +130,21 @@ impl PutItemResponse {
             None
         };
 
-        Self { attributes }
+        Self {
+            attributes,
+            consumed_capacity: None,
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct GetItemRequest {
     pub table_name: TableName,
 
     pub key: KeyAttributes,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attributes_to_get: Option<Vec<String>>,
 
@@ -144,11 +152,9 @@ pub struct GetItemRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consistent_read: Option<bool>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection_expression: Option<String>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = HashMap<String, String>)]
     pub expression_attribute_names: Option<crate::VecMap<String, String>>,
@@ -173,7 +179,8 @@ impl GetItemRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct GetItemResponse {
     #[serde(
         rename = "Item",
@@ -183,9 +190,13 @@ pub struct GetItemResponse {
     )]
     #[schema(value_type = Option<AttributeMap>)]
     pub item: Option<WireItem>,
+
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    pub consumed_capacity: Option<crate::ConsumedCapacity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct DeleteItemRequest {
     pub table_name: TableName,
@@ -205,12 +216,12 @@ pub struct DeleteItemRequest {
     #[builder(default)]
     pub expression_attribute_values: Option<AttributeMap>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
@@ -255,13 +266,18 @@ impl DeleteItemRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct DeleteItemResponse {
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
     pub attributes: Option<AttributeMap>,
+
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    pub consumed_capacity: Option<crate::ConsumedCapacity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct UpdateItemRequest {
     pub table_name: TableName,
@@ -277,7 +293,7 @@ pub struct UpdateItemRequest {
     #[builder(default, setter(strip_option, into))]
     pub update_expression: Option<String>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub attribute_updates: Option<HashMap<String, AttributeValueUpdate>>,
@@ -295,12 +311,12 @@ pub struct UpdateItemRequest {
     #[builder(default)]
     pub expression_attribute_values: Option<AttributeMap>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
@@ -335,8 +351,12 @@ pub enum ReturnValuesOldNewUpdated {
     UpdatedNew,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct UpdateItemResponse {
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
     pub attributes: Option<AttributeMap>,
+
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    pub consumed_capacity: Option<crate::ConsumedCapacity>,
 }

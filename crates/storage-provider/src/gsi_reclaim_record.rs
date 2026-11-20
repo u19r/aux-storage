@@ -17,14 +17,20 @@ pub(crate) struct GsiReclaimRecord {
     format: u8,
     pub(crate) history: TableHistoryId,
     pub(crate) target: GsiBuildTarget,
+    pub(crate) native_index: Option<storage_types::BoundGsi>,
 }
 
 impl GsiReclaimRecord {
-    pub(crate) fn try_new(history: TableHistoryId, target: GsiBuildTarget) -> StorageResult<Self> {
+    pub(crate) fn try_new(
+        history: TableHistoryId,
+        target: GsiBuildTarget,
+        native_index: Option<storage_types::BoundGsi>,
+    ) -> StorageResult<Self> {
         let record = Self {
             format: 1,
             history,
             target,
+            native_index,
         };
         record.require_identity()?;
         Ok(record)
@@ -41,6 +47,11 @@ impl GsiReclaimRecord {
     }
 
     fn require_identity(&self) -> StorageResult<()> {
+        if self.native_index.as_ref().is_some_and(|index| {
+            index.name != self.target.index_name || index.build != self.target.incarnation
+        }) {
+            return Err(invalid_marker());
+        }
         if self.format != 1
             || self.history.as_ref() == &[0; 16]
             || self.target.table_name.as_ref().is_empty()

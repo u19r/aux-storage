@@ -33,22 +33,40 @@ impl TtlPolicyChange {
         existing: Option<&TtlConfigRecord>,
         now: TimestampMillis,
     ) -> StorageResult<SemanticDecision<Self>> {
-        let rejection = if attribute.trim().is_empty() {
-            Some("Time to live attribute name must not be empty")
+        let length_bound = if attribute.is_empty() {
+            Some("greater than or equal to 1")
+        } else if attribute.chars().count() > 255 {
+            Some("less than or equal to 255")
         } else {
+            None
+        };
+        if let Some(bound) = length_bound {
+            return Ok(SemanticDecision::Rejected(StorageError::validation(
+                format!(
+                    "1 validation error detected: Value '{attribute}' at \
+                     'timeToLiveSpecification.attributeName' failed to satisfy constraint: Member \
+                     must have length {bound}"
+                ),
+            )));
+        }
+        let rejection =
             match existing.map(|config| (&config.status, config.attribute_name.as_str())) {
-                Some((TimeToLiveStatus::Enabling | TimeToLiveStatus::Disabling, _)) => {
-                    Some("Time to live configuration update in progress; retry later")
+                Some((TimeToLiveStatus::Enabling | TimeToLiveStatus::Enabled, current))
+                    if current != attribute =>
+                {
+                    Some(format!(
+                        "TimeToLive is active on a different AttributeName: current AttributeName \
+                         is {current}"
+                    ))
                 }
-                Some((TimeToLiveStatus::Enabled, current)) if current == attribute => {
-                    return Ok(SemanticDecision::Accepted(Self::Unchanged));
+                Some((TimeToLiveStatus::Enabling | TimeToLiveStatus::Disabling, _)) => {
+                    Some("Time to live configuration update in progress; retry later".to_owned())
                 }
                 Some((TimeToLiveStatus::Enabled, _)) => {
-                    Some("Disable time to live before changing attribute name")
+                    return Ok(SemanticDecision::Accepted(Self::Unchanged));
                 }
                 _ => None,
-            }
-        };
+            };
         if let Some(message) = rejection {
             return Ok(SemanticDecision::Rejected(StorageError::validation(
                 message,

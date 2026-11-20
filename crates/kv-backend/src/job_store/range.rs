@@ -48,9 +48,7 @@ fn physical_range(
         } else {
             let mut next = cursor;
             next.try_reserve_exact(1).map_err(|_| {
-                RawOrderedJobStoreError::Backend(
-                    storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-                )
+                RawOrderedJobStoreError::Backend(storage_types::AttemptFailure::CAPACITY.into())
             })?;
             next.push(0);
             begin = begin.max(next);
@@ -61,11 +59,8 @@ fn physical_range(
             "scheduled-job range limit overflowed",
         ))
     })?;
-    let rejected = || {
-        RawOrderedJobStoreError::Backend(
-            storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
-        )
-    };
+    let rejected =
+        || RawOrderedJobStoreError::Backend(storage_types::AttemptFailure::CAPACITY.into());
     let key_bytes = capabilities
         .max_key_bytes()
         .get()

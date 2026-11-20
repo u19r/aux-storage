@@ -9,3 +9,7 @@ mod value;
 
 pub use attempt::TursoAttempt;
 pub use driver::TursoBackend;
+#[cfg(test)]
+mod driver_tests;
+#[cfg(test)]
+mod error_tests;

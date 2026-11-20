@@ -9,17 +9,17 @@ use stream_provider::{
 };
 
 use super::{
-    StreamDurationTrimConfig, StreamDurationTrimStats, StreamRetentionRepository,
-    StreamRetentionWave, StreamTrimDueMarker, SystemStreamTrimRepository,
+    StreamDurationTrimConfig, StreamDurationTrimStats, StreamRetentionWave, StreamTrimDueMarker,
 };
+use crate::maintenance::MaintenanceOperations;
 
 pub struct SystemStreamTrimExecutor<'a> {
-    repository: &'a dyn SystemStreamTrimRepository,
+    repository: &'a dyn MaintenanceOperations,
     page_limit: usize,
 }
 
 impl<'a> SystemStreamTrimExecutor<'a> {
-    pub fn new(repository: &'a dyn SystemStreamTrimRepository, page_limit: usize) -> Self {
+    pub fn new(repository: &'a dyn MaintenanceOperations, page_limit: usize) -> Self {
         Self {
             repository,
             page_limit,
@@ -53,15 +53,12 @@ impl<'a> SystemStreamTrimExecutor<'a> {
 }
 
 pub struct StreamDurationTrimWorker<'a> {
-    backend: &'a (dyn StreamRetentionRepository + Send + Sync),
+    backend: &'a dyn MaintenanceOperations,
     config: StreamDurationTrimConfig,
 }
 
 impl<'a> StreamDurationTrimWorker<'a> {
-    pub fn new(
-        backend: &'a (dyn StreamRetentionRepository + Send + Sync),
-        config: StreamDurationTrimConfig,
-    ) -> Self {
+    pub fn new(backend: &'a dyn MaintenanceOperations, config: StreamDurationTrimConfig) -> Self {
         Self { backend, config }
     }
 

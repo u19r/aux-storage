@@ -1,4 +1,5 @@
-use super::{DYNAMODB_NUMBER_KEY_BYTES, DYNAMODB_NUMBER_KEY_EXPONENT_BIAS, ParsedDynamodbNumber};
+use super::ParsedDynamodbNumber;
+use crate::constants::{DYNAMODB_NUMBER_KEY_BYTES, DYNAMODB_NUMBER_KEY_EXPONENT_BIAS};
 
 fn legacy_encode_dynamodb_number_key(value: &str) -> Result<String, String> {
     let number = ParsedDynamodbNumber::parse(value).map_err(|error| error.to_string())?;

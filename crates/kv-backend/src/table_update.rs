@@ -3,7 +3,7 @@
 use storage_backfill::{GsiBuild, GsiBuildTarget};
 use storage_common::GsiLifecycleAction;
 use storage_provider::{
-    CatalogAttempt, GsiReadinessSnapshot, StreamTrimScope, TableUpdateChange, TableUpdateRetention,
+    CatalogAttempt, StreamTrimScope, TableUpdateChange, TableUpdateRetention,
     TableUpdateTransaction, table_retention_scope_id,
 };
 use storage_types::{
@@ -14,12 +14,16 @@ use storage_types::{
 use crate::{
     KvAttempt, KvMutation,
     catalog::{KvCatalogAttempt, KvIndexKind, KvTableIdentity},
-    gsi::{delete_gsi_builds, gsi_name_lock_key, read_gsi_readiness, register_gsi_builds},
+    gsi::{delete_gsi_builds, gsi_name_lock_key, register_gsi_builds},
     retention::{load_table_retention, write_stream_retention},
     stream_history::capture_high,
 };
 
 impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
+    async fn load_stream_source(&mut self) -> StorageResult<stream_provider::SystemStreamHistory> {
+        stream_provider::StreamAttempt::read_system_page_start_snapshot(self).await
+    }
+
     async fn observe_table_update(
         &mut self,
         name: &TableName,
@@ -51,7 +55,7 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
-            let identity = catalog.identity_for(&table.info.table_name)?.clone();
+            let identity = catalog.load_table_identity(table).await?;
             let scope = StreamTrimScope::table(
                 table_retention_scope_id(identity.table_id.into()),
                 table.info.table_name.clone(),
@@ -76,7 +80,7 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
             let lock = catalog
                 .attempt
                 .get(
-                    &gsi_name_lock_key(identity.table_id, name),
+                    &gsi_name_lock_key(identity.table_id, name)?,
                     crate::ReadProtection::Conflict,
                 )
                 .await?;
@@ -102,70 +106,53 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
         let catalog = settlement.as_mut();
         let result = async {
             let (plan, retention, name_locked_until) = change.into_parts();
-            let old_identity = catalog.identity_for(&current.info.table_name)?.clone();
+            let old_identity = catalog.load_table_identity(&current).await?;
             let next_identity = old_identity.reconcile_user_indexes(&plan.next_table)?;
-            match plan.lifecycle.as_ref() {
+            let current_binding = catalog.current_binding(&current);
+            let binding = match plan.lifecycle.as_ref() {
                 Some(GsiLifecycleAction::Create(create)) => {
-                    register_created_index(catalog.attempt, &next_identity, &create.index_name)
-                        .await?;
+                    let phase =
+                        register_created_index(catalog.attempt, &next_identity, &create.index_name)
+                            .await?;
+                    next_identity.with_added_gsi(
+                        &current_binding,
+                        &create.clone().into(),
+                        &plan.next_table.attribute_definitions,
+                        phase,
+                    )?
                 }
                 Some(GsiLifecycleAction::Delete(delete)) => {
-                    let index = old_identity
-                        .indexes
-                        .iter()
-                        .find(|index| {
-                            index.index_kind == KvIndexKind::UserGsi
-                                && index.index_name == delete.index_name
-                        })
-                        .ok_or_else(|| {
-                            StorageError::internal("KV deleted index has no physical identity")
-                        })?;
-                    let target = GsiBuildTarget {
-                        history_id: current.history_id,
-                        table_name: current.table_name.clone(),
-                        index_name: delete.index_name.clone(),
-                        incarnation: crate::gsi::index_incarnation(
-                            old_identity.table_id,
-                            index.index_id,
-                        )
-                        .into(),
-                    };
+                    // KV keeps no native index; reclaim deletes key ranges
+                    // only.
+                    let retirement = storage_provider::deleted_index_retirement(
+                        &current,
+                        &plan,
+                        <Self as storage_provider::maintenance::GsiPort>::NATIVE_INDEX,
+                    )?
+                    .ok_or_else(|| StorageError::internal("KV deleted index has no retirement"))?;
                     storage_provider::register_index_retirement(
                         catalog,
                         current.history_id,
-                        target,
+                        retirement.target,
+                        retirement.native_index,
                     )
                     .await?;
                     delete_gsi_builds(catalog.attempt, &old_identity, Some(&delete.index_name))
                         .await?;
                     catalog.attempt.stage(vec![KvMutation::Put {
-                        key: gsi_name_lock_key(old_identity.table_id, &delete.index_name),
+                        key: gsi_name_lock_key(old_identity.table_id, &delete.index_name)?,
                         value: name_locked_until.timestamp_millis().to_be_bytes().to_vec(),
                     }])?;
+                    current_binding.without_gsi(&delete.index_name)
                 }
-                None => {}
-            }
+                None => current_binding,
+            };
             if let Some(write) = retention {
                 write_stream_retention(catalog.attempt, &next_identity, write).await?;
             }
             catalog
-                .replace_table_layout(&current, next_identity, plan.next_table)
+                .replace_table_layout(&current, next_identity, plan.next_table, binding)
                 .await
-        }
-        .await;
-        settlement.complete(result)
-    }
-
-    async fn observe_table_update_readiness(
-        &mut self,
-        table: &BoundTableInfo,
-    ) -> StorageResult<GsiReadinessSnapshot> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async {
-            let identity = catalog.identity_for(&table.info.table_name)?.clone();
-            read_gsi_readiness(catalog.attempt, &identity, catalog.protection, None).await
         }
         .await;
         settlement.complete(result)
@@ -176,7 +163,7 @@ async fn register_created_index<A: KvAttempt>(
     attempt: &mut A,
     identity: &KvTableIdentity,
     name: &storage_types::IndexName,
-) -> StorageResult<()> {
+) -> StorageResult<storage_types::GsiPhase> {
     let index = identity
         .indexes
         .iter()
@@ -193,5 +180,7 @@ async fn register_created_index<A: KvAttempt>(
         },
         frontier,
     );
-    register_gsi_builds(attempt, identity, vec![build]).await
+    let phase = storage_backfill::GsiBuildPhase::from(&build.state).into();
+    register_gsi_builds(attempt, identity, vec![build]).await?;
+    Ok(phase)
 }

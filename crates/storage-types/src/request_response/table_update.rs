@@ -13,20 +13,6 @@ use crate::{
 pub struct UpdateTableRequest {
     pub table_name: TableName,
 
-    /// Aux-storage extension: transfer configuration ownership to an active
-    /// replica. Submit to the current primary as a separate table control.
-    #[cfg(feature = "regional")]
-    #[serde(
-        rename = "AuxConfigurationPrimaryRegion",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[schema(
-        min_length = 1,
-        max_length = 64,
-        pattern = "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
-    )]
-    pub aux_configuration_primary_region: Option<String>,
-
     /// Aux-storage extension: increase the ordered item indexer capacity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_indexers: Option<MaxIndexers>,
@@ -83,8 +69,6 @@ impl UpdateTableRequest {
     pub fn new(table_name: TableName) -> Self {
         Self {
             table_name,
-            #[cfg(feature = "regional")]
-            aux_configuration_primary_region: None,
             max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
@@ -97,18 +81,6 @@ impl UpdateTableRequest {
             stream_specification: None,
             aux_stream_duration_hours: None,
             table_class: None,
-        }
-    }
-
-    #[must_use]
-    pub fn configuration_primary_region(&self) -> Option<&str> {
-        #[cfg(feature = "regional")]
-        {
-            self.aux_configuration_primary_region.as_deref()
-        }
-        #[cfg(not(feature = "regional"))]
-        {
-            None
         }
     }
 }

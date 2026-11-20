@@ -8,9 +8,7 @@ use storage_provider::maintenance::{
 use storage_types::{BoundTableInfo, StorageResult};
 
 use super::read::read_expiration_index;
-use crate::{
-    SqlAttempt, SqlLayout, catalog::SqlCatalogAttempt, item_write::apply_ttl_index_writes,
-};
+use crate::{SqlAttempt, SqlLayout, catalog::SqlCatalogAttempt};
 
 impl<A: SqlAttempt, L: SqlLayout> ExpirationPort for SqlCatalogAttempt<'_, A, L> {
     async fn scan_expiration_index(
@@ -39,13 +37,10 @@ impl<A: SqlAttempt, L: SqlLayout> ExpirationPort for SqlCatalogAttempt<'_, A, L>
         table: &BoundTableInfo,
         writes: impl Iterator<Item = TtlIndexWrite> + Send,
     ) -> StorageResult<()> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result =
-            async { apply_ttl_index_writes(catalog.attempt, catalog.engine, table, writes).await }
-                .await;
-        settlement.complete(result)
+        // The primary partial index has no independently stale SQL entry.
+        // Never clear metadata here: the current item may have been renewed.
+        let _ = (table, writes);
+        Ok(())
     }
 
     async fn scan_transact_receipts(

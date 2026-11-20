@@ -1,4 +1,4 @@
-use storage_types::{InfrastructureResultKind, NativeAttemptSettlement, StorageResult};
+use storage_types::{NativeAttemptSettlement, StorageResult};
 
 use crate::KvRangePage;
 
@@ -16,7 +16,7 @@ impl NativeReadWork<'_> {
             self.0.charge_data(
                 key.len()
                     .checked_add(std::mem::size_of::<Vec<u8>>())
-                    .ok_or(InfrastructureResultKind::NativeCapacityRejected)?,
+                    .ok_or(storage_types::AttemptFailure::CAPACITY)?,
             )?;
         }
         Ok(())
@@ -29,7 +29,7 @@ impl NativeReadWork<'_> {
                     .as_ref()
                     .map_or(0, Vec::len)
                     .checked_add(std::mem::size_of::<Option<Vec<u8>>>())
-                    .ok_or(InfrastructureResultKind::NativeCapacityRejected)?,
+                    .ok_or(storage_types::AttemptFailure::CAPACITY)?,
             )?;
         }
         Ok(())
@@ -44,7 +44,7 @@ impl NativeReadWork<'_> {
                     .len()
                     .checked_add(entry.value.len())
                     .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(entry)))
-                    .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+                    .ok_or(storage_types::AttemptFailure::CAPACITY)?;
                 self.0.charge_data(bytes)?;
             }
         }

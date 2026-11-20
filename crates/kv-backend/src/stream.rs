@@ -6,12 +6,11 @@ use futures::future::BoxFuture;
 use storage_common::partition::{
     PartitionInfo, PartitionLoadSampleRecord, ResolvedPartitionFamily,
 };
-use storage_provider::DynamoTableStreamAttempt;
-use storage_types::{AttemptMode, StorageResult, StreamItemId, StreamName};
+use storage_types::{AttemptRequest, StorageResult, StreamItemId, StreamName};
 use stream_provider::{
     CursorName, StreamAttempt, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem,
     StreamItemIdAllocation, StreamPartitioningSupport, StreamPort, StreamReadKind,
-    StreamReadRequest, StreamReadResult, StreamRowKind, StreamRowPage, StreamRowValue,
+    StreamReadRequest, StreamReadResult, StreamRowPage, StreamRowValue,
     SystemStreamHistoryReadPage,
 };
 
@@ -91,6 +90,7 @@ impl<A: KvAttempt> StreamAttempt for KvCatalogAttempt<'_, A> {
 
     fn read_system_split_state(
         &mut self,
+        _parent: &storage_types::SystemStreamLineageId,
         operation_id: &stream_provider::SystemStreamSplitOperationId,
     ) -> impl Future<
         Output = StorageResult<(
@@ -103,7 +103,7 @@ impl<A: KvAttempt> StreamAttempt for KvCatalogAttempt<'_, A> {
 
     fn write_system_split(
         &mut self,
-        receipt: &stream_provider::SystemStreamSplitReceipt,
+        receipt: &stream_provider::SystemStreamSplitPlan,
     ) -> impl Future<Output = StorageResult<()>> + Send {
         stream_split::write_split(self.attempt, receipt)
     }
@@ -180,10 +180,10 @@ impl<A: KvAttempt> StreamAttempt for KvCatalogAttempt<'_, A> {
 
     fn read_cursor(
         &mut self,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
         cursor_name: &CursorName,
     ) -> impl Future<Output = StorageResult<Option<StreamCursor>>> + Send {
-        stream_cursor::read_cursor(self.attempt, self.protection, stream.value(), cursor_name)
+        stream_cursor::read_cursor(self.attempt, self.protection, stream, cursor_name)
     }
 
     fn write_cursor(
@@ -196,100 +196,51 @@ impl<A: KvAttempt> StreamAttempt for KvCatalogAttempt<'_, A> {
 
     fn delete_cursor(
         &mut self,
-        stream: &StreamRowKind,
+        stream: &storage_types::StreamName,
         cursor_name: &CursorName,
     ) -> impl Future<Output = StorageResult<()>> + Send {
-        stream_cursor::delete_cursor(self.attempt, stream.value(), cursor_name)
-    }
-}
-
-impl<A: KvAttempt> DynamoTableStreamAttempt for KvCatalogAttempt<'_, A> {}
-
-impl<B: KvBackend + 'static> StreamPort for KvStore<B> {
-    type Attempt<'native>
-        = KvCatalogAttempt<'native, B::Attempt>
-    where Self: 'native;
-
-    type AppendCapture = stream_provider::NoTableAppendCapture;
-
-    fn table_append_capture(&self) -> Self::AppendCapture {
-        stream_provider::NoTableAppendCapture
+        stream_cursor::delete_cursor(self.attempt, stream, cursor_name)
     }
 
-    fn partitioning_support(&self) -> StreamPartitioningSupport {
-        <Self::Attempt<'_> as StreamAttempt>::PARTITIONING_SUPPORT
-    }
-
-    fn item_id_allocation(&self) -> StreamItemIdAllocation {
-        match self.backend.topology() {
-            KvTopology::Local => StreamItemIdAllocation::AttemptAllocated,
-            KvTopology::Distributed => StreamItemIdAllocation::CommitVersionstamped,
-        }
-    }
-
-    fn with_stream_attempt<R, F>(
-        &self,
-        mode: AttemptMode,
-        operation: F,
-    ) -> impl Future<Output = StorageResult<R>> + Send
-    where
-        R: Send + 'static,
-        F: for<'native, 'borrow> FnOnce(
-                &'borrow mut Self::Attempt<'native>,
-            ) -> BoxFuture<'borrow, StorageResult<R>>
-            + Send
-            + 'static,
-    {
-        self.backend.with_attempt(mode, move |native| {
-            Box::pin(async move {
-                let mut attempt = KvCatalogAttempt::new(native, mode.read_protection());
-                let result = operation(&mut attempt).await?;
-                Ok(result)
-            })
-        })
-    }
-
-    fn with_committed_stream_attempt<R, F>(
-        &self,
-        operation: F,
-    ) -> impl Future<Output = StorageResult<(R, Option<[u8; 10]>)>> + Send
-    where
-        R: Send + 'static,
-        F: for<'native, 'borrow> FnOnce(
-                &'borrow mut Self::Attempt<'native>,
-            ) -> BoxFuture<'borrow, StorageResult<R>>
-            + Send
-            + 'static,
-    {
-        let distributed = self.backend.topology() == KvTopology::Distributed;
-        async move {
-            if distributed {
-                self.backend
-                    .with_versionstamped_attempt(move |native| {
-                        Box::pin(async move {
-                            let mut attempt = KvCatalogAttempt::new(
-                                native,
-                                storage_types::ReadProtection::Conflict,
-                            );
-                            let result = operation(&mut attempt).await?;
-                            Ok(result)
-                        })
-                    })
-                    .await
-            } else {
-                self.with_stream_attempt(AttemptMode::ReadWrite, operation)
-                    .await
-                    .map(|value| (value, None))
+    async fn load_table_history_states(
+        &mut self,
+        histories: &[storage_types::TableHistoryId],
+    ) -> StorageResult<Vec<Option<storage_types::TableHistoryState>>> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = async {
+            let keys = histories
+                .iter()
+                .map(|history| {
+                    crate::catalog::table_id_from_history(*history)
+                        .map(crate::catalog::metadata_key)
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            let records = catalog.attempt.get_batch(keys, catalog.protection).await?;
+            if records.len() != histories.len() {
+                return Err(storage_types::StorageError::internal(
+                    "Invalid table history catalog read",
+                ));
             }
+            records
+                .into_iter()
+                .zip(histories)
+                .map(|(record, history)| {
+                    record
+                        .map(|bytes| crate::catalog::decode_table_history_state(&bytes, *history))
+                        .transpose()
+                })
+                .collect()
         }
+        .await;
+        operation.complete(result)
     }
-}
 
-impl<A: KvAttempt> stream_provider::SystemHistoryReadAttempt for KvCatalogAttempt<'_, A> {
     async fn load_system_retired_frontiers(
         &mut self,
         origins: &[storage_types::SystemStreamPosition],
-    ) -> StorageResult<Vec<Option<storage_types::SystemStreamPosition>>> {
+    ) -> StorageResult<storage_types::Exact<Option<storage_types::SystemStreamPosition>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -321,5 +272,89 @@ impl<A: KvAttempt> stream_provider::SystemHistoryReadAttempt for KvCatalogAttemp
             stream_read::read_system_history_pages(catalog.attempt, catalog.protection, reads)
                 .await;
         settlement.complete(result)
+    }
+
+    fn load_trim_receipts(
+        &mut self,
+        operation: &stream_provider::SystemStreamTrimOperationId,
+        sequences: &[u64],
+    ) -> impl Future<
+        Output = StorageResult<
+            storage_types::Exact<Option<stream_provider::SystemStreamTrimPageReceipt>>,
+        >,
+    > + Send {
+        crate::stream_trim::load_receipts(self.attempt, operation, sequences)
+    }
+
+    fn scan_trim_records(
+        &mut self,
+        starts: &[storage_types::SystemStreamPosition],
+    ) -> impl Future<Output = StorageResult<(Vec<stream_provider::SystemStreamTrimRecord>, bool)>> + Send
+    {
+        crate::stream_trim::scan_records(self.attempt, starts)
+    }
+
+    fn apply_trim_page(
+        &mut self,
+        selected: &[stream_provider::SystemStreamTrimRecord],
+        frontiers: &[storage_types::SystemStreamPosition],
+        receipt: &stream_provider::SystemStreamTrimPageReceipt,
+    ) -> impl Future<Output = StorageResult<()>> + Send {
+        crate::stream_trim::apply_page(self.attempt, selected, frontiers, receipt)
+    }
+}
+
+impl<B: KvBackend + 'static> StreamPort for KvStore<B> {
+    type Attempt<'native>
+        = KvCatalogAttempt<'native, B::Attempt>
+    where Self: 'native;
+
+    type AppendCapture = stream_provider::NoTableAppendCapture;
+
+    fn table_append_capture(&self) -> Self::AppendCapture {
+        stream_provider::NoTableAppendCapture
+    }
+
+    fn partitioning_support(&self) -> StreamPartitioningSupport {
+        <Self::Attempt<'_> as StreamAttempt>::PARTITIONING_SUPPORT
+    }
+
+    fn item_id_allocation(&self) -> StreamItemIdAllocation {
+        match self.backend.topology() {
+            KvTopology::Local => StreamItemIdAllocation::AttemptAllocated,
+            KvTopology::Distributed => StreamItemIdAllocation::CommitVersionstamped,
+        }
+    }
+
+    fn with_attempt<R, F>(
+        &self,
+        request: AttemptRequest,
+        step: F,
+    ) -> impl Future<Output = StorageResult<R>> + Send
+    where
+        R: Send + 'static,
+        F: for<'native, 'borrow> FnOnce(
+                &'borrow mut Self::Attempt<'native>,
+            ) -> BoxFuture<'borrow, StorageResult<R>>
+            + Send
+            + 'static,
+    {
+        self.with_catalog_attempt(request, step)
+    }
+
+    fn with_committed_stream_attempt<R, F>(
+        &self,
+        request: AttemptRequest,
+        operation: F,
+    ) -> impl Future<Output = StorageResult<(R, Option<[u8; 10]>)>> + Send
+    where
+        R: Send + 'static,
+        F: for<'native, 'borrow> FnOnce(
+                &'borrow mut Self::Attempt<'native>,
+            ) -> BoxFuture<'borrow, StorageResult<R>>
+            + Send
+            + 'static,
+    {
+        self.with_versionstamped_catalog_attempt(request, operation)
     }
 }

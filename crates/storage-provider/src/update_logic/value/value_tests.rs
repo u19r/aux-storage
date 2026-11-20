@@ -1,4 +1,6 @@
-use super::{DynamoDecimal, StorageResult};
+use storage_types::StorageResult;
+
+use super::value_plan::DynamoDecimal;
 
 pub(in crate::update_logic) fn add_with_aligned_scratch(
     lhs: &DynamoDecimal,

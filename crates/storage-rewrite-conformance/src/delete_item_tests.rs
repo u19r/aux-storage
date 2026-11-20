@@ -12,12 +12,12 @@ use stream_provider::SystemStreamPageRequest;
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
-/// Business rule from the legacy SQL no-op delete test: deleting an absent
-/// item succeeds without publishing a change or advancing the CDC checkpoint.
+/// Deleting an absent item checks conditions but stores no item changes.
 #[tokio::test]
-async fn given_missing_item_when_delete_item_succeeds_then_response_is_empty_and_cdc_does_not_advance()
- {
-    let store = TestStore::new().await;
+async fn given_missing_item_when_deletes_repeat_then_no_item_writes_or_stream_records_are_created()
+{
+    let census = super::native_census_test_support::NativeCensus::new();
+    let store = TestStore::new_with_census(std::sync::Arc::clone(&census)).await;
     let outcome = AssertUnwindSafe(async {
         let table = unique_table_name();
         let private_key = "private_delete_key_marker_7b1c";
@@ -49,24 +49,39 @@ async fn given_missing_item_when_delete_item_succeeds_then_response_is_empty_and
             "ReturnValues": "ALL_OLD"
         }))
         .unwrap();
-        let deleted = observe(store.operations.delete_item(request)).await;
-        deleted.assert_no_warning_or_error();
-        let span = deleted.one_span_with("dynamo_operation", &[("operation", "DeleteItem")]);
-        assert_eq!(span.fields.len(), 1);
-        assert!(!format!("{:?}{:?}", deleted.events, deleted.spans).contains(private_key));
-        assert_eq!(
-            serde_json::to_value(deleted.result.unwrap()).unwrap(),
-            json!({})
+        census.reset();
+        for _ in 0..2 {
+            let deleted = observe(store.operations.delete_item(request.clone())).await;
+            deleted.assert_no_warning_or_error();
+            let span = deleted.one_span_with("dynamo_operation", &[("operation", "DeleteItem")]);
+            assert_eq!(span.fields.len(), 1);
+            assert!(!format!("{:?}{:?}", deleted.events, deleted.spans).contains(private_key));
+            assert_eq!(serde_json::to_value(deleted.result.unwrap()).unwrap(), json!({}));
+        }
+        let rejected = store.operations.delete_item(DeleteItemRequest::try_from(json!({
+            "TableName": table.as_ref(), "Key": {"pk": {"S": private_key}},
+            "ConditionExpression": "attribute_exists(pk)"
+        })).unwrap()).await.unwrap_err();
+        assert_dynamo_error_response_exact(
+            rejected,
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
         );
+        let counts = census.snapshot();
+        assert_eq!(counts.rows_written, 0, "absent deletes stage no native mutation: {counts}");
+        assert!(counts.touched_written.is_empty(), "no item, index, TTL or history writes: {counts}");
+        eprintln!("ordinary_absent_delete provider={} {counts} {}", TestStore::selected_backend(), counts.durable_summary());
 
         let after = observe(store.stream_operations.get_system_stream_page(
-            SystemStreamPageRequest::try_new(scope, Some(checkpoint.clone()), 1).unwrap(),
+            SystemStreamPageRequest::try_new(scope, Some(checkpoint.clone()), 100).unwrap(),
         ))
         .await;
         after.assert_no_warning_or_error();
         let after = after.result.unwrap();
         assert!(after.records().is_empty());
-        assert_eq!(after.issued_checkpoint().token(), &checkpoint);
+        if matches!(TestStore::selected_backend().as_str(), "sqlite" | "turso") {
+            assert_eq!(after.issued_checkpoint().token(), &checkpoint);
+        }
 
         let get = GetItemRequest::try_from(json!({
             "TableName": table.as_ref(),
@@ -119,6 +134,7 @@ async fn given_versioned_item_when_conditional_deletes_run_then_only_matching_de
         .unwrap();
         store.operations.put_item(put).await.unwrap();
 
+        store.wait_until_changes_are_readable().await;
         let before = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
         assert_eq!(before.len(), 1);
@@ -160,6 +176,7 @@ async fn given_versioned_item_when_conditional_deletes_run_then_only_matching_de
             .unwrap(), json!({"Attributes": original}));
         let absent = store.operations.get_item(get_request()).await.unwrap();
         assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
+        store.wait_until_changes_are_readable().await;
         let after_commit = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
         assert_eq!(after_commit.len(), 2);

@@ -1,61 +1,81 @@
+use storage_types::{AttemptPlan, DeadlineClass};
+
 use crate::{AttemptMode, SqlAttempt as _, SqlBackend as _, SqlStatement};
 
 #[tokio::test]
 async fn given_memory_backend_when_write_is_followed_by_read_then_both_use_the_same_database() {
     use crate::{ReadProtection, SqlAttempt as _, SqlBackend as _, SqlStatement};
-    let backend = super::driver::SqliteBackend::initialize(":memory:")
-        .await
-        .unwrap();
+    let backend = super::driver::SqliteBackend::initialize(
+        ":memory:",
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .unwrap();
     backend
-        .with_attempt(AttemptMode::ReadWrite, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .execute(SqlStatement::new(
-                        "CREATE TABLE proof (id INTEGER PRIMARY KEY)",
-                        vec![],
-                    ))
-                    .await?;
-                attempt
-                    .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
-                    .await?;
-                Ok(())
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .execute(SqlStatement::new(
+                            "CREATE TABLE proof (id INTEGER PRIMARY KEY)",
+                            vec![],
+                        ))
+                        .await?;
+                    attempt
+                        .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
+                        .await?;
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
     let page = backend
-        .with_attempt(AttemptMode::ReadOnly, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .query(
-                        SqlStatement::new("SELECT id FROM proof", vec![]),
-                        ReadProtection::Snapshot,
-                        std::num::NonZeroUsize::new(1024).unwrap(),
-                    )
-                    .await
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .query(
+                            SqlStatement::new("SELECT id FROM proof", vec![]),
+                            ReadProtection::Snapshot,
+                            std::num::NonZeroUsize::new(1024).unwrap(),
+                        )
+                        .await
+                })
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 1);
 }
 
 async fn open_backend() -> super::driver::SqliteBackend {
-    let backend = super::driver::SqliteBackend::initialize(":memory:")
-        .await
-        .unwrap();
+    let backend = super::driver::SqliteBackend::initialize(
+        ":memory:",
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .unwrap();
     backend
-        .with_attempt(AttemptMode::ReadWrite, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .execute(SqlStatement::new(
-                        "CREATE TABLE proof (id INTEGER PRIMARY KEY)",
-                        vec![],
-                    ))
-                    .await?;
-                Ok(())
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .execute(SqlStatement::new(
+                            "CREATE TABLE proof (id INTEGER PRIMARY KEY)",
+                            vec![],
+                        ))
+                        .await?;
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
     backend
@@ -63,18 +83,22 @@ async fn open_backend() -> super::driver::SqliteBackend {
 
 async fn count_rows(backend: &super::driver::SqliteBackend) -> usize {
     backend
-        .with_attempt(AttemptMode::ReadOnly, |attempt| {
-            Box::pin(async move {
-                let page = attempt
-                    .query(
-                        SqlStatement::new("SELECT id FROM proof", vec![]),
-                        crate::ReadProtection::Snapshot,
-                        std::num::NonZeroUsize::new(1024).unwrap(),
-                    )
-                    .await?;
-                Ok(page.rows.len())
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    let page = attempt
+                        .query(
+                            SqlStatement::new("SELECT id FROM proof", vec![]),
+                            crate::ReadProtection::Snapshot,
+                            std::num::NonZeroUsize::new(1024).unwrap(),
+                        )
+                        .await?;
+                    Ok(page.rows.len())
+                })
+            },
+        )
         .await
         .unwrap()
 }
@@ -83,14 +107,18 @@ async fn count_rows(backend: &super::driver::SqliteBackend) -> usize {
 async fn given_write_attempt_when_operation_fails_then_rows_are_rolled_back() {
     let backend = open_backend().await;
     let result: storage_types::StorageResult<()> = backend
-        .with_attempt(AttemptMode::ReadWrite, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
-                    .await?;
-                Err(storage_types::StorageError::internal("deliberate failure"))
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
+                        .await?;
+                    Err(storage_types::StorageError::internal("deliberate failure"))
+                })
+            },
+        )
         .await;
     assert!(result.is_err());
     assert_eq!(count_rows(&backend).await, 0);
@@ -100,14 +128,18 @@ async fn given_write_attempt_when_operation_fails_then_rows_are_rolled_back() {
 async fn given_write_attempt_when_operation_panics_then_rows_are_rolled_back() {
     let backend = open_backend().await;
     let result: storage_types::StorageResult<()> = backend
-        .with_attempt(AttemptMode::ReadWrite, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
-                    .await?;
-                panic!("deliberate failure");
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
+                        .await?;
+                    panic!("deliberate failure");
+                })
+            },
+        )
         .await;
     assert!(result.is_err());
     assert_eq!(count_rows(&backend).await, 0);
@@ -117,18 +149,22 @@ async fn given_write_attempt_when_operation_panics_then_rows_are_rolled_back() {
 async fn given_external_await_when_worker_resumes_then_transaction_commits() {
     let backend = open_backend().await;
     backend
-        .with_attempt(AttemptMode::ReadWrite, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
-                    .await?;
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                attempt
-                    .execute(SqlStatement::new("INSERT INTO proof VALUES (2)", vec![]))
-                    .await?;
-                Ok(())
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
+                        .await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    attempt
+                        .execute(SqlStatement::new("INSERT INTO proof VALUES (2)", vec![]))
+                        .await?;
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
     assert_eq!(count_rows(&backend).await, 2);
@@ -147,9 +183,13 @@ fn given_failed_native_commit_when_attempt_settles_then_unknown_classification_s
         )
         .unwrap();
     let (session, commands) = super::transaction::Session::open();
-    let result: storage_types::StorageResult<()> = super::transaction::execute_attempt(
+    let (result, _): (storage_types::StorageResult<()>, _) = super::transaction::execute_attempt(
         &mut connection,
-        AttemptMode::ReadWrite,
+        (
+            AttemptMode::ReadWrite,
+            storage_types::AttemptDeadlines::default().start(storage_types::DeadlineClass::Write),
+        ),
+        &opened_lifecycle(),
         Box::pin(async move {
             session
                 .call(|native| {
@@ -162,11 +202,15 @@ fn given_failed_native_commit_when_attempt_settles_then_unknown_classification_s
             Ok(())
         }),
         commands,
+        &super::attempt::DurableWriteSlot::new(None),
+        None,
     );
-    assert!(matches!(
-        (result).as_ref().err().and_then(|error| error.base_error()),
-        Some(storage_types::StorageEnum::SyncSubmissionAmbiguous { .. })
-    ));
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(storage_types::StorageError::is_commit_unknown)
+    );
     let rows: i64 = connection
         .query_row("SELECT count(*) FROM child", [], |row| row.get(0))
         .unwrap();
@@ -189,6 +233,7 @@ impl crate::SqlFaultProbe for ReadProgressGate {
     fn at_commit_boundary(
         &self,
         boundary: crate::SqlCommitBoundary,
+        _mode: storage_types::AttemptMode,
     ) -> futures::future::BoxFuture<'_, storage_types::StorageResult<()>> {
         Box::pin(async move {
             if boundary == crate::SqlCommitBoundary::BeforeCommit
@@ -210,21 +255,26 @@ async fn given_pending_write_receipt_when_a_file_backed_reader_runs_then_it_prog
         "sqlite-reader-progress-{}.db",
         uuid::Uuid::now_v7()
     ));
-    let backend = super::driver::SqliteBackend::initialize(&path)
-        .await
-        .unwrap();
+    let backend =
+        super::driver::SqliteBackend::initialize(&path, storage_types::AttemptDeadlines::default())
+            .await
+            .unwrap();
     backend
-        .with_attempt(AttemptMode::ReadWrite, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .execute(SqlStatement::new(
-                        "CREATE TABLE proof (id INTEGER PRIMARY KEY)",
-                        vec![],
-                    ))
-                    .await?;
-                Ok(())
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .execute(SqlStatement::new(
+                            "CREATE TABLE proof (id INTEGER PRIMARY KEY)",
+                            vec![],
+                        ))
+                        .await?;
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
     let gate = std::sync::Arc::new(ReadProgressGate {
@@ -236,14 +286,18 @@ async fn given_pending_write_receipt_when_a_file_backed_reader_runs_then_it_prog
     let writer_backend = backend.clone();
     let writer = tokio::spawn(async move {
         writer_backend
-            .with_attempt(AttemptMode::ReadWrite, |attempt| {
-                Box::pin(async move {
-                    attempt
-                        .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
-                        .await?;
-                    Ok(())
-                })
-            })
+            .with_attempt(
+                AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                    .start(writer_backend.attempt_deadlines()),
+                |attempt| {
+                    Box::pin(async move {
+                        attempt
+                            .execute(SqlStatement::new("INSERT INTO proof VALUES (1)", vec![]))
+                            .await?;
+                        Ok(())
+                    })
+                },
+            )
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
@@ -264,10 +318,17 @@ async fn given_pending_write_receipt_when_a_file_backed_reader_runs_then_it_prog
         .expect("write receives its real durable acknowledgment");
     assert_eq!(count_rows(&backend).await, 1);
     drop(backend);
-    let reopened = super::driver::SqliteBackend::initialize(&path)
-        .await
-        .unwrap();
+    let reopened =
+        super::driver::SqliteBackend::initialize(&path, storage_types::AttemptDeadlines::default())
+            .await
+            .unwrap();
     assert_eq!(count_rows(&reopened).await, 1);
     drop(reopened);
     std::fs::remove_file(path).unwrap();
+}
+
+fn opened_lifecycle() -> storage_common::native_attempt_lifecycle::AttemptLifecycle {
+    let lifecycle = storage_common::native_attempt_lifecycle::AttemptLifecycle::new();
+    assert!(lifecycle.open());
+    lifecycle
 }

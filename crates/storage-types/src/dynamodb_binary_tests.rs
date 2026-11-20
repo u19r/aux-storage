@@ -136,7 +136,7 @@ fn parse_required_dynamo_binary_errors_when_invalid() {
         parse_required_dynamo_binary(Some("%%%"), "payload").expect_err("invalid base64 must fail");
     assert!(
         matches!(error.base_error(), Some(StorageEnum::InternalServerError { message })
-                if message.starts_with("invalid payload field binary payload:")),
+                if message == "invalid payload field binary payload"),
         "unexpected error: {error:?}"
     );
 }

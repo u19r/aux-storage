@@ -1,14 +1,18 @@
 //! Physical SQL reclamation after a deleted incarnation leaves the public
 //! catalog.
 
+use storage_backfill::GsiBuildTarget;
 use storage_provider::{
-    CATALOG_READ_BYTES, CatalogAttempt, TableReclaimAttempt, TableReclaimPhase, TableReclaimStep,
+    CATALOG_READ_BYTES, CatalogAttempt, ReclaimAttempt, TableReclaimPhase, TableReclaimStep,
     TableReclaimTarget,
 };
-use storage_types::{StorageError, StorageResult, storage_serde};
+use storage_types::{
+    StorageError, StorageResult, TableHistoryId, maintenance::TargetIncarnation, storage_serde,
+};
 
 use crate::{
-    ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue, catalog::SqlCatalogAttempt,
+    ColumnIndex, ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue,
+    catalog::SqlCatalogAttempt, gsi_reclaim_sql_statements,
 };
 
 pub(crate) async fn initialize_table_reclaim<A: SqlAttempt>(
@@ -21,43 +25,7 @@ pub(crate) async fn initialize_table_reclaim<A: SqlAttempt>(
     Ok(())
 }
 
-impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, A, L> {
-    async fn load_table_system_rows(
-        &mut self,
-        history: storage_types::TableHistoryId,
-        limit: std::num::NonZeroU32,
-    ) -> StorageResult<storage_provider::TableSystemHistoryPage> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        let result = crate::table_history_reclaim::load_table_system_rows(
-            catalog.attempt,
-            catalog.engine,
-            history,
-            limit,
-        )
-        .await;
-        operation.complete(result)
-    }
-
-    async fn store_table_system_removals(
-        &mut self,
-        history: storage_types::TableHistoryId,
-        rows: &[storage_types::SystemHistoryRecord],
-    ) -> StorageResult<()> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        let result = crate::table_history_reclaim::store_table_system_removals(
-            catalog.attempt,
-            catalog.engine,
-            history,
-            rows,
-        )
-        .await;
-        operation.complete(result)
-    }
-
+impl<A: SqlAttempt, L: SqlLayout> ReclaimAttempt for SqlCatalogAttempt<'_, A, L> {
     async fn load_reclaim_target(&mut self) -> StorageResult<Option<TableReclaimTarget>> {
         let page = self
             .attempt
@@ -94,12 +62,12 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
     ) -> StorageResult<TableReclaimStep> {
         let history = target.history_id;
         match target.phase {
-            TableReclaimPhase::ExternalData | TableReclaimPhase::SystemHistory => {
+            TableReclaimPhase::ExternalData => {
                 return Err(StorageError::internal(
                     "Table reclaim phase requires its domain owner",
                 ));
             }
-            TableReclaimPhase::TableHistory => {
+            TableReclaimPhase::StreamEntries => {
                 return crate::table_history_reclaim::delete_table_history_rows(
                     self.attempt,
                     self.engine,
@@ -122,11 +90,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
                         history,
                     ))],
                 ));
-                let expected = statements.len();
-                let counts = self.attempt.execute_batch(statements).await?;
-                if counts.len() != expected {
-                    return Err(StorageError::internal("SQL metadata reclaim count differs"));
-                }
+                let counts = self.attempt.execute_batch_exact(statements).await?;
                 if counts.into_iter().any(|count| count == 64) {
                     return Ok(TableReclaimStep::Advanced);
                 }
@@ -142,45 +106,9 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
             TableReclaimPhase::PrimaryItems => {
                 drop_relation(self.attempt, self.engine.item_table_name(history)).await?;
             }
-            TableReclaimPhase::PrimaryTombstones => {
-                let count = self
-                    .attempt
-                    .execute(SqlStatement::new(
-                        format!(
-                            "DELETE FROM {relation} WHERE table_id = {} AND key_json IN (SELECT \
-                             key_json FROM {relation} WHERE table_id = {} ORDER BY key_json LIMIT \
-                             64)",
-                            self.engine.engine().placeholder(1),
-                            self.engine.engine().placeholder(2),
-                            relation = self.engine.relation_name("item_tombstones"),
-                        ),
-                        vec![
-                            SqlValue::Blob(history.as_ref().to_vec()),
-                            SqlValue::Blob(history.as_ref().to_vec()),
-                        ],
-                    ))
-                    .await?;
-                if count == 64 {
-                    return Ok(TableReclaimStep::Advanced);
-                }
-            }
-            TableReclaimPhase::GsiProjections => {
-                let statements = target
-                    .gsi_targets
-                    .iter()
-                    .map(|gsi| {
-                        let relation = self.engine.gsi_table_name(&gsi.incarnation);
-                        SqlStatement::new(format!("DROP TABLE IF EXISTS \"{relation}\""), vec![])
-                    })
-                    .collect();
-                if !target.gsi_targets.is_empty() {
-                    self.attempt.execute_batch(statements).await?;
-                }
-            }
-            TableReclaimPhase::TtlIndex => {
-                drop_relation(self.attempt, self.engine.ttl_table_name(history)).await?;
-            }
-            TableReclaimPhase::GsiTombstones | TableReclaimPhase::GsiNameLocks => {}
+            TableReclaimPhase::TtlIndex => {}
+            // GSI partial indexes go with the item relation.
+            TableReclaimPhase::GsiProjections | TableReclaimPhase::GsiNameLocks => {}
         }
         Ok(TableReclaimStep::Complete)
     }
@@ -209,6 +137,87 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
             ));
         }
         Ok(())
+    }
+
+    async fn load_index_incarnation(
+        &mut self,
+        _history: TableHistoryId,
+        target: &GsiBuildTarget,
+    ) -> StorageResult<Option<TargetIncarnation>> {
+        let page = self
+            .attempt
+            .query(
+                gsi_reclaim_sql_statements::load_incarnation(self.engine, target),
+                ReadProtection::Conflict,
+                CATALOG_READ_BYTES,
+            )
+            .await?;
+        if page.more || page.rows.len() > 1 {
+            return Err(StorageError::internal("SQL index binding page is invalid"));
+        }
+        page.rows
+            .first()
+            .map(|row| {
+                let SqlValue::Blob(bytes) = row.value(ColumnIndex::new(0))? else {
+                    return Err(StorageError::internal("SQL index binding type is invalid"));
+                };
+                TargetIncarnation::try_from(bytes.clone())
+                    .map_err(|_| StorageError::internal("SQL index binding incarnation is invalid"))
+            })
+            .transpose()
+    }
+
+    async fn delete_index_page(
+        &mut self,
+        history: TableHistoryId,
+        _target: &GsiBuildTarget,
+        native: Option<storage_provider::NativeGsiRetirement>,
+    ) -> StorageResult<TableReclaimStep> {
+        let Some(native) = native else {
+            return Ok(TableReclaimStep::Complete);
+        };
+        let page = self
+            .attempt
+            .query(
+                crate::gsi::index_state_statement(self.engine, history, &native.index),
+                ReadProtection::Snapshot,
+                CATALOG_READ_BYTES,
+            )
+            .await?;
+        if !page.rows.is_empty() {
+            self.deferred_ddl.push(crate::ddl::SqlDdl::drop_index(
+                self.engine,
+                history,
+                &native.index,
+            ));
+            return Ok(TableReclaimStep::Advanced);
+        }
+        // SQLite and Turso retire unused columns in place; dropping them
+        // would rewrite every item. A future GSI always gets a new generation.
+        if self.engine.engine() != crate::SqlEngine::Postgres || native.unused_columns.is_empty() {
+            return Ok(TableReclaimStep::Complete);
+        }
+        let page = self
+            .attempt
+            .query(
+                gsi_reclaim_sql_statements::load_columns(
+                    self.engine,
+                    history,
+                    &native.unused_columns,
+                ),
+                ReadProtection::Snapshot,
+                CATALOG_READ_BYTES,
+            )
+            .await?;
+        if !page.rows.is_empty() {
+            for column in native.unused_columns.iter().filter(|column| page.rows.iter().any(|row| {
+                matches!(row.value(ColumnIndex::new(0)), Ok(SqlValue::Text(name)) if *name == column.physical_name())
+            })) {
+                self.deferred_ddl.push(crate::ddl::SqlDdl::drop_column(self.engine, history, column));
+            }
+            return Ok(TableReclaimStep::Advanced);
+        }
+        Ok(TableReclaimStep::Complete)
     }
 }
 

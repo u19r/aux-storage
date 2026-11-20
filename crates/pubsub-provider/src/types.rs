@@ -1,12 +1,16 @@
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
-use storage_types::TimestampMillis;
-use uuid::Uuid;
+use storage_types::{MessagingIdentity, TimestampMillis};
 
 use crate::{
-    PubsubError, PubsubMessageId, PubsubResult, PubsubValidationKind, SubscriptionArn, TopicArn,
-    TopicName,
+    FilterPolicyScope, PubsubError, PubsubMessageId, PubsubResult, PubsubValidationKind,
+    SubscriptionArn, SubscriptionAttributes, SubscriptionRedrivePolicy, TopicArn, TopicName,
+    topic_attributes::account_of,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -14,6 +18,8 @@ pub struct Topic {
     pub topic_arn: TopicArn,
     pub name: TopicName,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
     pub created_at: TimestampMillis,
 }
 
@@ -25,7 +31,7 @@ impl Topic {
     ) -> HashMap<String, String> {
         HashMap::from([
             ("TopicArn".to_string(), self.topic_arn.to_string()),
-            ("Owner".to_string(), "000000000000".to_string()),
+            ("Owner".to_string(), self.owner().to_owned()),
             (
                 "SubscriptionsPending".to_string(),
                 pending_subscriptions.to_string(),
@@ -43,14 +49,23 @@ impl Topic {
     }
 }
 
-impl From<CreateTopicRequest> for Topic {
-    fn from(request: CreateTopicRequest) -> Self {
-        Self {
-            topic_arn: TopicArn::compose("aws", "us-east-1", "000000000000", &request.name),
-            name: request.name,
-            display_name: request.attributes.get("DisplayName").cloned(),
-            created_at: TimestampMillis::now(),
-        }
+/// Why a `Protocol` value is rejected (W3 design, section 8.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolRejection {
+    /// Not an AWS protocol string.
+    Unknown,
+    /// An AWS protocol that this service does not implement.
+    NotImplemented,
+}
+
+impl ProtocolRejection {
+    #[must_use]
+    pub fn error(self, value: &str) -> PubsubError {
+        let kind = match self {
+            Self::Unknown => PubsubValidationKind::UnsupportedProtocol,
+            Self::NotImplemented => PubsubValidationKind::ProtocolNotImplemented,
+        };
+        PubsubError::validation_with_detail(kind, value)
     }
 }
 
@@ -63,12 +78,15 @@ pub enum SubscriptionProtocol {
 }
 
 impl SubscriptionProtocol {
-    pub fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Result<Self, ProtocolRejection> {
         match value {
-            "sqs" => Some(Self::Queue),
-            "http" => Some(Self::Http),
-            "https" => Some(Self::Https),
-            _ => None,
+            "sqs" => Ok(Self::Queue),
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            "email" | "email-json" | "sms" | "lambda" | "application" | "firehose" => {
+                Err(ProtocolRejection::NotImplemented)
+            }
+            _ => Err(ProtocolRejection::Unknown),
         }
     }
 
@@ -81,20 +99,29 @@ impl SubscriptionProtocol {
         }
     }
 
-    pub fn validate_endpoint(self, endpoint: &str) -> PubsubResult<()> {
-        if endpoint.is_empty() {
-            return Err(PubsubError::validation(
-                PubsubValidationKind::InvalidEndpoint,
-            ));
-        }
-        match self {
-            Self::Http if !endpoint.starts_with("http://") => Err(PubsubError::validation(
+    /// An `sqs` endpoint is the ARN of a standard queue in this deployment's
+    /// partition and account (AWS rejects a queue URL, section 13). The queue
+    /// does not need to exist.
+    pub fn validate_endpoint(
+        self,
+        endpoint: &str,
+        identity: &MessagingIdentity,
+    ) -> PubsubResult<()> {
+        let is_valid = match self {
+            Self::Queue => {
+                queue_provider::QueueArn::parse(endpoint, identity).is_ok_and(|arn| !arn.is_fifo())
+            }
+            Self::Http => endpoint.starts_with("http://"),
+            Self::Https => endpoint.starts_with("https://"),
+        };
+        match (is_valid, self) {
+            (true, _) => Ok(()),
+            (false, Self::Queue) => Err(PubsubError::validation(
+                PubsubValidationKind::InvalidSqsEndpoint,
+            )),
+            (false, _) => Err(PubsubError::validation(
                 PubsubValidationKind::InvalidEndpoint,
             )),
-            Self::Https if !endpoint.starts_with("https://") => Err(PubsubError::validation(
-                PubsubValidationKind::InvalidEndpoint,
-            )),
-            _ => Ok(()),
         }
     }
 
@@ -102,7 +129,7 @@ impl SubscriptionProtocol {
         match self {
             Self::Queue => SubscriptionConfirmation::Confirmed,
             Self::Http | Self::Https => SubscriptionConfirmation::Pending {
-                token: Uuid::now_v7().to_string(),
+                token: storage_types::ambient::uuid_now_v7().to_string(),
             },
         }
     }
@@ -116,6 +143,14 @@ pub struct Subscription {
     pub endpoint: String,
     pub raw_message_delivery: bool,
     #[serde(default)]
+    pub filter_policy: Option<String>,
+    #[serde(default)]
+    pub filter_policy_scope: FilterPolicyScope,
+    #[serde(default)]
+    pub redrive_policy: Option<SubscriptionRedrivePolicy>,
+    #[serde(default)]
+    pub delivery_policy: Option<String>,
+    #[serde(default)]
     pub confirmation: SubscriptionConfirmation,
     #[serde(default)]
     pub extra_json: serde_json::Value,
@@ -123,8 +158,39 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Validate the endpoint and every attribute of a `Subscribe` request.
+    pub fn try_new(request: SubscribeRequest, identity: &MessagingIdentity) -> PubsubResult<Self> {
+        request
+            .protocol
+            .validate_endpoint(&request.endpoint, identity)?;
+        let attributes =
+            SubscriptionAttributes::parse_for_subscribe(&request.attributes, identity)?;
+        let mut subscription = Self {
+            subscription_arn: SubscriptionArn::compose(&request.topic_arn),
+            confirmation: request.protocol.subscription_confirmation(),
+            topic_arn: request.topic_arn,
+            protocol: request.protocol,
+            endpoint: request.endpoint,
+            raw_message_delivery: false,
+            filter_policy: None,
+            filter_policy_scope: FilterPolicyScope::default(),
+            redrive_policy: None,
+            delivery_policy: None,
+            extra_json: request.extra_json,
+            created_at: TimestampMillis::now(),
+        };
+        attributes.apply(&mut subscription);
+        Ok(subscription)
+    }
+
+    /// The account of the topic ARN; it is the `Owner` attribute.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        account_of(self.topic_arn.as_str())
+    }
+
     pub fn attributes(&self) -> HashMap<String, String> {
-        HashMap::from([
+        let mut attributes = HashMap::from([
             ("TopicArn".to_string(), self.topic_arn.to_string()),
             (
                 "SubscriptionArn".to_string(),
@@ -136,32 +202,14 @@ impl Subscription {
                 "PendingConfirmation".to_string(),
                 self.confirmation.pending_confirmation().to_string(),
             ),
-            (
-                "RawMessageDelivery".to_string(),
-                self.raw_message_delivery.to_string(),
-            ),
-            ("Owner".to_string(), "000000000000".to_string()),
-        ])
-    }
-}
-
-impl From<SubscribeRequest> for Subscription {
-    fn from(request: SubscribeRequest) -> Self {
-        let subscription_arn = SubscriptionArn::compose(&request.topic_arn);
-        let confirmation = request.protocol.subscription_confirmation();
-        Self {
-            subscription_arn,
-            topic_arn: request.topic_arn,
-            protocol: request.protocol,
-            endpoint: request.endpoint,
-            raw_message_delivery: request
-                .attributes
-                .get("RawMessageDelivery")
-                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
-            confirmation,
-            extra_json: request.extra_json,
-            created_at: TimestampMillis::now(),
-        }
+            ("Owner".to_string(), self.owner().to_owned()),
+        ]);
+        attributes.extend(
+            self.stored_attributes()
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        );
+        attributes
     }
 }
 
@@ -190,7 +238,7 @@ impl SubscriptionConfirmation {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeliveryRecordId(pub String);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,232 +272,6 @@ impl FromStr for DeliveryTarget {
             "custom_sender" => Ok(Self::CustomSender),
             _ => Err(PubsubError::storage("invalid delivery target")),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryStatus {
-    Pending,
-    Delivered,
-    AcceptedByCustomSender,
-    RetryScheduled,
-    Failed,
-}
-
-impl From<DeliveryStatus> for &'static str {
-    fn from(status: DeliveryStatus) -> Self {
-        match status {
-            DeliveryStatus::Pending => "pending",
-            DeliveryStatus::Delivered => "delivered",
-            DeliveryStatus::AcceptedByCustomSender => "accepted_by_custom_sender",
-            DeliveryStatus::RetryScheduled => "retry_scheduled",
-            DeliveryStatus::Failed => "failed",
-        }
-    }
-}
-
-impl fmt::Display for DeliveryStatus {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str((*self).into())
-    }
-}
-
-impl FromStr for DeliveryStatus {
-    type Err = PubsubError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "delivered" => Ok(Self::Delivered),
-            "accepted_by_custom_sender" => Ok(Self::AcceptedByCustomSender),
-            "retry_scheduled" => Ok(Self::RetryScheduled),
-            "failed" => Ok(Self::Failed),
-            _ => Err(PubsubError::storage("invalid delivery status")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeliveryRecord {
-    pub id: DeliveryRecordId,
-    #[serde(default)]
-    pub kind: DeliveryRecordKind,
-    pub message_id: PubsubMessageId,
-    pub subscription_arn: SubscriptionArn,
-    #[serde(default)]
-    pub subscription: Option<Subscription>,
-    #[serde(default)]
-    pub message_body: Option<String>,
-    #[serde(default)]
-    pub subject: Option<String>,
-    #[serde(default)]
-    pub message_attributes: HashMap<String, crate::MessageAttribute>,
-    pub target: DeliveryTarget,
-    pub status: DeliveryStatus,
-    pub attempts: u32,
-    pub claim_generation: u64,
-    pub next_attempt_at: Option<TimestampMillis>,
-    #[serde(default)]
-    pub lease_owner: Option<String>,
-    #[serde(default)]
-    pub lease_expires_at: Option<TimestampMillis>,
-    pub last_error: Option<String>,
-    pub created_at: TimestampMillis,
-    pub updated_at: TimestampMillis,
-}
-
-/// Mutable delivery outcome guarded by the claim that produced it.
-///
-/// The delivery payload and subscription snapshot are intentionally absent:
-/// once a record is accepted, those values are immutable. Providers must
-/// apply this outcome only when both the generation and owner still match the
-/// active claim.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeliveryRecordUpdate {
-    pub record_id: DeliveryRecordId,
-    pub expected_claim_generation: u64,
-    pub expected_lease_owner: String,
-    pub status: DeliveryStatus,
-    pub attempts: u32,
-    pub next_attempt_at: Option<TimestampMillis>,
-    pub last_error: Option<String>,
-    pub updated_at: TimestampMillis,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingNotificationContext {
-    pub accepted_at: TimestampMillis,
-    pub custom_sender_enabled: bool,
-}
-
-impl PendingNotificationContext {
-    #[must_use]
-    pub const fn new(accepted_at: TimestampMillis, custom_sender_enabled: bool) -> Self {
-        Self {
-            accepted_at,
-            custom_sender_enabled,
-        }
-    }
-}
-
-impl DeliveryRecord {
-    /// The physical delivery stores use signed 64-bit claim generations.
-    /// Reject an unrepresentable record before any batch member is written.
-    pub fn validate_storage_range(&self) -> PubsubResult<()> {
-        i64::try_from(self.claim_generation)
-            .map(|_| ())
-            .map_err(|_| PubsubError::storage("delivery claim generation exceeds storage range"))
-    }
-
-    #[must_use]
-    pub fn pending_notification(
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-        custom_sender_enabled: bool,
-    ) -> Self {
-        Self::pending_notification_at(
-            request,
-            message_id,
-            subscription,
-            PendingNotificationContext::new(TimestampMillis::now(), custom_sender_enabled),
-        )
-    }
-
-    #[must_use]
-    pub fn pending_notification_at(
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-        context: PendingNotificationContext,
-    ) -> Self {
-        let target = if context.custom_sender_enabled
-            && matches!(
-                subscription.protocol,
-                SubscriptionProtocol::Http | SubscriptionProtocol::Https
-            ) {
-            DeliveryTarget::CustomSender
-        } else {
-            DeliveryTarget::BuiltIn
-        };
-        Self {
-            id: DeliveryRecordId(format!("{}:{}", subscription.subscription_arn, message_id)),
-            kind: DeliveryRecordKind::Notification,
-            message_id: message_id.clone(),
-            subscription_arn: subscription.subscription_arn.clone(),
-            subscription: Some(subscription.clone()),
-            message_body: Some(request.message.clone()),
-            subject: request.subject.clone(),
-            message_attributes: request.message_attributes.clone(),
-            target,
-            status: DeliveryStatus::Pending,
-            attempts: 0,
-            claim_generation: 0,
-            next_attempt_at: None,
-            lease_owner: None,
-            lease_expires_at: None,
-            last_error: None,
-            created_at: context.accepted_at,
-            updated_at: context.accepted_at,
-        }
-    }
-
-    pub fn is_claimable(&self, now: TimestampMillis) -> bool {
-        matches!(
-            self.status,
-            DeliveryStatus::Pending | DeliveryStatus::RetryScheduled
-        ) && self
-            .next_attempt_at
-            .is_none_or(|next_attempt| next_attempt <= now)
-            && self
-                .lease_expires_at
-                .is_none_or(|lease_expires_at| lease_expires_at <= now)
-    }
-
-    /// Physical due indexes use this bound; claim policy still checks the row.
-    pub fn due_at(&self) -> Option<TimestampMillis> {
-        if !matches!(
-            self.status,
-            DeliveryStatus::Pending | DeliveryStatus::RetryScheduled
-        ) {
-            return None;
-        }
-        let mut due = self.created_at;
-        if let Some(next) = self.next_attempt_at {
-            due = due.max(next);
-        }
-        if let Some(lease) = self.lease_expires_at {
-            due = due.max(lease);
-        }
-        Some(due)
-    }
-
-    /// Build the mutable outcome for this record's active claim.
-    pub fn update_for_claim(
-        &self,
-        status: DeliveryStatus,
-        attempts: u32,
-        next_attempt_at: Option<TimestampMillis>,
-        last_error: Option<String>,
-        updated_at: TimestampMillis,
-    ) -> PubsubResult<DeliveryRecordUpdate> {
-        let Some(expected_lease_owner) = self.lease_owner.clone() else {
-            return Err(PubsubError::delivery_claim_lost(self.id.0.clone()));
-        };
-        if self.claim_generation == 0 {
-            return Err(PubsubError::delivery_claim_lost(self.id.0.clone()));
-        }
-        Ok(DeliveryRecordUpdate {
-            record_id: self.id.clone(),
-            expected_claim_generation: self.claim_generation,
-            expected_lease_owner,
-            status,
-            attempts,
-            next_attempt_at,
-            last_error,
-            updated_at,
-        })
     }
 }
 
@@ -496,22 +318,11 @@ impl TryFrom<(&str, Option<String>)> for DeliveryRecordKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClaimDeliveryRecordsRequest {
-    pub owner: String,
-    pub now: TimestampMillis,
-    pub lease_expires_at: TimestampMillis,
-    pub limit: crate::DeliveryClaimLimit,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClaimDeliveryRecordsResponse {
-    pub records: Vec<DeliveryRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateTopicRequest {
     pub name: TopicName,
     pub attributes: HashMap<String, String>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -601,16 +412,26 @@ pub struct ListSubscriptionsResponse {
     pub next_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PublishRequest {
     pub topic_arn: TopicArn,
     pub message: String,
     pub subject: Option<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_attributes")]
     pub message_attributes: HashMap<String, crate::MessageAttribute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublishResponse {
     pub message_id: PubsubMessageId,
+}
+
+/// Stored in name order, so that the bytes of one payload are the same after
+/// each encode.
+pub(crate) fn serialize_sorted_attributes<S: serde::Serializer>(
+    attributes: &HashMap<String, crate::MessageAttribute>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(attributes.iter().collect::<BTreeMap<_, _>>())
 }

@@ -15,6 +15,23 @@ pub struct NativeWorkLimits {
     pub call_guards: NonZeroUsize,
 }
 
+/// The work budgets bound once to an initialized driver.
+#[derive(Debug, Default)]
+pub struct BoundWorkLimits(std::sync::OnceLock<NativeWorkLimits>);
+
+impl BoundWorkLimits {
+    pub fn bind(&self, limits: NativeWorkLimits) -> crate::StorageResult<()> {
+        self.0
+            .set(limits)
+            .map_err(|_| crate::StorageError::validation("native work budgets are already bound"))
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Option<NativeWorkLimits> {
+        self.0.get().copied()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NativeWorkBudget {
     limits: Option<NativeWorkLimits>,
@@ -51,6 +68,6 @@ impl NativeWorkBudget {
                     .filter(|total| *total <= maximum.get())
             })
             .map(|_| ())
-            .map_err(|_| crate::InfrastructureResultKind::NativeCapacityRejected.into())
+            .map_err(|_| crate::AttemptFailure::CAPACITY.into())
     }
 }

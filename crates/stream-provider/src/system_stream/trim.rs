@@ -1,4 +1,4 @@
-use std::{fmt, future::Future};
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use storage_types::{
@@ -18,7 +18,6 @@ use crate::{
 pub struct SystemStreamTrimRecord {
     pub position: SystemStreamPosition,
     pub created_at: TimestampMillis,
-    pub table_history_id: Option<storage_types::TableHistoryId>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -342,33 +341,68 @@ impl SystemStreamTrimPageRequest {
     }
 }
 
-/// The physical family observes and applies one bounded trim page on the
-/// caller's native attempt. All authorization and candidate selection stay in
-/// this shared executor.
-pub trait SystemStreamTrimAttempt: StreamAttempt {
-    fn read_trim_receipts(
-        &mut self,
-        request: &SystemStreamTrimPageRequest,
-    ) -> impl Future<
-        Output = StorageResult<(
-            Option<SystemStreamTrimPageReceipt>,
-            Option<SystemStreamTrimPageReceipt>,
-        )>,
-    > + Send;
-
-    fn scan_trim_records(
-        &mut self,
-        after: Option<&SystemStreamPosition>,
-    ) -> impl Future<Output = StorageResult<(Vec<SystemStreamTrimRecord>, bool)>> + Send;
-
-    fn apply_trim_page(
-        &mut self,
-        selected: &[SystemStreamTrimRecord],
-        receipt: &SystemStreamTrimPageReceipt,
-    ) -> impl Future<Output = StorageResult<()>> + Send;
+/// The stored receipt of this page and of its predecessor page.
+async fn read_trim_receipts<A: StreamAttempt>(
+    attempt: &mut A,
+    request: &SystemStreamTrimPageRequest,
+) -> StorageResult<(
+    Option<SystemStreamTrimPageReceipt>,
+    Option<SystemStreamTrimPageReceipt>,
+)> {
+    let sequence = request.continuation().map_or(0, |cursor| cursor.sequence());
+    let mut sequences = vec![sequence];
+    if let Some(previous) = sequence.checked_sub(1) {
+        sequences.push(previous);
+    }
+    let receipts = attempt
+        .load_trim_receipts(request.operation_id(), &sequences)
+        .await?;
+    let mut checked = receipts.zip(sequences).map(|(sequence, receipt)| {
+        receipt
+            .map(|receipt| {
+                if receipt.operation_id != *request.operation_id()
+                    || receipt.input_sequence != sequence
+                {
+                    return Err(StorageError::internal(
+                        "SystemStream trim receipt is invalid",
+                    ));
+                }
+                Ok(receipt)
+            })
+            .transpose()
+    });
+    // `sequences` always holds the current sequence first.
+    let current = checked.next().transpose()?.flatten();
+    let predecessor = checked.next().transpose()?.flatten();
+    Ok((current, predecessor))
 }
 
-pub async fn execute_trim_page<A: SystemStreamTrimAttempt>(
+/// The greatest selected position of each lane, ordered by
+/// `(shard_id, lineage_id)`.
+pub fn retired_frontiers(
+    selected: &[SystemStreamTrimRecord],
+) -> StorageResult<Vec<SystemStreamPosition>> {
+    let mut frontiers: Vec<SystemStreamPosition> = Vec::new();
+    for record in selected {
+        match frontiers.iter_mut().find(|frontier| {
+            frontier.shard_id() == record.position.shard_id()
+                && frontier.lineage_id() == record.position.lineage_id()
+        }) {
+            Some(frontier) => {
+                if precedes_position(frontier, &record.position)? {
+                    *frontier = record.position.clone();
+                }
+            }
+            None => frontiers.push(record.position.clone()),
+        }
+    }
+    frontiers.sort_by(|left, right| {
+        (left.shard_id(), left.lineage_id()).cmp(&(right.shard_id(), right.lineage_id()))
+    });
+    Ok(frontiers)
+}
+
+pub async fn execute_trim_page<A: StreamAttempt>(
     attempt: &mut A,
     request: SystemStreamTrimPageRequest,
 ) -> StorageResult<SystemStreamTrimPageResult> {
@@ -376,7 +410,7 @@ pub async fn execute_trim_page<A: SystemStreamTrimAttempt>(
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
     let result = async {
-        let (current, predecessor) = attempt.read_trim_receipts(&request).await?;
+        let (current, predecessor) = read_trim_receipts(attempt, &request).await?;
         if let Some(current) = current {
             return current.replay(&request);
         }
@@ -386,12 +420,37 @@ pub async fn execute_trim_page<A: SystemStreamTrimAttempt>(
             .validate_scope(request.scope())
             .map_err(|_| StorageError::internal("SystemStream trim has another source"))?;
         let after = request.after_position()?;
-        let (records, more) = attempt.scan_trim_records(after.as_ref()).await?;
+        let origins = history
+            .retirement_origins()
+            .map_err(|_| StorageError::internal("Invalid SystemStream trim origins"))?;
+        let retired = attempt.load_system_retired_frontiers(&origins).await?;
+        let mut starts = Vec::with_capacity(origins.len());
+        for (origin, retired) in retired.zip(origins) {
+            let mut start = retired.unwrap_or(origin);
+            if let Some(after) = &after {
+                let lane = (start.shard_id(), start.lineage_id());
+                let cursor_lane = (after.shard_id(), after.lineage_id());
+                if lane < cursor_lane {
+                    continue;
+                }
+                if lane == cursor_lane && precedes_position(&start, after)? {
+                    start = after.clone();
+                }
+            }
+            starts.push(start);
+        }
+        starts.sort_by(|left, right| {
+            (left.shard_id(), left.lineage_id()).cmp(&(right.shard_id(), right.lineage_id()))
+        });
+        let (records, more) = attempt.scan_trim_records(&starts).await?;
         let boundaries = history
             .retirement_boundaries()
             .map_err(|_| StorageError::internal("Invalid SystemStream publication frontier"))?;
         let (selected, receipt) = request.select_records(records, more, &boundaries)?;
-        attempt.apply_trim_page(&selected, &receipt).await?;
+        let frontiers = retired_frontiers(&selected)?;
+        attempt
+            .apply_trim_page(&selected, &frontiers, &receipt)
+            .await?;
         receipt.replay(&request)
     }
     .await;

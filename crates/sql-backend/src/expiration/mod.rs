@@ -2,4 +2,6 @@
 
 mod read;
 mod sql_statements;
+#[cfg(test)]
+mod sql_statements_tests;
 mod transaction;

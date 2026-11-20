@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use storage_types::{StorageError, StorageResult};
 use tokio::sync::{mpsc, oneshot};
@@ -12,6 +15,9 @@ use crate::{
 // this channel is its async bridge. FoundationDB owns an async transaction and
 // implements the same KvAttempt trait without a command channel.
 pub(super) enum Command {
+    SnapshotSequence {
+        answer: oneshot::Sender<StorageResult<u64>>,
+    },
     FirstKeyInRange {
         begin: Vec<u8>,
         end: Vec<u8>,
@@ -23,11 +29,13 @@ pub(super) enum Command {
         protection: ReadProtection,
         allowance: crate::KvValueAllowance,
         answer: oneshot::Sender<StorageResult<Vec<Option<Vec<u8>>>>>,
+        probe: Option<Arc<dyn crate::KvFaultProbe>>,
     },
     ScanBatch {
         ranges: Vec<KvRange>,
         protection: ReadProtection,
         answer: oneshot::Sender<StorageResult<Vec<KvRangePage>>>,
+        probe: Option<Arc<dyn crate::KvFaultProbe>>,
     },
     ApplyBatch {
         changes: Vec<KvMutation>,
@@ -36,8 +44,9 @@ pub(super) enum Command {
     Finish {
         commit: bool,
         changes: Vec<KvMutation>,
+        /// Records the commit ticket on the writer thread after commit.
+        recorder: Option<storage_common::durability::CommitRecorder>,
         answer: oneshot::Sender<StorageResult<()>>,
-        #[cfg(feature = "fault-injection")]
         probe: Option<(tokio::runtime::Handle, Arc<dyn crate::KvFaultProbe>)>,
     },
 }
@@ -46,10 +55,19 @@ pub(super) enum Command {
 pub struct RocksDbAttempt {
     settlement: Arc<storage_types::NativeAttemptSettlement>,
     sender: mpsc::UnboundedSender<Command>,
+    /// Commands sent and not yet answered: the writer guard's evidence that
+    /// a pending operation waits for native work.
+    native_requests: Arc<AtomicUsize>,
     mode: AttemptMode,
+    catalog: crate::native_catalog::NativeCatalogState,
+    snapshot_sequence: tokio::sync::OnceCell<u64>,
     // Reads flush this buffer first so they observe preceding writes.
     pending: Mutex<Vec<KvMutation>>,
-    #[cfg(feature = "fault-injection")]
+    // The first staged mutation registers this attempt as a pending durable
+    // writer before its commit, even if the attempt later fails.
+    durability: Option<Arc<storage_common::durability::DurabilityBatch>>,
+    durable_write: Option<storage_common::durability::PendingDurableWrite>,
+    /// `None` in production.
     fault_probe: Option<Arc<dyn crate::KvFaultProbe>>,
 }
 
@@ -58,14 +76,20 @@ impl RocksDbAttempt {
         sender: mpsc::UnboundedSender<Command>,
         mode: AttemptMode,
         settlement: Arc<storage_types::NativeAttemptSettlement>,
-        #[cfg(feature = "fault-injection")] fault_probe: Option<Arc<dyn crate::KvFaultProbe>>,
+        durability: Option<Arc<storage_common::durability::DurabilityBatch>>,
+        fault_probe: Option<Arc<dyn crate::KvFaultProbe>>,
     ) -> Self {
+        crate::fault_injection::observe(fault_probe.as_deref(), crate::KvNativeEvent::Begin);
         Self {
             settlement,
             sender,
+            native_requests: Arc::default(),
             mode,
+            catalog: Default::default(),
+            snapshot_sequence: tokio::sync::OnceCell::new(),
             pending: Mutex::new(Vec::new()),
-            #[cfg(feature = "fault-injection")]
+            durability,
+            durable_write: None,
             fault_probe,
         }
     }
@@ -77,30 +101,93 @@ impl RocksDbAttempt {
                 .require_open()
                 .and_then(|()| self.take_pending())
             {
-                Ok(changes) => (changes, Ok(())),
+                Ok(changes) => {
+                    self.catalog.debug_assert_change_protected();
+                    (changes, Ok(()))
+                }
                 Err(error) => (Vec::new(), Err(error)),
             }
         } else {
             (Vec::new(), Ok(()))
         };
+        let wave = crate::fault_injection::KvWaveScope::start(
+            self.fault_probe.as_deref(),
+            if commit {
+                crate::KvWaveKind::Commit
+            } else {
+                crate::KvWaveKind::Abort
+            },
+            0,
+        )
+        .await?;
         let (answer, reply) = oneshot::channel();
+        let commit_native = commit && flush.is_ok();
         self.sender
             .send(Command::Finish {
-                commit: commit && flush.is_ok(),
+                commit: commit_native,
                 changes,
+                recorder: self
+                    .durable_write
+                    .as_ref()
+                    .map(storage_common::durability::PendingDurableWrite::recorder),
                 answer,
-                #[cfg(feature = "fault-injection")]
                 probe: self
                     .fault_probe
                     .as_ref()
                     .map(|probe| (tokio::runtime::Handle::current(), Arc::clone(probe))),
             })
             .map_err(|_| StorageError::internal("RocksDB attempt ended before settlement"))?;
-        let settled = reply.await.map_err(|_| {
-            StorageError::sync_submission_ambiguous(None, "RocksDB settlement was not acknowledged")
-        })?;
+        let settled = reply
+            .await
+            .map_err(|_| StorageError::commit_unknown("RocksDB settlement was not acknowledged"))?;
+        crate::fault_injection::KvWaveScope::finish(wave, 0);
+        if let Some(probe) = self.fault_probe.as_deref() {
+            probe.observe(if commit && settled.is_ok() && flush.is_ok() {
+                crate::KvNativeEvent::Commit
+            } else {
+                crate::KvNativeEvent::Abort
+            });
+        }
         settled?;
         flush
+    }
+
+    async fn load_catalog_counter(&self) -> StorageResult<Option<std::num::NonZeroU64>> {
+        let value = self
+            .native_get(
+                crate::constants::ROCKSDB_CATALOG_VERSION_KEY,
+                self.mode.read_protection(),
+                crate::KvValueAllowance::new(8, 8),
+            )
+            .await?;
+        value
+            .map(|value| {
+                let value = u64::from_be_bytes(
+                    value
+                        .try_into()
+                        .map_err(|_| StorageError::internal("Invalid RocksDB catalog version"))?,
+                );
+                std::num::NonZeroU64::new(value)
+                    .ok_or_else(|| StorageError::internal("Invalid RocksDB catalog version"))
+            })
+            .transpose()
+    }
+
+    pub(super) fn native_requests(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.native_requests)
+    }
+
+    /// Counts one command from its send until its answer or cancellation.
+    fn begin_native_request(&self) -> NativeRequest<'_> {
+        self.native_requests.fetch_add(1, Ordering::Relaxed);
+        NativeRequest(&self.native_requests)
+    }
+
+    /// The pending durable writer registration, if a mutation was staged.
+    pub(super) fn take_durable_write(
+        &mut self,
+    ) -> Option<storage_common::durability::PendingDurableWrite> {
+        self.durable_write.take()
     }
 
     fn take_pending(&self) -> StorageResult<Vec<KvMutation>> {
@@ -129,18 +216,130 @@ impl RocksDbAttempt {
     }
 
     async fn flush_pending(&self) -> StorageResult<()> {
+        let _request = self.begin_native_request();
         let Some(reply) = self.dispatch_pending()? else {
             return Ok(());
         };
+        crate::fault_injection::observe(
+            self.fault_probe.as_deref(),
+            crate::KvNativeEvent::Wave {
+                kind: crate::KvWaveKind::Write,
+                keys: 0,
+                cached_read_version: false,
+            },
+        );
         reply
             .await
             .map_err(|_| StorageError::internal("RocksDB write was not answered"))?
     }
 }
 
+struct NativeRequest<'attempt>(&'attempt AtomicUsize);
+
+impl Drop for NativeRequest<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl KvAttempt for RocksDbAttempt {
     fn settlement(&self) -> &storage_types::NativeAttemptSettlement {
         &self.settlement
+    }
+
+    fn catalog_changed(&self) -> bool {
+        self.catalog.changed
+    }
+
+    fn writer_routes(&self) -> Option<Arc<stream_provider::SystemStreamLineageCatalog>> {
+        self.catalog.writer_routes.clone()
+    }
+
+    fn install_writer_routes(
+        &mut self,
+        routes: Arc<stream_provider::SystemStreamLineageCatalog>,
+    ) -> StorageResult<()> {
+        self.settlement.require_open()?;
+        self.catalog.writer_routes = Some(routes);
+        Ok(())
+    }
+
+    fn reserve_system_event_number(&mut self) -> StorageResult<u16> {
+        self.catalog.reserve_event_number(&self.settlement)
+    }
+
+    async fn native_catalog_version(
+        &mut self,
+    ) -> StorageResult<Option<storage_types::CatalogVersion>> {
+        let settlement = Arc::clone(&self.settlement);
+        let call = settlement.begin_call()?;
+        let result = async {
+            if self.catalog.changed {
+                return Ok(None);
+            }
+            if let Some(observation) = self.catalog.observation {
+                return Ok(observation);
+            }
+            let observation = self
+                .load_catalog_counter()
+                .await?
+                .map(storage_types::CatalogVersion::RocksDb);
+            self.catalog.observation = Some(observation);
+            Ok(observation)
+        }
+        .await;
+        call.complete(result)
+    }
+
+    async fn native_record_catalog_change(&mut self) -> StorageResult<()> {
+        let settlement = Arc::clone(&self.settlement);
+        let call = settlement.begin_call()?;
+        let result = async {
+            self.mode.require_write()?;
+            // A private original-counter read remains legal after invalidation.
+            let observation = self.catalog.observation;
+            self.catalog.record_change();
+            if self.catalog.publication_staged {
+                return Ok(());
+            }
+            let previous = match observation {
+                Some(Some(storage_types::CatalogVersion::RocksDb(value))) => Some(value),
+                Some(None) => None,
+                _ => self.load_catalog_counter().await?,
+            };
+            let next = previous
+                .map_or(Some(1), |value| value.get().checked_add(1))
+                .ok_or_else(|| StorageError::internal("RocksDB catalog version exhausted"))?;
+            self.native_stage(vec![KvMutation::PutUnchunked {
+                key: crate::constants::ROCKSDB_CATALOG_VERSION_KEY.to_vec(),
+                value: next.to_be_bytes().to_vec(),
+            }])?;
+            self.catalog.publication_staged = true;
+            Ok(())
+        }
+        .await;
+        call.complete(result)
+    }
+
+    async fn native_snapshot_sequence(&self) -> StorageResult<Option<u64>> {
+        let call = self.settlement.begin_call()?;
+        let result = async {
+            self.snapshot_sequence
+                .get_or_try_init(|| async {
+                    let _request = self.begin_native_request();
+                    let (answer, reply) = oneshot::channel();
+                    self.sender
+                        .send(Command::SnapshotSequence { answer })
+                        .map_err(|_| StorageError::internal("RocksDB snapshot worker stopped"))?;
+                    reply
+                        .await
+                        .map_err(|_| StorageError::internal("RocksDB snapshot was not answered"))?
+                })
+                .await
+                .map(|sequence| Some(*sequence))
+        }
+        .await;
+        call.complete(result)
     }
 
     async fn native_first_key_in_range(
@@ -155,11 +354,24 @@ impl KvAttempt for RocksDbAttempt {
                 begin
                     .len()
                     .checked_add(end.len())
-                    .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?,
+                    .ok_or(storage_types::AttemptFailure::CAPACITY)?,
             )?;
+            crate::fault_injection::observe_reads(
+                self.fault_probe.as_deref(),
+                crate::KvAccessKind::ReadRange,
+                [begin],
+                false,
+            );
             let begin = crate::backend::copy_native_key(begin)?;
             let end = crate::backend::copy_native_key(end)?;
+            let wave = crate::fault_injection::KvWaveScope::start(
+                self.fault_probe.as_deref(),
+                crate::KvWaveKind::FirstKey,
+                1,
+            )
+            .await?;
             self.flush_pending().await?;
+            let _request = self.begin_native_request();
             let (answer, reply) = oneshot::channel();
             self.sender
                 .send(Command::FirstKeyInRange {
@@ -169,9 +381,11 @@ impl KvAttempt for RocksDbAttempt {
                     answer,
                 })
                 .map_err(|_| StorageError::internal("RocksDB range worker stopped"))?;
-            reply
+            let key = reply
                 .await
-                .map_err(|_| StorageError::internal("RocksDB range was not answered"))?
+                .map_err(|_| StorageError::internal("RocksDB range was not answered"))?;
+            crate::fault_injection::KvWaveScope::finish(wave, 0);
+            key
         }
         .await;
         call.complete(result)
@@ -181,7 +395,6 @@ impl KvAttempt for RocksDbAttempt {
         storage_common::diagnostics::NativeEngine::RocksDb
     }
 
-    #[cfg(feature = "fault-injection")]
     fn fault_probe(&self) -> Option<&dyn crate::KvFaultProbe> {
         self.fault_probe.as_deref()
     }
@@ -199,20 +412,38 @@ impl KvAttempt for RocksDbAttempt {
         let call = self.settlement.begin_call()?;
         let result = async {
             crate::work_admission::NativeReadWork::from(&*self.settlement).charge_keys(keys)?;
+            // Plain reads: the optimistic commit validates written keys only.
+            crate::fault_injection::observe_reads(
+                self.fault_probe.as_deref(),
+                crate::KvAccessKind::Read,
+                keys.iter().map(Vec::as_slice),
+                false,
+            );
             let keys = crate::backend::copy_native_keys(keys)?;
+            let wave = crate::fault_injection::KvWaveScope::start(
+                self.fault_probe.as_deref(),
+                crate::KvWaveKind::GetBatch,
+                keys.len(),
+            )
+            .await?;
             self.flush_pending().await?;
+            let _request = self.begin_native_request();
             let (answer, reply) = oneshot::channel();
             self.sender
                 .send(Command::GetBatch {
                     keys,
                     protection,
                     allowance,
+                    probe: self.fault_probe.clone(),
                     answer,
                 })
                 .map_err(|_| StorageError::internal("RocksDB read worker stopped"))?;
-            reply
+            let values = reply
                 .await
-                .map_err(|_| StorageError::internal("RocksDB read was not answered"))?
+                .map_err(|_| StorageError::internal("RocksDB read was not answered"))??;
+            crate::fault_injection::KvWaveScope::finish(wave, 0);
+            crate::fault_injection::observe_keys_read(self.fault_probe.as_deref(), &values);
+            Ok(values)
         }
         .await;
         let result = result.and_then(|values| {
@@ -233,7 +464,7 @@ impl KvAttempt for RocksDbAttempt {
             let mut ranges = Vec::new();
             ranges
                 .try_reserve_exact(1)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             ranges.push(range);
             let mut pages = self.native_scan_batch(ranges, protection).await?;
             pages
@@ -254,18 +485,35 @@ impl KvAttempt for RocksDbAttempt {
             for range in &ranges {
                 range.charge_work(&self.settlement)?;
             }
+            crate::fault_injection::observe_reads(
+                self.fault_probe.as_deref(),
+                crate::KvAccessKind::ReadRange,
+                ranges.iter().map(|range| range.begin.as_slice()),
+                false,
+            );
+            let wave = crate::fault_injection::KvWaveScope::start(
+                self.fault_probe.as_deref(),
+                crate::KvWaveKind::Scan,
+                ranges.len(),
+            )
+            .await?;
             self.flush_pending().await?;
+            let _request = self.begin_native_request();
             let (answer, reply) = oneshot::channel();
             self.sender
                 .send(Command::ScanBatch {
                     ranges,
                     protection,
+                    probe: self.fault_probe.clone(),
                     answer,
                 })
                 .map_err(|_| StorageError::internal("RocksDB range worker stopped"))?;
-            reply
+            let pages = reply
                 .await
-                .map_err(|_| StorageError::internal("RocksDB range was not answered"))?
+                .map_err(|_| StorageError::internal("RocksDB range was not answered"))??;
+            crate::fault_injection::KvWaveScope::finish(wave, 0);
+            crate::fault_injection::observe_ranges_read(self.fault_probe.as_deref(), &pages);
+            Ok(pages)
         }
         .await;
         let result = result.and_then(|pages| {
@@ -276,6 +524,12 @@ impl KvAttempt for RocksDbAttempt {
     }
 
     fn native_stage(&mut self, changes: Vec<KvMutation>) -> StorageResult<()> {
+        if !changes.is_empty()
+            && self.durable_write.is_none()
+            && let Some(durability) = &self.durability
+        {
+            self.durable_write = Some(durability.begin_write());
+        }
         let call = self.settlement.begin_call()?;
         let result = (|| {
             self.settlement.charge_calls(changes.len())?;
@@ -283,13 +537,20 @@ impl KvAttempt for RocksDbAttempt {
                 change.charge_work(&self.settlement)?;
             }
             self.mode.require_write()?;
+            if let Some(probe) = self.fault_probe.as_deref() {
+                crate::fault_injection::observe_mutations(Some(probe), &changes);
+                observe_writes(probe, &changes);
+            }
+            for change in &changes {
+                self.catalog.observe_write(change);
+            }
             let pending = self
                 .pending
                 .get_mut()
                 .map_err(|_| StorageError::internal("RocksDB pending writes were poisoned"))?;
             pending
                 .try_reserve(changes.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             pending.extend(changes);
             Ok(())
         })();
@@ -305,5 +566,29 @@ impl KvAttempt for RocksDbAttempt {
             "RocksDB has no native versionstamped keys",
         ));
         call.complete(result)
+    }
+}
+
+/// The optimistic commit validates each written key.
+fn observe_writes(probe: &dyn crate::KvFaultProbe, changes: &[KvMutation]) {
+    for change in changes {
+        let (kind, key) = match change {
+            KvMutation::Put { key, .. } | KvMutation::PutUnchunked { key, .. } => {
+                (crate::KvAccessKind::Write, key)
+            }
+            KvMutation::Delete { key } | KvMutation::DeleteUnchunked { key } => {
+                (crate::KvAccessKind::Clear, key)
+            }
+            KvMutation::DeleteRange { begin, .. }
+            | KvMutation::ClearUnchunkedRange { begin, .. } => {
+                (crate::KvAccessKind::ClearRange, begin)
+            }
+        };
+        probe.observe_access(crate::KvAccess {
+            kind,
+            key,
+            native_bytes: 0,
+            conflict: true,
+        });
     }
 }

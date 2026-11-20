@@ -1,7 +1,3 @@
-use std::{hint::black_box, time::Instant};
-
-use alloc_counter::AllocationGuard;
-
 use super::{
     ExpressionKind,
     functions::{
@@ -71,84 +67,6 @@ fn given_function_operands_when_validated_then_preserves_errors() {
         .unwrap_err()
         .contains("operand type: N")
     );
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_expression_function_scenarios_when_validated_repeatedly_then_report_cost() {
-    const ITERATIONS: usize = 20_000;
-    let values = operand_values();
-    let cases = [
-        (
-            "absent",
-            "tenant = :prefix AND revision >= :revision".to_owned(),
-        ),
-        ("single", "contains(tags, :prefix)".to_owned()),
-        (
-            "multiple",
-            std::iter::repeat_n(
-                "contains(tags, :prefix) AND attribute_type(payload, :kind) AND \
-                 begins_with(tenant, :prefix)",
-                8,
-            )
-            .collect::<Vec<_>>()
-            .join(" AND "),
-        ),
-        (
-            "unicode",
-            "contains(étiquette, :prefix) AND begins_with(tenant, :prefix)".to_owned(),
-        ),
-        ("malformed", "contains(tags, contains(unfinished".to_owned()),
-        ("invalid", "contains(tags, tags)".to_owned()),
-        (
-            "long_absent",
-            format!(
-                "{}revision >= :revision",
-                "tenant = :prefix AND ".repeat(128)
-            ),
-        ),
-    ];
-    for (label, expression) in cases {
-        let guard = AllocationGuard::start(
-            module_path!(),
-            "expression_functions",
-            file!(),
-            line!(),
-            Some(label),
-        );
-        let started = Instant::now();
-        let cpu_started = cpu_time::ProcessTime::try_now().unwrap();
-        for _ in 0..ITERATIONS {
-            let expression = black_box(expression.as_str());
-            let _ = black_box(contains_same_operand_error(
-                expression,
-                ExpressionKind::Filter,
-                None,
-            ));
-            let _ = black_box(attribute_type_literal_operand_error(
-                expression,
-                ExpressionKind::Filter,
-            ));
-            let _ = black_box(validate_attribute_type_value_operands(
-                expression,
-                ExpressionKind::Filter,
-                Some(&values),
-                false,
-            ));
-            let _ = black_box(validate_begins_with_value_operands(
-                expression,
-                ExpressionKind::Filter,
-                Some(&values),
-                false,
-            ));
-        }
-        eprintln!(
-            "expression_functions label={label} iterations={ITERATIONS} elapsed_ns={} cpu_ns={}",
-            started.elapsed().as_nanos(),
-            cpu_started.try_elapsed().unwrap().as_nanos()
-        );
-        alloc_counter::emit_report(&guard.finish()).unwrap();
-    }
 }
 
 fn operand_values() -> AttributeMap {

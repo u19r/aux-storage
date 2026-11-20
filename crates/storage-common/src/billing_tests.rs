@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Serializer;
-use storage_types::{AttributeValue, StorageResult, WireItem, WireItemKeyAttributes};
+use storage_types::{AttributeMap, AttributeValue, StorageResult, WireItem};
 
 use super::billing::{
     WriteCostTally, attr_map_payload_bytes, serializable_payload_bytes, storage_payload_bytes,
@@ -49,7 +49,10 @@ fn storage_payload_measurement_matches_the_encoded_storage_format() {
             "number".to_string(),
             AttributeValue::N("1.2300e+4".to_string()),
         ),
-        ("nested".to_string(), AttributeValue::M(nested)),
+        (
+            "nested".to_string(),
+            AttributeValue::M(AttributeMap::from(nested)),
+        ),
         (
             "list".to_string(),
             AttributeValue::L(vec![AttributeValue::BOOL(true), AttributeValue::NULL(true)]),
@@ -97,21 +100,12 @@ fn storage_payload_measurement_propagates_serialization_errors() {
 }
 
 #[test]
-fn wire_payload_measurement_counts_each_storage_representation() {
+fn wire_payload_measurement_sums_each_item_payload() {
     let items = [
         WireItem::dynamo_json(vec![1, 2]),
-        WireItem::local_split(
-            WireItemKeyAttributes::new(
-                "pk".to_string(),
-                AttributeValue::S("key".to_string()),
-                None,
-                None,
-            ),
-            None,
-            Some(vec![3, 4, 5]),
-        ),
+        WireItem::dynamo_json(vec![3, 4, 5]),
     ];
 
     assert_eq!(wire_items_payload_bytes(&[]), 0);
-    assert_eq!(wire_items_payload_bytes(&items), 10);
+    assert_eq!(wire_items_payload_bytes(&items), 5);
 }

@@ -6,6 +6,8 @@ use storage_types::{
 
 /// Image pairs belong exclusively to the standard DynamoDB Streams adapter.
 pub(crate) struct DynamoStreamRecord {
+    pub size_bytes: u64,
+    pub change: stream_provider::StreamChange,
     pub cursor: Option<String>,
     pub source_table_name: Option<TableName>,
     pub keys: KeyAttributes,
@@ -30,30 +32,20 @@ impl From<DynamoStreamRecord> for StreamRecord {
 }
 
 pub(super) fn dynamodb_stream_record(
-    mut record: DynamoStreamRecord,
+    record: DynamoStreamRecord,
     stream_specification: &StreamSpecification,
     stream_arn: &str,
 ) -> DynamoDbStreamsRecord {
-    let event_name = match (&record.old_image, &record.new_image) {
-        (None, Some(_)) => "INSERT",
-        (Some(_), None) => "REMOVE",
-        _ => "MODIFY",
+    let event_name = match record.change {
+        stream_provider::StreamChange::Insert => "INSERT",
+        stream_provider::StreamChange::Modify => "MODIFY",
+        stream_provider::StreamChange::Remove => "REMOVE",
     }
     .to_string();
     let view = stream_specification
         .stream_view_type
         .clone()
         .unwrap_or(StreamViewType::NewAndOldImages);
-    match view {
-        StreamViewType::KeysOnly => {
-            record.old_image = None;
-            record.new_image = None;
-        }
-        StreamViewType::NewImage => record.old_image = None,
-        StreamViewType::OldImage => record.new_image = None,
-        StreamViewType::NewAndOldImages => {}
-    }
-    let size_bytes = stream_record_size_bytes(&record);
     let sequence_number = record.sequence_number;
     DynamoDbStreamsRecord {
         event_id: sequence_number.clone(),
@@ -64,21 +56,18 @@ pub(super) fn dynamodb_stream_record(
         event_source_arn: stream_arn.to_string(),
         user_identity: record.user_identity,
         dynamodb: StreamRecordDetails {
-            approximate_creation_date_time: Some(TimestampSecondsFractional::from(
-                record.created_at,
+            // AWS rounds the creation time down to the second.
+            approximate_creation_date_time: Some(TimestampSecondsFractional::from_seconds(
+                TimestampSecondsFractional::from(record.created_at)
+                    .as_seconds()
+                    .floor(),
             )),
             keys: record.keys,
             sequence_number,
             stream_view_type: view,
-            size_bytes,
+            size_bytes: record.size_bytes,
             old_image: record.old_image,
             new_image: record.new_image,
         },
     }
-}
-
-fn stream_record_size_bytes(record: &DynamoStreamRecord) -> u64 {
-    serde_json::to_vec(&(&record.keys, &record.old_image, &record.new_image))
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0)
 }

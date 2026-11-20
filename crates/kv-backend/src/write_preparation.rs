@@ -1,17 +1,9 @@
 //! KV new-image encoding before the native conflict window opens.
 
-use storage_provider::{
-    AcceptedUpsert, BoundPutItem, ItemPrimaryEffects, PreparedWriteAttempt, UpsertImage,
-};
+use storage_provider::{AcceptedUpsert, BoundPutItem, LiveItemMetadata, UpsertImage};
 use storage_types::{ItemKey, KeyAttributes, StorageResult, TableHistoryId};
 
-use crate::{
-    KvAttempt, KvMutation,
-    catalog::{KvCatalogAttempt, KvTableIdentity},
-    gsi::PreparedGsiWrite,
-    item_codec::encode_primary_item,
-    item_tombstone::primary_tombstone_key,
-};
+use crate::{KvMutation, gsi::PreparedGsiWrite, item_codec::encode_primary_item};
 
 #[derive(Default)]
 pub struct KvPreparedWrites {
@@ -25,17 +17,17 @@ impl KvPreparedWrites {
         prepared
             .primary
             .try_reserve_exact(items.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         let projections = items
             .iter()
             .try_fold(0usize, |count, item| {
                 count.checked_add(item.gsi_puts().count())
             })
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         prepared
             .gsi
             .try_reserve_exact(projections)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for item in items {
             prepared
                 .primary
@@ -50,33 +42,11 @@ impl KvPreparedWrites {
     }
 }
 
-impl<A: KvAttempt> PreparedWriteAttempt for KvCatalogAttempt<'_, A> {
-    type PreparedWrites = KvPreparedWrites;
-    fn install_prepared_writes(&mut self, writes: StorageResult<Self::PreparedWrites>) {
-        if let Err(error) = &writes {
-            self.attempt.root_attempt().settlement().reject_error(error);
-        }
-        self.prepared_writes = writes;
-    }
-
-    fn prepare_put_items(&mut self, items: &[&BoundPutItem]) -> StorageResult<()> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        catalog.prepared_writes = Ok(Default::default());
-        let result = KvPreparedWrites::try_new(items).map(|writes| {
-            catalog.prepared_writes = Ok(writes);
-        });
-        operation.complete(result)
-    }
-}
-
 pub(crate) struct PreparedPrimaryWrite {
     history_id: TableHistoryId,
     key: KeyAttributes,
     suffix: Vec<u8>,
     image: Vec<u8>,
-    tombstone_key: Vec<u8>,
 }
 
 impl PreparedPrimaryWrite {
@@ -96,7 +66,6 @@ impl PreparedPrimaryWrite {
             key: item.key.clone(),
             suffix: item_key.sorted_storage_suffix()?,
             image,
-            tombstone_key: primary_tombstone_key(item.table, item.key)?.0,
         })
     }
 
@@ -106,29 +75,18 @@ impl PreparedPrimaryWrite {
 
     pub(crate) fn prepare(
         self,
-        identity: &KvTableIdentity,
-        effects: &ItemPrimaryEffects,
+        table_id: u32,
+        effects: &LiveItemMetadata<'_>,
     ) -> StorageResult<Vec<KvMutation>> {
         let mut changes = Vec::new();
         changes
-            .try_reserve_exact(2)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let bytes = 5usize
-            .checked_add(self.suffix.len())
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let mut key = Vec::new();
-        key.try_reserve_exact(bytes)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        key.push(crate::constants::PRIMARY_ITEM_FAMILY);
-        key.extend_from_slice(&identity.table_id.to_be_bytes());
-        key.extend_from_slice(&self.suffix);
+            .try_reserve_exact(1)
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+        let key = crate::item_read::item_key_from_suffix(table_id, &self.suffix)?;
         let image = self.image;
         changes.push(KvMutation::Put {
             key,
             value: encode_primary_item(&image, effects)?,
-        });
-        changes.push(KvMutation::Delete {
-            key: self.tombstone_key,
         });
         Ok(changes)
     }

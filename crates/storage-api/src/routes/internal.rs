@@ -22,9 +22,13 @@ use stream_provider::{
 };
 
 use crate::{
-    manager::StorageApiManager,
     routes::dynamodb::{
         parse_json_request, parse_json_value, parse_try_into_request, response_to_http,
+    },
+    storage_operations::{
+        append_table_stream_record, clear_all_tables, get_stream_records,
+        reconcile_table_stream_record, run_background_job, run_system_stream_trim_page,
+        split_system_stream,
     },
     types::AppState,
 };
@@ -135,9 +139,7 @@ impl AdmissionConnectionQuery {
 pub async fn clear_all_tables_endpoint(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    let response = app_state
-        .storage_manager
-        .clear_all_tables(serde_json::json!({}))
+    let response = clear_all_tables(&app_state.db_manager)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
@@ -173,16 +175,17 @@ pub async fn run_background_job_endpoint(
         );
     };
     payload.insert("JobName".to_string(), serde_json::Value::String(job_name));
-    let response = app_state
-        .storage_manager
-        .run_background_job(serde_json::Value::Object(std::mem::take(payload)))
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
+    let response = run_background_job(
+        &app_state.db_manager,
+        serde_json::Value::Object(std::mem::take(payload)),
+    )
+    .await
+    .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
 }
 
 /// Split one exact logical SystemStream lineage through the admitted
-/// storage-manager boundary. The provider validates the request against its
+/// admitted stream boundary. The provider validates the request against its
 /// current catalog and owns Applied/Replayed disposition.
 pub async fn split_system_stream_endpoint(
     State(app_state): State<Arc<AppState>>,
@@ -192,9 +195,7 @@ pub async fn split_system_stream_endpoint(
     let request = payload
         .try_into()
         .map_err(|error: HttpApiError| -> (StatusCode, Json<ErrorResponse>) { error.into() })?;
-    let result = app_state
-        .storage_manager
-        .split_system_stream(request)
+    let result = split_system_stream(&app_state.db_manager, request)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(Json(json!({
@@ -231,9 +232,7 @@ pub async fn trim_system_stream_endpoint(
         continuation,
     )
     .map_err(storage_system_error)?;
-    let result = app_state
-        .storage_manager
-        .run_system_stream_trim_page(request)
+    let result = run_system_stream_trim_page(&app_state.db_manager, request)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(Json(json!({
@@ -340,9 +339,7 @@ pub async fn append_table_stream_record_endpoint(
     body: Bytes,
 ) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
     let payload = parse_json_value(&body)?;
-    let response = app_state
-        .storage_manager
-        .append_table_stream_record(payload)
+    let response = append_table_stream_record(&app_state.db_manager, payload)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
@@ -362,9 +359,7 @@ pub async fn reconcile_table_stream_record_endpoint(
     State(app_state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    let response = app_state
-        .storage_manager
-        .reconcile_table_stream_record(parse_json_value(&body)?)
+    let response = reconcile_table_stream_record(&app_state.db_manager, parse_json_value(&body)?)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
@@ -385,22 +380,22 @@ pub async fn get_stream_records_endpoint(
     body: Bytes,
 ) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
     let request = parse_try_into_request::<GetStreamRecordsRequest>(&body)?;
-    let response = app_state
-        .storage_manager
-        .get_stream_records(request)
+    let response = get_stream_records(&app_state.db_manager, request)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
 }
 
-fn storage_system_error(error: storage_types::StorageError) -> (StatusCode, Json<ErrorResponse>) {
-    HttpApiError::from(error).into()
+pub(crate) fn storage_system_error(
+    error: storage_types::StorageError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    crate::errors::dynamodb_storage_error(error).into()
 }
 
 fn storage_admission_error(
     error: storage_types::StorageError,
 ) -> (StatusCode, HeaderMap, Json<ErrorResponse>) {
-    let (status, body) = HttpApiError::from(error).into();
+    let (status, body) = crate::errors::dynamodb_storage_error(error).into();
     let mut headers = HeaderMap::new();
     if let Some(retry_after_seconds) = body.0.retry_after_seconds {
         headers.insert("retry-after", HeaderValue::from(retry_after_seconds));

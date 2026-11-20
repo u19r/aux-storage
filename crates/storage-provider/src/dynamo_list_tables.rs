@@ -1,13 +1,11 @@
 //! One ListTables pagination and visibility decision for SQL and KV.
 
-use std::future::Future;
-
 use storage_types::{
     ListTablesRequest, ListTablesResponse, MAX_LIST_TABLES_LIMIT, StorageError, StorageResult,
     TableName,
 };
 
-use crate::constants::INTERNAL_TABLE_NAMES;
+use crate::{ListingAttempt, constants::INTERNAL_TABLE_NAMES};
 
 /// Read ordered catalog names inside the caller's native read attempt.
 /// `more` means the physical byte budget stopped this page before the SQL
@@ -17,21 +15,12 @@ pub struct CatalogNamePage {
     pub more: bool,
 }
 
-/// One byte-bounded physical page, including private system tables.
-pub trait ListTablesAttempt: Send {
-    fn list_name_page(
-        &mut self,
-        after: Option<&TableName>,
-        limit: u32,
-    ) -> impl Future<Output = StorageResult<CatalogNamePage>> + Send;
-}
-
 /// The three internal tables are API policy, not SQL or KV layout policy.
 pub fn is_public_table_name(name: &TableName) -> bool {
     !INTERNAL_TABLE_NAMES.contains(&name.as_ref())
 }
 
-async fn collect_names<A: ListTablesAttempt>(
+async fn collect_names<A: ListingAttempt>(
     attempt: &mut A,
     after: Option<&TableName>,
     limit: u32,
@@ -70,7 +59,7 @@ async fn collect_names<A: ListTablesAttempt>(
 
 /// Extra physical names cover the internal tables and one
 /// continuation candidate. Every supported backend uses the same ordering.
-pub async fn list_tables_in_attempt<A: ListTablesAttempt>(
+pub async fn list_tables_in_attempt<A: ListingAttempt>(
     attempt: &mut A,
     request: &ListTablesRequest,
 ) -> StorageResult<ListTablesResponse> {

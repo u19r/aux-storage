@@ -6,16 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 [features]
 native = [
-    "dep:axum",
-    "dep:pubsub",
+    "dep:bytes",
+    "dep:uuid",
+    "dep:tokio",
+    "dep:serde_json",
+    "dep:storage-types",
+    "dep:tempfile",
+    "dep:infrastructure-provider",
+    "dep:futures",
     "dep:bg-job-store",
-    "dep:pubsub-provider",
-    "dep:queue-provider",
     "dep:scheduled-bg-jobs",
     "dep:storage-provider",
     "dep:storage-common",
     "dep:stream-provider",
-    "dep:tracing-subscriber",
 ]
 native-sqlite = ["native", "dep:sql-backend", "sql-backend/sqlite", "dep:rusqlite"]
 native-postgres = [
@@ -29,31 +32,26 @@ native-turso = ["native", "dep:sql-backend", "sql-backend/turso"]
 native-rocksdb = ["native", "dep:kv-backend", "kv-backend/rocksdb"]
 native-foundationdb = ["native", "dep:kv-backend", "kv-backend/foundationdb"]
 [dependencies]
-axum = { workspace = true, optional = true }
 bg-job-store = { path = "../bg-job-store", optional = true }
-bytes.workspace = true
-futures.workspace = true
-infrastructure-provider.workspace = true
+bytes = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+infrastructure-provider = { workspace = true, optional = true }
 kv-backend = { path = "../kv-backend", optional = true, features = ["fault-injection"] }
-pubsub = { path = "../pubsub", optional = true, default-features = false }
-pubsub-provider = { path = "../pubsub-provider", optional = true }
-queue-provider = { path = "../queue-provider", optional = true }
-replication-provider.workspace = true
-replication-types.workspace = true
 rusqlite = { workspace = true, optional = true }
 scheduled-bg-jobs = { workspace = true, optional = true, features = ["test-support"] }
-serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, optional = true }
 sql-backend = { path = "../sql-backend", optional = true, features = ["fault-injection"] }
 storage-common = { path = "../storage-common", optional = true }
 storage-provider = { path = "../storage-provider", optional = true }
-storage-types.workspace = true
+storage-types = { workspace = true, optional = true }
 stream-provider = { path = "../stream-provider", optional = true }
-tempfile.workspace = true
-tokio.workspace = true
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
-uuid.workspace = true
+uuid = { workspace = true, optional = true }
+[dev-dependencies]
+storage-types = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

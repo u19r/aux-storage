@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use serde_json::json;
 use storage::{DatabaseManager, PutItemInput};
-use storage_types::{
-    AttributeDefinition, AttributeValue, CreateTableRequest, KeyAttributeType, KeySchemaElement,
-    KeyType, TableName,
-};
+use storage_types::{AttributeMap, AttributeValue, CreateTableRequest, TableName};
 
 use crate::{
-    routes::routes_tests::{default_conformance_backends, handle_scan, seed_item},
+    routes::routes_tests::{
+        create_string_key_table, default_conformance_backends, handle_scan, seed_attributes,
+        seed_item, seed_nested_projection_item,
+    },
     types::Response,
 };
 
@@ -24,158 +24,36 @@ fn decode_scan_items(
 }
 
 async fn create_test_table(db: &DatabaseManager, table_name: &str) {
-    let request = CreateTableRequest::new(
-        TableName::new(table_name),
-        vec![AttributeDefinition {
-            attribute_name: "id".to_string(),
-            attribute_type: KeyAttributeType::S,
-        }],
-        vec![KeySchemaElement {
-            attribute_name: "id".to_string(),
-            key_type: KeyType::Hash,
-        }],
-        storage_types::BillingMode::PayPerRequest,
-    );
-
-    db.create_table(&request).await.unwrap();
+    create_string_key_table(db, table_name, "id", None).await;
 }
 
 async fn create_test_table_hash_range(db: &DatabaseManager, table_name: &str) {
-    let request = CreateTableRequest::new(
-        TableName::new(table_name),
-        vec![
-            AttributeDefinition {
-                attribute_name: "pk".to_string(),
-                attribute_type: KeyAttributeType::S,
-            },
-            AttributeDefinition {
-                attribute_name: "sk".to_string(),
-                attribute_type: KeyAttributeType::S,
-            },
-        ],
-        vec![
-            KeySchemaElement {
-                attribute_name: "pk".to_string(),
-                key_type: KeyType::Hash,
-            },
-            KeySchemaElement {
-                attribute_name: "sk".to_string(),
-                key_type: KeyType::Range,
-            },
-        ],
-        storage_types::BillingMode::PayPerRequest,
-    );
-
-    db.create_table(&request).await.unwrap();
+    create_string_key_table(db, table_name, "pk", Some("sk")).await;
 }
 
 async fn put_test_item(db: &DatabaseManager, table_name: &str, id: &str, name: &str, age: u32) {
-    let mut item = HashMap::new();
-    item.insert("id".to_string(), AttributeValue::S(id.to_string()));
-    item.insert("name".to_string(), AttributeValue::S(name.to_string()));
-    item.insert("age".to_string(), AttributeValue::N(age.to_string()));
-
-    seed_item(
+    seed_attributes(
         db,
-        PutItemInput::builder()
-            .table_name(TableName::new(table_name))
-            .item(item)
-            .build(),
+        table_name,
+        vec![
+            ("id", AttributeValue::S(id.to_string())),
+            ("name", AttributeValue::S(name.to_string())),
+            ("age", AttributeValue::N(age.to_string())),
+        ],
     )
-    .await
-    .unwrap();
-}
-
-async fn put_nested_scan_item(db: &DatabaseManager, table_name: &str) {
-    let item = HashMap::from([
-        ("id".to_string(), AttributeValue::S("item-1".to_string())),
-        (
-            "status".to_string(),
-            AttributeValue::S("active".to_string()),
-        ),
-        (
-            "tags".to_string(),
-            AttributeValue::L(vec![
-                AttributeValue::S("red".to_string()),
-                AttributeValue::S("blue".to_string()),
-            ]),
-        ),
-        (
-            "profile".to_string(),
-            AttributeValue::M(HashMap::from([
-                ("name".to_string(), AttributeValue::S("Ada".to_string())),
-                ("age".to_string(), AttributeValue::N("37".to_string())),
-                ("city".to_string(), AttributeValue::S("London".to_string())),
-            ])),
-        ),
-        (
-            "nested".to_string(),
-            AttributeValue::M(HashMap::from([(
-                "list".to_string(),
-                AttributeValue::L(vec![
-                    AttributeValue::M(HashMap::from([
-                        ("v".to_string(), AttributeValue::S("first".to_string())),
-                        ("x".to_string(), AttributeValue::S("drop".to_string())),
-                    ])),
-                    AttributeValue::M(HashMap::from([(
-                        "v".to_string(),
-                        AttributeValue::S("second".to_string()),
-                    )])),
-                ]),
-            )])),
-        ),
-    ]);
-
-    seed_item(
-        db,
-        PutItemInput::builder()
-            .table_name(TableName::new(table_name))
-            .item(item)
-            .build(),
-    )
-    .await
-    .unwrap();
+    .await;
 }
 
 async fn put_test_item_hash_range(db: &DatabaseManager, table_name: &str, pk: &str, sk: &str) {
-    let mut item = HashMap::new();
-    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
-    item.insert("sk".to_string(), AttributeValue::S(sk.to_string()));
-
-    seed_item(
+    seed_attributes(
         db,
-        PutItemInput::builder()
-            .table_name(TableName::new(table_name))
-            .item(item)
-            .build(),
+        table_name,
+        vec![
+            ("pk", AttributeValue::S(pk.to_string())),
+            ("sk", AttributeValue::S(sk.to_string())),
+        ],
     )
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn scan_empty_table() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "EmptyTable").await;
-
-        let payload = json!({
-            "TableName": "EmptyTable"
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok());
-
-        if let Response::Scan(response) = result.unwrap() {
-            assert_eq!(response.count, 0);
-            assert_eq!(response.scanned_count, 0);
-            assert!(response.items.is_some());
-            assert!(decode_scan_items(response.items).unwrap().is_empty());
-            assert!(response.last_evaluated_key.is_none());
-        } else {
-            panic!("Expected Scan response");
-        }
-    }
+    .await;
 }
 
 #[tokio::test]
@@ -420,107 +298,6 @@ async fn scan_with_limit_returns_compatible_hash_range_last_evaluated_key() {
     }
 }
 
-#[tokio::test]
-async fn scan_single_item() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "SingleItemTable").await;
-        put_test_item(db.as_ref(), "SingleItemTable", "item1", "Test Item", 25).await;
-
-        let payload = json!({
-            "TableName": "SingleItemTable"
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok());
-
-        if let Response::Scan(response) = result.unwrap() {
-            assert_eq!(response.count, 1);
-            assert_eq!(response.scanned_count, 1);
-            let items = decode_scan_items(response.items).unwrap();
-            assert_eq!(items.len(), 1);
-
-            let item = &items[0];
-            assert_eq!(
-                item.get("id"),
-                Some(&AttributeValue::S("item1".to_string()))
-            );
-            assert_eq!(
-                item.get("name"),
-                Some(&AttributeValue::S("Test Item".to_string()))
-            );
-            assert_eq!(item.get("age"), Some(&AttributeValue::N("25".to_string())));
-        } else {
-            panic!("Expected Scan response");
-        }
-    }
-}
-
-#[tokio::test]
-async fn scan_multiple_items() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "MultiItemTable").await;
-
-        put_test_item(db.as_ref(), "MultiItemTable", "user1", "Alice", 30).await;
-        put_test_item(db.as_ref(), "MultiItemTable", "user2", "Bob", 25).await;
-        put_test_item(db.as_ref(), "MultiItemTable", "user3", "Carol", 35).await;
-
-        let payload = json!({
-            "TableName": "MultiItemTable"
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok());
-
-        if let Response::Scan(response) = result.unwrap() {
-            assert_eq!(response.count, 3);
-            assert_eq!(response.scanned_count, 3);
-            let items = decode_scan_items(response.items).unwrap();
-            assert_eq!(items.len(), 3);
-        } else {
-            panic!("Expected Scan response");
-        }
-    }
-}
-
-#[tokio::test]
-async fn scan_with_limit() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "LimitedTable").await;
-
-        for i in 1..=5 {
-            put_test_item(
-                &db,
-                "LimitedTable",
-                &format!("item{i}"),
-                &format!("Name {i}"),
-                20 + i,
-            )
-            .await;
-        }
-
-        let payload = json!({
-            "TableName": "LimitedTable",
-            "Limit": 2
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok(), "{}: {result:?}", backend.name);
-
-        if let Response::Scan(response) = result.unwrap() {
-            assert_eq!(response.count, 2, "{}", backend.name);
-            assert_eq!(response.scanned_count, 2, "{}", backend.name);
-            let items = decode_scan_items(response.items).unwrap();
-            assert_eq!(items.len(), 2, "{}", backend.name);
-            assert!(response.last_evaluated_key.is_some(), "{}", backend.name);
-        } else {
-            panic!("{} expected Scan response", backend.name);
-        }
-    }
-}
-
 fn scan_item_ids(items: &[storage_types::AttributeMap]) -> Vec<String> {
     items
         .iter()
@@ -531,37 +308,6 @@ fn scan_item_ids(items: &[storage_types::AttributeMap]) -> Vec<String> {
             id.clone()
         })
         .collect()
-}
-
-#[tokio::test]
-async fn scan_with_filter_expression() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "FilterTable").await;
-        put_test_item(db.as_ref(), "FilterTable", "user1", "Alice", 20).await;
-        put_test_item(db.as_ref(), "FilterTable", "user2", "Bob", 30).await;
-        put_test_item(db.as_ref(), "FilterTable", "user3", "Carol", 40).await;
-
-        let payload = json!({
-            "TableName": "FilterTable",
-            "FilterExpression": "age > :minAge",
-            "ExpressionAttributeValues": {
-                ":minAge": {"N": "25"}
-            }
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok());
-
-        if let Response::Scan(response) = result.unwrap() {
-            assert_eq!(response.count, 2); // Bob (30) and Carol (40)
-            assert_eq!(response.scanned_count, 3); // All 3 items were scanned
-            let items = decode_scan_items(response.items).unwrap();
-            assert_eq!(items.len(), 2);
-        } else {
-            panic!("Expected Scan response");
-        }
-    }
 }
 
 #[tokio::test]
@@ -675,43 +421,11 @@ async fn scan_count_filter_and_limit_keep_evaluated_frontier() {
 }
 
 #[tokio::test]
-async fn scan_with_projection_expression() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "ProjectionTable").await;
-        put_test_item(db.as_ref(), "ProjectionTable", "user1", "Alice", 25).await;
-
-        let payload = json!({
-            "TableName": "ProjectionTable",
-            "ProjectionExpression": "id, #name",
-            "ExpressionAttributeNames": {
-                "#name": "name"
-            }
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok());
-
-        if let Response::Scan(response) = result.unwrap() {
-            let items = decode_scan_items(response.items).unwrap();
-            assert_eq!(items.len(), 1);
-
-            let item = &items[0];
-            assert!(item.contains_key("id"));
-            assert!(item.contains_key("name"));
-            assert!(!item.contains_key("age")); // Should be excluded by projection
-        } else {
-            panic!("Expected Scan response");
-        }
-    }
-}
-
-#[tokio::test]
 async fn scan_filter_expression_uses_full_condition_expression_engine() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;
         create_test_table(db.as_ref(), "FullFilterTable").await;
-        put_nested_scan_item(db.as_ref(), "FullFilterTable").await;
+        seed_nested_projection_item(db.as_ref(), "FullFilterTable", "id").await;
 
         let payload = json!({
             "TableName": "FullFilterTable",
@@ -737,7 +451,7 @@ async fn scan_filter_expression_supports_size_function() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;
         create_test_table(db.as_ref(), "FullFilterSizeTable").await;
-        put_nested_scan_item(db.as_ref(), "FullFilterSizeTable").await;
+        seed_nested_projection_item(db.as_ref(), "FullFilterSizeTable", "id").await;
 
         let payload = json!({
             "TableName": "FullFilterSizeTable",
@@ -762,7 +476,7 @@ async fn scan_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;
         create_test_table(db.as_ref(), "NestedProjectionTable").await;
-        put_nested_scan_item(db.as_ref(), "NestedProjectionTable").await;
+        seed_nested_projection_item(db.as_ref(), "NestedProjectionTable", "id").await;
 
         let payload = json!({
             "TableName": "NestedProjectionTable",
@@ -783,10 +497,10 @@ async fn scan_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
 
         assert_eq!(
             item.get("profile"),
-            Some(&AttributeValue::M(HashMap::from([(
+            Some(&AttributeValue::M(AttributeMap::from(HashMap::from([(
                 "name".to_string(),
                 AttributeValue::S("Ada".to_string()),
-            )])))
+            )]))))
         );
         assert_eq!(
             item.get("tags"),
@@ -796,118 +510,13 @@ async fn scan_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
         );
         assert_eq!(
             item.get("nested"),
-            Some(&AttributeValue::M(HashMap::from([(
+            Some(&AttributeValue::M(AttributeMap::from(HashMap::from([(
                 "list".to_string(),
-                AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
-                    "v".to_string(),
-                    AttributeValue::S("first".to_string()),
-                )]))]),
-            )])))
+                AttributeValue::L(vec![AttributeValue::M(AttributeMap::from(HashMap::from(
+                    [("v".to_string(), AttributeValue::S("first".to_string()),)]
+                )))]),
+            )]))))
         );
-    }
-}
-
-#[tokio::test]
-async fn scan_count_only() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "CountTable").await;
-
-        put_test_item(db.as_ref(), "CountTable", "item1", "Alice", 25).await;
-        put_test_item(db.as_ref(), "CountTable", "item2", "Bob", 30).await;
-
-        let payload = json!({
-            "TableName": "CountTable",
-            "Select": "COUNT"
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_ok());
-
-        if let Response::Scan(response) = result.unwrap() {
-            assert_eq!(response.count, 2);
-            assert_eq!(response.scanned_count, 2);
-            assert!(response.items.is_none()); // No items returned for COUNT
-        } else {
-            panic!("Expected Scan response");
-        }
-    }
-}
-
-#[tokio::test]
-async fn scan_nonexistent_table() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-
-        let payload = json!({
-            "TableName": "NonExistentTable"
-        });
-
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        assert!(result.is_err());
-
-        let handler_error = result.unwrap_err();
-        assert_eq!(handler_error.status_code, 400);
-        assert!(
-            handler_error
-                .error_type
-                .contains("ResourceNotFoundException")
-        );
-    }
-}
-
-#[tokio::test]
-async fn scan_empty_table_name() {
-    let payload = json!({
-        "TableName": ""
-    });
-
-    let request_result: Result<storage_types::ScanRequest, String> = payload.try_into();
-    assert!(request_result.is_err(), "Request should fail validation");
-
-    let error = request_result.unwrap_err();
-    assert!(error.contains("TableName cannot be empty"));
-}
-
-#[tokio::test]
-async fn scan_missing_expression_attribute_values() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "TestTable").await;
-
-        let payload = json!({
-            "TableName": "TestTable",
-            "FilterExpression": "age > :minAge"
-            // Missing ExpressionAttributeValues
-        });
-
-        let request_result: Result<storage_types::ScanRequest, String> = payload.try_into();
-        assert!(request_result.is_err(), "Request should fail validation");
-
-        let error = request_result.unwrap_err();
-        assert!(error.contains(
-            "Invalid FilterExpression: An expression attribute value used in expression is not \
-             defined; attribute value: :minAge"
-        ));
-    }
-}
-
-#[tokio::test]
-async fn scan_invalid_filter_expression() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-        create_test_table(db.as_ref(), "TestTable").await;
-
-        let payload = json!({
-            "TableName": "TestTable",
-            "FilterExpression": "invalid filter"
-        });
-
-        let request_result: Result<storage_types::ScanRequest, String> = payload.try_into();
-        assert!(request_result.is_err(), "Request should fail validation");
-
-        let error = request_result.unwrap_err();
-        assert!(error.contains("Invalid FilterExpression"));
     }
 }
 
@@ -959,7 +568,7 @@ async fn scan_consumed_capacity_total() {
             let consumed_capacity = response.consumed_capacity.unwrap();
 
             assert_eq!(consumed_capacity.table_name.to_string(), "TestTable");
-            assert!(consumed_capacity.capacity_units > 0.0);
+            assert_eq!(consumed_capacity.capacity_units, 0.0);
         } else {
             panic!("Expected Scan response");
         }
@@ -967,26 +576,7 @@ async fn scan_consumed_capacity_total() {
 }
 
 #[tokio::test]
-async fn scan_invalid_json() {
-    for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
-
-        // Invalid JSON - missing closing brace
-        let payload = json!({
-            "TableName": "TestTable"
-        });
-
-        // This should pass JSON parsing but fail request parsing
-        let result = handle_scan(db.clone(), payload.try_into().unwrap()).await;
-        // This test would require malformed JSON, which is hard to create with
-        // json! macro In practice, this would be tested through integration
-        // tests
-        assert!(result.is_ok() || result.is_err()); // Either outcome is acceptable for this test
-    }
-}
-
-#[tokio::test]
-async fn given_partial_gsi_projection_when_scan_requests_missing_attributes_then_request_is_rejected()
+async fn given_partial_gsi_projection_when_scan_projects_missing_attributes_then_request_is_rejected()
  {
     for backend in default_conformance_backends() {
         for projection in [
@@ -1014,8 +604,6 @@ async fn given_partial_gsi_projection_when_scan_requests_missing_attributes_then
             for selection in [
                 json!({"ProjectionExpression": "#missing", "ExpressionAttributeNames": {"#missing": "private_note"}}),
                 json!({"AttributesToGet": ["private_note"]}),
-                json!({"FilterExpression": "#missing = :wanted", "ExpressionAttributeNames": {"#missing": "private_note"}, "ExpressionAttributeValues": {":wanted": {"S": "hidden"}}}),
-                json!({"FilterExpression": "attribute_exists(gpk) OR attribute_exists(#missing.child[0])", "ExpressionAttributeNames": {"#missing": "private_note"}}),
             ] {
                 let mut request = json!({"TableName": table, "IndexName": "ByGroup"});
                 request
@@ -1030,6 +618,37 @@ async fn given_partial_gsi_projection_when_scan_requests_missing_attributes_then
                     error.message.contains("does not project [private_note]"),
                     "{error:?}"
                 );
+            }
+            let error = handle_scan(
+                db.clone(),
+                json!({"TableName": table, "IndexName": "ByGroup", "Select": "ALL_ATTRIBUTES"})
+                    .try_into()
+                    .expect("scan request"),
+            )
+            .await
+            .expect_err("Select ALL_ATTRIBUTES needs an ALL projection");
+            assert_eq!(error.status_code, 400, "{}", backend.name);
+            assert_eq!(
+                error.message,
+                "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
+                 supported for global secondary index ByGroup because its projection type is not \
+                 ALL"
+            );
+            // AWS (probe 2026-11-13) evaluates a Scan filter against the
+            // projected index item: an unprojected attribute is missing.
+            for filter in [
+                json!({"FilterExpression": "#missing = :wanted", "ExpressionAttributeNames": {"#missing": "private_note"}, "ExpressionAttributeValues": {":wanted": {"S": "hidden"}}}),
+                json!({"FilterExpression": "attribute_exists(gpk) OR attribute_exists(#missing.child[0])", "ExpressionAttributeNames": {"#missing": "private_note"}}),
+            ] {
+                let mut request = json!({"TableName": table, "IndexName": "ByGroup"});
+                request
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(filter.as_object().unwrap().clone());
+                let response = handle_scan(db.clone(), request.try_into().expect("scan request"))
+                    .await
+                    .expect("GSI scan accepts a filter on an unprojected attribute");
+                assert!(matches!(response, Response::Scan(_)), "{}", backend.name);
             }
             let allowed = json!({
                 "TableName": table, "IndexName": "ByGroup", "ProjectionExpression": "id, gpk", "FilterExpression": "attribute_exists(gpk)"

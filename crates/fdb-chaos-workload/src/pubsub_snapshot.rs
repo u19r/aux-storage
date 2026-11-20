@@ -1,26 +1,30 @@
 //! Complete bounded durable snapshots for the simulator's publish oracle.
 
 use kv_backend::{AttemptMode, KvAttempt, KvBackend, KvRange, ReadProtection};
-use pubsub_provider::{DeliveryRecord, PublishCandidate, PublishIntent, Subscription};
-use storage_types::{StorageError, StorageResult, storage_serde};
+use pubsub_provider::{
+    DeliveryPayload, DeliveryRecordId, PublishCandidate, PublishIntent, Subscription,
+};
+use storage_types::{AttemptPlan, DeadlineClass, StorageError, StorageResult, storage_serde};
 
 pub(crate) async fn read_pubsub_snapshot(
     driver: kv_backend::foundationdb::FoundationDbBackend,
-) -> Result<(Vec<PublishCandidate>, Vec<DeliveryRecord>), String> {
+) -> Result<(Vec<PublishCandidate>, Vec<DeliveryPayload>), String> {
     driver
-        .with_attempt(AttemptMode::ReadOnly, |attempt| {
-            Box::pin(async move { read_snapshot_rows(attempt).await })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead)
+                .start(driver.attempt_deadlines()),
+            |attempt| Box::pin(async move { read_snapshot_rows(attempt).await }),
+        )
         .await
         .map_err(|error| crate::common::storage_error_detail(&error))
 }
 
 async fn read_snapshot_rows(
     attempt: &impl KvAttempt,
-) -> StorageResult<(Vec<PublishCandidate>, Vec<DeliveryRecord>)> {
+) -> StorageResult<(Vec<PublishCandidate>, Vec<DeliveryPayload>)> {
     let ranges = [
         kv_backend::PUBSUB_PUBLISH_INTENT_PREFIX,
-        kv_backend::PUBSUB_DELIVERY_PREFIX,
+        kv_backend::PUBSUB_DELIVERY_PAYLOAD_PREFIX,
     ]
     .into_iter()
     .map(|prefix| {
@@ -63,6 +67,7 @@ async fn read_snapshot_rows(
                 chunk.ok_or_else(|| StorageError::internal("publish audit snapshot missing"))?;
             let subscriptions: Vec<Subscription> = storage_serde::from_bytes(&chunk)?;
             Ok(PublishCandidate {
+                due_at: intent.due_at(),
                 intent,
                 subscriptions,
             })
@@ -95,12 +100,12 @@ fn decode_intent(entry: kv_backend::KvEntry) -> StorageResult<PublishIntent> {
     Ok(intent)
 }
 
-fn decode_delivery(entry: kv_backend::KvEntry) -> StorageResult<DeliveryRecord> {
-    let record: DeliveryRecord = storage_serde::from_bytes(&entry.value)?;
-    if entry.key.strip_prefix(kv_backend::PUBSUB_DELIVERY_PREFIX) != Some(record.id.0.as_bytes()) {
-        return Err(StorageError::internal(
-            "delivery audit identity differs from key",
-        ));
-    }
-    Ok(record)
+/// The payloads: written once by the chunk commit (W3S R1).
+fn decode_delivery(entry: kv_backend::KvEntry) -> StorageResult<DeliveryPayload> {
+    let id = entry
+        .key
+        .strip_prefix(kv_backend::PUBSUB_DELIVERY_PAYLOAD_PREFIX)
+        .and_then(|id| std::str::from_utf8(id).ok())
+        .ok_or_else(|| StorageError::internal("delivery audit key is invalid"))?;
+    DeliveryPayload::decode(&entry.value, &DeliveryRecordId(id.to_owned()))
 }

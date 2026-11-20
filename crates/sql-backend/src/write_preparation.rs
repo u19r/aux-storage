@@ -1,28 +1,23 @@
-//! SQL new-image lowering before writer admission; revisions remain protected.
+//! SQL new-image lowering before writer admission.
 
 use std::borrow::Cow;
 
-use storage_provider::{
-    AcceptedUpsert, BoundPutItem, ItemPrimaryEffects, PreparedWriteAttempt, UpsertImage,
-};
+use storage_provider::{AcceptedUpsert, BoundPutItem, LiveItemMetadata, UpsertImage};
 use storage_types::{
     AttributeName, AttributeValue, BoundTableInfo, KeyAttributeType, KeyAttributes,
-    KeySchemaElement, StorageError, StorageResult, TableHistoryId, planned_key_columns,
+    KeySchemaElement, PlannedKeyColumn, StorageError, StorageResult, TableHistoryId,
+    planned_key_columns,
 };
 
 use crate::{
-    SqlAttempt, SqlEngine, SqlLayout, SqlStatement, SqlValue,
-    catalog::SqlCatalogAttempt,
-    gsi::PreparedGsiWrite,
+    SqlEngine, SqlLayout, SqlValue,
     item_read::encode_key_value,
-    item_tombstone::sql_statements::delete_tombstone_statement,
     write_batch::{DeleteShape, PreparedDeleteRow, PreparedUpsertRow, UpsertShape},
 };
 
 #[derive(Default)]
 pub struct SqlPreparedWrites {
     pub(crate) primary: Vec<PreparedPrimaryWrite>,
-    pub(crate) gsi: Vec<PreparedGsiWrite>,
 }
 
 impl SqlPreparedWrites {
@@ -31,52 +26,13 @@ impl SqlPreparedWrites {
         prepared
             .primary
             .try_reserve_exact(items.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let projections = items
-            .iter()
-            .try_fold(0usize, |count, item| {
-                count.checked_add(item.gsi_puts().count())
-            })
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        prepared
-            .gsi
-            .try_reserve_exact(projections)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for item in items {
             prepared
                 .primary
                 .push(PreparedPrimaryWrite::try_new(engine, (*item).into())?);
-            for row in item.gsi_puts() {
-                prepared.gsi.push(PreparedGsiWrite::try_new(
-                    engine,
-                    &item.table,
-                    &row.key,
-                    Some(row),
-                )?);
-            }
         }
         Ok(prepared)
-    }
-}
-
-impl<A: SqlAttempt, L: SqlLayout> PreparedWriteAttempt for SqlCatalogAttempt<'_, A, L> {
-    type PreparedWrites = SqlPreparedWrites;
-    fn install_prepared_writes(&mut self, writes: StorageResult<Self::PreparedWrites>) {
-        if let Err(error) = &writes {
-            self.attempt.reject_settlement_error(error);
-        }
-        self.prepared_writes = writes;
-    }
-
-    fn prepare_put_items(&mut self, items: &[&BoundPutItem]) -> StorageResult<()> {
-        let mut operation =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = operation.as_mut();
-        catalog.prepared_writes = Ok(Default::default());
-        let result = SqlPreparedWrites::try_new(catalog.engine, items).map(|writes| {
-            catalog.prepared_writes = Ok(writes);
-        });
-        operation.complete(result)
     }
 }
 
@@ -86,8 +42,7 @@ pub(crate) struct PreparedPrimaryWrite {
     relation: String,
     shape: UpsertShape,
     binds: Vec<SqlValue>,
-    revision_bind: usize,
-    tombstone: SqlStatement,
+    metadata_bind: usize,
     image: Vec<u8>,
 }
 
@@ -100,16 +55,14 @@ impl PreparedPrimaryWrite {
         )?;
         let history_id = item.table.history_id;
         let key = item.key.clone();
-        let tombstone = delete_tombstone_statement(engine, item.table, item.key)?;
-        let (relation, shape, binds, revision_bind) = encode_primary_upsert(engine, item)?;
+        let (relation, shape, binds, metadata_bind) = encode_primary_upsert(engine, item)?;
         Ok(Self {
             history_id,
             key,
             relation,
             shape,
             binds,
-            revision_bind,
-            tombstone,
+            metadata_bind,
             image,
         })
     }
@@ -120,71 +73,95 @@ impl PreparedPrimaryWrite {
 
     pub(crate) fn prepare(
         self,
-        effects: &ItemPrimaryEffects,
-    ) -> StorageResult<(PreparedUpsertRow, SqlStatement)> {
+        effects: &LiveItemMetadata<'_>,
+    ) -> StorageResult<PreparedUpsertRow> {
         let image = self.image;
         let mut binds = self.binds;
-        binds[self.revision_bind + 4] = SqlValue::Blob(image);
-        binds[self.revision_bind] = SqlValue::Integer(i64::try_from(effects.revision())?);
-        binds[self.revision_bind + 1] = SqlValue::try_from(crate::row_view::SqlValueRef::Blob(
+        binds[self.metadata_bind + 4] = SqlValue::Blob(image);
+        binds[self.metadata_bind] = SqlValue::try_from(crate::row_view::SqlValueRef::Blob(
             effects.provenance().as_bytes(),
         ))?;
-        binds[self.revision_bind + 2] = effects
+        binds[self.metadata_bind + 1] = effects
             .ttl_epoch()
             .map_or(SqlValue::Null, SqlValue::Integer);
-        Ok((
-            PreparedUpsertRow {
-                relation: self.relation,
-                shape: self.shape,
-                binds,
-            },
-            self.tombstone,
-        ))
+        binds[self.metadata_bind + 2] = effects
+            .ttl_key()
+            .map(|key| key.encode_ordered_bytes().map(SqlValue::Blob))
+            .transpose()?
+            .unwrap_or(SqlValue::Null);
+        Ok(PreparedUpsertRow {
+            relation: self.relation,
+            shape: self.shape,
+            binds,
+        })
     }
 }
 
+/// The upsert lists the table key, the key column of each GSI that writers
+/// maintain (from the new image; NULL for a sparse item), and the payload.
+/// No GSI relation, revision guard, or tombstone is written.
 fn encode_primary_upsert(
     engine: impl SqlLayout,
     item: storage_provider::UpsertImage<'_>,
 ) -> StorageResult<(String, UpsertShape, Vec<SqlValue>, usize)> {
     let table = &item.table.info;
-    let schemas = table
-        .global_secondary_indexes
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|index| index.key_schema.as_slice());
-    let columns = planned_key_columns(&table.key_schema, schemas, &table.attribute_definitions);
+    let mut columns = planned_key_columns(
+        &table.key_schema,
+        std::iter::empty(),
+        &table.attribute_definitions,
+    )
+    .into_iter()
+    .map(|column| {
+        let name = crate::statement::SqlText::render(format_args!(
+            "{}",
+            AttributeName::new(&column.attribute_name).sanitized()
+        ))?;
+        Ok((name, column))
+    })
+    .collect::<StorageResult<Vec<_>>>()?;
+    for column in crate::item_schema::projecting_key_columns(&item.table.binding) {
+        columns.push((
+            crate::item_schema::key_column_identifier(column),
+            PlannedKeyColumn {
+                attribute_name: column.attribute.clone(),
+                attribute_type: column.kind,
+            },
+        ));
+    }
     let field_count = columns
         .len()
         .checked_add(item.declaration.names().len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut fields = Vec::new();
     fields
         .try_reserve_exact(field_count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     fields.extend(
         columns
             .iter()
-            .map(|column| column.attribute_name.as_str())
+            .map(|(_, column)| column.attribute_name.as_str())
             .chain(item.declaration.names().iter().map(String::as_str)),
     );
     let count = columns
         .len()
         .checked_add(5)
         .and_then(|count| count.checked_add(table.max_indexers.as_usize()))
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut row = InsertRow::try_new(engine, count)?;
     let attributes = item.new_item.project_attributes(&fields)?;
     row.append_item_keys(&item, columns, &attributes)?;
-    let revision_bind = row.binds.len();
-    for column in ["__aux_revision", "__aux_provenance", "__aux_ttl_epoch"] {
+    let metadata_bind = row.binds.len();
+    for column in [
+        "__aux_provenance",
+        "__aux_ttl_epoch",
+        crate::item_schema::TTL_KEY_COLUMN,
+    ] {
         row.push(column.into(), None, SqlValue::Null);
     }
     row.append_item_payload(&item, &attributes)?;
     let physical = engine.item_table_name(item.table.history_id);
     let (relation, shape, binds) = row.finish(engine, &physical, &table.key_schema)?;
-    Ok((relation, shape, binds, revision_bind))
+    Ok((relation, shape, binds, metadata_bind))
 }
 
 pub(crate) fn encode_primary_delete(
@@ -198,13 +175,13 @@ pub(crate) fn encode_primary_delete(
     let mut binds = Vec::new();
     columns
         .try_reserve_exact(key_elements.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     numeric_columns
         .try_reserve_exact(key_elements.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     binds
         .try_reserve_exact(key_elements.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for element in key_elements {
         let column = AttributeName::new(&element.attribute_name);
         columns.push(column.sanitized().to_owned());
@@ -245,37 +222,29 @@ impl<L: SqlLayout> InsertRow<L> {
         };
         row.columns
             .try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         row.key_types
             .try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         row.binds
             .try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         Ok(row)
     }
 
     fn append_item_keys(
         &mut self,
         item: &storage_provider::UpsertImage<'_>,
-        columns: Vec<storage_types::PlannedKeyColumn>,
+        columns: Vec<(String, PlannedKeyColumn)>,
         attributes: &storage_types::AttributeMap,
     ) -> StorageResult<()> {
-        for column in columns {
+        for (name, column) in columns {
             let value = item.key_column_value(&column, attributes);
             let bind = value
                 .map(|value| encode_key_value(self.engine, value))
                 .transpose()?
                 .unwrap_or(SqlValue::Null);
-            self.push(
-                crate::statement::SqlText::render(format_args!(
-                    "{}",
-                    AttributeName::new(&column.attribute_name).sanitized()
-                ))?
-                .into(),
-                Some(column.attribute_type),
-                bind,
-            );
+            self.push(name.into(), Some(column.attribute_type), bind);
         }
         Ok(())
     }
@@ -354,7 +323,7 @@ impl<L: SqlLayout> InsertRow<L> {
             .into_iter()
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
-        let shape = UpsertShape::try_new(columns, numeric_columns, conflict_columns, false)?;
+        let shape = UpsertShape::try_new(columns, numeric_columns, conflict_columns)?;
         Ok((physical.to_owned(), shape, self.binds))
     }
 }

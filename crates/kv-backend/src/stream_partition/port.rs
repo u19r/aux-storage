@@ -22,15 +22,6 @@ use crate::{
 };
 
 impl<B: KvBackend + 'static> PartitionReconciliationSource for KvStore<B> {
-    fn admitted_partition_reconciliation(
-        self: Arc<Self>,
-        binding: Arc<storage_provider::native_admission::NativeAdmissionBinding>,
-    ) -> StorageResult<Option<Arc<dyn PartitionReconciliationRepository>>> {
-        Ok(Some(Arc::new(
-            storage_provider::maintenance::AdmittedPartitionRepository::new(self, binding),
-        )))
-    }
-
     fn partition_reconciliation(
         self: Arc<Self>,
     ) -> Option<Arc<dyn PartitionReconciliationRepository>> {

@@ -21,8 +21,16 @@ impl From<&StorageError> for FailureDisposition {
         if error.is_commit_unknown() {
             return Self::Unknown;
         }
+        // An operation deadline that expires before commit submission
+        // destroys the transaction and its staged mutations.
+        if error
+            .attempt_kind()
+            .is_some_and(storage_types::AttemptKind::is_unavailable)
+        {
+            return Self::KnownAborted;
+        }
         match error.recursive_context(Vec::new()).0 {
-            StorageEnum::TransactionConflict { .. } => Self::KnownAborted,
+            StorageEnum::Attempt(storage_types::AttemptFailure::Conflict(_)) => Self::KnownAborted,
             _ => Self::Unexpected,
         }
     }
@@ -73,42 +81,7 @@ impl TableAtomicityWorkload {
     pub(crate) fn record(&mut self, event: HistoryEvent) {
         self.model.apply(&event);
         self.possible_model.apply(&event);
-        self.apply_gsi_model(&event);
         self.history.push(event);
-    }
-
-    pub(crate) fn apply_gsi_model(&mut self, event: &HistoryEvent) {
-        match &event.outcome {
-            OperationOutcome::Committed => match event.kind {
-                OperationKind::Put
-                | OperationKind::PutIfAbsent
-                | OperationKind::Update
-                | OperationKind::TransactWrite => {
-                    if let Some(value) = &event.value
-                        && let Some((partition, sort)) = self.gsi_projection(&event.key, value)
-                    {
-                        self.gsi_seen_partitions.insert(partition.clone());
-                        self.gsi_model.put(
-                            partition,
-                            GsiEntry::new(event.key.clone(), sort, value.clone()),
-                        );
-                    }
-                }
-                OperationKind::Delete => {
-                    self.gsi_model.delete(&event.key);
-                }
-                OperationKind::Read => {}
-            },
-            OperationOutcome::Unknown { .. } => {
-                if let Some(value) = &event.value
-                    && let Some((partition, _)) = self.gsi_projection(&event.key, value)
-                {
-                    self.gsi_seen_partitions.insert(partition.clone());
-                    self.gsi_unclassified_partitions.insert(partition);
-                }
-            }
-            OperationOutcome::ConditionFailed { .. } | OperationOutcome::Failed { .. } => {}
-        }
     }
 
     pub(crate) fn sim_time_us(&self) -> u64 {

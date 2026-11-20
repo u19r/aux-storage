@@ -8,45 +8,52 @@ version = "0.1.0"
 [lib]
 doctest = false
 
+[[bin]]
+name = "storage-recovery"
+path = "src/bin/storage-recovery/main.rs"
+required-features = ["foundationdb"]
+
 [features]
 default = ["sqlite"]
 sqlite = ["storage/sqlite", "storage-types/sqlite"]
 turso = ["storage/turso", "storage-types/turso"]
 postgres = ["storage/postgres", "storage-types/postgres"]
 rocksdb = ["storage/rocksdb", "storage-types/rocksdb"]
-foundationdb = ["storage/foundationdb"]
-queue = ["dep:queue", "dep:queue-provider"]
-pubsub = ["dep:pubsub"]
+foundationdb = ["storage/foundationdb", "dep:kv-backend"]
 remote = ["storage/remote"]
-regional = ["storage/regional"]
-test-support = ["storage/test-support"]
+test-support = [
+    "http-error/test-support",
+    "pubsub/test-support",
+    "queue-provider/test-support",
+    "storage/test-support",
+    "storage-provider/test-support",
+    "storage-types/test-support",
+    "stream-provider/test-support",
+]
 tokio-console = ["dep:console-subscriber"]
 internal-test-routes = []
 
 [dependencies]
-async-trait = { workspace = true }
 axum = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
 config = { path = "../config" }
 console-subscriber = { version = "0.5.0", optional = true }
-futures = { workspace = true }
 http-error = { path = "../http-error" }
 http-request = { workspace = true }
+jiff = { workspace = true }
+kv-backend = { path = "../kv-backend", features = ["foundationdb"], optional = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-facade = { workspace = true }
 notify = { workspace = true, default-features = true }
-pubsub = { path = "../pubsub", default-features = false, optional = true }
-queue = { path = "../queue", default-features = false, optional = true }
-queue-provider = { path = "../queue-provider", optional = true }
+pubsub = { path = "../pubsub", default-features = false }
+queue = { path = "../queue", default-features = false }
+queue-provider = { path = "../queue-provider" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 storage = { path = "../storage", default-features = false }
-storage-backfill = { path = "../storage-backfill" }
 storage-common = { path = "../storage-common" }
-storage-condition = { path = "../storage-condition" }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types", default-features = false }
 stream-provider = { path = "../stream-provider" }
@@ -60,45 +67,49 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
-anyhow = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-sqs = { workspace = true }
 bytes = { workspace = true }
-cpu-time = { workspace = true }
+http-error = { path = "../http-error", features = ["test-support"] }
 httpmock = { workspace = true }
+pubsub = { path = "../pubsub", default-features = false, features = ["test-support"] }
+queue-provider = { path = "../queue-provider", features = ["test-support"] }
 queue-remote = { path = "../queue-remote" }
-regional-replication = { path = "../regional-replication" }
-replication-provider = { workspace = true }
-replication-types = { path = "../replication-types" }
 reqwest = { workspace = true }
-rusqlite = { workspace = true }
 scheduled-bg-jobs = { workspace = true }
 scheduled-bg-jobs-conformance = { workspace = true }
+sql-backend = { path = "../sql-backend", features = ["fault-injection"] }
 storage = { path = "../storage", default-features = false, features = ["test-support"] }
 storage-observability-test-support = { path = "../storage-observability-test-support" }
+storage-provider = { path = "../storage-provider", features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
+stream-provider = { path = "../stream-provider", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio-postgres = { workspace = true }
 tower = { version = "0.5.3", features = ["util"] }
+xmlparser = { workspace = true }
 yaml_serde = "0.10.7"
+
+[[test]]
+name = "aws_sqs_parity"
+path = "tests/aws_sqs_parity_tests/mod.rs"
+required-features = ["sqlite"]
 
 [[test]]
 name = "scheduled_job_store_remote"
 path = "tests/scheduled_job_store_remote_tests.rs"
-required-features = ["remote", "sqlite", "queue"]
+required-features = ["remote", "sqlite"]
 
 [[test]]
 name = "remote_canary_fixture"
 path = "tests/remote_canary_fixture_tests/mod.rs"
 harness = false
-required-features = ["remote", "sqlite", "queue"]
+required-features = ["remote", "sqlite"]
 
 [[test]]
 name = "remote_canary_lifecycle"
 path = "tests/remote_canary_lifecycle_tests/mod.rs"
-required-features = ["remote", "sqlite", "queue"]
-
-[[test]]
-name = "regional_http"
-path = "tests/regional_http_tests/mod.rs"
-required-features = ["regional", "test-support"]
+required-features = ["remote", "sqlite"]
 
 [[test]]
 name = "query_source_remote"
@@ -108,7 +119,7 @@ required-features = ["remote", "sqlite"]
 [[test]]
 name = "queue_publication_remote"
 path = "tests/queue_publication_remote_tests.rs"
-required-features = ["remote", "sqlite", "queue", "test-support"]
+required-features = ["remote", "sqlite", "test-support"]
 
 [lints]
 workspace = true

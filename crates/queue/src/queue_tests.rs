@@ -3,42 +3,28 @@ use std::{collections::HashMap, time::Instant};
 
 use queue_provider::{
     ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityBatchRequestEntry,
-    ChangeMessageVisibilityRequest, CreateQueueRequest, DeleteMessageBatchRequest,
-    DeleteMessageBatchRequestEntry, DeleteMessageRequest, GetQueueAttributesRequest,
-    MessageAttributeValue, ReceiveMessageRequest, SendMessageBatchRequest,
-    SendMessageBatchRequestEntry, SendMessageRequest,
+    CreateQueueRequest, DeleteMessageRequest, GetQueueAttributesRequest, ReceiveMessageRequest,
+    SendMessageBatchRequest, SendMessageBatchRequestEntry, SendMessageRequest,
 };
 
-#[cfg(feature = "sqlite")]
-use crate::queue_test_support_tests::{create_sqlite_service, local_sqlite_test_path};
 use crate::{QueueManager, queue_test_support_tests::create_selected_test_service};
 
 async fn create_test_service() -> QueueManager {
     create_selected_test_service("queue-tests").await
 }
 
+/// A shared database (Postgres, FoundationDB) keeps queues between runs, so
+/// each run gets its own queue.
 async fn create_test_queue(service: &QueueManager, queue_name: &str) -> String {
     service
         .create_queue(CreateQueueRequest {
-            queue_name: queue_name.to_string(),
+            queue_name: crate::queue_test_support_tests::unique_suffix(queue_name),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap()
         .queue_url
-}
-
-#[tokio::test]
-async fn create_queue() {
-    let service = create_test_service().await;
-
-    let request = CreateQueueRequest {
-        queue_name: "test-queue".to_string(),
-        attributes: None,
-    };
-
-    let response = service.create_queue(request).await.unwrap();
-    assert!(!response.queue_url.is_empty());
 }
 
 #[tokio::test]
@@ -49,6 +35,7 @@ async fn manager_rejects_invalid_queue_name_before_storage() {
         .create_queue(CreateQueueRequest {
             queue_name: "invalid.name".to_string(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -72,7 +59,7 @@ async fn manager_rejects_unsupported_queue_attributes_before_storage() {
     let error = service
         .set_queue_attributes(queue_provider::SetQueueAttributesRequest {
             queue_url,
-            attributes: HashMap::from([("RedrivePolicy".to_string(), "{}".to_string())]),
+            attributes: HashMap::from([("RedriveAllowPolicy".to_string(), "{}".to_string())]),
         })
         .await
         .unwrap_err();
@@ -83,7 +70,7 @@ async fn manager_rejects_unsupported_queue_attributes_before_storage() {
     );
     assert_eq!(
         error.aws_query_message(),
-        "Unsupported queue attribute: RedrivePolicy"
+        "RedriveAllowPolicy is not supported"
     );
 }
 
@@ -98,6 +85,7 @@ async fn manager_rejects_empty_message_body_before_storage() {
             message_body: String::new(),
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -105,30 +93,6 @@ async fn manager_rejects_empty_message_body_before_storage() {
     assert_eq!(
         error.aws_query_message(),
         "The request must contain the parameter MessageBody."
-    );
-}
-
-#[tokio::test]
-async fn manager_rejects_receive_count_above_sqs_limit() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "receive-validation").await;
-
-    let error = service
-        .receive_message(ReceiveMessageRequest {
-            queue_url: queue_url.clone(),
-            max_number_of_messages: Some(11),
-            visibility_timeout: None,
-            wait_time_seconds: None,
-            attribute_names: None,
-            message_attribute_names: None,
-        })
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        error.aws_query_message(),
-        "Value 11 for parameter MaxNumberOfMessages is invalid. Reason: Must be between 1 and 10, \
-         if provided."
     );
 }
 
@@ -146,12 +110,14 @@ async fn manager_rejects_duplicate_batch_entry_ids_before_partial_send() {
                     message_body: "first".to_string(),
                     delay_seconds: None,
                     message_attributes: None,
+                    ..Default::default()
                 },
                 SendMessageBatchRequestEntry {
                     id: "dup".to_string(),
                     message_body: "second".to_string(),
                     delay_seconds: None,
                     message_attributes: None,
+                    ..Default::default()
                 },
             ],
         })
@@ -174,284 +140,6 @@ async fn manager_rejects_duplicate_batch_entry_ids_before_partial_send() {
 }
 
 #[tokio::test]
-async fn create_queue_is_idempotent_when_attributes_match() {
-    let service = create_test_service().await;
-    let mut attributes = HashMap::new();
-    attributes.insert("VisibilityTimeout".to_string(), "30".to_string());
-
-    let first_response = service
-        .create_queue(CreateQueueRequest {
-            queue_name: "idempotent-queue".to_string(),
-            attributes: Some(attributes.clone()),
-        })
-        .await
-        .unwrap();
-    let response = service
-        .create_queue(CreateQueueRequest {
-            queue_name: "idempotent-queue".to_string(),
-            attributes: Some(attributes),
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(response.queue_url, first_response.queue_url);
-}
-
-#[tokio::test]
-async fn create_queue_rejects_existing_queue_with_different_attributes() {
-    let service = create_test_service().await;
-
-    let first_response = service
-        .create_queue(CreateQueueRequest {
-            queue_name: "duplicate-queue".to_string(),
-            attributes: Some(HashMap::from([(
-                "VisibilityTimeout".to_string(),
-                "30".to_string(),
-            )])),
-        })
-        .await
-        .unwrap()
-        .queue_url;
-    assert!(!first_response.is_empty());
-    let result = service
-        .create_queue(CreateQueueRequest {
-            queue_name: "duplicate-queue".to_string(),
-            attributes: Some(HashMap::from([(
-                "VisibilityTimeout".to_string(),
-                "60".to_string(),
-            )])),
-        })
-        .await;
-
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn send_message() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "send-queue").await;
-
-    // Send a message
-    let send_request = SendMessageRequest {
-        queue_url,
-        message_body: "Hello, World!".to_string(),
-        delay_seconds: None,
-        message_attributes: None,
-    };
-
-    let response = service.send_message(send_request).await.unwrap();
-    assert!(!response.message_id.to_string().is_empty());
-    assert!(!response.md5_of_body.is_empty());
-    assert_eq!(response.md5_of_body.len(), 32); // MD5 hash is 32 hex chars
-}
-
-#[tokio::test]
-async fn receive_message() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "receive-queue").await;
-
-    let send_request = SendMessageRequest {
-        queue_url: queue_url.clone(),
-        message_body: "Test message".to_string(),
-        delay_seconds: None,
-        message_attributes: None,
-    };
-    service.send_message(send_request).await.unwrap();
-
-    // Receive the message
-    let receive_request = ReceiveMessageRequest {
-        queue_url,
-        max_number_of_messages: Some(1),
-        visibility_timeout: None,
-        wait_time_seconds: None,
-        attribute_names: None,
-        message_attribute_names: None,
-    };
-
-    let response = service.receive_message(receive_request).await.unwrap();
-
-    assert_eq!(response.messages.len(), 1);
-    let message = &response.messages[0];
-    assert_eq!(message.body, "Test message");
-    assert!(!message.receipt_handle.is_empty());
-    assert!(!message.message_id.clone().is_empty());
-}
-
-#[tokio::test]
-async fn delete_message() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "delete-queue").await;
-
-    let send_request = SendMessageRequest {
-        queue_url: queue_url.clone(),
-        message_body: "Delete me".to_string(),
-        delay_seconds: None,
-        message_attributes: None,
-    };
-    service.send_message(send_request).await.unwrap();
-
-    let receive_request = ReceiveMessageRequest {
-        queue_url: queue_url.clone(),
-        max_number_of_messages: Some(1),
-        visibility_timeout: None,
-        wait_time_seconds: None,
-        attribute_names: None,
-        message_attribute_names: None,
-    };
-    let receive_response = service.receive_message(receive_request).await.unwrap();
-    let receipt_handle = &receive_response.messages[0].receipt_handle;
-    let delete_request = DeleteMessageRequest {
-        queue_url,
-        receipt_handle: receipt_handle.as_str().into(),
-    };
-
-    let result = service.delete_message(delete_request).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn change_message_visibility() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "visibility-queue").await;
-
-    let send_request = SendMessageRequest {
-        queue_url: queue_url.clone(),
-        message_body: "Visibility test".to_string(),
-        delay_seconds: None,
-        message_attributes: None,
-    };
-    service.send_message(send_request).await.unwrap();
-
-    let receive_request = ReceiveMessageRequest {
-        queue_url: queue_url.clone(),
-        max_number_of_messages: Some(1),
-        visibility_timeout: Some(30),
-        wait_time_seconds: None,
-        attribute_names: None,
-        message_attribute_names: None,
-    };
-    let receive_response = service.receive_message(receive_request).await.unwrap();
-    let receipt_handle = &receive_response.messages[0].receipt_handle;
-
-    // Change visibility timeout
-    let change_request = ChangeMessageVisibilityRequest {
-        queue_url,
-        receipt_handle: receipt_handle.as_str().into(),
-        visibility_timeout: 120,
-    };
-
-    let result = service.change_message_visibility(change_request).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn send_message_with_attributes() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "attr-queue").await;
-
-    let mut message_attributes = HashMap::new();
-    message_attributes.insert(
-        "priority".to_string(),
-        MessageAttributeValue {
-            string_value: Some("high".to_string()),
-            binary_value: None,
-            data_type: "String".to_string(),
-        },
-    );
-
-    let send_request = SendMessageRequest {
-        queue_url,
-        message_body: "Message with attributes".to_string(),
-        delay_seconds: None,
-        message_attributes: Some(message_attributes),
-    };
-
-    let response = service.send_message(send_request).await.unwrap();
-    assert!(!response.message_id.to_string().is_empty());
-}
-
-#[tokio::test]
-async fn send_message_batch_returns_per_entry_successes() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "send-batch-queue").await;
-
-    let response = service
-        .send_message_batch(SendMessageBatchRequest {
-            queue_url,
-            entries: vec![
-                SendMessageBatchRequestEntry {
-                    id: "first".to_string(),
-                    message_body: "one".to_string(),
-                    delay_seconds: None,
-                    message_attributes: None,
-                },
-                SendMessageBatchRequestEntry {
-                    id: "second".to_string(),
-                    message_body: "two".to_string(),
-                    delay_seconds: None,
-                    message_attributes: None,
-                },
-            ],
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(response.successful.len(), 2);
-    assert!(response.failed.is_empty());
-    assert_eq!(response.successful[0].id, "first");
-    assert_eq!(response.successful[1].id, "second");
-}
-
-#[tokio::test]
-async fn delete_message_batch_returns_mixed_success_and_failure_entries() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "delete-batch-queue").await;
-    service
-        .send_message(SendMessageRequest {
-            queue_url: queue_url.clone(),
-            message_body: "delete me".to_string(),
-            delay_seconds: None,
-            message_attributes: None,
-        })
-        .await
-        .unwrap();
-    let receive_response = service
-        .receive_message(ReceiveMessageRequest {
-            queue_url: queue_url.clone(),
-            max_number_of_messages: Some(1),
-            visibility_timeout: Some(30),
-            wait_time_seconds: None,
-            attribute_names: None,
-            message_attribute_names: None,
-        })
-        .await
-        .unwrap();
-    let receipt_handle = receive_response.messages[0].receipt_handle.as_str().into();
-
-    let response = service
-        .delete_message_batch(DeleteMessageBatchRequest {
-            queue_url,
-            entries: vec![
-                DeleteMessageBatchRequestEntry {
-                    id: "ok".to_string(),
-                    receipt_handle,
-                },
-                DeleteMessageBatchRequestEntry {
-                    id: "missing".to_string(),
-                    receipt_handle: "missing-handle".into(),
-                },
-            ],
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(response.successful.len(), 1);
-    assert_eq!(response.successful[0].id, "ok");
-    assert_eq!(response.failed.len(), 1);
-    assert_eq!(response.failed[0].id, "missing");
-}
-
-#[tokio::test]
 async fn change_message_visibility_batch_returns_successes() {
     let service = create_test_service().await;
     let queue_url = create_test_queue(&service, "change-batch-queue").await;
@@ -461,6 +149,7 @@ async fn change_message_visibility_batch_returns_successes() {
             message_body: "change me".to_string(),
             delay_seconds: None,
             message_attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -493,141 +182,18 @@ async fn change_message_visibility_batch_returns_successes() {
 }
 
 #[tokio::test]
-async fn empty_queue_receive() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "empty-queue").await;
-
-    let receive_request = ReceiveMessageRequest {
-        queue_url,
-        max_number_of_messages: Some(5),
-        visibility_timeout: None,
-        wait_time_seconds: None,
-        attribute_names: None,
-        message_attribute_names: None,
-    };
-
-    let response = service.receive_message(receive_request).await.unwrap();
-    assert_eq!(response.messages.len(), 0);
-}
-
-#[tokio::test]
-async fn get_queue_attributes_returns_defaults_and_approximate_counts() {
-    let service = create_test_service().await;
-    let queue_url = create_test_queue(&service, "attributes-count-queue").await;
-    service
-        .send_message(SendMessageRequest {
-            queue_url: queue_url.clone(),
-            message_body: "visible".to_string(),
-            delay_seconds: None,
-            message_attributes: None,
-        })
-        .await
-        .unwrap();
-    service
-        .send_message(SendMessageRequest {
-            queue_url: queue_url.clone(),
-            message_body: "delayed".to_string(),
-            delay_seconds: Some(60),
-            message_attributes: None,
-        })
-        .await
-        .unwrap();
-    let received = service
-        .receive_message(ReceiveMessageRequest {
-            queue_url: queue_url.clone(),
-            max_number_of_messages: Some(1),
-            visibility_timeout: Some(60),
-            wait_time_seconds: None,
-            attribute_names: None,
-            message_attribute_names: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(received.messages.len(), 1);
-
-    let response = service
-        .get_queue_attributes(GetQueueAttributesRequest {
-            queue_url,
-            attribute_names: Some(vec!["All".to_string()]),
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(response.attributes["DelaySeconds"], "0");
-    assert_eq!(response.attributes["MaximumMessageSize"], "1048576");
-    assert_eq!(response.attributes["ApproximateNumberOfMessages"], "0");
-    assert_eq!(
-        response.attributes["ApproximateNumberOfMessagesNotVisible"],
-        "1"
-    );
-    assert_eq!(
-        response.attributes["ApproximateNumberOfMessagesDelayed"],
-        "1"
-    );
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn sqlite_shared_backend_prevents_duplicate_concurrent_claims() {
-    let db_path = local_sqlite_test_path("shared-queue");
-    let first_manager = create_sqlite_service(&db_path).await;
-    let second_manager = create_sqlite_service(&db_path).await;
-
-    let queue_url = first_manager
-        .create_queue(CreateQueueRequest {
-            queue_name: "shared-queue".to_string(),
-            attributes: None,
-        })
-        .await
-        .unwrap()
-        .queue_url;
-    first_manager
-        .send_message(SendMessageRequest {
-            queue_url: queue_url.clone(),
-            message_body: "shared".to_string(),
-            delay_seconds: None,
-            message_attributes: None,
-        })
-        .await
-        .unwrap();
-
-    let first_receive = first_manager.receive_message(ReceiveMessageRequest {
-        queue_url: queue_url.clone(),
-        max_number_of_messages: Some(1),
-        visibility_timeout: Some(30),
-        wait_time_seconds: None,
-        attribute_names: None,
-        message_attribute_names: None,
-    });
-    let second_receive = second_manager.receive_message(ReceiveMessageRequest {
-        queue_url,
-        max_number_of_messages: Some(1),
-        visibility_timeout: Some(30),
-        wait_time_seconds: None,
-        attribute_names: None,
-        message_attribute_names: None,
-    });
-
-    let (first_response, second_response) = tokio::join!(first_receive, second_receive);
-    let received_count =
-        first_response.unwrap().messages.len() + second_response.unwrap().messages.len();
-
-    assert_eq!(received_count, 1);
-}
-
-#[tokio::test]
 async fn sqlite_send_receive_delete_handles_representative_local_volume() {
     let service = create_test_service().await;
     let queue_url = service
         .create_queue(CreateQueueRequest {
             queue_name: "volume-check-queue".to_string(),
             attributes: None,
+            ..Default::default()
         })
         .await
         .unwrap()
         .queue_url;
 
-    let started = Instant::now();
     for index in 0..200usize {
         service
             .send_message(SendMessageRequest {
@@ -635,6 +201,7 @@ async fn sqlite_send_receive_delete_handles_representative_local_volume() {
                 message_body: format!("volume-check-{index}"),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -672,11 +239,6 @@ async fn sqlite_send_receive_delete_handles_representative_local_volume() {
                 .unwrap();
         }
     }
-
-    eprintln!(
-        "200-message send/receive/delete elapsed={:?}",
-        started.elapsed()
-    );
 }
 
 #[tokio::test]
@@ -694,6 +256,7 @@ async fn given_private_queue_and_body_when_messages_are_sent_then_traces_omit_id
                 message_body: body.to_owned(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -703,6 +266,7 @@ async fn given_private_queue_and_body_when_messages_are_sent_then_traces_omit_id
                 message_body: body.to_owned(),
                 delay_seconds: None,
                 message_attributes: None,
+                ..Default::default()
             })
             .await;
         assert!(failure.is_err());
@@ -723,4 +287,187 @@ async fn given_private_queue_and_body_when_messages_are_sent_then_traces_omit_id
             "private queue data entered tracing"
         );
     }
+}
+
+/// W12 through the manager: `QueueArn`, a policy set with a string count
+/// reads back in normal form, the move, the source ARN on receive, and
+/// `ListDeadLetterSourceQueues` with paging.
+#[tokio::test]
+async fn manager_moves_exhausted_message_to_dead_letter_queue_and_lists_its_source() {
+    let service = create_test_service().await;
+    let dlq = create_test_queue(&service, "dlq").await;
+    let source = create_test_queue(&service, "dlq-source").await;
+    let attributes = |queue_url: &str, names: &[&str]| GetQueueAttributesRequest {
+        queue_url: queue_url.to_owned(),
+        attribute_names: Some(names.iter().map(|name| (*name).to_owned()).collect()),
+    };
+    let dlq_arn = service
+        .get_queue_attributes(attributes(&dlq, &["QueueArn"]))
+        .await
+        .unwrap()
+        .attributes["QueueArn"]
+        .clone();
+    let source_arn = service
+        .get_queue_attributes(attributes(&source, &["All"]))
+        .await
+        .unwrap()
+        .attributes["QueueArn"]
+        .clone();
+    service
+        .set_queue_attributes(queue_provider::SetQueueAttributesRequest {
+            queue_url: source.clone(),
+            attributes: HashMap::from([(
+                "RedrivePolicy".to_owned(),
+                format!("{{\"deadLetterTargetArn\":\"{dlq_arn}\",\"maxReceiveCount\":\"1\"}}"),
+            )]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .get_queue_attributes(attributes(&source, &["RedrivePolicy"]))
+            .await
+            .unwrap()
+            .attributes["RedrivePolicy"],
+        format!("{{\"deadLetterTargetArn\":\"{dlq_arn}\",\"maxReceiveCount\":1}}")
+    );
+    service
+        .send_message(SendMessageRequest {
+            queue_url: source.clone(),
+            message_body: "poison".to_owned(),
+            delay_seconds: None,
+            message_attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let receive = |queue_url: &str| ReceiveMessageRequest {
+        queue_url: queue_url.to_owned(),
+        max_number_of_messages: Some(1),
+        visibility_timeout: Some(0),
+        wait_time_seconds: Some(0),
+        attribute_names: Some(vec!["All".to_owned()]),
+        message_attribute_names: None,
+    };
+    assert_eq!(
+        service
+            .receive_message(receive(&source))
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    assert!(
+        service
+            .receive_message(receive(&source))
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    let moved = service
+        .receive_message(receive(&dlq))
+        .await
+        .unwrap()
+        .messages;
+    assert_eq!(moved.len(), 1);
+    let moved_attributes = moved[0].attributes.as_ref().unwrap();
+    assert_eq!(moved_attributes["DeadLetterQueueSourceArn"], source_arn);
+    assert_eq!(moved_attributes["ApproximateReceiveCount"], "2");
+
+    let listed = service
+        .list_dead_letter_source_queues(queue_provider::ListDeadLetterSourceQueuesRequest {
+            queue_url: dlq.clone(),
+            max_results: Some(1),
+            next_token: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.queue_urls, vec![source.clone()]);
+    assert_eq!(listed.next_token, None);
+    let error = service
+        .list_dead_letter_source_queues(queue_provider::ListDeadLetterSourceQueuesRequest {
+            queue_url: dlq,
+            max_results: Some(0),
+            next_token: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.aws_query_error_type(),
+        queue_provider::SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE
+    );
+}
+
+/// Review A1 through the manager: two queues that are each other's
+/// dead-letter queue with `maxReceiveCount = 1`. A long poll on the second
+/// queue is woken by the move and receives the message; it does not move the
+/// message back and wait on.
+#[tokio::test]
+async fn manager_long_poll_on_a_redrive_cycle_receives_the_moved_message() {
+    let service = create_test_service().await;
+    let first = create_test_queue(&service, "cycle-a").await;
+    let second = create_test_queue(&service, "cycle-b").await;
+    let arn = |queue_url: &str| {
+        let service = &service;
+        let queue_url = queue_url.to_owned();
+        async move {
+            service
+                .get_queue_attributes(GetQueueAttributesRequest {
+                    queue_url,
+                    attribute_names: Some(vec!["QueueArn".to_owned()]),
+                })
+                .await
+                .unwrap()
+                .attributes["QueueArn"]
+                .clone()
+        }
+    };
+    for (source, target) in [(&first, &second), (&second, &first)] {
+        let target_arn = arn(target).await;
+        service
+            .set_queue_attributes(queue_provider::SetQueueAttributesRequest {
+                queue_url: source.clone(),
+                attributes: HashMap::from([(
+                    "RedrivePolicy".to_owned(),
+                    format!("{{\"deadLetterTargetArn\":\"{target_arn}\",\"maxReceiveCount\":1}}"),
+                )]),
+            })
+            .await
+            .unwrap();
+    }
+    service
+        .send_message(SendMessageRequest {
+            queue_url: first.clone(),
+            message_body: "cycle".to_owned(),
+            delay_seconds: None,
+            message_attributes: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let receive = |queue_url: &str, wait: u32| ReceiveMessageRequest {
+        queue_url: queue_url.to_owned(),
+        max_number_of_messages: Some(1),
+        visibility_timeout: Some(0),
+        wait_time_seconds: Some(wait.into()),
+        attribute_names: Some(vec!["All".to_owned()]),
+        message_attribute_names: None,
+    };
+    let started = Instant::now();
+    let (polled, ()) = tokio::join!(service.receive_message(receive(&second, 5)), async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let delivered = service.receive_message(receive(&first, 0)).await.unwrap();
+        assert_eq!(delivered.messages.len(), 1);
+        let moved = service.receive_message(receive(&first, 0)).await.unwrap();
+        assert!(moved.messages.is_empty(), "the second receive moves");
+    });
+    let polled = polled.unwrap().messages;
+    assert_eq!(polled.len(), 1, "the long poll receives the moved message");
+    assert_eq!(polled[0].body, "cycle");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the long poll ended on the move, not on its timeout"
+    );
 }

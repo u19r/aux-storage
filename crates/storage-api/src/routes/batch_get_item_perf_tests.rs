@@ -1,6 +1,5 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc};
 
-use alloc_counter::AllocationGuard;
 use axum::{
     body::{self, Bytes},
     extract::State,
@@ -14,49 +13,6 @@ use crate::{
     routes::{dynamodb::dynamodb_endpoint, routes_tests::seed_item},
     types::AppState,
 };
-
-const ITERATIONS: u32 = 20;
-
-#[tokio::test]
-#[ignore = "manual caller-thread allocation probe; SQLite worker allocations are excluded"]
-async fn given_realistic_batches_when_http_batch_get_then_measure_caller_allocations() {
-    for width in [800, 1150, 1500] {
-        let state = create_batch_fixture(width).await;
-        for (label, count, mode) in [
-            ("one_projected", 1, "expression"),
-            ("ten_projected", 10, "expression"),
-            ("quarter_projected", 25, "expression"),
-            ("full_projected", 100, "expression"),
-            ("full_wire", 100, "wire"),
-            ("legacy_projected", 25, "legacy"),
-            ("mixed_tables", 25, "mixed"),
-            ("missing_items", 25, "missing"),
-            ("wire_holdout", 25, "wire"),
-        ] {
-            let request = make_batch_request(count, mode);
-            for _ in 0..3 {
-                execute_batch_request(&state, &request).await;
-            }
-            let guard = AllocationGuard::start(module_path!(), label, file!(), line!(), None);
-            let started = Instant::now();
-            let mut last_body = Bytes::new();
-            for _ in 0..ITERATIONS {
-                last_body = execute_batch_request(&state, &request).await;
-                std::hint::black_box(&last_body);
-            }
-            let elapsed = started.elapsed();
-            let report = guard.finish();
-            assert_batch_response(&last_body, count, mode, width);
-            println!(
-                "batch_get_http case={label} width={width} iterations={ITERATIONS} \
-                 allocations_per_op={:.2} bytes_per_op={:.2} us_per_op={:.2}",
-                report.allocation_count as f64 / f64::from(ITERATIONS),
-                report.allocated_bytes as f64 / f64::from(ITERATIONS),
-                elapsed.as_secs_f64() * 1_000_000.0 / f64::from(ITERATIONS),
-            );
-        }
-    }
-}
 
 #[tokio::test]
 async fn given_mixed_batch_get_shapes_when_projecting_then_preserve_items_and_empty_tables() {

@@ -1,86 +1,38 @@
-//! Protected KV item and revision observations for a native write.
+//! Protected KV item observations for a native write.
 
 use storage_backfill::GsiProjectionLifecycle;
-use storage_common::{TtlConfigRecord, TtlIndexWrite, TtlIndexWriteBatch};
+use storage_common::{TtlIndexWrite, TtlIndexWriteBatch};
 use storage_provider::{
-    AcceptedUpsert, ItemPrimaryEffects, ItemWriteObservation, ItemWriteObservationAttempt,
-    ItemWriteObservationRead, UpsertAttempt, combine_write_observations,
+    AcceptedDeleteItem, AcceptedUpsert, BoundPutItem, ItemWriteAttempt, ItemWriteObservation,
+    ItemWriteObservationRead, LiveItemMetadata, combine_write_observations,
     lifecycle_tables_for_writes,
 };
-use storage_types::{BoundTableInfo, KeyAttributes, StorageError, StorageResult, storage_serde};
+use storage_types::{BoundTableInfo, StorageError, StorageResult};
 
 use crate::{
-    KvAttempt, KvMutation, ReadProtection,
-    catalog::{KvCatalogAttempt, KvTableIdentity},
+    KvAttempt, KvMutation,
+    catalog::{KvCatalogAttempt, table_id_from_history},
     expiration::key_layout::encode_index_key,
-    gsi::{decode_gsi_lifecycle, gsi_build_keys},
-    item_read::{HydratedPrimaryItem, decode_primary_items, primary_item_key},
-    item_tombstone::{decode::decode_deleted, primary_tombstone_key},
-    stream_history, ttl_policy,
+    item_read::{decode_primary_items, primary_item_key},
+    write_preparation::KvPreparedWrites,
 };
 
-impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
-    fn item_write_cache(&self) -> Option<&storage_provider::TableMetadataCache> {
-        self.metadata_cache.as_deref()
-    }
-
+impl<A: KvAttempt> ItemWriteAttempt for KvCatalogAttempt<'_, A> {
     async fn read_item_write_prerequisites(
         &mut self,
-        table: &BoundTableInfo,
+        _table: &BoundTableInfo,
         prerequisites: storage_provider::ItemWritePrerequisites,
-    ) -> StorageResult<Option<TtlConfigRecord>> {
+    ) -> StorageResult<()> {
         let mut operation =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = operation.as_mut();
         let result = async {
-            let storage_provider::ItemWritePrerequisites {
-                needs_ttl,
-                needs_history,
-            } = prerequisites;
-            let mut keys = Vec::new();
-            keys.try_reserve_exact(usize::from(needs_ttl))
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            if needs_ttl {
-                let identity = catalog.identity_for(&table.info.table_name)?;
-                keys.push(ttl_policy::ttl_config_key(identity.table_id));
+            if prerequisites.needs_history
+                && catalog.attempt.root_attempt().writer_routes().is_none()
+            {
+                return Err(StorageError::internal("KV writer routes were not prepared"));
             }
-            let needs_history = needs_history && catalog.dynamo_history.is_none();
-            let attempt = &*catalog.attempt;
-            let protection = catalog.protection;
-            let values = async {
-                if keys.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    attempt.get_batch(keys, protection).await
-                }
-            };
-            let history = async {
-                if needs_history {
-                    stream_history::read_history(attempt).await.map(Some)
-                } else {
-                    Ok(None)
-                }
-            };
-            let (values, history) = futures::try_join!(values, history)?;
-            if let Some(history) = history {
-                catalog.dynamo_history = Some(stream_history::KvSystemWriteState::new(history));
-            }
-            if values.len() != usize::from(needs_ttl) {
-                return Err(StorageError::internal(
-                    "KV item write prerequisite count differs",
-                ));
-            }
-            let mut values = values.into_iter();
-            let ttl = if needs_ttl {
-                values
-                    .next()
-                    .ok_or_else(|| StorageError::internal("KV TTL prerequisite is missing"))?
-                    .map(|bytes| storage_serde::from_bytes(&bytes))
-                    .transpose()?
-            } else {
-                None
-            };
-            Ok(ttl)
+            Ok(())
         }
         .await;
         operation.complete(result)
@@ -89,68 +41,66 @@ impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
     async fn observe_for_writes(
         &mut self,
         reads: &[ItemWriteObservationRead<'_>],
-    ) -> StorageResult<Vec<(ItemWriteObservation, GsiProjectionLifecycle)>> {
+    ) -> StorageResult<storage_types::Exact<(ItemWriteObservation, GsiProjectionLifecycle)>> {
         let mut operation =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = operation.as_mut();
         let result = async {
-            let count = reads
-                .len()
-                .checked_mul(2)
-                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            let mut keys = Vec::new();
-            let mut key_jsons = Vec::new();
-            keys.try_reserve_exact(count)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            key_jsons
-                .try_reserve_exact(reads.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
             let lifecycle_tables = lifecycle_tables_for_writes(reads)?;
+            // Paired write targets read their marker in the same native call
+            // (no new wave).
+            let mut marker_reads = Vec::new();
+            for (index, read) in reads.iter().enumerate() {
+                if read.reads_marker() {
+                    marker_reads.push(index);
+                }
+            }
+            let mut keys = Vec::new();
+            keys.try_reserve_exact(reads.len() + marker_reads.len())
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             for read in reads {
                 let (table, key) = read.target();
-                let identity = catalog.identity_for(&table.info.table_name)?;
-                let (primary, key_json) = write_observation_keys(identity, table, key)?;
-                keys.extend(primary);
-                key_jsons.push(key_json);
+                keys.push(primary_item_key(
+                    table_id_from_history(table.history_id)?,
+                    table,
+                    key,
+                )?);
             }
-            let primary_count = keys.len();
-            let mut identities = Vec::new();
-            let mut lifecycle_counts = Vec::new();
-            identities
-                .try_reserve_exact(lifecycle_tables.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            lifecycle_counts
-                .try_reserve_exact(lifecycle_tables.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            for table in lifecycle_tables {
-                identities.push(catalog.identity_for(&table.info.table_name)?.clone());
-            }
-            for identity in &identities {
-                let builds = gsi_build_keys(identity)?;
-                keys.try_reserve_exact(builds.len())
-                    .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-                lifecycle_counts.push(builds.len());
-                keys.extend(builds);
+            for &index in &marker_reads {
+                let (table, key) = reads[index].target();
+                keys.push(crate::regional::regional_marker_key(
+                    table_id_from_history(table.history_id)?,
+                    table,
+                    key,
+                )?);
             }
             let expected = keys.len();
-            let values = catalog
+            let mut values = catalog
                 .attempt
-                .get_batch(keys, ReadProtection::Conflict)
+                .get_batch_primary_layouts(keys, &mut catalog.primary_layouts)
                 .await?;
             if values.len() != expected {
                 return Err(StorageError::internal(
                     "KV write observation returned the wrong count",
                 ));
             }
+            if catalog
+                .attempt
+                .root_attempt()
+                .native_pipelined_version_moved()
+            {
+                return Ok(None);
+            }
+            let markers = values.split_off(reads.len());
             let mut requests = Vec::new();
             requests
                 .try_reserve_exact(reads.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             requests.extend(
                 reads
                     .iter()
                     .enumerate()
-                    .map(|(index, read)| (read.target().0, values[index * 2].as_deref())),
+                    .map(|(index, read)| (read.target().0, values[index].as_deref())),
             );
             let hydrated = decode_primary_items(
                 requests,
@@ -168,57 +118,53 @@ impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
                     ));
                 }
             }
-            let mut hydrated = hydrated.into_iter();
-            let mut values = values.into_iter();
-            let mut items = Vec::new();
-            items
-                .try_reserve_exact(reads.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            for (read, key_json) in reads.iter().zip(key_jsons) {
-                let (table, _) = read.target();
-                values
-                    .next()
-                    .ok_or_else(|| StorageError::internal("KV item observation is missing"))?;
-                let revision = values
-                    .next()
-                    .ok_or_else(|| StorageError::internal("KV revision observation is missing"))?;
-                items.push(decode_primary_observation(
-                    table,
-                    &key_json,
-                    hydrated
-                        .next()
-                        .ok_or_else(|| StorageError::internal("Missing primary observation"))?,
-                    revision,
-                )?);
+            let mut items: Vec<ItemWriteObservation> = hydrated
+                .into_iter()
+                .map(|item| match item {
+                    None => ItemWriteObservation::Absent,
+                    Some(item) => ItemWriteObservation::Live {
+                        stored: Box::new(item.stored),
+                        provenance: item.provenance,
+                        ttl_epoch: item.ttl_epoch,
+                    },
+                })
+                .collect();
+            for (index, value) in marker_reads.into_iter().zip(markers) {
+                let marker = value
+                    .as_deref()
+                    .map(storage_types::RegionalMarker::decode)
+                    .transpose()?;
+                let observed = std::mem::replace(&mut items[index], ItemWriteObservation::Absent);
+                items[index] = observed.with_marker(marker)?;
             }
-            debug_assert_eq!(primary_count, reads.len() * 2);
-            let mut lifecycles = Vec::new();
-            lifecycles
-                .try_reserve_exact(identities.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            for (identity, count) in identities.into_iter().zip(lifecycle_counts) {
-                let mut builds = Vec::new();
-                builds
-                    .try_reserve_exact(count)
-                    .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-                builds.extend(values.by_ref().take(count));
-                lifecycles.push((
-                    identity.table_name.clone(),
-                    decode_gsi_lifecycle(&identity, builds)?,
-                ));
-            }
-            combine_write_observations(reads, items, lifecycles)
+            // GSI phases come from the confirmed catalog binding.
+            let lifecycles = lifecycle_tables
+                .into_iter()
+                .map(|table| {
+                    (
+                        table.info.table_name.clone(),
+                        GsiProjectionLifecycle::from_binding(table),
+                    )
+                })
+                .collect();
+            combine_write_observations(
+                reads,
+                storage_types::Exact::try_new(reads.len(), items)?,
+                lifecycles,
+            )
+            .map(Some)
         }
         .await;
-        operation.complete(result)
+        match operation.complete(result)? {
+            Some(observations) => Ok(observations),
+            None => Err(crate::catalog::pipelined_version_moved()),
+        }
     }
-}
 
-impl<A: KvAttempt> UpsertAttempt for KvCatalogAttempt<'_, A> {
     async fn prepare_primary_upsert(
         &mut self,
         item: &AcceptedUpsert,
-        effects: &ItemPrimaryEffects,
+        effects: &LiveItemMetadata<'_>,
         writes: TtlIndexWriteBatch,
     ) -> StorageResult<()> {
         let mut operation =
@@ -236,12 +182,12 @@ impl<A: KvAttempt> UpsertAttempt for KvCatalogAttempt<'_, A> {
                 None => crate::write_preparation::PreparedPrimaryWrite::try_new(item.into())?,
             };
             catalog.prepared_writes = Ok(prepared);
-            let identity = catalog.identity_for(&item.table.info.table_name)?.clone();
-            let mut changes = image.prepare(&identity, effects)?;
-            let ttl = ttl_index_mutations(identity.table_id, writes)?;
+            let table_id = table_id_from_history(item.table.history_id)?;
+            let mut changes = image.prepare(table_id, effects)?;
+            let ttl = ttl_index_mutations(table_id, writes)?;
             changes
                 .try_reserve(ttl.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             changes.extend(ttl);
             catalog.append_dynamo_mutations(changes)?;
             Ok(())
@@ -249,16 +195,50 @@ impl<A: KvAttempt> UpsertAttempt for KvCatalogAttempt<'_, A> {
         .await;
         operation.complete(result)
     }
-}
 
-fn write_observation_keys(
-    identity: &KvTableIdentity,
-    table: &BoundTableInfo,
-    key: &KeyAttributes,
-) -> StorageResult<([Vec<u8>; 2], String)> {
-    let primary = primary_item_key(identity, table, key)?;
-    let (tombstone, key_json) = primary_tombstone_key(table, key)?;
-    Ok(([primary, tombstone], key_json))
+    fn stage_primary_delete(
+        &mut self,
+        item: &AcceptedDeleteItem,
+        writes: TtlIndexWriteBatch,
+    ) -> StorageResult<()> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = (|| {
+            let table_id = table_id_from_history(item.table.history_id)?;
+            let ttl = ttl_index_mutations(table_id, writes)?;
+            let mut changes = Vec::new();
+            changes
+                .try_reserve(ttl.len() + 1)
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+            changes.push(crate::KvMutation::Delete {
+                key: crate::item_read::primary_item_key(table_id, &item.table, &item.key)?,
+            });
+            changes.extend(ttl);
+            catalog.append_dynamo_mutations(changes)?;
+            Ok(())
+        })();
+        operation.complete(result)
+    }
+
+    type PreparedWrites = KvPreparedWrites;
+    fn install_prepared_writes(&mut self, writes: StorageResult<Self::PreparedWrites>) {
+        if let Err(error) = &writes {
+            self.attempt.root_attempt().settlement().reject_error(error);
+        }
+        self.prepared_writes = writes;
+    }
+
+    fn prepare_put_items(&mut self, items: &[&BoundPutItem]) -> StorageResult<()> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        catalog.prepared_writes = Ok(Default::default());
+        let result = KvPreparedWrites::try_new(items).map(|writes| {
+            catalog.prepared_writes = Ok(writes);
+        });
+        operation.complete(result)
+    }
 }
 
 pub(crate) async fn apply_ttl_index_writes<A: KvAttempt>(
@@ -282,36 +262,16 @@ pub(crate) fn ttl_index_mutations(
         let key = encode_index_key(table_id, &key)?;
         mutations
             .try_reserve(1)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+        // Empty markers never hold chunks.
         mutations.push(if upsert {
-            KvMutation::Put {
+            KvMutation::PutUnchunked {
                 key,
                 value: Vec::new(),
             }
         } else {
-            KvMutation::Delete { key }
+            KvMutation::DeleteUnchunked { key }
         });
     }
     Ok(mutations)
-}
-
-fn decode_primary_observation(
-    table: &BoundTableInfo,
-    key_json: &str,
-    item: Option<HydratedPrimaryItem>,
-    revision: Option<Vec<u8>>,
-) -> StorageResult<ItemWriteObservation> {
-    match (item, revision) {
-        (None, None) => Ok(ItemWriteObservation::Absent),
-        (Some(item), None) => Ok(ItemWriteObservation::Live {
-            stored: Box::new(item.stored),
-            revision: item.revision,
-            provenance: item.provenance,
-            ttl_epoch: item.ttl_epoch,
-        }),
-        (None, Some(bytes)) => decode_deleted(table, key_json, &bytes),
-        (Some(_), Some(_)) => Err(StorageError::internal(
-            "KV key has both a live item and a tombstone",
-        )),
-    }
 }

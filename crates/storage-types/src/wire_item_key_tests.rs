@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{
-    AttributeValue, KeyAttributes, StorageEnum, WireItem, WireItemKeyAttributes,
-    context::WrappedError as _,
-};
+use crate::{AttributeValue, KeyAttributes, WireItem};
 
 fn key(value: AttributeValue) -> KeyAttributes {
     let mut key = KeyAttributes::new();
@@ -18,19 +15,15 @@ fn complete_wire_item_keeps_its_owned_representation_for_equivalent_numeric_key(
         ("data".to_owned(), AttributeValue::S("value".to_owned())),
     ]))
     .unwrap();
-    let original_data = match &original {
-        WireItem::DynamoJson { data } => data.as_ptr(),
-        WireItem::LocalSplit { .. } => panic!("expected Dynamo JSON"),
-    };
+    let WireItem::DynamoJson { data } = &original;
+    let original_data = data.as_ptr();
 
     let verified = original
         .with_verified_keys(&key(AttributeValue::N("100".to_owned())))
         .unwrap();
 
-    match verified {
-        WireItem::DynamoJson { data } => assert_eq!(data.as_ptr(), original_data),
-        WireItem::LocalSplit { .. } => panic!("complete item changed representation"),
-    }
+    let WireItem::DynamoJson { data } = verified;
+    assert_eq!(data.as_ptr(), original_data);
 }
 
 #[test]
@@ -53,35 +46,6 @@ fn missing_wire_key_is_completed_and_numeric_key_is_write_normalized() {
         completed.attribute_value("data").unwrap(),
         Some(AttributeValue::S("value".to_owned()))
     );
-}
-
-#[test]
-fn mismatched_local_split_key_is_rejected_even_if_blob_disagrees_in_other_direction() {
-    let blob = serde_json::to_vec(&HashMap::from([(
-        "pk".to_owned(),
-        AttributeValue::S("requested".to_owned()),
-    )]))
-    .unwrap();
-    let item = WireItem::local_split(
-        WireItemKeyAttributes::new(
-            "pk".to_owned(),
-            AttributeValue::S("stored".to_owned()),
-            None,
-            None,
-        ),
-        None,
-        Some(blob),
-    );
-
-    let error = item
-        .with_verified_keys(&key(AttributeValue::S("requested".to_owned())))
-        .unwrap_err();
-
-    assert!(matches!(
-        error.to_enum(),
-        StorageEnum::InternalServerError { message }
-            if message == "Key attribute mismatch for pk"
-    ));
 }
 
 #[test]

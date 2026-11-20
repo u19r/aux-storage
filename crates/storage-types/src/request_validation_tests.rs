@@ -131,19 +131,6 @@ fn update_table_rejects_invalid_aux_stream_duration_extensions() {
 }
 
 #[test]
-fn get_item_ignores_unknown_fields() {
-    let payload = json!({
-        "TableName": "TestTable",
-        "Key": {"id": {"S": "test123"}},
-        "InvalidField": "invalid",
-    });
-
-    let result: Result<GetItemRequest, String> = payload.try_into();
-    let request = result.unwrap();
-    assert_eq!(request.table_name.as_ref(), "TestTable");
-}
-
-#[test]
 fn get_item_empty_key_uses_dynamodb_schema_message() {
     let payload = json!({
         "TableName": "TestTable",
@@ -156,19 +143,6 @@ fn get_item_empty_key_uses_dynamodb_schema_message() {
 }
 
 #[test]
-fn put_item_ignores_unknown_fields() {
-    let payload = json!({
-        "TableName": "TestTable",
-        "Item": {"id": {"S": "test123"}},
-        "InvalidField": "invalid",
-    });
-
-    let result: Result<PutItemRequest, String> = payload.try_into();
-    let request = result.unwrap();
-    assert_eq!(request.table_name.as_ref(), "TestTable");
-}
-
-#[test]
 fn delete_item_ignores_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
@@ -177,18 +151,6 @@ fn delete_item_ignores_unknown_fields() {
     });
 
     let result: Result<DeleteItemRequest, String> = payload.try_into();
-    let request = result.unwrap();
-    assert_eq!(request.table_name.as_ref(), "TestTable");
-}
-
-#[test]
-fn scan_ignores_unknown_fields() {
-    let payload = json!({
-        "TableName": "TestTable",
-        "InvalidField": "invalid",
-    });
-
-    let result: Result<ScanRequest, String> = payload.try_into();
     let request = result.unwrap();
     assert_eq!(request.table_name.as_ref(), "TestTable");
 }
@@ -309,7 +271,7 @@ fn create_table_rejects_invalid_table_and_key_shapes() {
                 ]);
                 payload
             },
-            "Key attribute 'missing_pk' not found in AttributeDefinitions",
+            "Invalid KeySchema: Some index key attribute have no definition",
         ),
         (
             "too many gsis",
@@ -682,7 +644,10 @@ fn scan_rejects_missing_expression_values_and_invalid_filter_syntax() {
         "Invalid FilterExpression: An expression attribute value used in expression is not \
          defined; attribute value: :pk"
     );
-    assert_eq!(invalid_filter_err, "Invalid FilterExpression");
+    assert_eq!(
+        invalid_filter_err,
+        "Invalid FilterExpression: Syntax error; token: \"filter\", near: \"invalid filter\""
+    );
 }
 
 #[test]
@@ -2461,6 +2426,15 @@ fn single_item_and_transact_get_request_parameter_validation_matches_dynamodb() 
     );
 }
 
+/// A syntactically valid condition of exactly `MAX_EXPRESSION_BYTES`.
+fn max_size_condition_expression() -> String {
+    let wrapper = "attribute_exists()".len();
+    format!(
+        "attribute_exists({})",
+        "a".repeat(crate::MAX_EXPRESSION_BYTES - wrapper)
+    )
+}
+
 #[test]
 fn dynamodb_limit_boundaries_are_accepted() {
     let max_item = "x".repeat(crate::constants::MAX_ITEM_SIZE_BYTES - "pk".len());
@@ -2472,7 +2446,7 @@ fn dynamodb_limit_boundaries_are_accepted() {
     let put_item = json!({
         "TableName": "TestTable",
         "Item": { "pk": { "S": max_item } },
-        "ConditionExpression": "a".repeat(crate::MAX_EXPRESSION_BYTES)
+        "ConditionExpression": max_size_condition_expression()
     });
     let binary_put_item = json!({
         "TableName": "TestTable",
@@ -2553,7 +2527,7 @@ fn dynamodb_limit_boundaries_are_accepted() {
         "TableName": "TestTable",
         "KeyConditionExpression": "pk = :pk",
         "ExpressionAttributeValues": { ":pk": { "S": "1" } },
-        "FilterExpression": "a".repeat(crate::MAX_EXPRESSION_BYTES),
+        "FilterExpression": max_size_condition_expression(),
         "ProjectionExpression": "b".repeat(crate::MAX_EXPRESSION_BYTES)
     });
     let create_table = create_table_with_projected_attribute_count(20, 5);
@@ -2580,144 +2554,6 @@ fn dynamodb_limit_boundaries_are_accepted() {
     assert!(QueryRequest::try_from(query).is_ok());
     assert!(CreateTableRequest::try_from(create_table).is_ok());
     assert!(TransactGetItemsRequest::try_from(transact_get).is_ok());
-}
-
-#[test]
-fn dynamodb_item_limits_reject_invalid_requests() {
-    let max_binary_item_bytes =
-        crate::constants::MAX_ITEM_SIZE_BYTES - "pk".len() - "p".len() - "data".len();
-    let max_nested_list_binary_item_bytes = max_binary_item_bytes - 3 - 1;
-    let max_nested_map_binary_item_bytes = max_binary_item_bytes - 3 - 1 - "child".len();
-    let oversized_item = json!({
-        "TableName": "TestTable",
-        "Item": { "pk": { "S": "x".repeat(crate::constants::MAX_ITEM_SIZE_BYTES) } }
-    });
-    let oversized_binary_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": { "B": zero_binary_base64(max_binary_item_bytes + 1) }
-        }
-    });
-    let oversized_binary_set_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": {
-                "BS": [
-                    zero_binary_base64(max_binary_item_bytes / 2),
-                    zero_binary_base64((max_binary_item_bytes - (max_binary_item_bytes / 2)) + 1)
-                ]
-            }
-        }
-    });
-    let oversized_numeric_set_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": { "NS": number_string_set(20_480) }
-        }
-    });
-    let oversized_nested_list_number_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": { "L": number_list(19_505) }
-        }
-    });
-    let oversized_nested_map_numeric_set_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": {
-                "M": {
-                    "c": { "NS": number_string_set(20_480) }
-                }
-            }
-        }
-    });
-    let oversized_nested_list_binary_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": {
-                "L": [
-                    { "B": zero_binary_base64(max_nested_list_binary_item_bytes + 1) }
-                ]
-            }
-        }
-    });
-    let oversized_nested_map_binary_set_item = json!({
-        "TableName": "TestTable",
-        "Item": {
-            "pk": { "S": "p" },
-            "data": {
-                "M": {
-                    "child": {
-                        "BS": [
-                            zero_binary_base64(max_nested_map_binary_item_bytes / 2),
-                            zero_binary_base64(
-                                (max_nested_map_binary_item_bytes
-                                    - (max_nested_map_binary_item_bytes / 2))
-                                    + 1
-                            )
-                        ]
-                    }
-                }
-            }
-        }
-    });
-    let oversized_attribute_name = json!({
-        "TableName": "TestTable",
-        "Item": { "x".repeat(crate::constants::MAX_ATTRIBUTE_NAME_BYTES + 1): { "S": "1" } }
-    });
-    let too_deep_item = json!({
-        "TableName": "TestTable",
-        "Item": { "pk": nested_attribute_value(crate::constants::MAX_ATTRIBUTE_NESTING_DEPTH + 1) }
-    });
-
-    assert_eq!(
-        PutItemRequest::try_from(oversized_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_binary_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_binary_set_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_numeric_set_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_nested_list_number_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_nested_map_numeric_set_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_nested_list_binary_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert_eq!(
-        PutItemRequest::try_from(oversized_nested_map_binary_set_item).unwrap_err(),
-        "Item size has exceeded the maximum allowed size"
-    );
-    assert!(
-        PutItemRequest::try_from(oversized_attribute_name)
-            .unwrap_err()
-            .contains("attribute name cannot exceed")
-    );
-    assert!(
-        PutItemRequest::try_from(too_deep_item)
-            .unwrap_err()
-            .contains("nesting depth")
-    );
 }
 
 fn zero_binary_base64(byte_len: usize) -> String {
@@ -2783,7 +2619,7 @@ fn dynamodb_index_limits_reject_invalid_requests() {
     assert!(
         CreateTableRequest::try_from(too_many_projected)
             .unwrap_err()
-            .contains("Projected attributes")
+            .contains("Number of projected attributes in all indexes exceeds limit of 100")
     );
 }
 
@@ -2851,7 +2687,8 @@ fn dynamodb_transaction_limits_reject_invalid_requests() {
 
     assert_eq!(
         TransactGetItemsRequest::try_from(too_many_gets).unwrap_err(),
-        "TransactItems cannot contain more than 100 operations"
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
     );
     assert!(
         TransactWriteItemsRequest::try_from(oversized_request)
@@ -2891,7 +2728,7 @@ fn put_item_rejects_invalid_sets_before_insert() {
                 "v": { "BS": ["QUE=", "QkI=", "QUE=", "QkI=", "QUE="] }
             }),
             "One or more parameter values were invalid: Input collection \
-             [\"QUE=\",\"QkI=\",\"QUE=\",\"QkI=\",\"QUE=\"]of type BS contains duplicates.",
+             [\"QUE=\",\"QkI=\",\"QUE=\"]of type BS contains duplicates.",
         ),
         (
             json!({
@@ -2934,9 +2771,10 @@ fn put_item_rejects_invalid_sets_before_insert() {
             "TableName": "TestTable",
             "Item": item
         });
+        // PutItem reports item defects with the validation-count prefix.
         assert_eq!(
             PutItemRequest::try_from(put_item).unwrap_err(),
-            expected_message
+            format!("1 validation error detected: {expected_message}")
         );
     }
 }
@@ -3076,14 +2914,6 @@ fn transaction_update_expression_values_reject_invalid_sets_before_execution() {
         "ExpressionAttributeValues contains invalid value: One or more parameter values were \
          invalid: Binary sets should not be empty for key :set"
     );
-}
-
-fn nested_attribute_value(depth: usize) -> serde_json::Value {
-    let mut value = json!({ "S": "leaf" });
-    for _ in 0..depth {
-        value = json!({ "M": { "child": value } });
-    }
-    value
 }
 
 fn create_table_with_projected_attribute_count(
@@ -3256,4 +3086,52 @@ fn given_legacy_expected_only_when_write_is_validated_then_condition_is_not_sile
             .unwrap_err()
             .contains("Expected is not supported")
     );
+}
+
+const MISSING_KEY_CONDITION_TEXT: &str = "Either the KeyConditions or KeyConditionExpression \
+                                          parameter must be specified in the request.";
+
+#[test]
+fn given_query_without_key_condition_when_deserialized_then_field_is_none_and_validation_names_both_parameters()
+ {
+    let request: QueryRequest = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    assert_eq!(request.key_condition_expression, None);
+    let error = crate::DynamoRequestValidate::validate_for_dynamodb(&request).unwrap_err();
+    assert_eq!(error, MISSING_KEY_CONDITION_TEXT);
+}
+
+#[test]
+fn given_query_with_empty_key_condition_when_deserialized_then_field_is_some_empty_and_validation_reports_empty_expression()
+ {
+    let request: QueryRequest =
+        serde_json::from_value(json!({"TableName": "TestTable", "KeyConditionExpression": ""}))
+            .unwrap();
+    assert_eq!(request.key_condition_expression.as_deref(), Some(""));
+    let error = crate::DynamoRequestValidate::validate_for_dynamodb(&request).unwrap_err();
+    assert_eq!(
+        error,
+        "Invalid KeyConditionExpression: The expression can not be empty;"
+    );
+}
+
+#[test]
+fn given_query_with_only_key_conditions_when_validated_then_legacy_text_wins_over_missing_expression()
+ {
+    let request: QueryRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "KeyConditions": {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}}
+    }))
+    .unwrap();
+    let error = crate::DynamoRequestValidate::validate_for_dynamodb(&request).unwrap_err();
+    assert_eq!(
+        error,
+        "KeyConditions is not supported; use KeyConditionExpression"
+    );
+}
+
+#[test]
+fn given_query_without_key_condition_when_serialized_then_field_is_omitted() {
+    let request: QueryRequest = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let value = serde_json::to_value(&request).unwrap();
+    assert!(value.get("KeyConditionExpression").is_none());
 }

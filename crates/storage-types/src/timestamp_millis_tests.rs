@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use alloc_counter::AllocationGuard;
-use chrono::Duration as ChronoDuration;
+use jiff::{SignedDuration, Timestamp, tz::Offset};
 
 use crate::{DurationSeconds, TimestampMillis, timestamp_bounds};
 
@@ -9,6 +9,14 @@ use crate::{DurationSeconds, TimestampMillis, timestamp_bounds};
 fn timestamp_millis_reports_seconds_by_flooring_toward_negative_infinity() {
     assert_eq!(TimestampMillis::from_timestamp(1_999).timestamp(), 1);
     assert_eq!(TimestampMillis::from_timestamp(-1).timestamp(), -1);
+}
+
+#[test]
+fn given_pre_epoch_timestamp_when_converted_then_epoch_units_round_down() {
+    let timestamp = Timestamp::new(0, -1).expect("one nanosecond before the epoch");
+
+    assert_eq!(TimestampMillis::from(timestamp).timestamp_millis(), -1);
+    assert_eq!(crate::TimestampSeconds::from(timestamp).as_seconds(), -1);
 }
 
 #[test]
@@ -28,9 +36,19 @@ fn timestamp_millis_checked_add_signed_returns_none_on_overflow() {
     let timestamp = TimestampMillis::from_timestamp(i64::MAX);
 
     assert_eq!(
-        timestamp.checked_add_signed(ChronoDuration::milliseconds(1)),
+        timestamp.checked_add_signed(SignedDuration::from_millis(1)),
         None
     );
+}
+
+#[test]
+fn timestamp_millis_signed_arithmetic_saturates_on_overflow() {
+    let min = TimestampMillis::from_timestamp(i64::MIN);
+    let max = TimestampMillis::from_timestamp(i64::MAX);
+    let one_millisecond = SignedDuration::from_millis(1);
+
+    assert_eq!(max + one_millisecond, max);
+    assert_eq!(min - one_millisecond, min);
 }
 
 #[test]
@@ -52,10 +70,10 @@ fn timestamp_bounds_preserves_explicit_bounds() {
     assert_eq!(end, until);
 }
 
-fn write_legacy_display(value: TimestampMillis, output: &mut String) {
-    let datetime = chrono::DateTime::from_timestamp_millis(value.timestamp_millis())
-        .unwrap_or_else(chrono::Utc::now);
-    let rfc3339 = datetime.to_rfc3339();
+fn write_allocated_display(value: TimestampMillis, output: &mut String) {
+    let datetime =
+        Timestamp::from_millisecond(value.timestamp_millis()).unwrap_or_else(|_| Timestamp::now());
+    let rfc3339 = datetime.display_with_offset(Offset::UTC).to_string();
     write!(output, "{rfc3339}").expect("String accepts all writes");
 }
 
@@ -94,7 +112,7 @@ fn given_millisecond_timestamp_when_displayed_then_rfc3339_bytes_are_preserved()
 
 #[test]
 fn given_repeated_timestamp_displays_when_profiled_then_direct_formatting_avoids_allocations() {
-    let legacy = measure_display_allocations("legacy_to_rfc3339", write_legacy_display);
+    let legacy = measure_display_allocations("allocated_rfc3339", write_allocated_display);
     let candidate = measure_display_allocations("direct_formatter", write_candidate_display);
     let _ = alloc_counter::emit_report(&legacy);
     let _ = alloc_counter::emit_report(&candidate);

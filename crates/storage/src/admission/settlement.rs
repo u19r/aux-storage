@@ -1,6 +1,6 @@
 use std::{future::Future, time::Duration};
 
-use storage_provider::native_admission::{
+use storage_common::native_admission::{
     NativeAdmissionOutcome, NativeAdmissionPermit, NativeWork, settle_native_attempt,
 };
 use storage_types::{StorageError, StorageResult};
@@ -55,8 +55,12 @@ impl AdmissionController {
                 })?;
                 Ok(Box::new(permit))
             }
-            NativeWork::Recovery | NativeWork::RangeRead | NativeWork::Write => {
+            NativeWork::Recovery
+            | NativeWork::PointRead
+            | NativeWork::RangeRead
+            | NativeWork::Write => {
                 let class = match work {
+                    NativeWork::PointRead => AdmissionClass::PointRead,
                     NativeWork::RangeRead => AdmissionClass::RangeRead,
                     _ => AdmissionClass::Write,
                 };

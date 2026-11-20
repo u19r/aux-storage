@@ -7,7 +7,10 @@ use storage_provider::{
 use storage_types::{ReadProtection, StorageError, StorageResult, TimestampMillis, storage_serde};
 
 use super::sql_statements;
-use crate::{SqlAttempt, SqlLayout, SqlRow, SqlValue, constants::RETENTION_READ_BYTES};
+use crate::{
+    SqlAttempt, SqlEngine, SqlLayout, SqlQueryPage, SqlRow, SqlValue,
+    constants::RETENTION_READ_BYTES,
+};
 
 pub(crate) async fn list_due_stream_trim_markers<A: SqlAttempt>(
     attempt: &mut A,
@@ -20,13 +23,26 @@ pub(crate) async fn list_due_stream_trim_markers<A: SqlAttempt>(
     }
     let limit = i64::try_from(limit)
         .map_err(|_| StorageError::validation("stream trim marker page limit is too large"))?;
-    let page = attempt
-        .query(
-            sql_statements::due_markers(engine, *due_before, limit),
-            ReadProtection::Snapshot,
-            RETENTION_READ_BYTES,
-        )
-        .await?;
+    let statement = sql_statements::due_markers(engine, *due_before, limit);
+    let page = if engine.engine() == SqlEngine::Postgres {
+        // Both independent reads share the existing discovery attempt and query
+        // wave.
+        let pages = attempt
+            .query_batch_exact(
+                vec![statement, sql_statements::oldest_assigned_transaction_age()],
+                ReadProtection::Snapshot,
+                RETENTION_READ_BYTES,
+            )
+            .await?;
+        let [markers, age]: [SqlQueryPage; 2] = pages.into_array()?;
+        let age_ms = decode_oldest_assigned_transaction_age(age)?;
+        metrics::gauge!("storage.postgres.stream.frontier.oldest_xact.age.ms").set(age_ms as f64);
+        markers
+    } else {
+        attempt
+            .query(statement, ReadProtection::Snapshot, RETENTION_READ_BYTES)
+            .await?
+    };
     page.rows.into_iter().map(decode_due_marker).collect()
 }
 
@@ -43,13 +59,8 @@ pub(crate) async fn load_stream_trim_states<A: SqlAttempt>(
         .map(|index| sql_statements::state(engine, &scopes[*index].scope_id))
         .collect();
     let pages = attempt
-        .query_batch(statements, protection, RETENTION_READ_BYTES)
+        .query_batch_exact(statements, protection, RETENTION_READ_BYTES)
         .await?;
-    if pages.len() != scopes.len() {
-        return Err(StorageError::internal(
-            "SQL stream trim state batch count differs",
-        ));
-    }
     let mut states = vec![None; scopes.len()];
     for (index, page) in order.into_iter().zip(pages) {
         if page.more || page.rows.len() > 1 {
@@ -71,7 +82,7 @@ pub(crate) async fn load_stream_trim_observations<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
     markers: &[StreamTrimDueMarker],
-) -> StorageResult<Vec<StreamRetentionObservation>> {
+) -> StorageResult<storage_types::Exact<StreamRetentionObservation>> {
     let mut order = (0..markers.len()).collect::<Vec<_>>();
     order.sort_unstable_by(|left, right| {
         markers[*left]
@@ -95,13 +106,8 @@ pub(crate) async fn load_stream_trim_observations<A: SqlAttempt>(
             .collect::<StorageResult<Vec<_>>>()?,
     );
     let pages = attempt
-        .query_batch(statements, ReadProtection::Conflict, RETENTION_READ_BYTES)
+        .query_batch_exact(statements, ReadProtection::Conflict, RETENTION_READ_BYTES)
         .await?;
-    if pages.len() != markers.len() * 2 {
-        return Err(StorageError::internal(
-            "SQL stream trim observation batch count differs",
-        ));
-    }
     let mut pages = pages.into_iter();
     let mut states = vec![None; markers.len()];
     for &index in &order {
@@ -149,7 +155,10 @@ pub(crate) async fn load_stream_trim_observations<A: SqlAttempt>(
             present[index] = true;
         }
     }
-    Ok(present.into_iter().zip(states).map(Into::into).collect())
+    storage_types::Exact::try_new(
+        markers.len(),
+        present.into_iter().zip(states).map(Into::into).collect(),
+    )
 }
 
 fn decode_due_marker(row: SqlRow) -> StorageResult<StreamTrimDueMarker> {
@@ -197,4 +206,28 @@ pub(crate) fn decode_trim_state(
         ));
     }
     Ok(state)
+}
+
+pub(super) fn decode_oldest_assigned_transaction_age(page: SqlQueryPage) -> StorageResult<u64> {
+    if page.more || page.rows.len() != 1 {
+        return Err(StorageError::internal(
+            "Postgres transaction age row count is invalid",
+        ));
+    }
+    let [row]: [SqlRow; 1] = page
+        .rows
+        .try_into()
+        .map_err(|_| StorageError::internal("Postgres transaction age row is missing"))?;
+    let [SqlValue::Integer(age_ms)]: [SqlValue; 1] = row
+        .into_values()
+        .try_into()
+        .map_err(|_| StorageError::internal("Postgres transaction age columns are invalid"))?
+    else {
+        return Err(StorageError::internal(
+            "Postgres transaction age is not an integer",
+        ));
+    };
+    // Host clock corrections can put a transaction start after the observation
+    // time.
+    Ok(age_ms.max(0) as u64)
 }

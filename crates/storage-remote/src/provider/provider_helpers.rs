@@ -13,20 +13,19 @@ use http_request::{Url, reqwest::Client};
 use metrics_facade::{HistogramMetric, histogram};
 use rand::{RngExt as _, rng};
 use serde::Serialize;
-use storage_common::{DEFAULT_QUERY_LIMIT, DEFAULT_SCAN_LIMIT, MAX_QUERY_LIMIT, MAX_SCAN_LIMIT};
 use storage_provider::{GsiIndexReadiness, RemoteTimeoutOverrides};
 use storage_types::{
     ExclusiveStartKey, GlobalSecondaryIndex, GlobalSecondaryIndexDescription, IndexName, ItemKey,
-    KeyAttributes, QueryTableRequest, ScanRequest, ScanTableRequest, StorageEnum, StorageError,
-    StorageResult, StoredTableInfo, TableDescription, TableName, TimestampMillis,
-    context::WrappedError, subset_expression_attribute_names_for_expression,
+    KeyAttributes, QueryTableRequest, StorageError, StorageResult, StoredTableInfo,
+    TableDescription, TableName, TimestampMillis, subset_expression_attribute_names_for_expression,
 };
 
 use crate::{
     constants::{
-        BASE_BACKOFF_MS, MAX_BACKOFF_MS, RETRY_TOKEN_CAPACITY, RETRY_TOKEN_REFILL_PER_SECOND,
+        BASE_BACKOFF_MS, MAX_BACKOFF_MS, MAX_DEFAULT_CONNECT_TIMEOUT, POOL_IDLE_TIMEOUT,
+        RETRY_TOKEN_CAPACITY, RETRY_TOKEN_REFILL_PER_SECOND,
     },
-    provider::{AttemptError, EndpointState},
+    provider::{AttemptError, EndpointState, connect_timeout_for},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,14 +60,30 @@ pub(crate) fn redirect_url(
 }
 
 pub(crate) fn build_client(timeouts: Option<&RemoteTimeoutOverrides>) -> StorageResult<Client> {
-    let mut builder = Client::builder().redirect(http_request::reqwest::redirect::Policy::none());
-    if let Some(overrides) = timeouts {
-        if let Some(connect_ms) = overrides.connect_timeout_ms {
-            builder = builder.connect_timeout(Duration::from_millis(connect_ms));
-        }
-        if let Some(request_ms) = overrides.request_timeout_ms {
-            builder = builder.timeout(Duration::from_millis(request_ms));
-        }
+    if let Some(overrides) = timeouts
+        && let (Some(connect), Some(request)) =
+            (overrides.connect_timeout_ms, overrides.request_timeout_ms)
+        && connect >= request
+    {
+        return Err(StorageError::validation(format!(
+            "connect_timeout_ms ({connect}) must be less than request_timeout_ms ({request})"
+        )));
+    }
+    let request_timeout = timeouts
+        .and_then(|overrides| overrides.request_timeout_ms)
+        .map(Duration::from_millis);
+    let connect_timeout = timeouts
+        .and_then(|overrides| overrides.connect_timeout_ms)
+        .map_or_else(
+            || request_timeout.map_or(MAX_DEFAULT_CONNECT_TIMEOUT, connect_timeout_for),
+            Duration::from_millis,
+        );
+    let mut builder = Client::builder()
+        .redirect(http_request::reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    if let Some(request_timeout) = request_timeout {
+        builder = builder.timeout(request_timeout);
     }
     builder
         .build()
@@ -126,7 +141,6 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
             indexes
                 .into_iter()
                 .map(|index| GlobalSecondaryIndex {
-                    capture_for_build: false,
                     index_name: index.index_name,
                     key_schema: index.key_schema,
                     projection: index.projection,
@@ -136,6 +150,10 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
         table_size_bytes: table.table_size_bytes,
         item_count: table.item_count,
         stream_specification: table.stream_specification,
+        stream_enabled_at: table
+            .latest_stream_label
+            .as_deref()
+            .and_then(storage_types::stream_label_enabled_at),
         table_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: table.deletion_protection_enabled,
     }
@@ -168,22 +186,8 @@ pub(crate) fn gsi_index_readiness(
         .collect()
 }
 
-pub(super) fn build_scan_request(request: &ScanTableRequest) -> StorageResult<ScanRequest> {
-    let limit = storage_common::normalize_limit(request.limit, DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT)?;
-    let mut remote_request = ScanRequest::builder()
-        .table_name(request.table_name.clone())
-        .index_name(request.index_name.clone())
-        .limit(Some(limit))
-        .build();
-    remote_request.exclusive_start_key = request
-        .exclusive_start_key
-        .as_deref()
-        .map(exclusive_start_key_from_string);
-    remote_request.consistent_read = Some(request.consistent_read);
-    Ok(remote_request)
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub(super) struct QueryRequestView<'a> {
     pub(super) table_name: &'a TableName,
@@ -215,8 +219,6 @@ pub(super) struct QueryRequestView<'a> {
 pub(super) fn build_query_request_view(
     request: &QueryTableRequest,
 ) -> StorageResult<QueryRequestView<'_>> {
-    let limit =
-        storage_common::normalize_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
     Ok(QueryRequestView {
         table_name: &request.table_name,
         index_name: request.index_name.as_ref(),
@@ -226,7 +228,7 @@ pub(super) fn build_query_request_view(
             request.expression_attribute_names.as_ref(),
         ),
         expression_attribute_values: request.expression_attribute_values.as_ref(),
-        limit: Some(limit),
+        limit: request.limit,
         exclusive_start_key: request
             .exclusive_start_key
             .as_deref()
@@ -412,52 +414,11 @@ pub(super) fn attempt_signing(err: &SigningError) -> AttemptError {
 
 pub(super) fn attempt_transport(err: http_request::reqwest::Error) -> AttemptError {
     let retryable = err.is_timeout() || err.is_connect() || err.is_request();
+    let err = err.without_url();
     let message = format!("remote transport error: {err}");
     let dispatch_status = http_request::HttpRequestError::from(err).dispatch_status();
     AttemptError::new(StorageError::internal(&message), retryable, None, None)
         .with_dispatch_status(dispatch_status)
-}
-
-pub(super) fn error_label(error: &StorageError) -> &'static str {
-    match error.to_enum() {
-        StorageEnum::Database(_) => "database",
-        StorageEnum::AwsSerialization(_) => "aws_serialization",
-        StorageEnum::Serialization(_) => "serialization",
-        StorageEnum::ResourceNotFound { .. } => "resource_not_found",
-        StorageEnum::ResourceExists { .. } => "resource_exists",
-        StorageEnum::IndexNotFound { .. } => "index_not_found",
-        StorageEnum::KeyValidation(_) => "key_validation",
-        StorageEnum::InternalServerError { .. } => "internal_server_error",
-        StorageEnum::HistoryUnavailable => "history_unavailable",
-        StorageEnum::HistoryExpired => "history_expired",
-        StorageEnum::TrimmedDataAccess => "trimmed_data_access",
-        StorageEnum::GuardConflict { .. } => "guard_conflict",
-        StorageEnum::Unsupported { .. } => "unsupported",
-        StorageEnum::ConditionalCheckFailed
-        | StorageEnum::ConditionalCheckFailedWithItem { .. } => "conditional_check_failed",
-        StorageEnum::TableAlreadyExists { .. } => "table_exists",
-        StorageEnum::TableNotFound { .. } => "table_not_found",
-        StorageEnum::Validation { .. }
-        | StorageEnum::RawValidation { .. }
-        | StorageEnum::DeletionProtectionEnabled { .. } => "validation",
-        StorageEnum::TransactionConflict { .. } => "transaction_conflict",
-        StorageEnum::TransactionInProgress { .. } => "transaction_in_progress",
-        StorageEnum::IdempotentParameterMismatch => "idempotent_parameter_mismatch",
-        StorageEnum::TransactionCanceled { .. } => "transaction_canceled",
-        StorageEnum::ProvisionedThroughputExceeded { .. } => "provisioned_throughput",
-        StorageEnum::Throttled { .. } => "throttled",
-        StorageEnum::LimitExceeded { .. } => "limit_exceeded",
-        StorageEnum::RequestLimitExceeded => "request_limit_exceeded",
-        StorageEnum::ServiceUnavailable { .. } => "service_unavailable",
-        StorageEnum::SyncNotLeader { .. } => "sync_not_leader",
-        StorageEnum::SyncSubmissionAmbiguous { .. } => "sync_submission_ambiguous",
-        StorageEnum::InfrastructureResult(_) => "internal_server_error",
-        StorageEnum::Authentication { .. } => "authentication",
-        StorageEnum::MissingAuthenticationToken => "missing_authentication_token",
-        StorageEnum::AccessDenied { .. } => "access_denied",
-        StorageEnum::AwsService { .. } => "aws_service",
-        StorageEnum::IdempotencyReplay { .. } => "idempotency_replay",
-    }
 }
 
 pub(super) fn extract_operation(target: &str) -> &str {

@@ -11,7 +11,7 @@ pub(super) fn decode_row(row: &Row) -> StorageResult<Vec<SqlValueRef<'_>>> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(row.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for (index, column) in row.columns().iter().enumerate() {
         let value = if <&str as FromSql>::accepts(column.type_()) {
             row.try_get::<_, Option<&str>>(index)
@@ -75,4 +75,48 @@ impl ToSql for SqlValue {
             Self::Blob(value) => value.to_sql_checked(ty, out),
         }
     }
+}
+
+/// The prepared parameter type was checked before terminal dispatch. Primitive
+/// encoders in pinned postgres-types return no recoverable encoding failure;
+/// forwarding their unchecked encoding avoids copying complete payloads here.
+pub(super) struct CheckedBind(SqlValue);
+
+impl std::fmt::Debug for CheckedBind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CheckedBind([redacted])")
+    }
+}
+
+impl CheckedBind {
+    pub(super) fn try_new(value: SqlValue, ty: &Type) -> StorageResult<Self> {
+        let accepts = match &value {
+            SqlValue::Null => true,
+            SqlValue::Integer(_) => <i64 as ToSql>::accepts(ty),
+            SqlValue::Boolean(_) => <bool as ToSql>::accepts(ty),
+            SqlValue::Real(_) => <f64 as ToSql>::accepts(ty),
+            SqlValue::Text(_) => <String as ToSql>::accepts(ty),
+            SqlValue::Blob(_) => <Vec<u8> as ToSql>::accepts(ty),
+        };
+        if !accepts {
+            return Err(StorageError::internal(
+                "Postgres counted write parameter type is unsupported",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl ToSql for CheckedBind {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
+        self.0.to_sql(ty, out)
+    }
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+    tokio_postgres::types::to_sql_checked!();
 }

@@ -27,10 +27,7 @@ fn numeric_string_strategy() -> impl Strategy<Value = String> {
             // Use strip_prefix to satisfy clippy::manual_strip; safe because we
             // only remove ASCII '-'
             let int_digits = int.strip_prefix('-').unwrap_or(int);
-            if int_digits.len() > 1 && int_digits.starts_with('0') {
-                return false;
-            }
-            true
+            !(int_digits.len() > 1 && int_digits.starts_with('0'))
         })
 }
 

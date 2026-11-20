@@ -237,7 +237,6 @@ async fn verify_complete_update(fixture: &TestStore) -> anyhow::Result<()> {
             "MaxIndexers": 3,
             "DeletionProtectionEnabled": true,
             "AuxStreamDurationHours": 48,
-            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
             "GlobalSecondaryIndexUpdates": [{"Create": {
                 "IndexName": "new-index",
                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -287,7 +286,7 @@ async fn verify_committed_update(fixture: &TestStore) -> anyhow::Result<()> {
             .is_some_and(|indexes| indexes.len() == 1)
     );
     let markers = fixture
-        .stream_retention_repository
+        .maintenance
         .list_due_stream_trim_markers(TimestampMillis::now() + 49 * 60 * 60 * 1000, 100)
         .await?;
     let marker = markers
@@ -296,7 +295,7 @@ async fn verify_committed_update(fixture: &TestStore) -> anyhow::Result<()> {
         .max_by_key(|marker| marker.policy_version)
         .context("updated table has no marker")?;
     let state = fixture
-        .stream_retention_repository
+        .maintenance
         .load_stream_trim_states(std::slice::from_ref(&marker.scope))
         .await?
         .pop()
@@ -327,7 +326,7 @@ async fn verify_deleted_index(fixture: &TestStore) -> anyhow::Result<()> {
             .is_empty()
     );
     let markers = fixture
-        .stream_retention_repository
+        .maintenance
         .list_due_stream_trim_markers(TimestampMillis::now() + 73 * 60 * 60 * 1000, 100)
         .await?;
     let marker = markers
@@ -336,7 +335,7 @@ async fn verify_deleted_index(fixture: &TestStore) -> anyhow::Result<()> {
         .max_by_key(|marker| marker.policy_version)
         .context("deleted index update has no marker")?;
     let state = fixture
-        .stream_retention_repository
+        .maintenance
         .load_stream_trim_states(std::slice::from_ref(&marker.scope))
         .await?
         .pop()
@@ -366,6 +365,7 @@ async fn given_existing_gsi_when_combined_delete_commits_then_settings_and_delet
     let fixture = TestStore::new_durable().await;
     let result = async {
         verify_complete_update(&fixture).await?;
+        super::gsi_lifecycle_tests::finish_backfill(&fixture, 64).await?;
         let response = fixture
             .operations
             .update_table(serde_json::from_value(serde_json::json!({
@@ -378,13 +378,16 @@ async fn given_existing_gsi_when_combined_delete_commits_then_settings_and_delet
             }))?)
             .await
             .map_err(|error| anyhow::anyhow!("combined delete: {:?}", error.to_enum()))?;
+        let indexes = response
+            .table_description
+            .global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default();
         anyhow::ensure!(
-            response
-                .table_description
-                .global_secondary_indexes
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
+            indexes.len() == 1
+                && indexes[0].index_name.as_ref() == "new-index"
+                && indexes[0].index_status == Some(storage_types::IndexStatus::Deleting),
+            "response must list the deleted index as DELETING"
         );
         verify_deleted_index(&fixture).await
     }

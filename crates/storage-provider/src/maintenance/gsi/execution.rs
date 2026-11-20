@@ -28,6 +28,19 @@ impl GsiBuildEvaluation {
                 ttl_activation: None,
             });
         };
+        if let Some(advance) = transaction
+            .advance_native_gsi(
+                &build,
+                super::NativeGsiProgress {
+                    expected_revision: self.expected_revision,
+                    next_progress: self.next_progress()?,
+                    page_limit: self.page_limit,
+                },
+            )
+            .await?
+        {
+            return Ok(advance);
+        }
         let change = Box::pin(transaction.evaluate_gsi_build(&build, self.page_limit)).await?;
         // Keep each large generic future behind its own allocation. Turso's
         // concrete transaction future otherwise exceeds the test-thread stack.
@@ -56,6 +69,7 @@ impl GsiBuildEvaluation {
                     next_progress: self.next_progress()?,
                     expected,
                     projections,
+                    primary_ttl_metadata: Vec::new(),
                     next_state,
                     ttl_activation: ttl_activation.as_ref(),
                 }))
@@ -96,10 +110,7 @@ impl GsiBuildEvaluation {
         Transaction: GsiBuildTransaction,
     {
         if !expected.target.index_name.is_ttl_index()
-            || !matches!(
-                expected.state,
-                storage_backfill::GsiState::Scanning(_) | storage_backfill::GsiState::CatchingUp(_)
-            )
+            || !matches!(expected.state, storage_backfill::GsiState::Building(_))
             || !matches!(next_state, storage_backfill::GsiState::Active(_))
         {
             return Ok(None);

@@ -19,6 +19,8 @@ use storage_types::{
     AttemptMode, InfrastructureContext, InfrastructureResultKind, StorageEnum, StorageError,
     StorageResult,
 };
+#[cfg(any(feature = "native-rocksdb", feature = "native-foundationdb"))]
+use storage_types::{AttemptPlan, DeadlineClass};
 
 use super::fixture;
 use crate::HarnessResult;
@@ -29,8 +31,17 @@ async fn given_ordinary_file_sqlite_when_initialized_then_protected_record_infra
 -> HarnessResult<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("ordinary.sqlite");
-    let backend = sql_backend::sqlite::SqliteBackend::initialize(&path).await?;
-    let _ordinary = sql_backend::SqlStore::initialize_schema(backend).await?;
+    let backend = sql_backend::sqlite::SqliteBackend::initialize(
+        &path,
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await?;
+    let _ordinary = sql_backend::SqlStore::initialize_schema(
+        backend,
+        storage_types::InitialStreamLineages::ONE,
+        true,
+    )
+    .await?;
     let connection = rusqlite::Connection::open(path)?;
     let count: i64 = connection.query_row(
         "SELECT count(*) FROM sqlite_master WHERE name LIKE 'sys_infrastructure_%'",
@@ -460,6 +471,7 @@ async fn execute_turso_statement(
 
     let backend = sql_backend::turso::TursoBackend::initialize(
         path.to_str().ok_or("Turso fixture path is not UTF-8")?,
+        storage_types::AttemptDeadlines::default(),
     )
     .await?;
     backend
@@ -479,6 +491,7 @@ async fn query_turso_statement(
 
     let backend = sql_backend::turso::TursoBackend::initialize(
         path.to_str().ok_or("Turso fixture path is not UTF-8")?,
+        storage_types::AttemptDeadlines::default(),
     )
     .await?;
     Ok(backend
@@ -511,6 +524,8 @@ async fn given_rocksdb_marker_when_reopened_or_corrupted_then_identity_persists_
     verify_kv_layout(|| {
         std::future::ready(kv_backend::rocksdb::RocksDbBackend::initialize(
             fixture.path.clone(),
+            storage_types::AttemptDeadlines::default(),
+            256,
         ))
     })
     .await
@@ -526,6 +541,7 @@ async fn given_foundationdb_marker_when_independent_client_opens_or_layout_is_co
             kv_backend::foundationdb::FoundationDbOptions {
                 cluster_file: fixture.cluster_file.to_str(),
                 subspace_prefix: Some(&fixture.prefix),
+                attempt_deadlines: storage_types::AttemptDeadlines::default(),
                 ..Default::default()
             },
         )
@@ -542,12 +558,20 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = StorageResult<B>>,
 {
-    let store = kv_backend::KvStore::initialize_format(open_backend().await?).await?;
+    let store = kv_backend::KvStore::initialize_format(
+        open_backend().await?,
+        storage_types::InitialStreamLineages::ONE,
+    )
+    .await?;
     let identity = store.initialize_records(fixture::limits()?).await?;
     assert_identity(&identity);
     seed_golden_records(&store).await?;
     drop(store);
-    let store = kv_backend::KvStore::initialize_format(open_backend().await?).await?;
+    let store = kv_backend::KvStore::initialize_format(
+        open_backend().await?,
+        storage_types::InitialStreamLineages::ONE,
+    )
+    .await?;
     assert_eq!(
         identity,
         store.initialize_records(fixture::limits()?).await?
@@ -569,7 +593,11 @@ where
         let backend = open_backend().await?;
         store_kv_marker(&backend, Some(marker.clone())).await?;
         let error = async {
-            let store = kv_backend::KvStore::initialize_format(backend).await?;
+            let store = kv_backend::KvStore::initialize_format(
+                backend,
+                storage_types::InitialStreamLineages::ONE,
+            )
+            .await?;
             store.initialize_records(fixture::limits()?).await
         }
         .await
@@ -585,9 +613,7 @@ where
             assert!(
                 matches!(
                     error.as_ref(),
-                    StorageEnum::InfrastructureResult(
-                        InfrastructureResultKind::NativeCapacityRejected
-                    )
+                    StorageEnum::Attempt(storage_types::AttemptFailure::CAPACITY)
                 ),
                 "over-bound marker: {:?}",
                 error.as_ref()
@@ -608,7 +634,9 @@ where
     }
     let backend = open_backend().await?;
     store_kv_marker(&backend, Some(valid.clone())).await?;
-    let store = kv_backend::KvStore::initialize_format(backend).await?;
+    let store =
+        kv_backend::KvStore::initialize_format(backend, storage_types::InitialStreamLineages::ONE)
+            .await?;
     assert_eq!(
         identity,
         store.initialize_records(fixture::limits()?).await?
@@ -617,7 +645,11 @@ where
     let backend = open_backend().await?;
     store_kv_marker(&backend, None).await?;
     let error = async {
-        let store = kv_backend::KvStore::initialize_format(backend).await?;
+        let store = kv_backend::KvStore::initialize_format(
+            backend,
+            storage_types::InitialStreamLineages::ONE,
+        )
+        .await?;
         store.initialize_records(fixture::limits()?).await
     }
     .await
@@ -629,7 +661,9 @@ where
     assert!(load_kv_marker(&open_backend().await?).await?.is_none());
     let backend = open_backend().await?;
     store_kv_marker(&backend, Some(valid)).await?;
-    let store = kv_backend::KvStore::initialize_format(backend).await?;
+    let store =
+        kv_backend::KvStore::initialize_format(backend, storage_types::InitialStreamLineages::ONE)
+            .await?;
     store.initialize_records(fixture::limits()?).await?;
     verify_golden_record_present(&store).await?;
     drop(store);
@@ -644,18 +678,22 @@ async fn store_kv_marker<B: kv_backend::KvBackend>(
     use kv_backend::KvAttempt as _;
 
     backend
-        .with_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                // Fixture corruption uses the persisted V1 marker grammar,
-                // never a fake lowerer.
-                let key = b"\x7fi/v".to_vec();
-                let change = match marker {
-                    Some(value) => kv_backend::KvMutation::Put { key, value },
-                    None => kv_backend::KvMutation::Delete { key },
-                };
-                attempt.stage(vec![change])
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                .start(backend.attempt_deadlines()),
+            move |attempt| {
+                Box::pin(async move {
+                    // Fixture corruption uses the persisted V1 marker grammar,
+                    // never a fake lowerer.
+                    let key = b"\x7fi/v".to_vec();
+                    let change = match marker {
+                        Some(value) => kv_backend::KvMutation::Put { key, value },
+                        None => kv_backend::KvMutation::Delete { key },
+                    };
+                    attempt.stage(vec![change])
+                })
+            },
+        )
         .await
 }
 
@@ -664,13 +702,17 @@ async fn load_kv_marker<B: kv_backend::KvBackend>(backend: &B) -> StorageResult<
     use kv_backend::KvAttempt as _;
 
     backend
-        .with_attempt(AttemptMode::ReadOnly, |attempt| {
-            Box::pin(async move {
-                attempt
-                    .get(b"\x7fi/v", storage_types::ReadProtection::Snapshot)
-                    .await
-            })
-        })
+        .with_attempt(
+            AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead)
+                .start(backend.attempt_deadlines()),
+            |attempt| {
+                Box::pin(async move {
+                    attempt
+                        .get(b"\x7fi/v", storage_types::ReadProtection::Snapshot)
+                        .await
+                })
+            },
+        )
         .await
 }
 

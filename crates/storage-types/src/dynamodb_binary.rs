@@ -50,9 +50,8 @@ pub fn decode_base64_string(input: &str) -> Result<Vec<u8>, base64::DecodeError>
 pub fn parse_required_dynamo_binary(raw: Option<&str>, field: &str) -> StorageResult<Vec<u8>> {
     let payload_b64 =
         raw.ok_or_else(|| StorageError::internal(&format!("missing required field {field}")))?;
-    decode_base64(payload_b64).map_err(|err| {
-        StorageError::internal(&format!("invalid {field} field binary payload: {err}"))
-    })
+    decode_base64(payload_b64)
+        .map_err(|_| StorageError::internal(&format!("invalid {field} field binary payload")))
 }
 
 fn serialize_inner<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>

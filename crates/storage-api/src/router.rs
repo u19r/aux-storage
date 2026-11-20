@@ -39,9 +39,7 @@ pub struct PrometheusMetricsEndpointConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceRoutePaths {
     pub storage: String,
-    #[cfg(feature = "queue")]
     pub queue: String,
-    #[cfg(feature = "pubsub")]
     pub pubsub: String,
 }
 
@@ -49,9 +47,7 @@ impl Default for ServiceRoutePaths {
     fn default() -> Self {
         Self {
             storage: constants::BASE_PATH.to_string(),
-            #[cfg(feature = "queue")]
             queue: "/queue".to_string(),
-            #[cfg(feature = "pubsub")]
             pubsub: "/pubsub".to_string(),
         }
     }
@@ -118,34 +114,65 @@ pub(crate) fn server_router_with_metrics_and_routes(
         .with_state(app_state.clone())
         .nest(&routes.storage, prefixed_router);
 
-    #[cfg(feature = "queue")]
     {
-        router = router.nest(
-            &routes.queue,
-            Router::new()
-                .route(
-                    "/",
-                    post(crate::routes::queue::queue_endpoint).layer::<_, Infallible>(
-                        middleware::from_fn_with_state(app_state.clone(), fixed_ingress_ceiling),
-                    ),
-                )
+        // A receive releases its ingress slot when it starts to wait. A
+        // refused slot is answered in the SQS shape (review L10).
+        let ingress = middleware::from_fn_with_state(app_state.clone(), queue_ingress_ceiling);
+        let endpoint =
+            post(crate::routes::queue::queue_endpoint).layer::<_, Infallible>(ingress.clone());
+        let url_endpoint =
+            post(crate::routes::queue::queue_url_endpoint).layer::<_, Infallible>(ingress);
+        let body_limit = DefaultBodyLimit::max(constants::AUXILIARY_JSON_BODY_LIMIT_BYTES);
+        // AWS SDKs append `/` to an endpoint URL, so `{base}/` is the same
+        // route as `{base}`.
+        router = router
+            .route(
+                &format!("{}/", routes.queue.trim_end_matches('/')),
+                endpoint
+                    .clone()
+                    .layer(body_limit)
+                    .with_state(app_state.clone()),
+            )
+            .nest(
+                &routes.queue,
+                Router::new()
+                    .route("/health", get(health_status))
+                    .route("/", endpoint.clone())
+                    .route("/{account}/{queue_name}", url_endpoint.clone())
+                    .route("/{account}/{queue_name}/", url_endpoint)
+                    .layer(body_limit)
+                    .with_state(app_state.clone()),
+            );
+    }
+
+    {
+        // AWS SDKs append `/` to an endpoint URL, so `{base}/` is the same
+        // route as `{base}` (as for the queue route).
+        router = router.route(
+            &format!("{}/", routes.pubsub.trim_end_matches('/')),
+            get(crate::routes::pubsub::pubsub_query_endpoint)
+                .post(crate::routes::pubsub::pubsub_endpoint)
+                .layer::<_, Infallible>(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    fixed_ingress_ceiling,
+                ))
                 .layer(DefaultBodyLimit::max(
                     constants::AUXILIARY_JSON_BODY_LIMIT_BYTES,
                 ))
                 .with_state(app_state.clone()),
         );
-    }
-
-    #[cfg(feature = "pubsub")]
-    {
         router = router.nest(
             &routes.pubsub,
             Router::new()
+                .route("/health", get(health_status))
                 .route(
                     "/",
-                    post(crate::routes::pubsub::pubsub_endpoint).layer::<_, Infallible>(
-                        middleware::from_fn_with_state(app_state.clone(), fixed_ingress_ceiling),
-                    ),
+                    get(crate::routes::pubsub::pubsub_query_endpoint)
+                        .post(crate::routes::pubsub::pubsub_endpoint)
+                        .layer::<_, Infallible>(middleware::from_fn_with_state(
+                            app_state.clone(),
+                            fixed_ingress_ceiling,
+                        )),
                 )
                 .layer(DefaultBodyLimit::max(
                     constants::AUXILIARY_JSON_BODY_LIMIT_BYTES,
@@ -179,17 +206,68 @@ async fn fixed_ingress_ceiling(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
-    if !app_state.is_startup_ready() {
+    with_ingress_slot(&app_state, request, next, |_| {
         let error: (StatusCode, Json<ErrorResponse>) = HttpApiError::service_unavailable(1).into();
-        return error.into_response();
-    }
-    let Ok(permit) = app_state.ingress_semaphore.clone().try_acquire_owned() else {
-        let error: (StatusCode, Json<ErrorResponse>) = HttpApiError::service_unavailable(1).into();
-        return error.into_response();
+        error.into_response()
+    })
+    .await
+}
+
+async fn queue_ingress_ceiling(
+    State(app_state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    with_ingress_slot(&app_state, request, next, |request| {
+        crate::routes::queue::unavailable_response(request.headers())
+    })
+    .await
+}
+
+/// Run `next` with one ingress slot, taken before the body is read; with no
+/// slot, answer `refused`.
+async fn with_ingress_slot(
+    app_state: &AppState,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+    refused: impl FnOnce(&Request<axum::body::Body>) -> axum::response::Response,
+) -> axum::response::Response {
+    let Some(slot) = IngressSlot::acquire(app_state) else {
+        return refused(&request);
     };
+    request.extensions_mut().insert(slot.clone());
     let response = next.run(request).await;
-    drop(permit);
+    slot.release();
     response
+}
+
+/// One slot of the ingress ceiling shared by the DynamoDB, queue, and pubsub
+/// routes. The handler can release it early, for example when a receive starts
+/// to wait; otherwise it is released when the response is ready.
+#[derive(Clone)]
+pub(crate) struct IngressSlot(Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
+
+impl IngressSlot {
+    fn acquire(app_state: &AppState) -> Option<Self> {
+        if !app_state.is_startup_ready() {
+            return None;
+        }
+        let permit = app_state
+            .ingress_semaphore
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        Some(Self(Arc::new(std::sync::Mutex::new(Some(permit)))))
+    }
+
+    pub(crate) fn release(&self) {
+        drop(
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
 }
 
 fn prometheus_metrics_router(config: PrometheusMetricsEndpointConfig) -> Router {
@@ -206,7 +284,6 @@ async fn prometheus_metrics_endpoint(
 ) -> impl IntoResponse {
     let mut metrics = state.handle.render();
     append_metrics_facade_metrics(&mut metrics);
-    append_storage_backend_metrics(&mut metrics);
 
     (
         StatusCode::OK,
@@ -235,11 +312,6 @@ fn append_metrics_facade_metrics(metrics: &mut String) {
         "metrics_facade_handle_cache_entries{{kind=\"histogram\"}} {}\n",
         snapshot.histograms
     ));
-}
-
-fn append_storage_backend_metrics(metrics: &mut String) {
-    metrics.push('\n');
-    metrics.push_str(&storage_provider::read_sequence_provider_metrics_snapshot());
 }
 
 #[cfg(any(test, feature = "internal-test-routes"))]
@@ -313,7 +385,7 @@ pub(crate) async fn ready(State(app_state): State<Arc<AppState>>) -> (StatusCode
                 StatusCode::OK,
                 Json(json!({
                     "status": "ready",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "timestamp": jiff::Timestamp::now().to_string(),
                 })),
             )
         }
@@ -325,7 +397,7 @@ pub(crate) async fn ready(State(app_state): State<Arc<AppState>>) -> (StatusCode
                 Json(json!({
                     "status": "not_ready",
                     "error": message,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "timestamp": jiff::Timestamp::now().to_string(),
                 })),
             )
         }
@@ -345,7 +417,7 @@ pub(crate) async fn health_status(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "unhealthy", "reason": error.to_string(),
-                "timestamp": chrono::Utc::now().to_rfc3339()})),
+                "timestamp": jiff::Timestamp::now().to_string()})),
         );
     }
     let summary = app_state.health.status();
@@ -354,7 +426,7 @@ pub(crate) async fn health_status(
             StatusCode::OK,
             Json(json!({
                 "status": "healthy",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
             })),
         )
     } else {
@@ -363,7 +435,7 @@ pub(crate) async fn health_status(
             Json(json!({
                 "status": "unhealthy",
                 "reason": summary.reason,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
             })),
         )
     }
@@ -385,6 +457,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
         paths(
             crate::routes::dynamodb::dynamodb_endpoint,
             crate::routes::queue::queue_endpoint,
+            crate::routes::queue::queue_url_endpoint,
             crate::routes::pubsub::pubsub_endpoint,
         ),
         components(schemas(http_error::ErrorResponse)),
@@ -402,7 +475,7 @@ fn prefix_paths(mut doc: utoipa::openapi::OpenApi, base_path: &str) -> utoipa::o
 
     let paths = std::mem::take(&mut doc.paths.paths);
     for (path, item) in paths {
-        if path == "/queue" || path == "/pubsub" {
+        if path == "/queue" || path.starts_with("/queue/") || path == "/pubsub" {
             doc.paths.paths.insert(path, item);
             continue;
         }

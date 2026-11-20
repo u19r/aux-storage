@@ -23,12 +23,11 @@ use storage_provider::{StorageBackend, StorageConfig};
 use storage_remote::RemoteStorageProvider;
 use storage_types::{StorageError, StorageResult};
 
+use super::models::InitializedStore;
 #[cfg(feature = "remote")]
 use super::models::RemoteScheduledJobStoreConfig;
-use super::models::StorageProviderBundle;
 #[cfg(feature = "remote")]
-use crate::newtypes::DatabaseTrait;
-
+use super::models::StoreKind;
 #[cfg(feature = "remote")]
 const MAX_REMOTE_SCHEDULED_JOB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -79,37 +78,75 @@ pub async fn connect_remote_scheduled_job_store(
         tls: false,
         credentials: RemoteCredentialStrategy::DefaultChain,
         timeouts: Some(RemoteTimeoutOverrides {
-            connect_timeout_ms: Some(timeout_ms),
+            connect_timeout_ms: Some(
+                u64::try_from(
+                    storage_remote::connect_timeout_for(config.request_timeout).as_millis(),
+                )
+                .unwrap_or(timeout_ms),
+            ),
             request_timeout_ms: Some(timeout_ms),
         }),
     };
     storage_remote::connect_scheduled_job_store(settings).await
 }
 
-pub(crate) async fn create_storage_provider_bundle(
+pub(crate) async fn open_store(
     config: StorageConfig,
     _runtime_options: &crate::DatabaseManagerRuntimeOptions,
     _connection_id: &str,
-) -> StorageResult<StorageProviderBundle> {
+) -> StorageResult<InitializedStore> {
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    ))]
+    let initial_stream_lineages = config
+        .initial_stream_lineages
+        .unwrap_or_else(|| config.backend_type.default_initial_stream_lineages());
     match config.backend_type {
         #[cfg(feature = "sqlite")]
         StorageBackend::SQLite => {
-            let path = config
-                .connection_string
-                .or(config.file_path)
-                .unwrap_or_else(|| "main.db".to_owned());
-            let driver = sql_backend::sqlite::SqliteBackend::initialize(path).await?;
-            let store = Arc::new(SqlStore::initialize_schema(driver).await?);
-            super::assembly::prepare_native_bundle(store, _runtime_options, _connection_id).await
+            let path = config.local_path().unwrap_or("main.db").to_owned();
+            let driver = sql_backend::sqlite::SqliteBackend::initialize(
+                path,
+                _runtime_options.attempt_deadlines,
+            )
+            .await?;
+            let store = Arc::new(
+                SqlStore::initialize_schema(
+                    driver,
+                    initial_stream_lineages,
+                    _runtime_options
+                        .regional_connections
+                        .contains_key(_connection_id),
+                )
+                .await?,
+            );
+            Ok(InitializedStore::native(store))
         }
         #[cfg(feature = "turso")]
         StorageBackend::Turso => {
             let path = config
                 .connection_string
                 .unwrap_or_else(|| "main.turso.db".to_owned());
-            let driver = sql_backend::turso::TursoBackend::initialize(&path).await?;
-            let store = Arc::new(SqlStore::initialize_schema(driver).await?);
-            super::assembly::prepare_native_bundle(store, _runtime_options, _connection_id).await
+            let driver = sql_backend::turso::TursoBackend::initialize(
+                &path,
+                _runtime_options.attempt_deadlines,
+            )
+            .await?;
+            let store = Arc::new(
+                SqlStore::initialize_schema(
+                    driver,
+                    initial_stream_lineages,
+                    _runtime_options
+                        .regional_connections
+                        .contains_key(_connection_id),
+                )
+                .await?,
+            );
+            Ok(InitializedStore::native(store))
         }
         #[cfg(feature = "postgres")]
         StorageBackend::Postgres => {
@@ -122,25 +159,41 @@ pub(crate) async fn create_storage_provider_bundle(
                 &settings.dsn,
                 settings.max_pool_size,
                 settings.tls,
+                _runtime_options.attempt_deadlines,
             )
             .await?;
-            let store = Arc::new(SqlStore::initialize_schema(driver).await?);
-            super::assembly::prepare_native_bundle(store, _runtime_options, _connection_id).await
+            let store = Arc::new(
+                SqlStore::initialize_schema(
+                    driver,
+                    initial_stream_lineages,
+                    _runtime_options
+                        .regional_connections
+                        .contains_key(_connection_id),
+                )
+                .await?,
+            );
+            Ok(InitializedStore::native(store))
         }
         #[cfg(feature = "rocksdb")]
         StorageBackend::RocksDB => {
-            let path = config
-                .connection_string
-                .or(config.file_path)
-                .unwrap_or_else(|| {
+            let path = config.local_path().map_or_else(
+                || {
                     std::env::temp_dir()
                         .join("rocksdb")
                         .to_string_lossy()
                         .into_owned()
-                });
-            let driver = kv_backend::rocksdb::RocksDbBackend::initialize(path.into())?;
-            let store = Arc::new(KvStore::initialize_format(driver).await?);
-            super::assembly::prepare_native_bundle(store, _runtime_options, _connection_id).await
+                },
+                str::to_owned,
+            );
+            let writer_queue_capacity = config.rocksdb.unwrap_or_default().writer_queue_capacity;
+            let driver = kv_backend::rocksdb::RocksDbBackend::initialize(
+                path.into(),
+                _runtime_options.attempt_deadlines,
+                writer_queue_capacity,
+            )?;
+            let store =
+                Arc::new(KvStore::initialize_format(driver, initial_stream_lineages).await?);
+            Ok(InitializedStore::native(store))
         }
         #[cfg(feature = "foundationdb")]
         StorageBackend::FoundationDb => {
@@ -151,13 +204,16 @@ pub(crate) async fn create_storage_provider_bundle(
                     subspace_prefix: settings.subspace_prefix.as_deref().map(str::as_bytes),
                     tenant_name: settings.tenant_name.as_deref().map(str::as_bytes),
                     cache_read_version_ms: settings.cache_read_version_ms,
+                    reply_byte_limit: settings.reply_byte_limit,
                     transaction_byte_limit: settings.transaction_byte_limit,
                     report_conflicting_keys: false,
+                    attempt_deadlines: _runtime_options.attempt_deadlines,
                 },
             )
             .await?;
-            let store = Arc::new(KvStore::initialize_format(driver).await?);
-            super::assembly::prepare_native_bundle(store, _runtime_options, _connection_id).await
+            let store =
+                Arc::new(KvStore::initialize_format(driver, initial_stream_lineages).await?);
+            Ok(InitializedStore::native(store))
         }
         #[cfg(feature = "remote")]
         StorageBackend::Remote => {
@@ -167,25 +223,11 @@ pub(crate) async fn create_storage_provider_bundle(
             let scheduled_job_store =
                 storage_remote::build_scheduled_job_store(settings.clone()).await?;
             let provider = Arc::new(RemoteStorageProvider::new(settings).await?);
-            let database: Arc<dyn DatabaseTrait> = provider.clone();
-            Ok(StorageProviderBundle {
-                native_attempt_capacity: None,
-                #[cfg(feature = "regional")]
-                regional_services: None,
-                database: Some(database),
-                dynamo: provider.clone(),
-                stream: None,
-
-                ttl_sweep_repository: None,
-                system_stream_trim_repository: None,
-                table_reclaim_repository: None,
-                gsi_lifecycle_repository: provider,
-                queue: None,
-                pubsub: None,
-                delivery_source: None,
-                maintenance: None,
-                maintenance_source: None,
-                scheduled_job_store,
+            Ok(InitializedStore {
+                kind: StoreKind::Remote {
+                    provider,
+                    jobs: scheduled_job_store,
+                },
             })
         }
         #[cfg(not(feature = "remote"))]

@@ -1,6 +1,5 @@
-use std::{borrow::Cow, fmt, hint::black_box, time::Instant};
+use std::{borrow::Cow, fmt};
 
-use alloc_counter::AllocationGuard;
 use serde::{
     Deserialize, Deserializer,
     de::{DeserializeSeed, Error, IgnoredAny, MapAccess, Visitor},
@@ -20,7 +19,6 @@ struct Case {
     present_field_count: usize,
     fields_last: bool,
     escape_selected: bool,
-    iterations: usize,
 }
 
 const CASES: [Case; 22] = [
@@ -32,7 +30,6 @@ const CASES: [Case; 22] = [
         present_field_count: 3,
         fields_last: false,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "all_selected_15",
@@ -42,7 +39,6 @@ const CASES: [Case; 22] = [
         present_field_count: 15,
         fields_last: false,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "all_selected_15_escaped",
@@ -52,7 +48,6 @@ const CASES: [Case; 22] = [
         present_field_count: 15,
         fields_last: false,
         escape_selected: true,
-        iterations: 100_000,
     },
     Case {
         name: "tiny_early_3",
@@ -62,7 +57,6 @@ const CASES: [Case; 22] = [
         present_field_count: 3,
         fields_last: false,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "tiny_late_3",
@@ -72,7 +66,6 @@ const CASES: [Case; 22] = [
         present_field_count: 3,
         fields_last: true,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "tiny_early_15",
@@ -82,7 +75,6 @@ const CASES: [Case; 22] = [
         present_field_count: 15,
         fields_last: false,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "medium_wide_early_9",
@@ -92,7 +84,6 @@ const CASES: [Case; 22] = [
         present_field_count: 9,
         fields_last: false,
         escape_selected: false,
-        iterations: 10_000,
     },
     Case {
         name: "medium_wide_late_9",
@@ -102,7 +93,6 @@ const CASES: [Case; 22] = [
         present_field_count: 9,
         fields_last: true,
         escape_selected: false,
-        iterations: 10_000,
     },
     Case {
         name: "large_wide_early_9",
@@ -112,7 +102,6 @@ const CASES: [Case; 22] = [
         present_field_count: 9,
         fields_last: false,
         escape_selected: false,
-        iterations: 2_000,
     },
     Case {
         name: "large_wide_late_15",
@@ -122,7 +111,6 @@ const CASES: [Case; 22] = [
         present_field_count: 15,
         fields_last: true,
         escape_selected: false,
-        iterations: 2_000,
     },
     Case {
         name: "large_blob_early_9",
@@ -132,7 +120,6 @@ const CASES: [Case; 22] = [
         present_field_count: 9,
         fields_last: false,
         escape_selected: false,
-        iterations: 2_000,
     },
     Case {
         name: "large_blob_late_9",
@@ -142,7 +129,6 @@ const CASES: [Case; 22] = [
         present_field_count: 9,
         fields_last: true,
         escape_selected: false,
-        iterations: 2_000,
     },
     Case {
         name: "flat_all_selected_18",
@@ -152,7 +138,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "flat_extra_2_select_18",
@@ -162,7 +147,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 100_000,
     },
     Case {
         name: "flat_extra_16_select_18",
@@ -172,7 +156,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 20_000,
     },
     Case {
         name: "flat_extra_24_select_18",
@@ -182,7 +165,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 20_000,
     },
     Case {
         name: "flat_extra_32_select_18",
@@ -192,7 +174,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 20_000,
     },
     Case {
         name: "flat_extra_48_select_18",
@@ -202,7 +183,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 20_000,
     },
     Case {
         name: "flat_extra_64_select_18",
@@ -212,7 +192,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 10_000,
     },
     Case {
         name: "flat_extra_256_select_18",
@@ -222,7 +201,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 2_000,
     },
     Case {
         name: "flat_extra_512_select_18",
@@ -232,7 +210,6 @@ const CASES: [Case; 22] = [
         present_field_count: 18,
         fields_last: true,
         escape_selected: false,
-        iterations: 2_000,
     },
     Case {
         name: "flat_sparse_18_present_3",
@@ -242,7 +219,6 @@ const CASES: [Case; 22] = [
         present_field_count: 3,
         fields_last: true,
         escape_selected: false,
-        iterations: 100_000,
     },
 ];
 
@@ -379,9 +355,7 @@ impl<'de> Visitor<'de> for ScalarSelection<'_> {
 }
 
 fn extract_borrowed_scalars<'a>(wire: &'a WireItem, fields: &[&str]) -> Vec<Option<Cow<'a, str>>> {
-    let WireItem::DynamoJson { data } = wire else {
-        panic!("experiment requires raw DynamoDB JSON");
-    };
+    let WireItem::DynamoJson { data } = wire;
     let mut deserializer = serde_json::Deserializer::from_slice(data);
     let selected = ScalarSelection(fields)
         .deserialize(&mut deserializer)
@@ -457,55 +431,4 @@ fn given_invalid_selected_scalars_when_borrowing_then_reject() {
         .deserialize(&mut deserializer)
         .unwrap();
     assert!(deserializer.end().unwrap_err().is_syntax());
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_varied_wire_items_when_extracting_repeatedly_then_report_cost() {
-    for case in &CASES {
-        let wire = build_wire_item(case);
-        let fields = &FIELDS[..case.field_count];
-        let size = wire.payload_len();
-        for mode in ["full_decode", "single_scan", "scalar_scan", "borrowed_scan"] {
-            let label = format!("{}_{}", case.name, mode);
-            let guard = AllocationGuard::start(
-                module_path!(),
-                "given_varied_wire_items_when_extracting_repeatedly_then_report_cost",
-                file!(),
-                line!(),
-                Some(&label),
-            );
-            let started = Instant::now();
-            let mut total = 0;
-            for _ in 0..case.iterations {
-                if matches!(mode, "scalar_scan" | "borrowed_scan") {
-                    let selected = if mode == "scalar_scan" {
-                        black_box(&wire).scalar_attributes(fields).unwrap()
-                    } else {
-                        extract_borrowed_scalars(black_box(&wire), fields)
-                    };
-                    total += black_box(selected).iter().flatten().count();
-                    continue;
-                }
-                let selected = if mode == "full_decode" {
-                    extract_after_full_decode(black_box(&wire), fields)
-                } else {
-                    black_box(&wire).project_attributes(fields).unwrap()
-                };
-                total += black_box(selected).len();
-            }
-            let elapsed = started.elapsed();
-            let report = guard.finish();
-            alloc_counter::emit_report(&report).unwrap();
-            assert_eq!(total, case.iterations * case.present_field_count);
-            println!(
-                "write_extraction case={} mode={mode} item_bytes={size} fields={} iterations={} \
-                 elapsed_ns={}",
-                case.name,
-                case.field_count,
-                case.iterations,
-                elapsed.as_nanos(),
-            );
-        }
-    }
 }

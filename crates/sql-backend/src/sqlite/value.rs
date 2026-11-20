@@ -9,7 +9,7 @@ pub(super) fn decode_row<'native>(
     let mut cells = Vec::new();
     cells
         .try_reserve_exact(row.as_ref().column_count())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for index in 0..row.as_ref().column_count() {
         use rusqlite::types::ValueRef;
         let cell = match row.get_ref(index).map_err(map_driver_error)? {

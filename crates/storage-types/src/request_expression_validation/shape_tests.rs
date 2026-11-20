@@ -1,5 +1,3 @@
-use alloc_counter::AllocationGuard;
-
 use super::{ExpressionKind, validate_expression_set};
 use crate::AttributeValue;
 
@@ -59,60 +57,6 @@ fn given_in_operand_shapes_when_scanned_then_preserve_nested_unicode_and_malform
     ] {
         let actual: Vec<_> = super::shape::in_operand_lists(expression).collect();
         assert_eq!(actual, legacy_in_operand_lists(expression), "{expression}");
-    }
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_in_scanner_cases_when_repeated_then_report_cpu_and_allocations() {
-    let long = format!("{} in (:v0, :v1)", "étiquette".repeat(100));
-    for (label, expression) in [
-        ("simple", "tenant_key = :v0"),
-        ("in", "tenant_key IN (:v0, :v1)"),
-        ("unicode", long.as_str()),
-        ("nested", "x IN (:v0, function(:v1)) AND y in (:v2)"),
-        ("malformed", "x IN ((:v0)"),
-    ] {
-        for optimized in [false, true] {
-            let label = format!(
-                "{}_{}",
-                if optimized { "optimized" } else { "baseline" },
-                label
-            );
-            let operation = || {
-                if optimized {
-                    super::shape::in_operand_lists(std::hint::black_box(expression))
-                        .map(str::len)
-                        .sum::<usize>()
-                } else {
-                    legacy_in_operand_lists(std::hint::black_box(expression))
-                        .into_iter()
-                        .map(str::len)
-                        .sum::<usize>()
-                }
-            };
-            for _ in 0..100 {
-                std::hint::black_box(operation());
-            }
-            let guard = AllocationGuard::start(
-                module_path!(),
-                "in_scanner",
-                file!(),
-                line!(),
-                Some(label.as_str()),
-            );
-            let started = cpu_time::ProcessTime::now();
-            for _ in 0..100_000 {
-                std::hint::black_box(operation());
-            }
-            let cpu = started.elapsed();
-            let report = guard.finish();
-            alloc_counter::emit_report(&report).unwrap();
-            eprintln!(
-                "in_scanner label={label} iterations=100000 cpu_ns={}",
-                cpu.as_nanos()
-            );
-        }
     }
 }
 
@@ -212,65 +156,6 @@ fn given_function_name_shapes_when_scanned_then_preserve_borrowed_names() {
 }
 
 #[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_function_name_cases_when_repeated_then_report_cpu_and_allocations() {
-    let long = format!("{}(tenant_key)", "étiquette".repeat(100));
-    for (name, expression) in [
-        ("simple", "tenant_key = :v0"),
-        ("in", "tenant_key IN (:v0, :v1)"),
-        (
-            "functions",
-            "attribute_exists(tenant_key) AND attribute_not_exists(payload_key)",
-        ),
-        ("unicode", long.as_str()),
-        (
-            "nested",
-            "list_append(if_not_exists(notes_key, :empty), :value)",
-        ),
-    ] {
-        for optimized in [false, true] {
-            let label = format!(
-                "{}_{}",
-                if optimized { "optimized" } else { "baseline" },
-                name
-            );
-            let operation = || {
-                if optimized {
-                    super::shape::expression_function_names(std::hint::black_box(expression))
-                        .map(str::len)
-                        .sum::<usize>()
-                } else {
-                    legacy_expression_function_names(std::hint::black_box(expression))
-                        .into_iter()
-                        .map(str::len)
-                        .sum::<usize>()
-                }
-            };
-            for _ in 0..100 {
-                std::hint::black_box(operation());
-            }
-            let guard = AllocationGuard::start(
-                module_path!(),
-                "function_names",
-                file!(),
-                line!(),
-                Some(label.as_str()),
-            );
-            let started = cpu_time::ProcessTime::now();
-            for _ in 0..100_000 {
-                std::hint::black_box(operation());
-            }
-            let cpu = started.elapsed();
-            alloc_counter::emit_report(&guard.finish()).unwrap();
-            eprintln!(
-                "function_names label={label} iterations=100000 cpu_ns={}",
-                cpu.as_nanos()
-            );
-        }
-    }
-}
-
-#[test]
 fn given_invalid_update_values_when_validated_then_preserve_payload_and_operand_errors() {
     for keyword in ["ADD", "DELETE"] {
         let values =
@@ -302,5 +187,37 @@ fn given_invalid_update_values_when_validated_then_preserve_payload_and_operand_
             error.contains(&format!("operator: {keyword}, operand type: S")),
             "{error}"
         );
+    }
+}
+
+#[test]
+fn given_reversed_between_bounds_when_validated_then_each_kind_reports_its_own_prefix() {
+    for (kind, expression) in [
+        (ExpressionKind::Condition, "sk BETWEEN :a AND :b"),
+        (ExpressionKind::Filter, "sk BETWEEN :a AND :b"),
+        (
+            ExpressionKind::KeyCondition,
+            "pk = :a AND sk BETWEEN :a AND :b",
+        ),
+    ] {
+        let values = crate::AttributeMap::from_iter([
+            (":a".to_owned(), AttributeValue::N("5".to_owned())),
+            (":b".to_owned(), AttributeValue::N("4".to_owned())),
+        ]);
+        let error = validate_expression_set([(Some(expression), kind)], None, Some(&values), false)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "Invalid {kind}: The BETWEEN operator requires upper bound to be greater than or \
+                 equal to lower bound; lower bound operand: AttributeValue: {{N:5}}, upper bound \
+                 operand: AttributeValue: {{N:4}}"
+            )
+        );
+        let ordered = crate::AttributeMap::from_iter([
+            (":a".to_owned(), AttributeValue::N("4".to_owned())),
+            (":b".to_owned(), AttributeValue::N("4".to_owned())),
+        ]);
+        validate_expression_set([(Some(expression), kind)], None, Some(&ordered), false).unwrap();
     }
 }

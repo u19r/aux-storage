@@ -19,10 +19,22 @@ pub(super) fn parse_attributes<'a>(
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let entries = AttributeSeed(excluded)
         .deserialize(&mut deserializer)
-        .map_err(|error| StorageError::internal(&error.to_string()))?;
-    deserializer
-        .end()
-        .map_err(|error| StorageError::internal(&error.to_string()))?;
+        .map_err(|error| {
+            StorageError::internal(&format!(
+                "{:?} at {}:{}",
+                error.classify(),
+                error.line(),
+                error.column()
+            ))
+        })?;
+    deserializer.end().map_err(|error| {
+        StorageError::internal(&format!(
+            "{:?} at {}:{}",
+            error.classify(),
+            error.line(),
+            error.column()
+        ))
+    })?;
     Ok(entries)
 }
 
@@ -56,9 +68,6 @@ impl WireItem {
     pub fn dynamo_json_bytes(&self) -> StorageResult<Cow<'_, [u8]>> {
         match self {
             Self::DynamoJson { data } => Ok(Cow::Borrowed(data)),
-            Self::LocalSplit { .. } => serde_json::to_vec(&super::dynamo_json::ItemRef(self))
-                .map(Cow::Owned)
-                .map_err(|error| StorageError::internal(&error.to_string())),
         }
     }
 }

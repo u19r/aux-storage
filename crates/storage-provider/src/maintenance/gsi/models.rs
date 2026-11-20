@@ -36,16 +36,35 @@ pub struct GsiBuildAdvance {
     pub ttl_activation: Option<TtlConfigActivation>,
 }
 
+pub struct PrimaryTtlMetadata {
+    pub key: storage_types::KeyAttributes,
+    pub ttl: Option<storage_common::TtlIndexKey>,
+}
+
 pub struct GsiTransition<'a, Cursor> {
     pub expected_revision: Option<Revision>,
     pub next_progress: TaskProgress<Option<storage_backfill::GsiBuildTarget>>,
     pub expected: GsiBuild<Cursor>,
     pub projections: GsiProjectionWriteBatch,
+    pub primary_ttl_metadata: Vec<PrimaryTtlMetadata>,
     pub next_state: GsiState<Cursor>,
     pub ttl_activation: Option<&'a TtlConfigActivation>,
 }
 
 impl<Cursor> GsiTransition<'_, Cursor> {
+    /// The binding after this transition, or `None` when the GSI already has
+    /// the phase its next state implies. Only a writer-visible phase change
+    /// changes the binding and its stamp.
+    pub fn next_binding(
+        &self,
+        current: &storage_types::TableBinding,
+    ) -> storage_types::StorageResult<Option<storage_types::TableBinding>> {
+        current.with_gsi_phase(
+            &self.expected.target.index_name,
+            storage_backfill::GsiBuildPhase::from(&self.next_state).into(),
+        )
+    }
+
     pub fn validate_table(
         &self,
         table: &storage_types::BoundTableInfo,

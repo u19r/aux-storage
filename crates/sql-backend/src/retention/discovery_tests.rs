@@ -2,9 +2,14 @@
 async fn given_future_and_due_markers_in_one_hour_when_cleanup_reads_one_marker_then_due_work_progresses()
  {
     let store = crate::SqlStore::initialize_schema(
-        crate::sqlite::SqliteBackend::initialize(":memory:")
-            .await
-            .unwrap(),
+        crate::sqlite::SqliteBackend::initialize(
+            ":memory:",
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .unwrap(),
+        storage_types::InitialStreamLineages::ONE,
+        true,
     )
     .await
     .unwrap();
@@ -15,9 +20,14 @@ async fn given_future_and_due_markers_in_one_hour_when_cleanup_reads_one_marker_
 async fn given_pending_and_idle_tables_with_equal_deadlines_when_cleanup_reads_one_marker_then_both_make_progress()
  {
     let store = crate::SqlStore::initialize_schema(
-        crate::sqlite::SqliteBackend::initialize(":memory:")
-            .await
-            .unwrap(),
+        crate::sqlite::SqliteBackend::initialize(
+            ":memory:",
+            storage_types::AttemptDeadlines::default(),
+        )
+        .await
+        .unwrap(),
+        storage_types::InitialStreamLineages::ONE,
+        true,
     )
     .await
     .unwrap();

@@ -35,7 +35,7 @@ impl<'a> MaterializedItemRecord<'a> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(size)
-            .map_err(|_| crate::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| crate::AttemptFailure::CAPACITY)?;
         bytes.push(MATERIALIZED_ITEM_FORMAT);
         bytes.extend_from_slice(history.as_ref());
         bytes.extend_from_slice(&length.to_be_bytes());

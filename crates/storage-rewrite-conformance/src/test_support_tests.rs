@@ -33,17 +33,17 @@ fn given_missing_postgres_dsn_when_backend_is_selected_then_error_explains_setup
 #[test]
 fn given_missing_foundationdb_cluster_file_when_backend_is_selected_then_error_explains_setup() {
     let error = required_backend_setting(
-        "FDB_CLUSTER_FILE",
+        "TEST_FDB_CLUSTER_FILE",
         None,
-        "FDB_CLUSTER_FILE=/path/to/fdb.cluster just test '-p storage-rewrite-conformance \
+        "TEST_FDB_CLUSTER_FILE=/path/to/fdb.cluster just test '-p storage-rewrite-conformance \
          --no-default-features --features foundationdb'",
     )
     .expect_err("missing cluster file must fail");
 
     assert_eq!(
         error,
-        "FDB_CLUSTER_FILE is required for this backend; set it before running tests, for example: \
-         FDB_CLUSTER_FILE=/path/to/fdb.cluster just test '-p storage-rewrite-conformance \
-         --no-default-features --features foundationdb'"
+        "TEST_FDB_CLUSTER_FILE is required for this backend; set it before running tests, for \
+         example: TEST_FDB_CLUSTER_FILE=/path/to/fdb.cluster just test '-p \
+         storage-rewrite-conformance --no-default-features --features foundationdb'"
     );
 }

@@ -6,7 +6,8 @@ use crate::{
     TransactPutRequest,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct TransactWriteItemsRequest {
     pub transact_items: Vec<TransactWriteItem>,
@@ -21,7 +22,8 @@ pub struct TransactWriteItemsRequest {
     pub return_item_collection_metrics: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct TransactWriteItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,7 +39,21 @@ pub struct TransactWriteItem {
     pub condition_check: Option<TransactConditionCheckRequest>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+impl TransactWriteItem {
+    /// The member's table, whichever action it carries.
+    #[must_use]
+    pub fn table_name(&self) -> Option<&TableName> {
+        self.put
+            .as_ref()
+            .map(|put| &put.table_name)
+            .or_else(|| self.update.as_ref().map(|update| &update.table_name))
+            .or_else(|| self.delete.as_ref().map(|delete| &delete.table_name))
+            .or_else(|| self.condition_check.as_ref().map(|check| &check.table_name))
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct TransactUpdateRequest {
     pub table_name: TableName,
@@ -65,7 +81,8 @@ pub struct TransactUpdateRequest {
     pub return_values_on_condition_check_failure: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct TransactConditionCheckRequest {
     pub table_name: TableName,
@@ -89,7 +106,7 @@ pub struct TransactConditionCheckRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TransactWriteItemsResponse {
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
-    pub consumed_capacity: Option<serde_json::Value>,
+    pub consumed_capacity: Option<Vec<crate::ConsumedCapacity>>,
 
     #[serde(
         rename = "ItemCollectionMetrics",

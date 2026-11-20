@@ -37,7 +37,7 @@ impl<A: Send> ExpirationTargetAdmission<A> for OrdinaryExpiration {
     }
 }
 
-impl<A: crate::DeleteItemAttempt> ExpirationEffectPolicy<A> for OrdinaryExpiration {
+impl<A: crate::ItemWriteAttempt> ExpirationEffectPolicy<A> for OrdinaryExpiration {
     async fn delete_items(
         &self,
         attempt: &mut A,

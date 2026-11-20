@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use crate::{AttributeValue, KeyAttributes, canonicalize_top_level_number_value};
+use alloc_counter::AllocationGuard;
+
+use crate::{
+    AttributeValue, KeyAttributes, KeySchemaElement, KeyType, MissingKeyAttribute, StorageResult,
+    canonicalize_top_level_number_value, schema_key_values,
+};
 
 #[test]
 fn given_number_set_when_canonicalized_then_valid_members_change_and_invalid_ones_survive() {
@@ -109,4 +114,158 @@ fn given_duplicate_key_name_when_inserted_then_value_is_replaced_without_growth(
 
     assert_eq!(keys.len(), 1);
     assert_eq!(keys.get("pk"), Some(&AttributeValue::S("new".to_owned())));
+}
+
+#[test]
+fn key_only_extraction_avoids_full_split_clones() {
+    let schema = vec![
+        KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        },
+        KeySchemaElement {
+            attribute_name: "sk".to_string(),
+            key_type: KeyType::Range,
+        },
+    ];
+    let item = [
+        ("pk".to_string(), AttributeValue::S("tenant".to_string())),
+        ("sk".to_string(), AttributeValue::S("item".to_string())),
+        ("payload_a".to_string(), AttributeValue::S("a".repeat(256))),
+        ("payload_b".to_string(), AttributeValue::S("b".repeat(256))),
+        ("payload_c".to_string(), AttributeValue::S("c".repeat(256))),
+    ]
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+
+    let expected = legacy_full_split_key_attributes(&item, &schema).expect("legacy keys");
+    let actual = KeyAttributes::from_schema(&schema, &item).expect("key-only keys");
+    assert_eq!(actual, expected);
+
+    let baseline = measure_legacy(&item, &schema);
+    let current = measure_current(&item, &schema);
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&current);
+    assert!(
+        current.allocation_count < baseline.allocation_count,
+        "expected key-only extraction to allocate less often, baseline={} current={}",
+        baseline.allocation_count,
+        current.allocation_count
+    );
+    assert!(
+        current.allocated_bytes < baseline.allocated_bytes,
+        "expected key-only extraction to allocate fewer bytes, baseline={} current={}",
+        baseline.allocated_bytes,
+        current.allocated_bytes
+    );
+}
+
+#[test]
+fn key_only_extraction_preserves_missing_and_empty_schema_cases() {
+    let schema = [KeySchemaElement {
+        attribute_name: "pk".to_string(),
+        key_type: KeyType::Hash,
+    }];
+    let missing = std::collections::HashMap::from([(
+        "other".to_string(),
+        AttributeValue::S("value".to_string()),
+    )]);
+    assert_eq!(
+        KeyAttributes::from_schema(&schema, &missing),
+        Err(MissingKeyAttribute { name: "pk" })
+    );
+
+    let empty = std::collections::HashMap::<String, AttributeValue>::new();
+    assert!(
+        KeyAttributes::from_schema(&[], &empty)
+            .expect("empty schema")
+            .is_empty()
+    );
+}
+
+fn legacy_full_split_key_attributes(
+    item: &std::collections::HashMap<String, AttributeValue>,
+    key_schema: &[KeySchemaElement],
+) -> StorageResult<KeyAttributes> {
+    let mut key_attributes = KeyAttributes::with_capacity(key_schema.len());
+    let mut non_key_attributes =
+        std::collections::HashMap::with_capacity(item.len().saturating_sub(key_schema.len()));
+    for (name, value) in item {
+        if key_schema.iter().any(|key| key.attribute_name == *name) {
+            key_attributes.insert(name.clone(), value.clone());
+        } else {
+            non_key_attributes.insert(name.clone(), value.clone());
+        }
+    }
+    for key in key_schema {
+        if !key_attributes.contains_key(&key.attribute_name) {
+            return Err(crate::StorageError::invalid_or_missing_key());
+        }
+    }
+    std::hint::black_box(non_key_attributes);
+    Ok(key_attributes)
+}
+
+fn measure_legacy(
+    item: &std::collections::HashMap<String, AttributeValue>,
+    schema: &[KeySchemaElement],
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "key_only_extraction_full_split_baseline",
+        file!(),
+        line!(),
+        Some("scan_all_attributes"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(legacy_full_split_key_attributes(item, schema).expect("keys"));
+    }
+    guard.finish()
+}
+
+fn measure_current(
+    item: &std::collections::HashMap<String, AttributeValue>,
+    schema: &[KeySchemaElement],
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "key_only_extraction_schema_direct_current",
+        file!(),
+        line!(),
+        Some("schema_direct_lookup"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(KeyAttributes::from_schema(schema, item).expect("keys"));
+    }
+    guard.finish()
+}
+
+fn element(name: &str, key_type: KeyType) -> KeySchemaElement {
+    KeySchemaElement {
+        attribute_name: name.to_string(),
+        key_type,
+    }
+}
+
+#[test]
+fn from_schema_reports_first_missing_in_schema_order() {
+    let schema = [element("sk", KeyType::Range), element("pk", KeyType::Hash)];
+    let item = HashMap::<String, AttributeValue>::new();
+    assert_eq!(
+        KeyAttributes::from_schema(&schema, &item),
+        Err(MissingKeyAttribute { name: "sk" })
+    );
+}
+
+#[test]
+fn schema_key_values_yields_schema_order() {
+    let schema = [element("sk", KeyType::Range), element("pk", KeyType::Hash)];
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("p".to_string())),
+        ("sk".to_string(), AttributeValue::S("s".to_string())),
+    ]);
+    let names = schema_key_values(&schema, &item)
+        .map(|entry| entry.expect("present").0.attribute_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["sk", "pk"]);
 }

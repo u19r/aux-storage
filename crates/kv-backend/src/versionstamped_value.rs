@@ -4,7 +4,7 @@ use storage_types::{StorageError, StorageResult};
 
 use crate::{
     KvMutation,
-    constants::{KV_CHUNK_BYTES, KV_VERSIONSTAMP_PLACEHOLDER},
+    constants::{KV_CHUNK_BYTES, KV_VALUE_INLINE_TAG, KV_VERSIONSTAMP_PLACEHOLDER},
     mutation_preparation::expand_mutations,
     value_layout::ChunkAddress,
 };
@@ -49,7 +49,8 @@ impl VersionstampedValue {
             )
         };
         let offset = u32::try_from(local_offset).map_err(|_| invalid_slot())?;
-        let mut changes = expand_mutations(vec![KvMutation::Put { key, value }], inline_limit)?;
+        let mut changes =
+            expand_mutations(vec![KvMutation::Put { key, value }], inline_limit, &mut [])?;
         let position = changes
             .iter()
             .position(|change| matches!(change, KvMutation::Put { key, .. } if key == &stamped_key))
@@ -65,6 +66,47 @@ impl VersionstampedValue {
             changes,
             stamped_key,
             stamped_value,
+            offset,
+        })
+    }
+
+    /// One stamped inline value of a family that never uses chunks: no
+    /// chunk-span clear and no chunk keys. A value over the native inline
+    /// allowance is an internal error, never a chunked write.
+    pub(crate) fn try_new_unchunked(
+        key: Vec<u8>,
+        mut value: Vec<u8>,
+        offset: u32,
+        native_limit: usize,
+    ) -> StorageResult<Self> {
+        let position = usize::try_from(offset).map_err(|_| invalid_slot())?;
+        if position
+            .checked_add(KV_VERSIONSTAMP_PLACEHOLDER.len())
+            .is_none_or(|end| end > value.len())
+        {
+            return Err(invalid_slot());
+        }
+        // The native versionstamped-value operand appends its offset trailer.
+        let inline_limit = native_limit
+            .checked_sub(std::mem::size_of::<u32>())
+            .ok_or_else(invalid_slot)?;
+        if value
+            .len()
+            .checked_add(1)
+            .is_none_or(|encoded| encoded > inline_limit)
+        {
+            return Err(StorageError::internal(
+                "KV unchunked versionstamped value exceeds the native value limit",
+            ));
+        }
+        value
+            .try_reserve_exact(1)
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
+        value.push(KV_VALUE_INLINE_TAG);
+        Ok(Self {
+            changes: Vec::new(),
+            stamped_key: key,
+            stamped_value: value,
             offset,
         })
     }

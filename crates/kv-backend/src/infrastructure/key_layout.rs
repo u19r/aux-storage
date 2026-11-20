@@ -25,11 +25,11 @@ pub(super) fn encode_key(key: &DurableRecordKey) -> StorageResult<Vec<u8>> {
         .checked_add(address.resource.len())
         .and_then(|bytes| bytes.checked_add(address.suffix.len()))
         .and_then(|bytes| bytes.checked_add(16))
-        .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(encoded_key_length_bound(logical)?)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     bytes.extend_from_slice(INFRASTRUCTURE_RECORD_PREFIX);
     append_segment(&mut bytes, address.namespace.as_bytes());
     append_segment(&mut bytes, &address.resource);
@@ -43,11 +43,11 @@ pub(super) fn encode_namespace_prefix(namespace: &str) -> StorageResult<Vec<u8>>
         .len()
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(INFRASTRUCTURE_RECORD_PREFIX.len() + 2))
-        .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(size)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     bytes.extend_from_slice(INFRASTRUCTURE_RECORD_PREFIX);
     append_segment(&mut bytes, namespace.as_bytes());
     Ok(bytes)
@@ -64,16 +64,16 @@ pub(super) fn generation_bounds(
         .len()
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(2 + std::mem::size_of::<u64>()))
-        .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     prefix
         .try_reserve_exact(extra)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     append_segment(&mut prefix, &address.resource);
     let range = KvRange::try_for_prefix(prefix, NonZeroU32::MIN, NonZeroUsize::MIN)?;
     let mut begin = range.begin;
     begin
         .try_reserve_exact(std::mem::size_of::<u64>())
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     begin.extend_from_slice(&minimum.to_be_bytes());
     Ok((begin, range.end))
 }
@@ -130,7 +130,7 @@ pub(super) fn encode_range(
         begin = encode_key(after)?;
         begin
             .try_reserve(1)
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         begin.push(0);
     }
     let limit = count
@@ -206,7 +206,7 @@ fn take_segment(bytes: &mut &[u8]) -> StorageResult<Vec<u8>> {
         if *byte != 0 {
             segment
                 .try_reserve(1)
-                .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+                .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
             segment.push(*byte);
             continue;
         }
@@ -217,7 +217,7 @@ fn take_segment(bytes: &mut &[u8]) -> StorageResult<Vec<u8>> {
             255 => {
                 segment
                     .try_reserve(1)
-                    .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+                    .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
                 segment.push(0);
             }
             _ => return Err(invalid_key()),

@@ -9,7 +9,8 @@ use crate::{
     ReturnConsumedCapacity, TableName, VecMap, WireItem,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct ScanRequest {
     pub table_name: TableName,
@@ -22,7 +23,7 @@ pub struct ScanRequest {
     #[builder(default)]
     pub attributes_to_get: Option<Vec<String>>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
@@ -35,7 +36,7 @@ pub struct ScanRequest {
     #[builder(default)]
     pub filter_expression: Option<String>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub scan_filter: Option<HashMap<String, Condition>>,
@@ -102,7 +103,8 @@ impl ScanRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ScanResponse {
     #[serde(
         rename = "Items",
@@ -134,6 +136,15 @@ pub struct ConsumedCapacity {
     #[serde(rename = "CapacityUnits")]
     pub capacity_units: f64,
 
+    #[serde(rename = "ReadCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub read_capacity_units: Option<f64>,
+
+    #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub write_capacity_units: Option<f64>,
+
+    #[serde(rename = "Table", skip_serializing_if = "Option::is_none")]
+    pub table: Option<ConsumedCapacityMetrics>,
+
     #[serde(
         rename = "GlobalSecondaryIndexes",
         skip_serializing_if = "Option::is_none"
@@ -146,6 +157,12 @@ pub struct ConsumedCapacity {
 pub struct ConsumedCapacityMetrics {
     #[serde(rename = "CapacityUnits")]
     pub capacity_units: f64,
+
+    #[serde(rename = "ReadCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub read_capacity_units: Option<f64>,
+
+    #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub write_capacity_units: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -155,7 +172,8 @@ pub enum ConditionalOperator {
     Or,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct Condition {
     pub comparison_operator: String,
@@ -163,7 +181,8 @@ pub struct Condition {
     pub attribute_value_list: Vec<AttributeValue>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct ExpectedAttributeValue {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,7 +198,8 @@ pub struct ExpectedAttributeValue {
     pub exists: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct AttributeValueUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,7 +217,8 @@ pub enum AttributeAction {
     Add,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(rename_all = "PascalCase")]
 pub struct QueryRequest {
     pub table_name: TableName,
@@ -206,14 +227,22 @@ pub struct QueryRequest {
     #[builder(default)]
     pub index_name: Option<IndexName>,
 
-    #[serde(default)]
-    pub key_condition_expression: String,
+    /// `None` when the field is absent; `Some("")` is an explicit empty
+    /// expression.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub key_condition_expression: Option<String>,
+
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub key_conditions: Option<HashMap<String, Condition>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub attributes_to_get: Option<Vec<String>>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
@@ -222,7 +251,7 @@ pub struct QueryRequest {
     #[builder(default)]
     pub filter_expression: Option<String>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Legacy parameter: rejected by request validation (DDB-PAR-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub query_filter: Option<HashMap<String, Condition>>,
@@ -271,7 +300,8 @@ impl QueryRequest {
         Self {
             table_name,
             index_name: None,
-            key_condition_expression,
+            key_condition_expression: Some(key_condition_expression),
+            key_conditions: None,
             attributes_to_get: None,
             conditional_operator: None,
             filter_expression: None,
@@ -289,7 +319,8 @@ impl QueryRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct QueryResponse {
     #[serde(
         rename = "Items",

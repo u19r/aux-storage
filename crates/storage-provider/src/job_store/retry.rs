@@ -4,7 +4,7 @@ use std::{
 };
 
 use scheduled_bg_jobs::store::CommitOutcome;
-use storage_types::{StorageEnum, StorageError, context::WrappedError as _};
+use storage_types::StorageError;
 
 use crate::RawOrderedJobStoreError;
 
@@ -28,10 +28,8 @@ where
         };
         match attempt(remaining).await {
             Err(RawOrderedJobStoreError::Backend(error))
-                if matches!(error.to_enum(), StorageEnum::TransactionConflict { .. }) => {}
-            Err(RawOrderedJobStoreError::Backend(error))
-                if matches!(error.to_enum(), StorageEnum::SyncSubmissionAmbiguous { .. }) =>
-            {
+                if error.attempt_kind() == Some(storage_types::AttemptKind::Conflict) => {}
+            Err(RawOrderedJobStoreError::Backend(error)) if error.is_commit_unknown() => {
                 return Ok(CommitOutcome::Unknown);
             }
             result => return result,

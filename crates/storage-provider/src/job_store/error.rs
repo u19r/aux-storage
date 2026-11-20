@@ -24,6 +24,12 @@ impl From<RawOrderedJobStoreError> for JobCommitError {
     }
 }
 
+impl From<storage_types::AttemptFailure> for JobCommitError {
+    fn from(error: storage_types::AttemptFailure) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
 impl From<storage_types::InfrastructureResultKind> for JobCommitError {
     fn from(error: storage_types::InfrastructureResultKind) -> Self {
         Self::Storage(error.into())

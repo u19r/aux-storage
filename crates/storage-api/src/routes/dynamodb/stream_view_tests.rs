@@ -17,6 +17,7 @@ async fn given_all_stream_views_when_item_changes_then_event_names_keys_and_imag
                 "DynamoDB_20120810.CreateTable",
                 json!({
                     "TableName": "StreamViews",
+                    "BillingMode": "PAY_PER_REQUEST",
                     "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
                     "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view}

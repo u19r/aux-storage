@@ -1,13 +1,13 @@
-//! Qualified table-pointer prefixes own discoverable item-history cleanup work.
+//! Canonical entry prefixes own table retention and atomic deletion progress.
 
 use std::{num::NonZeroU32, sync::Arc};
 
 use storage_types::{
-    BoundTableInfo, ItemHistoryPointer, ItemHistoryPublication, StorageError, StorageResult,
-    SystemStreamPosition, TableHistoryLane, TableStreamSequence, TimestampMillis,
+    BoundTableInfo, StorageError, StorageResult, SystemStreamOffset, SystemStreamPosition,
+    TableHistoryLane, TableStreamSequence, TimestampMillis,
 };
 use stream_provider::{
-    ReadDirection, SystemStreamHistory, TableHistoryIndexPage, TableHistoryIndexRead,
+    ReadDirection, SystemStreamHistory, TableHistoryIndexRead, TableHistoryObservationPage,
 };
 
 use super::{
@@ -18,7 +18,7 @@ use super::{
 pub(super) struct TableCleanupLane {
     pub lane: TableHistoryLane,
     pub through: SystemStreamPosition,
-    pub candidates: Vec<ItemHistoryPointer>,
+    pub candidates: Vec<stream_provider::TableHistoryObservation>,
 }
 
 pub(super) struct TableCleanupWork {
@@ -27,6 +27,13 @@ pub(super) struct TableCleanupWork {
     pub expected: StreamTrimState,
     pub state: StreamTrimState,
     pub lanes: Vec<TableCleanupLane>,
+    /// Send progress of a paired table (`None`: unpaired).
+    holds: Option<
+        Vec<(
+            regional_replication::message::LineageRef,
+            crate::LineageCursor,
+        )>,
+    >,
     next_event_due: Option<TimestampMillis>,
     needs_more: bool,
     pub deleted_rows: usize,
@@ -52,12 +59,70 @@ impl TableCleanupWork {
             expected,
             state,
             lanes: Vec::new(),
+            holds: None,
             next_event_due: None,
             needs_more: false,
             deleted_rows: 0,
         };
         work.bind_source_lanes(source)?;
         Ok(work)
+    }
+
+    pub(super) fn set_holds(
+        &mut self,
+        holds: Vec<(
+            regional_replication::message::LineageRef,
+            crate::LineageCursor,
+        )>,
+    ) {
+        self.holds = Some(holds);
+    }
+
+    /// A paired table keeps every entry its peer has not acknowledged (P11).
+    fn held(
+        &self,
+        index: usize,
+        entry: &stream_provider::TableHistoryObservation,
+    ) -> StorageResult<bool> {
+        let Some(holds) = &self.holds else {
+            return Ok(false);
+        };
+        let lineage = &self.state.frontier.lineages[index];
+        let Some((_, hold)) = holds.iter().find(|(known, _)| {
+            known.shard == lineage.shard_id && known.lineage == lineage.lineage_id
+        }) else {
+            return Ok(true);
+        };
+        Ok(crate::regional_receive::offset_order(
+            Some(entry.position.offset()),
+            hold.through.as_ref(),
+        )? == std::cmp::Ordering::Greater)
+    }
+
+    /// How far an empty lane retires: its head; on a paired table at most its
+    /// send record, and nothing without one (the sender refuses history retired
+    /// past the acknowledgment).
+    fn empty_lane_bound(&self, index: usize) -> StorageResult<Option<SystemStreamOffset>> {
+        use crate::regional_receive::offset_order;
+        let head = self.lanes[index].through.offset();
+        let Some(holds) = &self.holds else {
+            return Ok(Some(head.clone()));
+        };
+        let lineage = &self.state.frontier.lineages[index];
+        let Some((_, hold)) = holds.iter().find(|(known, _)| {
+            known.shard == lineage.shard_id && known.lineage == lineage.lineage_id
+        }) else {
+            return Ok(None);
+        };
+        let bound = if offset_order(Some(head), hold.through.as_ref())?.is_gt() {
+            hold.through.as_ref()
+        } else {
+            Some(head)
+        };
+        Ok(offset_order(bound, lineage.retired_through.as_ref())?
+            .is_gt()
+            .then(|| bound.cloned())
+            .flatten())
     }
 
     fn bind_source_lanes(&mut self, source: &SystemStreamHistory) -> StorageResult<()> {
@@ -101,9 +166,10 @@ impl TableCleanupWork {
     pub(super) fn reads(
         &self,
         limit: StreamTrimPageLimit,
+        maximum: usize,
     ) -> StorageResult<Vec<TableHistoryIndexRead>> {
         let quota = u32::from(limit)
-            .min(crate::constants::TABLE_CLEANUP_PAGE_ROWS as u32)
+            .min(maximum as u32)
             .div_ceil(self.lanes.len() as u32)
             .max(1);
         self.lanes
@@ -142,13 +208,12 @@ impl TableCleanupWork {
 
     pub(super) fn observe_pages(
         &mut self,
-        pages: Vec<TableHistoryIndexPage>,
+        pages: &mut impl Iterator<Item = TableHistoryObservationPage>,
         now: TimestampMillis,
     ) -> StorageResult<()> {
-        if pages.len() != self.lanes.len() {
-            return Err(invalid_cleanup());
-        }
-        for (index, page) in pages.into_iter().enumerate() {
+        // `reads` issued one read per lane and the driver proved one page per
+        // read, so this lane's pages are exactly the next `lanes.len()`.
+        for (index, page) in pages.take(self.lanes.len()).enumerate() {
             self.observe_lane(index, page, now)?;
         }
         Ok(())
@@ -157,20 +222,22 @@ impl TableCleanupWork {
     fn observe_lane(
         &mut self,
         index: usize,
-        page: TableHistoryIndexPage,
+        page: TableHistoryObservationPage,
         now: TimestampMillis,
     ) -> StorageResult<()> {
-        if page.pointers.is_empty() {
-            let progress = &mut self.state.frontier.lineages[index];
-            if self.state.retention != storage_types::StreamRetentionDuration::Forever {
-                progress.retired_through = Some(self.lanes[index].through.offset().clone());
+        if page.entries.is_empty() {
+            if self.state.retention != storage_types::StreamRetentionDuration::Forever
+                && let Some(bound) = self.empty_lane_bound(index)?
+            {
+                self.state.frontier.lineages[index].retired_through = Some(bound);
             }
+            let progress = &mut self.state.frontier.lineages[index];
             progress.cleaned_through = progress.retired_through.clone();
             return Ok(());
         }
-        let count = page.pointers.len();
-        for pointer in page.pointers {
-            if !self.include_pointer(index, pointer, now)? {
+        let count = page.entries.len();
+        for entry in page.entries {
+            if !self.include_entry(index, entry, now)? {
                 break;
             }
         }
@@ -178,30 +245,39 @@ impl TableCleanupWork {
         Ok(())
     }
 
-    fn include_pointer(
+    fn include_entry(
         &mut self,
         index: usize,
-        pointer: ItemHistoryPointer,
+        entry: stream_provider::TableHistoryObservation,
         now: TimestampMillis,
     ) -> StorageResult<bool> {
-        let ItemHistoryPublication::Event {
-            table_position,
-            created_at,
-            ..
-        } = pointer.metadata().publication()
-        else {
-            return Err(invalid_cleanup());
-        };
-        let retired = self.state.frontier.is_retired(pointer.metadata())?;
+        let retired = self.state.frontier.lineages[index]
+            .retired_through
+            .as_ref()
+            .map(|through| entry.position.offset().compare_order(through))
+            .transpose()
+            .map_err(|_| invalid_cleanup())?
+            .is_some_and(|order| !order.is_gt());
+        if !retired && self.held(index, &entry)? {
+            let recheck = now + crate::constants::REGIONAL_HOLD_RECHECK_MILLIS;
+            self.next_event_due = Some(
+                self.next_event_due
+                    .map_or(recheck, |current| current.min(recheck)),
+            );
+            return Ok(false);
+        }
+        let created_at = entry.created_at;
         let expires = self
             .state
             .retention
             .cutoff_at(now)
-            .is_some_and(|cutoff| *created_at <= cutoff);
+            .is_some_and(|cutoff| created_at <= cutoff);
+        // Commit order does not imply timestamp order: retain the entire suffix
+        // after the first unexpired event.
         if !retired && !expires {
             if let storage_types::StreamRetentionDuration::FiniteHours(hours) = self.state.retention
             {
-                let due = *created_at + i64::from(hours) * 3600 * 1000;
+                let due = created_at + i64::from(hours) * 3600 * 1000;
                 self.next_event_due =
                     Some(self.next_event_due.map_or(due, |current| current.min(due)));
             }
@@ -209,24 +285,35 @@ impl TableCleanupWork {
         }
         if !retired {
             self.state.frontier.lineages[index].retired_through =
-                Some(table_position.offset().clone());
+                Some(entry.position.offset().clone());
         }
-        self.lanes[index].candidates.push(pointer);
+        self.lanes[index].candidates.push(entry);
         Ok(true)
     }
 
-    pub(super) fn complete_pointer(
+    pub(super) fn select_deletes(
         &mut self,
-        lane: usize,
-        pointer: &ItemHistoryPointer,
-    ) -> StorageResult<()> {
-        let ItemHistoryPublication::Event { table_position, .. } = pointer.metadata().publication()
-        else {
-            return Err(invalid_cleanup());
-        };
-        self.state.frontier.lineages[lane].cleaned_through = Some(table_position.offset().clone());
-        self.deleted_rows += 1;
-        Ok(())
+        maximum: usize,
+    ) -> (Vec<stream_provider::StreamEntryAddress>, Option<usize>) {
+        let mut deletes = Vec::new();
+        let mut last_lane = None;
+        for (index, lane) in self.lanes.iter_mut().enumerate() {
+            for entry in lane
+                .candidates
+                .drain(..)
+                .take(maximum.saturating_sub(deletes.len()))
+            {
+                self.state.frontier.lineages[index].cleaned_through =
+                    Some(entry.position.offset().clone());
+                deletes.push(stream_provider::StreamEntryAddress {
+                    history_id: entry.history_id,
+                    position: entry.position,
+                });
+                self.deleted_rows += 1;
+                last_lane = Some(index);
+            }
+        }
+        (deletes, last_lane)
     }
 
     pub(super) fn finish(
@@ -270,12 +357,6 @@ impl TableCleanupWork {
 
     fn schedule_cleanup(&mut self, now: TimestampMillis) -> StorageResult<bool> {
         let pending = self.needs_more || self.state.frontier.has_pending_cleanup()?;
-        let sweep_due = self
-            .state
-            .frontier
-            .item_history_sweep
-            .as_ref()
-            .map(|sweep| sweep.not_before);
         self.state.next_due_at = if pending {
             // Yield this exact discovery window to other due tables. A bucket
             // or equal deadline can repeatedly select the same full page.
@@ -287,7 +368,6 @@ impl TableCleanupWork {
         } else {
             self.next_event_due
                 .into_iter()
-                .chain(sweep_due)
                 .min()
                 .or_else(|| match self.state.retention {
                     storage_types::StreamRetentionDuration::Forever => None,

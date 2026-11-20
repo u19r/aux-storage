@@ -5,7 +5,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 
 use super::error::{TransportError, TransportResult};
 
-pub(super) struct FrameReader<'a> {
+pub struct FrameReader<'a> {
     decoder: Decompress,
     decoded: usize,
     expected: usize,
@@ -14,7 +14,7 @@ pub(super) struct FrameReader<'a> {
 }
 
 impl<'a> FrameReader<'a> {
-    pub(super) fn new(packed: &'a [u8], expected: u32) -> Self {
+    pub fn new(packed: &'a [u8], expected: u32) -> Self {
         Self {
             decoder: Decompress::new(true),
             decoded: 0,
@@ -24,7 +24,7 @@ impl<'a> FrameReader<'a> {
         }
     }
 
-    pub(super) fn require_complete(&self) -> TransportResult<()> {
+    pub fn require_complete(&self) -> TransportResult<()> {
         if !self.finished
             || self.decoded != self.expected
             || self.decoder.total_in() != self.packed.len() as u64

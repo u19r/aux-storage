@@ -1,14 +1,10 @@
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use clap::Parser;
-use serde_json::Value;
 
-use crate::{
-    Backends, Config, ConfigError, Cors, MetricsConfig, RootConfig, Tracing, constants::VARIABLES,
-    load_optional_with_overrides,
-};
+use crate::{Config, ConfigError, constants::VARIABLES, load_optional_with_overrides};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "local-dynamodb-server")]
 #[command(about = "A local DynamoDB server implementation in Rust")]
 struct StorageApiArgs {
@@ -20,8 +16,6 @@ struct StorageApiArgs {
     postgres_dsn: Option<String>,
     #[arg(long)]
     postgres_max_pool_size: Option<usize>,
-    #[arg(long)]
-    postgres_background_max_pool_size: Option<usize>,
     #[arg(long)]
     postgres_tls: Option<bool>,
     #[arg(long)]
@@ -40,6 +34,22 @@ struct StorageApiArgs {
     storage_admission_queue_capacity: Option<usize>,
     #[arg(long)]
     storage_admission_max_queue_wait_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_point_read_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_range_read_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_write_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_transaction_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_schema_change_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_background_page_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_long_poll_probe_ms: Option<u64>,
+    #[arg(long)]
+    storage_deadlines_commit_grace_ms: Option<u64>,
     #[arg(short, long)]
     port: Option<String>,
     #[arg(long)]
@@ -74,17 +84,9 @@ pub struct LaunchInputs {
 
 #[derive(Debug, Clone)]
 pub struct StorageApiLaunchEffectiveConfig {
-    pub root: RootConfig,
     pub config: Arc<Config>,
-    pub bind_addr: String,
-    pub cors: Cors,
-    pub tracing: Tracing,
-    pub metrics: MetricsConfig,
-    pub backends: Backends,
-    pub enable_background_workers: bool,
     pub enable_internal_helper_routes: bool,
     pub config_watch_path: Option<PathBuf>,
-    pub effective_json: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -117,19 +119,10 @@ impl StorageApiLaunchConfig {
             .collect::<Vec<_>>();
         let config =
             load_optional_with_overrides(args.config.as_deref(), all_overrides.as_slice())?;
-        let root = config.root.clone();
         let effective = StorageApiLaunchEffectiveConfig {
-            bind_addr: root.http.bind_addr.clone(),
-            cors: root.http.cors.clone(),
-            tracing: root.features.tracing.clone(),
-            metrics: root.features.metrics.clone(),
-            backends: root.features.backends.clone(),
-            enable_background_workers: root.features.runtime.enable_background_workers,
+            config,
             enable_internal_helper_routes: args.enable_internal_helper_routes,
             config_watch_path: args.config.clone(),
-            effective_json: config.effective_json.clone(),
-            root,
-            config: config.clone(),
         };
 
         Ok(Self {
@@ -147,7 +140,6 @@ impl StorageApiLaunchConfig {
 fn collect_top_level_overrides(args: &StorageApiArgs, overrides: &mut Vec<(String, String)>) {
     let postgres_selected_by_setting = args.postgres_dsn.is_some()
         || args.postgres_max_pool_size.is_some()
-        || args.postgres_background_max_pool_size.is_some()
         || args.postgres_tls.is_some();
     let selected_backend = args
         .storage
@@ -178,12 +170,6 @@ fn collect_top_level_overrides(args: &StorageApiArgs, overrides: &mut Vec<(Strin
         overrides.push((
             "features.backends.postgres.max_pool_size".to_string(),
             max_pool_size.to_string(),
-        ));
-    }
-    if let Some(background_max_pool_size) = args.postgres_background_max_pool_size {
-        overrides.push((
-            "features.backends.postgres.background_max_pool_size".to_string(),
-            background_max_pool_size.to_string(),
         ));
     }
     if let Some(tls) = args.postgres_tls {
@@ -231,6 +217,46 @@ fn collect_top_level_overrides(args: &StorageApiArgs, overrides: &mut Vec<(Strin
         overrides,
         "features.storage_admission.max_queue_wait_ms",
         args.storage_admission_max_queue_wait_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.point_read_ms",
+        args.storage_deadlines_point_read_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.range_read_ms",
+        args.storage_deadlines_range_read_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.write_ms",
+        args.storage_deadlines_write_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.transaction_ms",
+        args.storage_deadlines_transaction_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.schema_change_ms",
+        args.storage_deadlines_schema_change_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.background_page_ms",
+        args.storage_deadlines_background_page_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.long_poll_probe_ms",
+        args.storage_deadlines_long_poll_probe_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_deadlines.commit_grace_ms",
+        args.storage_deadlines_commit_grace_ms,
     );
 }
 

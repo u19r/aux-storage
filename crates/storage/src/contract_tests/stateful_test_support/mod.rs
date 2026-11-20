@@ -4,6 +4,7 @@ mod fault;
 mod maintenance;
 mod models;
 mod observation;
+#[cfg(any(feature = "foundationdb", feature = "rocksdb"))]
 mod queue_reclamation;
 mod sql_statements;
 mod stream_reclamation;

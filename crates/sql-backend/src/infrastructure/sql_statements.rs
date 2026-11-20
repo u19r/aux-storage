@@ -5,7 +5,7 @@ use infrastructure_provider::{
     page::RecordPageRequest,
     record::{DurableRecord, DurableRecordKey, RecordChange, RecordExpectation},
 };
-use storage_types::{InfrastructureResultKind, Revision, StorageResult};
+use storage_types::{Revision, StorageResult};
 
 use super::codec;
 use crate::{SqlEngine, SqlStatement, SqlValue, row_view::SqlValueRef, sql_template::sql_template};
@@ -104,7 +104,7 @@ fn prepare_namespace_binds(namespace: &str) -> StorageResult<Vec<SqlValue>> {
     let mut binds = Vec::new();
     binds
         .try_reserve_exact(1)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     binds.push(SqlValue::try_from(SqlValueRef::Text(namespace))?);
     Ok(binds)
 }
@@ -144,11 +144,11 @@ pub(super) fn load_batch(
     let count = keys
         .len()
         .checked_mul(4)
-        .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+        .ok_or(storage_types::AttemptFailure::CAPACITY)?;
     let mut binds = Vec::new();
     binds
         .try_reserve_exact(count)
-        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for (index, key) in keys.iter().enumerate() {
         if index > 0 {
             sql.push_str(", ");

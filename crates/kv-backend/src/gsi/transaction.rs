@@ -1,17 +1,13 @@
 //! Physical GSI I/O joined to the initialized catalog attempt.
 
-use storage_backfill::{
-    GsiActivationState, GsiBuild, GsiBuildTarget, GsiProjection, GsiProjectionKey,
-    GsiProjectionStateReadBatch, GsiScanSourcePage,
-};
+use storage_backfill::{GsiBuild, GsiBuildTarget, GsiScanSourcePage};
 use storage_provider::maintenance::{GsiPort, GsiScanSource, GsiTransition};
-use storage_types::{BoundTableInfo, StorageResult, SystemStreamCheckpoint};
+use storage_types::{BoundTableInfo, StorageResult};
 
 use super::{
-    apply_gsi_transition, read_activation_state, read_candidate_binding, read_projection_states,
-    read_scan_source_page, scan_build_candidates,
+    apply_gsi_transition, read_candidate_binding, read_scan_source_page, scan_build_candidates,
 };
-use crate::{KvAttempt, catalog::KvCatalogAttempt, stream_history};
+use crate::{KvAttempt, catalog::KvCatalogAttempt};
 
 impl<A: KvAttempt> GsiPort for KvCatalogAttempt<'_, A> {
     async fn scan_gsi_candidates(
@@ -42,65 +38,24 @@ impl<A: KvAttempt> GsiPort for KvCatalogAttempt<'_, A> {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
-            let identity = catalog.identity_for(&source.target.table_name)?.clone();
+            let identity = catalog.load_table_identity(source.table).await?;
             read_scan_source_page(catalog, &identity, source).await
         }
         .await;
         settlement.complete(result)
     }
-    async fn load_gsi_projection_states(
+
+    async fn store_gsi_transition(
         &mut self,
         table: &BoundTableInfo,
-        batch: GsiProjectionStateReadBatch<'_>,
-    ) -> StorageResult<Vec<Option<GsiProjection<GsiProjectionKey>>>> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async {
-            let identity = catalog.identity_for(&table.table_name)?.clone();
-            read_projection_states(catalog, &identity, table, batch).await
-        }
-        .await;
-        settlement.complete(result)
-    }
-    async fn load_gsi_frontier(
-        &mut self,
-        current: &SystemStreamCheckpoint,
-        through: &SystemStreamCheckpoint,
+        transition: GsiTransition<'_, Vec<u8>>,
+        progress: storage_provider::maintenance::ProgressWrite,
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result =
-            async { stream_history::validate_frontier(catalog.attempt, current, through).await }
-                .await;
-        settlement.complete(result)
-    }
-    async fn load_gsi_activation_state(
-        &mut self,
-        _table: &BoundTableInfo,
-        target: &GsiBuildTarget,
-    ) -> StorageResult<GsiActivationState> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async {
-            let identity = catalog.identity_for(&target.table_name)?.clone();
-            read_activation_state(catalog.attempt, &identity, target).await
-        }
-        .await;
-        settlement.complete(result)
-    }
-    async fn store_gsi_transition(
-        &mut self,
-        table: &BoundTableInfo,
-        transition: GsiTransition<'_, Vec<u8>>,
-        fence: &Self::ProgressFence,
-    ) -> StorageResult<()> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async { apply_gsi_transition(catalog, table, transition, fence).await }.await;
+            async { apply_gsi_transition(catalog, table, transition, progress).await }.await;
         settlement.complete(result)
     }
 }

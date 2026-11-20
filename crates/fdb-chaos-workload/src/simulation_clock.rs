@@ -1,7 +1,17 @@
 //! Retry clocks hand delays to the simulator-owned workload future. Native
 //! operations keep their normal retry policy without a Tokio reactor.
 
-use std::{future::Future, pin::Pin, rc::Rc, sync::Arc, task::Poll, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll, Wake, Waker},
+    time::Duration,
+};
 
 use foundationdb_simulation::WorkloadContext;
 use futures::{
@@ -46,8 +56,8 @@ impl SimulationClock {
 
 impl Clock for SimulationClock {
     fn now(&self) -> TimestampMillis {
-        // Persisted event timestamps retain the workload's existing wall-time
-        // contract. Only asynchronous retry waits use simulated time.
+        // The simulation ambient source makes this simulated time, the same
+        // time that storage code without an injected clock reads.
         TimestampMillis::now()
     }
 
@@ -70,6 +80,13 @@ impl Clock for SimulationClock {
     }
 }
 
+/// The current phase clock as the attempt clock of a simulation backend.
+pub(crate) fn phase_clock(clock: Option<&Arc<SimulationClock>>) -> Result<Arc<dyn Clock>, String> {
+    clock
+        .map(|clock| Arc::clone(clock) as Arc<dyn Clock>)
+        .ok_or_else(|| "simulation phase clock is absent".to_owned())
+}
+
 pub(crate) async fn drive_operation(
     context: Rc<WorkloadContext>,
     mut requests: mpsc::UnboundedReceiver<DelayRequest>,
@@ -78,8 +95,18 @@ pub(crate) async fn drive_operation(
     let mut operation = std::pin::pin!(operation);
     let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
         FuturesUnordered::new();
-    futures::future::poll_fn(|waker| {
+    futures::future::poll_fn(|outer| {
         loop {
+            // `foundationdb-simulation` polls woken tasks from inside each
+            // native future callback. A callback that fires while this task
+            // is already being polled finds the task slot empty and drops the
+            // wake. Record every wake of this pass and poll again instead.
+            let flag = Arc::new(WakeFlag {
+                woken: AtomicBool::new(false),
+                outer: outer.waker().clone(),
+            });
+            let waker = Waker::from(Arc::clone(&flag));
+            let waker = &mut Context::from_waker(&waker);
             if operation.as_mut().poll(waker).is_ready() {
                 return Poll::Ready(());
             }
@@ -94,10 +121,27 @@ pub(crate) async fn drive_operation(
             // Deliver requests and completions produced during this poll before
             // yielding. The FDB callback owner must have a native delay armed;
             // a channel wake alone cannot supply that simulator event.
-            if !advanced {
+            if !advanced && !flag.woken.load(Ordering::Acquire) {
                 return Poll::Pending;
             }
         }
     })
     .await;
+}
+
+/// Wakes the simulator task and records that a wake happened.
+struct WakeFlag {
+    woken: AtomicBool,
+    outer: Waker,
+}
+
+impl Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Release);
+        self.outer.wake_by_ref();
+    }
 }

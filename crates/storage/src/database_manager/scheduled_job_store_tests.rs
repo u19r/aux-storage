@@ -11,22 +11,17 @@ use scheduled_bg_jobs::store::{
     CommitOperationId, Mutation, StoreKey, StoreTransaction, StoreTransactionInput,
     TransactionLimits,
 };
-use storage_provider::{
-    SqliteSettings, StorageBackend, StorageConfig, StorageConnectionConfig,
-    StorageConnectionRegistry,
-};
+use storage_provider::{SqliteSettings, StorageBackend, StorageConfig, StorageConnectionRegistry};
 
 use super::{DatabaseManager, DatabaseManagerRuntimeOptions};
 
 fn sqlite_config(path: &str) -> StorageConfig {
     StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(path.to_string()),
         file_path: None,
-        sqlite: Some(SqliteSettings {
-            force_file_backed_database: true,
-            ..SqliteSettings::default()
-        }),
+        sqlite: Some(SqliteSettings {}),
         postgres: None,
         turso: None,
         rocksdb: None,
@@ -35,9 +30,10 @@ fn sqlite_config(path: &str) -> StorageConfig {
     }
 }
 
-fn sqlite_connection(path: &Path) -> StorageConnectionConfig {
+fn sqlite_connection(path: &Path) -> StorageConfig {
     let config = sqlite_config(path.to_str().expect("UTF-8 test path"));
-    StorageConnectionConfig {
+    StorageConfig {
+        initial_stream_lineages: config.initial_stream_lineages,
         backend_type: config.backend_type,
         connection_string: config.connection_string,
         file_path: config.file_path,
@@ -75,12 +71,19 @@ fn put_transaction(key_bytes: &[u8], value: &[u8]) -> StoreTransaction {
 }
 
 async fn seed_scheduled_store(path: &Path, value: &[u8]) {
-    let driver = sql_backend::sqlite::SqliteBackend::initialize(path)
-        .await
-        .expect("open seed database");
-    let provider = sql_backend::SqlStore::initialize_schema(driver)
-        .await
-        .expect("initialize seed store");
+    let driver = sql_backend::sqlite::SqliteBackend::initialize(
+        path,
+        storage_types::AttemptDeadlines::default(),
+    )
+    .await
+    .expect("open seed database");
+    let provider = sql_backend::SqlStore::initialize_schema(
+        driver,
+        storage_types::InitialStreamLineages::ONE,
+        true,
+    )
+    .await
+    .expect("initialize seed store");
     let store = provider
         .scheduled_job_store(std::time::Duration::from_secs(30).into())
         .expect("scheduled-job capabilities");
@@ -119,7 +122,7 @@ async fn given_sqlite_runtime_toggle_when_manager_starts_then_driver_lifetime_ma
     )
     .await
     .expect("construct disabled SQLite manager");
-    assert!(disabled.maintenance_runtimes.is_empty());
+    assert!(disabled.default_connection.maintenance.is_none());
     let super::service_shutdown::BackgroundServiceState::Running(services) =
         &*disabled.background_services.lock().await
     else {
@@ -133,7 +136,7 @@ async fn given_sqlite_runtime_toggle_when_manager_starts_then_driver_lifetime_ma
     )
     .await
     .expect("construct enabled SQLite manager");
-    assert!(enabled.maintenance_runtimes.is_empty());
+    assert!(enabled.default_connection.maintenance.is_none());
     let super::service_shutdown::BackgroundServiceState::Running(services) =
         &*enabled.background_services.lock().await
     else {
@@ -186,7 +189,7 @@ async fn given_two_sqlite_connections_when_manager_is_constructed_then_store_rea
         .expect("read default scheduled row");
 
     assert_eq!(value, Some(Bytes::from_static(b"default-store")));
-    assert_eq!(manager.dynamo_registry.len(), 2);
+    assert_eq!(manager.named_connections.len(), 1);
     drop(manager);
     let _ = fs::remove_file(default_path);
     let _ = fs::remove_file(secondary_path);
@@ -197,14 +200,10 @@ async fn given_committed_job_when_initialized_manager_reopens_then_receipt_and_e
     let path = crate::storage_test_support_tests::unique_path("scheduled-store-reopen");
     let transaction = put_transaction(b"reopen-key", b"durable-value");
     let config = sqlite_config(path.to_str().expect("UTF-8 fixture path"));
-    let bundle = crate::provider_bundle::create_storage_provider_bundle(
-        config.clone(),
-        &Default::default(),
-        "default",
-    )
-    .await
-    .expect("construct initialized bundle");
-    let manager = DatabaseManager::from_initialized_bundle(config, bundle, runtime_options(false))
+    let bundle = crate::provider_bundle::open_store(config.clone(), &Default::default(), "default")
+        .await
+        .expect("construct initialized bundle");
+    let manager = DatabaseManager::from_initialized_store(config, bundle, runtime_options(false))
         .await
         .expect("construct initial manager");
     let store = manager

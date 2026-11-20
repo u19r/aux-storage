@@ -4,6 +4,17 @@ use std::num::NonZeroUsize;
 
 pub(crate) const INFRASTRUCTURE_LAYOUT_VERSION: i64 = 45;
 
+/// First key of the Postgres catalog advisory locks (`'AUXC'` as `int4`).
+pub(crate) const POSTGRES_CATALOG_LOCK_CLASS: i32 = 0x4155_5843;
+/// First key of the Postgres maintenance admission locks (`'AUXM'` as
+/// `int4`).
+pub(crate) const POSTGRES_MAINTENANCE_LOCK_CLASS: i32 = 0x4155_584D;
+
+/// Bound the ACCESS EXCLUSIVE lock queue of unused GSI column removal.
+#[cfg(feature = "postgres")]
+pub(crate) const POSTGRES_DDL_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 // One bounded scan, savepoint/rollback/release and conflict-revision query.
 #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
 pub(crate) const INFRASTRUCTURE_BATCH_CONTROL_STATEMENTS: usize = 5;
@@ -28,6 +39,17 @@ pub(crate) const INFRASTRUCTURE_RECORD_COLUMNS: [&str; 6] = [
 #[cfg(any(feature = "sqlite", feature = "turso"))]
 pub(crate) const LOCAL_SQL_MAX_CONNECTIONS: usize = 32;
 
+/// The longest busy wait of one local BEGIN; an attempt's deadline shortens it.
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+pub(crate) const LOCAL_SQL_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(5_000);
+
+/// Floor of the Postgres session `client_connection_check_interval`: the
+/// server polls the client socket at most this often while a statement runs.
+#[cfg(feature = "postgres")]
+pub(crate) const POSTGRES_CONNECTION_CHECK_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 /// Bound outstanding networked driver statements within one native attempt.
 #[cfg(feature = "postgres")]
 pub(crate) const POSTGRES_PIPELINE_STATEMENTS: usize = 256;
@@ -50,16 +72,16 @@ pub(crate) const POSTGRES_RECORD_ROW_FRAME_BYTES: usize = 4 + 2 + 6 * 4;
 #[cfg(feature = "postgres")]
 pub(crate) const POSTGRES_FORMAT_ROW_FRAME_BYTES: usize = 4 + 2 + INFRASTRUCTURE_FORMAT_COLUMNS * 4;
 
-pub(crate) const GSI_PROJECTION_STATE_READ_ROWS: usize = 64;
-#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
 pub(crate) const SCHEDULED_JOB_DATA_TABLE: &str = "sys_scheduled_jobs_v2";
 pub(crate) const SCHEDULED_JOB_POINT_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(2 * 1024 * 1024 - 1);
-#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
 pub(crate) const QUEUE_CATALOG_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
 pub(crate) const PUBSUB_CATALOG_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
+/// One claim reads at most 32 payloads of 256 KiB (W3S plan 5.4).
+pub(crate) const PUBSUB_DELIVERY_READ_BYTES: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(10 * 1024 * 1024 - 1);
 pub(crate) const QUEUE_MESSAGE_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(10 * 1024 * 1024 - 1);
 pub(crate) const QUEUE_CLEANUP_READ_BYTES: NonZeroUsize =
@@ -72,6 +94,14 @@ pub(crate) const SYSTEM_STREAM_PAGE_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
 pub(crate) const RANGE_PAGE_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
+/// The rows retained from the first range page of a read that commits in the
+/// same wave; the server sends the whole page either way. A logical page holds
+/// at most 1 MB of items plus the row that stops it; a physical row adds its
+/// key columns and its stored image is about twice the logical size (census
+/// page: 7.1 KB for a 3.5 KB item). Four times the logical bound keeps a full
+/// page in this one wave; a larger page ends early with a continuation key.
+pub(crate) const TERMINAL_RANGE_READ_BYTES: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(4 * 1024 * 1024 - 1);
 pub(crate) const RETENTION_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
 
@@ -111,5 +141,4 @@ pub(crate) const INFRASTRUCTURE_GENERATION_BYTES: std::num::NonZeroUsize =
 /// Keep batched writes below native parameter limits.
 pub(crate) const MULTI_ROW_WRITE_BINDS: usize = 8_000;
 
-pub(crate) const WRITE_COLUMNS: &str =
-    "item_value, __aux_revision, __aux_provenance, __aux_ttl_epoch";
+pub(crate) const WRITE_COLUMNS: &str = "item_value, __aux_provenance, __aux_ttl_epoch";

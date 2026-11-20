@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PubsubError, PubsubResult, PubsubValidationKind};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(tag = "Type", content = "Value")]
 pub enum MessageAttribute {
     String(String),
@@ -134,13 +135,31 @@ impl crate::PublishRequest {
 
 fn validate_attribute_name(name: &str) -> PubsubResult<()> {
     let lower = name.to_ascii_lowercase();
-    if !is_attribute_name_syntax_valid(name)
-        || name.starts_with('.')
-        || name.ends_with('.')
-        || name.contains("..")
-        || lower.starts_with("aws.")
-        || lower.starts_with("amazon.")
-    {
+    let rule = |text: &str| {
+        Err(PubsubError::validation_with_detail(
+            PubsubValidationKind::MessageAttributeRule,
+            text,
+        ))
+    };
+    if name.len() > crate::constants::SNS_MAX_ATTRIBUTE_NAME_BYTES {
+        return rule("Length of message attribute name must be less than 256 bytes.");
+    }
+    if lower.starts_with("aws.") || lower.starts_with("amazon.") {
+        return rule(
+            "Message attribute names starting with 'AWS.' or 'Amazon.' are reserved for use by \
+             Amazon.",
+        );
+    }
+    if name.starts_with('.') {
+        return rule("Invalid message attribute name starting with character '.' was found.");
+    }
+    if name.ends_with('.') {
+        return rule("Invalid message attribute name ending with character '.' was found.");
+    }
+    if name.contains("..") {
+        return rule("Message attribute name can not have successive '.' character.");
+    }
+    if !is_attribute_name_syntax_valid(name) {
         return Err(invalid_attribute());
     }
     Ok(())

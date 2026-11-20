@@ -3,58 +3,16 @@
 use std::num::NonZeroU32;
 
 use storage_provider::{
-    BoundRangeReadPage, BoundRangeReadPlan, DynamoRangeReadAttempt, GsiReadinessSnapshot,
-    PrimaryStateRow, PrimaryStateScan, PrimaryStateScanAttempt, RangeAdmission, RangeReadItem,
-    RangeReadPage,
+    BoundRangeReadPage, BoundRangeReadPlan, ItemReadAttempt, PrimaryStateRow, PrimaryStateScan,
+    PrimaryStateScanAttempt, RangeAdmission, RangeReadPage,
 };
-use storage_types::{
-    BoundTableInfo, IndexName, ItemKey, LogicalItemSize, StorageError, StorageResult,
-};
+use storage_types::{BoundTableInfo, ItemKey, LogicalItemSize, StorageError, StorageResult};
 
 use super::{
     key_layout::{after_key, physical_item_key, physical_span},
-    projection::{GsiState, PrimaryState, PublicImage, RangeContent, RangeProjection},
+    projection::{GsiState, PrimaryState, RangeContent, RangeProjection},
 };
-use crate::{
-    KvAttempt, KvRange, catalog::KvCatalogAttempt, constants::PAGE_READ_BYTES,
-    gsi::read_gsi_readiness,
-};
-
-impl<A: KvAttempt> DynamoRangeReadAttempt for KvCatalogAttempt<'_, A> {
-    async fn read_gsi_readiness(
-        &mut self,
-        table: &BoundTableInfo,
-        index: Option<&IndexName>,
-    ) -> StorageResult<GsiReadinessSnapshot> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async {
-            let identity = catalog.identity_for(&table.info.table_name)?.clone();
-            read_gsi_readiness(catalog.attempt, &identity, catalog.protection, index).await
-        }
-        .await;
-        settlement.complete(result)
-    }
-
-    async fn read_range_page(
-        &mut self,
-        table: &BoundTableInfo,
-        bound: &BoundRangeReadPlan<'_>,
-        page: &BoundRangeReadPage<'_>,
-    ) -> StorageResult<RangeReadPage<RangeReadItem>> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = async {
-            catalog
-                .read_projected_range::<PublicImage>(RangeReadInput { table, bound, page })
-                .await
-        }
-        .await;
-        settlement.complete(result)
-    }
-}
+use crate::{KvAttempt, KvRange, catalog::KvCatalogAttempt, constants::PAGE_READ_BYTES};
 
 impl<A: KvAttempt> PrimaryStateScanAttempt for KvCatalogAttempt<'_, A> {
     async fn scan_primary_state(
@@ -67,33 +25,35 @@ impl<A: KvAttempt> PrimaryStateScanAttempt for KvCatalogAttempt<'_, A> {
         let result = async {
             let bound = scan.bind()?;
             let page = scan.page(&bound)?;
-            catalog
+            let page = catalog
                 .read_projected_range::<PrimaryState>(RangeReadInput {
                     table: scan.table(),
                     bound: &bound,
                     page: &page,
                 })
-                .await
+                .await?;
+            page.ok_or_else(|| StorageError::internal("unrequested pipelined catalog version"))
         }
         .await;
         settlement.complete(result)
     }
 }
 
-pub(super) struct RangeReadInput<'a, 'b> {
-    pub(super) table: &'a BoundTableInfo,
-    pub(super) bound: &'a BoundRangeReadPlan<'b>,
-    pub(super) page: &'a BoundRangeReadPage<'b>,
+pub(crate) struct RangeReadInput<'a, 'b> {
+    pub(crate) table: &'a BoundTableInfo,
+    pub(crate) bound: &'a BoundRangeReadPlan<'b>,
+    pub(crate) page: &'a BoundRangeReadPage<'b>,
 }
 
 impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
-    async fn read_projected_range<P: RangeProjection>(
+    /// `None`: the pipelined catalog version moved before the first decode
+    /// (PERF-FDB-1).
+    pub(crate) async fn read_projected_range<P: RangeProjection>(
         &mut self,
         input: RangeReadInput<'_, '_>,
-    ) -> StorageResult<RangeReadPage<P::Item>> {
+    ) -> StorageResult<Option<RangeReadPage<P::Item>>> {
         let RangeReadInput { table, bound, page } = input;
-        let identity = self.identity_for(&table.info.table_name)?.clone();
-        let span = physical_span(&identity, table, bound, page)?;
+        let span = physical_span(table, bound, page)?;
         let mut begin = span.begin;
         let mut end = span.end;
         let mut result = RangeReadPage::<P::Item>::default();
@@ -103,24 +63,32 @@ impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
             }
             let range = input.physical_range(&begin, &end)?;
             let (batch, projections) = if bound.index_name.is_some() {
+                // GSI reads stay version-first (no pipelined version), so this
+                // gate holds only if a GSI pipeline is ever added.
                 let (batch, images) = crate::gsi::read_projection_page(self, table, range).await?;
+                if self.attempt.root_attempt().native_pipelined_version_moved() {
+                    return Ok(None);
+                }
                 (batch, Some(images))
             } else {
                 let mut batch = self.read_range_batch(range).await?;
+                if self.attempt.root_attempt().native_pipelined_version_moved() {
+                    return Ok(None);
+                }
                 crate::item_read::select_primary_prefix(table, &mut batch)?;
                 (batch, None)
             };
             let has_more = batch.more;
             let (last_physical, stopped) =
-                input.decode_batch::<P>((batch, projections), &mut result, &identity)?;
+                input.decode_batch::<P>((batch, projections), &mut result)?;
             if stopped {
-                return result.finish_with_more();
+                return result.finish_with_more().map(Some);
             }
             if !has_more {
                 break;
             }
             if result.progress.evaluated_count >= page.budget.max_items {
-                return result.finish_with_more();
+                return result.finish_with_more().map(Some);
             }
             let last = last_physical.ok_or_else(|| {
                 StorageError::internal("KV range reports more without a physical cursor")
@@ -131,7 +99,7 @@ impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
                 end = last;
             }
         }
-        result.finish()
+        result.finish().map(Some)
     }
 
     async fn read_range_batch(&mut self, range: KvRange) -> StorageResult<crate::KvRangePage> {
@@ -143,12 +111,11 @@ impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
 impl RangeReadInput<'_, '_> {
     pub(super) fn decode_entry<P: RangeProjection>(
         &self,
-        identity: &crate::catalog::KvTableIdentity,
         physical: &[u8],
         content: RangeContent,
     ) -> StorageResult<(P::Item, ItemKey, LogicalItemSize)> {
         let decoded = P::decode(self.table, self.bound, physical, content)?;
-        if physical_item_key(identity, self.table, self.bound, &decoded.1)? != physical {
+        if physical_item_key(self.table, self.bound, &decoded.1)? != physical {
             return Err(StorageError::internal(
                 "KV range image differs from physical key",
             ));
@@ -175,7 +142,6 @@ impl RangeReadInput<'_, '_> {
             Option<Vec<crate::gsi::DecodedProjection>>,
         ),
         result: &mut RangeReadPage<P::Item>,
-        identity: &crate::catalog::KvTableIdentity,
     ) -> StorageResult<(Option<Vec<u8>>, bool)> {
         let (batch, projections) = input;
         let mut content = if self.bound.index.is_none() {
@@ -206,7 +172,7 @@ impl RangeReadInput<'_, '_> {
             let hydrated = content
                 .next()
                 .ok_or_else(|| StorageError::internal("Missing range hydration slot"))?;
-            let (item, key, size) = self.decode_entry::<P>(identity, &entry.key, hydrated)?;
+            let (item, key, size) = self.decode_entry::<P>(&entry.key, hydrated)?;
             last = Some(entry.key);
             if self.page.budget.admit(&mut result.progress, key, size)? == RangeAdmission::Stop {
                 return Ok((last, true));
@@ -217,7 +183,7 @@ impl RangeReadInput<'_, '_> {
     }
 }
 
-impl<A: KvAttempt> storage_provider::GsiProjectionScanAttempt for KvCatalogAttempt<'_, A> {
+impl<A: KvAttempt> storage_provider::ProjectionScanAttempt for KvCatalogAttempt<'_, A> {
     async fn scan_gsi_projections(
         &mut self,
         scan: &storage_provider::GsiProjectionScan,
@@ -233,13 +199,43 @@ impl<A: KvAttempt> storage_provider::GsiProjectionScanAttempt for KvCatalogAttem
                 .require_queryable(scan.index())?;
             let bound = bound.mark_gsi_published()?;
             let page = scan.page(&bound)?;
-            catalog
+            let page = catalog
                 .read_projected_range::<GsiState>(RangeReadInput {
                     table: scan.table(),
                     bound: &bound,
                     page: &page,
                 })
-                .await
+                .await?;
+            page.ok_or_else(|| StorageError::internal("unrequested pipelined catalog version"))
+        }
+        .await;
+        settlement.complete(result)
+    }
+
+    async fn encode_gsi_projection_addresses(
+        &mut self,
+        table: &BoundTableInfo,
+        keys: &[storage_backfill::GsiProjectionKey],
+    ) -> StorageResult<Vec<storage_provider::NativeProjectionAddress>> {
+        let mut settlement =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = settlement.as_mut();
+        let result = async {
+            let mut addresses = Vec::with_capacity(keys.len());
+            for key in keys {
+                catalog
+                    .read_gsi_readiness(table, Some(&key.index_name))
+                    .await?
+                    .require_queryable(&key.index_name)?;
+                let incarnation = catalog.projection_incarnation(table, &key.index_name)?;
+                addresses.push(storage_provider::NativeProjectionAddress::try_new(
+                    table,
+                    &key.index_name,
+                    incarnation,
+                    crate::gsi::ordered_projection_suffix(&key.item_key(&table.info)?)?,
+                )?);
+            }
+            Ok(addresses)
         }
         .await;
         settlement.complete(result)

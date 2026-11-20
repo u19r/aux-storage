@@ -4,10 +4,10 @@ use std::future::Future;
 
 use storage_types::{
     ListStreamsRequest, ListStreamsResponse, StorageError, StorageResult, StreamDescriptor,
-    TableName, TableStreamIdentity, stream_identity,
+    TableName, TableStreamIdentity, stream_arn_table_name, stream_identity,
 };
 
-use crate::constants::INTERNAL_TABLE_NAMES;
+use crate::{CatalogNamePage, constants::INTERNAL_TABLE_NAMES};
 
 /// The physical index contains only currently stream-enabled tables.
 pub struct CatalogStreamPage {
@@ -15,7 +15,8 @@ pub struct CatalogStreamPage {
     pub more: bool,
 }
 
-pub trait ListStreamsAttempt: Send {
+/// One byte-bounded physical page, including private system tables.
+pub trait ListingAttempt: Send {
     fn read_stream_entry(
         &mut self,
         name: &TableName,
@@ -26,9 +27,15 @@ pub trait ListStreamsAttempt: Send {
         after: Option<&TableName>,
         limit: u32,
     ) -> impl Future<Output = StorageResult<CatalogStreamPage>> + Send;
+
+    fn list_name_page(
+        &mut self,
+        after: Option<&TableName>,
+        limit: u32,
+    ) -> impl Future<Output = StorageResult<CatalogNamePage>> + Send;
 }
 
-pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
+pub async fn list_streams_in_attempt<A: ListingAttempt>(
     attempt: &mut A,
     request: &ListStreamsRequest,
 ) -> StorageResult<ListStreamsResponse> {
@@ -38,7 +45,8 @@ pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
     }
     let after = match request.exclusive_start_stream_arn.as_deref() {
         Some(arn) => {
-            let name = stream_arn_table_name(arn)?;
+            let name = stream_arn_table_name(arn)
+                .map_err(|_| StorageError::validation("Invalid ExclusiveStartStreamArn"))?;
             let identity = attempt
                 .read_stream_entry(&name)
                 .await?
@@ -119,17 +127,4 @@ fn descriptor(table_name: TableName, identity: TableStreamIdentity) -> StreamDes
         table_name,
         stream_label,
     }
-}
-
-fn stream_arn_table_name(arn: &str) -> StorageResult<TableName> {
-    let (_, suffix) = arn
-        .split_once(":table/")
-        .ok_or_else(|| StorageError::validation("Invalid ExclusiveStartStreamArn"))?;
-    let (name, _) = suffix
-        .split_once("/stream/")
-        .ok_or_else(|| StorageError::validation("Invalid ExclusiveStartStreamArn"))?;
-    if name.is_empty() {
-        return Err(StorageError::validation("Invalid ExclusiveStartStreamArn"));
-    }
-    Ok(TableName::new(name))
 }

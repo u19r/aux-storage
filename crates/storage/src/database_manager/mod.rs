@@ -10,17 +10,18 @@ mod effect_authorization;
 mod entity_ops;
 mod errors;
 mod guarded_job_effect;
+#[cfg(any(test, feature = "test-support"))]
 mod test_database;
 pub use effect_authorization::DomainEffectAuthorization;
 mod models;
-mod native_admission;
 mod operation_metrics;
 mod query_ops;
 mod read_batch;
 mod read_ops;
 mod read_sequence_ops;
-#[cfg(feature = "regional")]
-mod regional_startup;
+mod replica_ops;
+#[cfg(test)]
+mod replica_ops_tests;
 mod runtime_options;
 mod service_shutdown;
 mod system_stream_trim;
@@ -28,6 +29,7 @@ mod table_ops;
 mod transact_get_ops;
 mod transaction_write_coordinator;
 mod ttl_sweep;
+mod user_stream_ops;
 mod wire_item_ops;
 mod write_bulk_ops;
 mod write_ops;
@@ -53,6 +55,8 @@ pub use crate::database_manager::{
 
 #[cfg(test)]
 mod admission_pressure_tests;
+#[cfg(all(test, feature = "sqlite"))]
+mod connection_resolution_tests;
 #[cfg(test)]
 pub(crate) mod construction_tests;
 #[cfg(test)]
@@ -67,26 +71,26 @@ mod read_ops_tests;
 mod runtime_options_tests;
 #[cfg(all(test, feature = "sqlite"))]
 mod scheduled_job_store_tests;
+#[cfg(all(test, feature = "sqlite"))]
+mod service_shutdown_tests;
 #[cfg(test)]
 mod transact_get_ops_tests;
 #[cfg(test)]
 mod transact_item_ops_tests;
 #[cfg(test)]
 mod ttl_sweep_tests;
+#[cfg(all(test, feature = "sqlite"))]
+mod user_stream_ops_tests;
 #[cfg(test)]
 mod write_ops_tests;
 
-#[cfg(feature = "regional")]
-mod history_read;
 #[cfg(all(test, any(feature = "sqlite", feature = "rocksdb")))]
 mod transact_receipt_trim_tests;
 #[cfg(all(test, feature = "sqlite"))]
 mod transaction_write_coordinator_tests;
 
-mod history_response;
-pub use history_response::CanonicalHistoryResponse;
-
 #[cfg(all(test, feature = "sqlite"))]
 mod read_sequence_ops_tests;
 
 mod point_read_source;
+mod protocol_ops;

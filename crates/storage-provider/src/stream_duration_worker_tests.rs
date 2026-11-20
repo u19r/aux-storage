@@ -17,7 +17,7 @@ use stream_provider::{
     SystemStreamTrimPageRequest, SystemStreamTrimPageResult,
 };
 
-use crate::{SystemStreamTrimExecutor, SystemStreamTrimRepository};
+use crate::{MaintenanceOperations, SystemStreamTrimExecutor};
 
 #[derive(Clone, Default)]
 struct FakeBackend {
@@ -46,7 +46,66 @@ where F: Future {
 }
 
 #[async_trait]
-impl SystemStreamTrimRepository for FakeBackend {
+impl MaintenanceOperations for FakeBackend {
+    async fn advance_expiration(
+        &self,
+        _: crate::maintenance::ExpirationRequest,
+    ) -> StorageResult<storage_types::maintenance::StepResult<()>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn trim_transact_receipts_page(
+        &self,
+        _: Option<String>,
+        _: std::num::NonZeroU32,
+    ) -> StorageResult<Option<String>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn advance_gsi_build(
+        &self,
+        _: crate::maintenance::GsiBuildRequest,
+    ) -> StorageResult<storage_types::maintenance::StepResult<()>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn trim_stream_marker_wave(
+        &self,
+        _: crate::maintenance::StreamRetentionWave,
+    ) -> StorageResult<crate::maintenance::StreamDurationTrimStats> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn list_due_stream_trim_markers(
+        &self,
+        _: TimestampMillis,
+        _: usize,
+    ) -> StorageResult<Vec<crate::StreamTrimDueMarker>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn load_stream_trim_states(
+        &self,
+        _: &[crate::StreamTrimScope],
+    ) -> StorageResult<Vec<Option<crate::StreamTrimState>>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn reclaim_table_page(&self) -> StorageResult<crate::TableReclaimStep> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn read_ttl_sweep_policy(
+        &self,
+        _: &storage_types::TableName,
+    ) -> StorageResult<Option<storage_common::TtlSweepPolicy>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn execute_ttl_sweep_page(
+        &self,
+        _: storage_common::TtlSweepPageCommand,
+    ) -> StorageResult<storage_common::TtlSweepPageResult> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn execute_ttl_sweep_request(
+        &self,
+        _: storage_common::TtlSweepRequest,
+    ) -> StorageResult<storage_common::TtlSweepPageResult> {
+        unimplemented!("not used by this fixture")
+    }
     async fn trim_system_stream_page(
         &self,
         request: SystemStreamTrimPageRequest,
@@ -102,7 +161,66 @@ struct PendingSystemBackend {
 }
 
 #[async_trait]
-impl SystemStreamTrimRepository for PendingSystemBackend {
+impl MaintenanceOperations for PendingSystemBackend {
+    async fn advance_expiration(
+        &self,
+        _: crate::maintenance::ExpirationRequest,
+    ) -> StorageResult<storage_types::maintenance::StepResult<()>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn trim_transact_receipts_page(
+        &self,
+        _: Option<String>,
+        _: std::num::NonZeroU32,
+    ) -> StorageResult<Option<String>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn advance_gsi_build(
+        &self,
+        _: crate::maintenance::GsiBuildRequest,
+    ) -> StorageResult<storage_types::maintenance::StepResult<()>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn trim_stream_marker_wave(
+        &self,
+        _: crate::maintenance::StreamRetentionWave,
+    ) -> StorageResult<crate::maintenance::StreamDurationTrimStats> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn list_due_stream_trim_markers(
+        &self,
+        _: TimestampMillis,
+        _: usize,
+    ) -> StorageResult<Vec<crate::StreamTrimDueMarker>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn load_stream_trim_states(
+        &self,
+        _: &[crate::StreamTrimScope],
+    ) -> StorageResult<Vec<Option<crate::StreamTrimState>>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn reclaim_table_page(&self) -> StorageResult<crate::TableReclaimStep> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn read_ttl_sweep_policy(
+        &self,
+        _: &storage_types::TableName,
+    ) -> StorageResult<Option<storage_common::TtlSweepPolicy>> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn execute_ttl_sweep_page(
+        &self,
+        _: storage_common::TtlSweepPageCommand,
+    ) -> StorageResult<storage_common::TtlSweepPageResult> {
+        unimplemented!("not used by this fixture")
+    }
+    async fn execute_ttl_sweep_request(
+        &self,
+        _: storage_common::TtlSweepRequest,
+    ) -> StorageResult<storage_common::TtlSweepPageResult> {
+        unimplemented!("not used by this fixture")
+    }
     async fn trim_system_stream_page(
         &self,
         _request: SystemStreamTrimPageRequest,
@@ -451,13 +569,6 @@ fn given_backend_error_when_system_trim_runs_then_worker_propagates_it() {
             .len(),
         1
     );
-}
-
-#[test]
-fn given_trim_backend_when_used_as_trait_object_then_it_is_object_safe() {
-    fn accepts_trait_object(_: &dyn SystemStreamTrimRepository) {}
-
-    accepts_trait_object(&FakeBackend::default());
 }
 
 #[test]

@@ -343,3 +343,38 @@ async fn given_a_definitive_not_leader_abort_when_invoked_then_the_native_attemp
     aborted.assert_calls_async(1).await;
     committed.assert_calls_async(1).await;
 }
+
+#[tokio::test]
+async fn given_a_throttled_journal_commit_when_invoked_then_it_is_retried_not_reconciled() {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorded = Arc::clone(&calls);
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+            then.respond_with(move |_| {
+                if recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    HttpMockResponse::builder()
+                        .status(400)
+                        .body(
+                            serde_json::json!({
+                                "__type": "com.amazonaws.dynamodb.v20120810#ThrottlingException",
+                                "message": "Rate exceeded"
+                            })
+                            .to_string(),
+                        )
+                        .build()
+                } else {
+                    HttpMockResponse::builder().status(200).body("{}").build()
+                }
+            });
+        })
+        .await;
+    let outcome = super::commit::run(provider, &absent_transaction())
+        .await
+        .unwrap();
+    assert_eq!(outcome, scheduled_bg_jobs::store::CommitOutcome::Committed);
+    transaction.assert_calls_async(2).await;
+}

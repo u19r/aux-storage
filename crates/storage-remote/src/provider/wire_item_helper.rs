@@ -1,20 +1,10 @@
-use std::collections::HashMap;
-
 use serde_json::value::RawValue;
 use storage_provider::{RangeAdmission, RangeReadBudget, RangeReadPage, RangeReadProgress};
 use storage_types::{
-    IndexName, KeyAttributes, KeysAndAttributes, StorageError, StorageResult, StoredTableInfo,
-    TableName, WireItem,
+    IndexName, KeyAttributes, StorageError, StorageResult, StoredTableInfo, WireItem,
 };
 
 use super::provider_helpers::remote_key_to_page_token;
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct GetItemWireResponse<'a> {
-    #[serde(default, borrow)]
-    item: Option<&'a RawValue>,
-}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -29,21 +19,7 @@ struct ScanQueryWireResponse<'a> {
     last_evaluated_key: Option<&'a RawValue>,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct BatchGetWireResponse<'a> {
-    #[serde(default, borrow)]
-    responses: Option<HashMap<TableName, Vec<&'a RawValue>>>,
-    #[serde(default)]
-    unprocessed_keys: Option<HashMap<TableName, KeysAndAttributes>>,
-}
-
-pub(super) struct BatchGetWireParsed {
-    pub responses: Option<HashMap<TableName, Vec<WireItem>>>,
-    pub unprocessed_keys: Option<HashMap<TableName, KeysAndAttributes>>,
-}
-
-#[derive(Debug)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub(super) struct ScanQueryWireParsed {
     pub items: Vec<WireItem>,
     pub count: u32,
@@ -109,10 +85,8 @@ impl ScanQueryWireParsed {
                 let key = item.item_key(table_info, index_name)?.ok_or_else(|| {
                     StorageError::internal("remote range source item is missing its key")
                 })?;
-                let size = item.logical_size().map_err(|error| {
-                    StorageError::internal(&format!(
-                        "remote range source logical size is invalid: {error}"
-                    ))
+                let size = item.logical_size().map_err(|_| {
+                    StorageError::internal("remote range source logical size is invalid")
                 })?;
                 if budget.admit(&mut progress, key, size)? == RangeAdmission::Stop {
                     return Err(StorageError::internal(
@@ -132,18 +106,15 @@ fn normalize_last_evaluated_key(
 ) -> StorageResult<String> {
     let key = serde_json::from_str::<KeyAttributes>(raw_key).map_err(|error| {
         StorageError::internal(&format!(
-            "remote scan/query LastEvaluatedKey must be a DynamoDB key object: {error}"
+            "remote scan/query LastEvaluatedKey must be a DynamoDB key object: {:?} at {}:{}",
+            error.classify(),
+            error.line(),
+            error.column()
         ))
     })?;
     let table_info = table_info
         .ok_or_else(|| StorageError::internal("remote range cursor requires table metadata"))?;
     remote_key_to_page_token(&key, table_info, index_name.as_ref())
-}
-
-pub(super) fn parse_get_item_wire(bytes: &[u8]) -> StorageResult<Option<WireItem>> {
-    let response: GetItemWireResponse<'_> =
-        serde_json::from_slice(bytes).map_err(StorageError::from)?;
-    response.item.map(raw_item_to_wire_item).transpose()
 }
 
 pub(super) fn parse_scan_query_wire(bytes: &[u8]) -> StorageResult<ScanQueryWireParsed> {
@@ -173,30 +144,6 @@ pub(super) fn parse_scan_query_wire(bytes: &[u8]) -> StorageResult<ScanQueryWire
         count,
         scanned_count,
         last_evaluated_key,
-    })
-}
-
-pub(super) fn parse_batch_get_wire(bytes: &[u8]) -> StorageResult<BatchGetWireParsed> {
-    let response: BatchGetWireResponse<'_> =
-        serde_json::from_slice(bytes).map_err(StorageError::from)?;
-
-    let responses = if let Some(tables) = response.responses {
-        let mut decoded = HashMap::with_capacity(tables.len());
-        for (table_name, table_items) in tables {
-            let mut wire_items = Vec::with_capacity(table_items.len());
-            for raw_item in table_items {
-                wire_items.push(raw_item_to_wire_item(raw_item)?);
-            }
-            decoded.insert(table_name, wire_items);
-        }
-        Some(decoded)
-    } else {
-        None
-    };
-
-    Ok(BatchGetWireParsed {
-        responses,
-        unprocessed_keys: response.unprocessed_keys,
     })
 }
 

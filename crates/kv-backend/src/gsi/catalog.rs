@@ -37,7 +37,7 @@ pub async fn register_gsi_builds<A: KvAttempt>(
                 "KV GSI build identity does not match catalog",
             ));
         }
-        keys.push(gsi_build_key(identity.table_id, index.index_id));
+        keys.push(gsi_build_key(identity.table_id, index.index_id)?);
         changes.extend(build_mutations(identity.table_id, index.index_id, &build)?);
     }
     let expected = keys.len();
@@ -74,10 +74,10 @@ pub(crate) async fn delete_gsi_builds<A: KvAttempt>(
     if indexes.is_empty() {
         return Ok(());
     }
-    let changes = indexes
-        .into_iter()
-        .flat_map(|index| delete_build_mutations(identity.table_id, index.index_id))
-        .collect();
+    let mut changes = Vec::new();
+    for index in indexes {
+        changes.extend(delete_build_mutations(identity.table_id, index.index_id)?);
+    }
     attempt.stage(changes)
 }
 
@@ -98,20 +98,20 @@ pub(super) fn build_mutations<Cursor: Serialize>(
     };
     Ok([
         KvMutation::Put {
-            key: gsi_build_key(table_id, index_id),
+            key: gsi_build_key(table_id, index_id)?,
             value,
         },
         runnable,
     ])
 }
 
-fn delete_build_mutations(table_id: u32, index_id: u16) -> [KvMutation; 2] {
-    [
+fn delete_build_mutations(table_id: u32, index_id: u16) -> StorageResult<[KvMutation; 2]> {
+    Ok([
         KvMutation::Delete {
-            key: gsi_build_key(table_id, index_id),
+            key: gsi_build_key(table_id, index_id)?,
         },
         KvMutation::Delete {
             key: gsi_runnable_key(table_id, index_id),
         },
-    ]
+    ])
 }

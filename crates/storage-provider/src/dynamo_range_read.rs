@@ -1,52 +1,112 @@
 //! Shared Query and Scan decisions around one native range-read attempt.
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
-use storage_common::{DEFAULT_QUERY_LIMIT, DEFAULT_SCAN_LIMIT, MAX_QUERY_LIMIT, MAX_SCAN_LIMIT};
-use storage_condition::{Condition, evaluate_condition, parse_condition_expression_typed};
+use storage_common::{MAX_QUERY_LIMIT, MAX_SCAN_LIMIT};
 use storage_types::{
-    AttributeProjection, BoundTableInfo, ConsumedCapacity, ConsumedCapacityMetrics,
-    DynamoRequestValidate as _, ExclusiveStartKey, IndexName, ItemKey, KeyAttributes, QueryRequest,
-    QueryResponse, QueryTableRequest, ReturnConsumedCapacity, ScanRequest, ScanResponse,
-    ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName, WireItem,
+    AttributeProjection, BoundTableInfo, ConsumedCapacity, DynamoRequestValidate as _,
+    ExclusiveStartKey, IndexName, ItemKey, KeyAttributes, QueryRequest, QueryResponse,
+    QueryTableRequest, ReturnConsumedCapacity, ScanRequest, ScanResponse, ScanTableRequest,
+    StorageError, StorageResult, StoredTableInfo, TableName, WireItem,
+    condition::{
+        CompiledCondition, Condition, evaluate_condition, validate_key_condition_operand_types,
+    },
     subset_expression_attribute_names_for_expression,
-    subset_expression_attribute_values_for_expression, validate_gsi_projection,
-    validate_gsi_required_attributes,
+    subset_expression_attribute_values_for_expression, validate_gsi_filter_attributes,
+    validate_gsi_projection, validate_gsi_select,
 };
 
 use crate::{
-    BoundRangeReadPage, BoundRangeReadPlan, CachePublication, CatalogAttempt, GsiReadinessSnapshot,
-    RangeReadItem, RangeReadPage, RangeReadPlan, RangeReadiness, TableMetadataCache,
-    resolve_table_in_attempt,
+    BoundRangeReadPage, BoundRangeReadPlan, CachePublication, ItemReadAttempt, RangeReadItem,
+    RangeReadPage, RangeReadPlan, RangeReadTarget, RangeReadiness, TableMetadataCache,
 };
 
-/// The family lowerer checks index publication and reads a bounded physical
-/// page. It does not parse Dynamo expressions or shape the API response.
-pub trait DynamoRangeReadAttempt: CatalogAttempt {
-    fn read_gsi_readiness(
-        &mut self,
-        table: &BoundTableInfo,
-        index: Option<&IndexName>,
-    ) -> impl Future<Output = StorageResult<GsiReadinessSnapshot>> + Send;
-
-    fn require_gsi_queryable(
-        &mut self,
-        table: &BoundTableInfo,
-        index: &IndexName,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        async move {
-            self.read_gsi_readiness(table, Some(index))
-                .await?
-                .require_queryable(index)
-        }
+/// Ordinary engines retain their existing authority observation and physical
+/// page.
+pub async fn read_range_observation_default<A: ItemReadAttempt + ?Sized>(
+    attempt: &mut A,
+    candidate: crate::TableReadCandidate<'_>,
+    range: Option<(&BoundRangeReadPlan<'_>, &BoundRangeReadPage<'_>)>,
+) -> StorageResult<crate::ReadObservationResult<Option<RangeReadPage<RangeReadItem>>>> {
+    // A GSI Query keeps the version-first order: a stale GSI binding never
+    // scans (B6).
+    if matches!(range, Some((bound, _)) if bound.index_name.is_none())
+        && crate::dynamo_pipelined_authority::begin_pipelined_authority(
+            attempt,
+            std::iter::once(candidate.catalog_version),
+        )?
+    {
+        let page = match range {
+            Some((bound, page)) => attempt
+                .read_range_page(candidate.table, bound, page)
+                .await
+                .map(Some),
+            None => Ok(None),
+        };
+        let authority = crate::dynamo_pipelined_authority::finish_pipelined_authority(
+            attempt,
+            std::iter::once((&candidate.table.info.table_name, Some(candidate))),
+            page.is_ok(),
+        )
+        .await?;
+        return Ok(match authority {
+            crate::dynamo_pipelined_authority::PipelinedAuthority::Observed {
+                version,
+                stamps,
+                confirmed,
+            } => crate::ReadObservationResult {
+                catalog_version: version,
+                stamps: Some(stamps),
+                // As the old path: an unconfirmed binding returns no page and
+                // the stamp conflict answers first.
+                result: if confirmed { page } else { Ok(None) },
+            },
+            crate::dynamo_pipelined_authority::PipelinedAuthority::ReadAgain {
+                version,
+                stamps,
+            } => crate::ReadObservationResult {
+                catalog_version: version,
+                stamps: Some(stamps),
+                result: match range {
+                    Some((bound, page)) => attempt
+                        .read_range_page(candidate.table, bound, page)
+                        .await
+                        .map(Some),
+                    None => Ok(None),
+                },
+            },
+            crate::dynamo_pipelined_authority::PipelinedAuthority::Failed => {
+                crate::ReadObservationResult {
+                    catalog_version: None,
+                    stamps: None,
+                    result: page,
+                }
+            }
+        });
     }
-
-    fn read_range_page(
-        &mut self,
-        table: &BoundTableInfo,
-        bound: &BoundRangeReadPlan<'_>,
-        page: &BoundRangeReadPage<'_>,
-    ) -> impl Future<Output = StorageResult<RangeReadPage<RangeReadItem>>> + Send;
+    let version = attempt.read_catalog_version().await?;
+    let stamps = crate::dynamo_catalog::observe_catalog_stamps(
+        attempt,
+        [(&candidate.table.info.table_name, Some(candidate))].into_iter(),
+        version,
+    )
+    .await?;
+    let result = if stamps == [Some(candidate.stamp)] {
+        match range {
+            Some((bound, page)) => attempt
+                .read_range_page(candidate.table, bound, page)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    } else {
+        Ok(None)
+    };
+    Ok(crate::ReadObservationResult {
+        catalog_version: version,
+        stamps: Some(stamps),
+        result,
+    })
 }
 
 /// Query and Scan have one range lifecycle but distinct response types.
@@ -62,14 +122,34 @@ pub enum DynamoRangeRequest {
     Scan(ScanRequest),
 }
 
+/// Query and Scan conditions compiled once per request, before the first
+/// attempt. A parse error is kept and returned at the step where the
+/// per-attempt parse returned it, so the error order is unchanged.
+pub struct CompiledRangeConditions {
+    pub(crate) filter: Result<Option<CompiledCondition>, StorageError>,
+    pub(crate) key_condition: Option<Result<Arc<CompiledCondition>, StorageError>>,
+}
+
+impl CompiledRangeConditions {
+    fn filter(&self) -> StorageResult<Option<&CompiledCondition>> {
+        self.filter
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(Clone::clone)
+    }
+}
+
 /// Immutable evidence that the range request passed its owning boundary.
-pub struct ValidatedDynamoRangeRequest(DynamoRangeRequest);
+pub struct ValidatedDynamoRangeRequest(
+    pub(crate) DynamoRangeRequest,
+    pub(crate) CompiledRangeConditions,
+);
 
 impl ValidatedDynamoRangeRequest {
-    /// The validated index selection is needed by regional publication
-    /// admission.
-    pub fn selected_index(&self) -> Option<&IndexName> {
-        self.0.index_name()
+    /// Compile the conditions of a request its owner has validated.
+    pub(crate) fn compile(request: DynamoRangeRequest) -> Self {
+        let conditions = request.compile_conditions();
+        Self(request, conditions)
     }
 }
 
@@ -88,10 +168,11 @@ impl TryFrom<DynamoRangeRequest> for ValidatedDynamoRangeRequest {
             DynamoRangeRequest::Scan(request) => request.validate_for_dynamodb(),
         }
         .map_err(StorageError::raw_validation)?;
-        Ok(Self(request))
+        Ok(Self::compile(request))
     }
 }
 
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct DynamoRangeOutput {
     pub items: Option<Vec<RangeReadItem>>,
     pub count: u32,
@@ -188,9 +269,61 @@ impl DynamoRangeReadShape for ScanRequest {
     }
 }
 
-pub(crate) async fn query_for_read_sequence_in_attempt<A: DynamoRangeReadAttempt>(
+impl crate::dynamo_read_execution::DynamoReadShape for ValidatedDynamoRangeRequest {
+    type Response = DynamoRangeOutput;
+
+    async fn execute<A: crate::ItemReadAttempt>(
+        &self,
+        attempt: &mut A,
+        cache: &TableMetadataCache,
+        bindings: &crate::RequestTableBindings,
+    ) -> StorageResult<(Self::Response, Vec<CachePublication>)> {
+        use crate::dynamo_read_execution::confirm_read_observation;
+        let (candidate, generation) = cache.candidate(self.as_ref());
+        let Some(candidate) = candidate else {
+            let (response, publication) =
+                range_read_output_in_attempt(attempt, cache, bindings, self, false).await?;
+            return Ok((response, publication.into_iter().collect()));
+        };
+        let candidates = [(candidate, generation)];
+        let candidate = &candidates[0].0;
+        let table = &candidate.table;
+        let request = &self.0;
+        let conditions = &self.1;
+        let prepared = request.prepare_range(&table.info, conditions);
+        let bound = prepared
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|plan| request.bind_range(table, plan));
+        let page = bound
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|bound| bound.page(request.max_limit()));
+        let range = bound.as_ref().ok().zip(page.as_ref().ok());
+        let observed = attempt
+            .read_range_observation(candidate.read_candidate(), range)
+            .await?;
+        let (source, publications) =
+            confirm_read_observation(cache, bindings, &candidates, observed)?;
+        prepared.as_ref().map_err(Clone::clone)?;
+        bound.as_ref().map_err(Clone::clone)?;
+        page.as_ref().map_err(Clone::clone)?;
+        let source = source
+            .ok_or_else(|| StorageError::internal("confirmed range has no data page"))?
+            .finish()?;
+        let response = request.finish_source(&table.info, conditions, source, false)?;
+        Ok((response, publications))
+    }
+
+    fn read_table_names(&self) -> impl Iterator<Item = &storage_types::TableName> {
+        std::iter::once(self.as_ref())
+    }
+}
+
+pub(crate) async fn query_for_read_sequence_in_attempt<A: ItemReadAttempt>(
     attempt: &mut A,
     cache: &TableMetadataCache,
+    bindings: &crate::RequestTableBindings,
     request: QueryRequest,
 ) -> StorageResult<(DynamoQueryPage, Option<CachePublication>)> {
     // The graph owns static request validation. Input binding changes values,
@@ -201,7 +334,8 @@ pub(crate) async fn query_for_read_sequence_in_attempt<A: DynamoRangeReadAttempt
     let (mut output, publication) = range_read_output_in_attempt(
         attempt,
         cache,
-        ValidatedDynamoRangeRequest(DynamoRangeRequest::Query(request)),
+        bindings,
+        &ValidatedDynamoRangeRequest::compile(DynamoRangeRequest::Query(request)),
         true,
     )
     .await?;
@@ -215,61 +349,82 @@ pub(crate) async fn query_for_read_sequence_in_attempt<A: DynamoRangeReadAttempt
     ))
 }
 
-pub(crate) async fn range_read_output_in_attempt<A: DynamoRangeReadAttempt>(
+pub(crate) async fn range_read_output_in_attempt<A: ItemReadAttempt>(
     attempt: &mut A,
     cache: &TableMetadataCache,
-    request: ValidatedDynamoRangeRequest,
+    bindings: &crate::RequestTableBindings,
+    request: &ValidatedDynamoRangeRequest,
     include_item_cursors: bool,
 ) -> StorageResult<(DynamoRangeOutput, Option<CachePublication>)> {
-    let (table, publication) = resolve_table_in_attempt(attempt, cache, request.as_ref()).await?;
+    let (table, publication) = bindings
+        .resolve_table(attempt, cache, request.as_ref())
+        .await?;
+    table.require_data_readable()?;
     let output = range_read_output_on_table(attempt, table, request, include_item_cursors).await?;
     Ok((output, publication))
 }
 
 /// Shared Query/Scan execution after the request owner resolves metadata in
 /// the same native snapshot. No second catalog lookup or read attempt.
-pub async fn range_read_output_on_table<A: DynamoRangeReadAttempt>(
+pub async fn range_read_output_on_table<A: ItemReadAttempt>(
     attempt: &mut A,
     table: Arc<BoundTableInfo>,
-    request: ValidatedDynamoRangeRequest,
+    request: &ValidatedDynamoRangeRequest,
     include_item_cursors: bool,
 ) -> StorageResult<DynamoRangeOutput> {
-    let request = request.0;
+    let (request, conditions) = (&request.0, &request.1);
     let info = &table.info;
-    let (plan, filter) = request.prepare_range(info)?;
-    let readiness = if request.index_name().is_some() {
-        RangeReadiness::GsiPending
-    } else {
-        RangeReadiness::BaseTable
-    };
-    let bound = plan.bind(Arc::clone(info), readiness)?;
-    if let Some(index) = request.index_name() {
-        attempt.require_gsi_queryable(&table, index).await?;
-    }
-    let bound = bound.mark_gsi_published()?;
-    let (default_limit, max_limit) = request.limits();
-    let page = bound.page(default_limit, max_limit)?;
+    let plan = request.prepare_range(info, conditions)?;
+    let bound = request.bind_range(&table, &plan)?;
+    let page = bound.page(request.max_limit())?;
     let source = attempt
         .read_range_page(&table, &bound, &page)
         .await?
         .finish()?;
-    // Scan has historically decoded the source before reporting a malformed
-    // filter, so corrupt stored data retains precedence over expression error.
-    let filter = if matches!(request, DynamoRangeRequest::Scan(_)) {
-        let filter = request.filter_condition()?;
-        request.validate_filter_projection(info, filter.as_ref())?;
-        filter
-    } else {
-        filter
-    };
-    request.finish_page(info, filter.as_ref(), source, include_item_cursors)
+    request.finish_source(info, conditions, source, include_item_cursors)
 }
 
 impl DynamoRangeRequest {
-    fn prepare_range(
+    fn bind_range<'a>(
+        &self,
+        table: &BoundTableInfo,
+        plan: &'a RangeReadPlan,
+    ) -> StorageResult<BoundRangeReadPlan<'a>> {
+        let readiness = if self.index_name().is_some() {
+            RangeReadiness::GsiPending
+        } else {
+            RangeReadiness::BaseTable
+        };
+        let bound = plan.bind(Arc::clone(&table.info), readiness)?;
+        if let Some(index) = self.index_name() {
+            crate::gsi_readiness_from_catalog(table, Some(index))?.require_queryable(index)?;
+        }
+        bound.mark_gsi_published()
+    }
+
+    pub(crate) fn finish_source(
+        &self,
+        info: &StoredTableInfo,
+        conditions: &CompiledRangeConditions,
+        source: RangeReadPage<RangeReadItem>,
+        include_item_cursors: bool,
+    ) -> StorageResult<DynamoRangeOutput> {
+        // Stored Scan corruption retains precedence over a malformed filter.
+        // A Scan filter on an unprojected index attribute sees it missing.
+        let filter = conditions.filter()?;
+        self.finish_page(
+            info,
+            filter.map(CompiledCondition::condition),
+            source,
+            include_item_cursors,
+        )
+    }
+
+    pub(crate) fn prepare_range(
         &self,
         table: &StoredTableInfo,
-    ) -> StorageResult<(RangeReadPlan, Option<Condition>)> {
+        conditions: &CompiledRangeConditions,
+    ) -> StorageResult<RangeReadPlan> {
         if self.index_name().is_some_and(IndexName::is_ttl_index) {
             return Err(StorageError::validation(
                 "The table does not have the specified index",
@@ -282,17 +437,41 @@ impl DynamoRangeRequest {
             self.attributes_to_get(),
             self.expression_attribute_names(),
         )?;
-        let filter = if matches!(self, DynamoRangeRequest::Query(_)) {
-            self.filter_condition()?
-        } else {
-            None
-        };
-        self.validate_filter_projection(table, filter.as_ref())?;
-        let plan = self.plan(table)?;
-        Ok((plan, filter))
+        validate_gsi_select(table, self.index_name(), self.select())?;
+        if let Self::Query(request) = self
+            && let Some(Ok(_)) = &conditions.key_condition
+        {
+            validate_key_condition_operand_types(
+                request
+                    .key_condition_expression
+                    .as_deref()
+                    .unwrap_or_default(),
+                request.expression_attribute_names.as_ref(),
+                request.expression_attribute_values.as_ref(),
+                |attribute| {
+                    table
+                        .attribute_definitions
+                        .iter()
+                        .find(|definition| definition.attribute_name == attribute)
+                        .map(|definition| definition.attribute_type)
+                },
+            )?;
+        }
+        if matches!(self, DynamoRangeRequest::Query(_)) {
+            let filter = conditions.filter()?;
+            self.validate_query_filter_projection(table, filter.map(CompiledCondition::condition))?;
+            validate_query_filter_excludes_primary_key(
+                table,
+                self.index_name(),
+                filter.map(CompiledCondition::condition),
+            )?;
+        }
+        self.plan(table, conditions)
     }
 
-    fn validate_filter_projection(
+    /// AWS rejects a Query filter on an attribute the index does not project;
+    /// a Scan evaluates it against the projected item instead.
+    fn validate_query_filter_projection(
         &self,
         table: &StoredTableInfo,
         filter: Option<&Condition>,
@@ -302,9 +481,9 @@ impl DynamoRangeRequest {
         };
         let mut required = Vec::new();
         filter.visit_attribute_paths(&mut |path| {
-            required.push(path.split(['.', '[']).next().unwrap_or(path));
+            required.push(path.root());
         });
-        validate_gsi_required_attributes(table, self.index_name(), required)
+        validate_gsi_filter_attributes(table, self.index_name(), required)
     }
 
     fn table_name(&self) -> &TableName {
@@ -356,60 +535,83 @@ impl DynamoRangeRequest {
         }
     }
 
-    fn limits(&self) -> (u32, u32) {
+    fn max_limit(&self) -> u32 {
         match self {
-            Self::Query(_) => (DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT),
-            Self::Scan(_) => (DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT),
+            Self::Query(_) => MAX_QUERY_LIMIT,
+            Self::Scan(_) => MAX_SCAN_LIMIT,
         }
     }
 
-    fn filter_condition(&self) -> StorageResult<Option<Condition>> {
-        self.filter_expression()
+    pub(crate) fn compile_conditions(&self) -> CompiledRangeConditions {
+        let filter = self
+            .filter_expression()
             .map(|expression| {
-                parse_condition_expression_typed(
+                CompiledCondition::compile_filter(
                     expression,
                     self.expression_attribute_names(),
                     self.expression_attribute_values(),
                 )
-                .map_err(|message| {
-                    StorageError::validation(
-                        message.replace("ConditionExpression", "FilterExpression"),
-                    )
-                })
             })
-            .transpose()
+            .transpose();
+        let key_condition = match self {
+            Self::Query(request) => {
+                // Validation rejects an absent expression before compilation;
+                // an empty fallback would fail the compile with the
+                // empty-expression text.
+                let key = request
+                    .key_condition_expression
+                    .as_deref()
+                    .unwrap_or_default();
+                let names = subset_expression_attribute_names_for_expression(
+                    key,
+                    request.expression_attribute_names.as_ref(),
+                );
+                let values = subset_expression_attribute_values_for_expression(
+                    key,
+                    request.expression_attribute_values.as_ref(),
+                );
+                Some(
+                    CompiledCondition::compile_key_condition(key, names.as_ref(), values.as_ref())
+                        .map(Arc::new),
+                )
+            }
+            Self::Scan(_) => None,
+        };
+        CompiledRangeConditions {
+            filter,
+            key_condition,
+        }
     }
 
-    fn plan(&self, table: &StoredTableInfo) -> StorageResult<RangeReadPlan> {
+    fn plan(
+        &self,
+        table: &StoredTableInfo,
+        conditions: &CompiledRangeConditions,
+    ) -> StorageResult<RangeReadPlan> {
         match self {
             Self::Query(request) => {
-                let key = &request.key_condition_expression;
-                let query = QueryTableRequest {
+                let target = RangeReadTarget {
                     table_name: request.table_name.clone(),
                     index_name: request.index_name.clone(),
-                    key_condition_expression: key.clone(),
-                    expression_attribute_names: subset_expression_attribute_names_for_expression(
-                        key,
-                        request.expression_attribute_names.as_ref(),
-                    ),
-                    expression_attribute_values: subset_expression_attribute_values_for_expression(
-                        key,
-                        request.expression_attribute_values.as_ref(),
-                    ),
-                    projection_expression: None,
                     limit: request.limit,
-                    exclusive_start_key: page_start(
+                    start_token: page_start(
                         request.exclusive_start_key.as_ref(),
                         table,
                         request.index_name.as_ref(),
                     )
-                    .map_err(|_| {
-                        StorageError::validation("The provided starting key is invalid")
-                    })?,
-                    scan_index_forward: request.scan_index_forward,
+                    .map_err(ExclusiveStartKey::query_error)?,
                     consistent_read: request.consistent_read.unwrap_or(false),
                 };
-                RangeReadPlan::from_validated_query(query)
+                let key_condition = conditions.key_condition.clone().unwrap_or_else(|| {
+                    Err(StorageError::internal(
+                        "query has no compiled key condition",
+                    ))
+                });
+                RangeReadPlan::query(
+                    target,
+                    request.scan_index_forward.unwrap_or(true),
+                    key_condition,
+                )
             }
             Self::Scan(request) => RangeReadPlan::try_from_scan(ScanTableRequest {
                 table_name: request.table_name.clone(),
@@ -421,9 +623,7 @@ impl DynamoRangeRequest {
                     request.index_name.as_ref(),
                 )
                 .map_err(|error| {
-                    StorageError::validation(format!(
-                        "The provided starting key is invalid: {error}"
-                    ))
+                    ExclusiveStartKey::scan_error(error, table, request.index_name.as_ref())
                 })?,
                 consistent_read: request.consistent_read.unwrap_or(false),
             }),
@@ -442,29 +642,45 @@ impl DynamoRangeRequest {
             self.attributes_to_get(),
             self.expression_attribute_names(),
         );
+        let roots = (filter.is_some() || projection.is_some()).then(|| {
+            let mut roots: Vec<&str> = Vec::new();
+            let mut push = |root| {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            };
+            if let Some(condition) = filter {
+                condition.visit_root_names(&mut push);
+            }
+            if let Some(rule) = projection.as_ref() {
+                rule.visit_root_names(&mut push);
+            }
+            roots
+        });
         let mut items = Vec::with_capacity(source.items.len());
         let mut item_cursors = (include_item_cursors && self.select() != Some("COUNT"))
             .then(|| Vec::with_capacity(source.items.len()));
         let mut count = 0_u32;
         for source_item in source.items {
             let RangeReadItem { key, item } = source_item;
-            let item = if filter.is_some() || projection.is_some() || item_cursors.is_some() {
-                let attributes = item.to_attribute_map()?;
-                if let Some(condition) = filter
-                    && !evaluate_condition(&attributes, condition)
-                {
-                    continue;
+            let item = match roots.as_deref() {
+                Some(roots) => {
+                    let attributes = item.project_attributes(roots)?;
+                    if let Some(condition) = filter
+                        && !evaluate_condition(&attributes, condition)
+                    {
+                        continue;
+                    }
+                    match projection.as_ref() {
+                        Some(rule) => WireItem::try_from(rule.project(&attributes))?,
+                        None => item,
+                    }
                 }
-                if let Some(cursors) = item_cursors.as_mut() {
-                    cursors.push(key.key_attributes(table)?);
-                }
-                match projection.as_ref() {
-                    Some(rule) => WireItem::try_from(rule.project(&attributes))?,
-                    None => item,
-                }
-            } else {
-                item
+                None => item,
             };
+            if let Some(cursors) = item_cursors.as_mut() {
+                cursors.push(key.key_attributes(table)?);
+            }
             count = count
                 .checked_add(1)
                 .ok_or_else(|| StorageError::internal("range result count overflow"))?;
@@ -472,22 +688,36 @@ impl DynamoRangeRequest {
                 items.push(RangeReadItem { key, item });
             }
         }
-        let evaluated_bytes = source.progress.evaluated_bytes;
-        let last_evaluated_key = source
-            .continuation
-            .as_deref()
-            .map(|token| key_from_token(token, table, self.index_name()))
-            .transpose()?
-            .flatten();
+        let last_evaluated_key = match source.continuation.as_deref() {
+            Some(token) => key_from_token(token, table, self.index_name())?,
+            // A Query that evaluated exactly its `Limit` keeps a
+            // LastEvaluatedKey although nothing follows (a Scan does not).
+            None if self.query_limit_reached(source.progress.evaluated_count) => source
+                .progress
+                .last_evaluated_key
+                .as_ref()
+                .map(|key| key.key_attributes(table))
+                .transpose()?,
+            None => None,
+        };
         Ok(DynamoRangeOutput {
             items: (self.select() != Some("COUNT")).then_some(items),
             count,
             progress: source.progress,
             continuation: source.continuation,
             last_evaluated_key,
-            consumed_capacity: self.consumed_capacity(evaluated_bytes),
+            consumed_capacity: self.consumed_capacity(),
             item_cursors,
         })
+    }
+
+    fn query_limit_reached(&self, evaluated_count: u32) -> bool {
+        match self {
+            Self::Query(request) => request
+                .limit
+                .is_some_and(|limit| limit != 0 && evaluated_count >= limit.min(MAX_QUERY_LIMIT)),
+            Self::Scan(_) => false,
+        }
     }
 
     fn select(&self) -> Option<&str> {
@@ -497,37 +727,8 @@ impl DynamoRangeRequest {
         }
     }
 
-    fn consumed_capacity(&self, evaluated_bytes: u64) -> Option<ConsumedCapacity> {
-        let consistent = match self {
-            Self::Query(request) => request.consistent_read.unwrap_or(false),
-            Self::Scan(request) => request.consistent_read.unwrap_or(false),
-        };
-        let units = evaluated_bytes
-            .div_ceil(crate::constants::READ_CAPACITY_UNIT_BYTES)
-            .max(1) as f64
-            * if consistent { 1.0 } else { 0.5 };
-        match self.capacity()? {
-            ReturnConsumedCapacity::None => None,
-            ReturnConsumedCapacity::Total => Some(ConsumedCapacity {
-                table_name: self.table_name().clone(),
-                capacity_units: units,
-                global_secondary_indexes: None,
-            }),
-            ReturnConsumedCapacity::Indexes => Some(ConsumedCapacity {
-                table_name: self.table_name().clone(),
-                capacity_units: units,
-                global_secondary_indexes: self.index_name().map(|name| {
-                    [(
-                        name.to_string(),
-                        ConsumedCapacityMetrics {
-                            capacity_units: units,
-                        },
-                    )]
-                    .into_iter()
-                    .collect()
-                }),
-            }),
-        }
+    fn consumed_capacity(&self) -> Option<ConsumedCapacity> {
+        ConsumedCapacity::zero(self.capacity(), self.table_name(), self.index_name())
     }
 
     fn capacity(&self) -> Option<ReturnConsumedCapacity> {
@@ -535,6 +736,35 @@ impl DynamoRangeRequest {
             Self::Query(request) => request.return_consumed_capacity,
             Self::Scan(request) => request.return_consumed_capacity,
         }
+    }
+}
+
+/// A base-table Query filter cannot name the table's own key attributes.
+fn validate_query_filter_excludes_primary_key(
+    table: &StoredTableInfo,
+    index: Option<&IndexName>,
+    filter: Option<&Condition>,
+) -> StorageResult<()> {
+    let Some(filter) = filter.filter(|_| index.is_none()) else {
+        return Ok(());
+    };
+    let mut key_attribute = None;
+    filter.visit_attribute_paths(&mut |path| {
+        if key_attribute.is_none()
+            && table
+                .key_schema
+                .iter()
+                .any(|key| key.attribute_name == path.root())
+        {
+            key_attribute = Some(path.root().to_owned());
+        }
+    });
+    match key_attribute {
+        Some(name) => Err(StorageError::validation(format!(
+            "Filter Expression can only contain non-primary key attributes: Primary key \
+             attribute: {name}"
+        ))),
+        None => Ok(()),
     }
 }
 

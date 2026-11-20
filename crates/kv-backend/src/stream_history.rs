@@ -1,4 +1,4 @@
-//! Protected SystemStream allocation bounds on the caller's KV attempt.
+//! SystemStream history bounds on the caller's native KV snapshot.
 
 use std::{collections::HashMap, num::NonZeroU64};
 
@@ -10,8 +10,7 @@ use storage_types::{
     SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope, storage_serde,
 };
 use stream_provider::{
-    DYNAMO_SYSTEM_LINEAGE_ID, DYNAMO_SYSTEM_SHARD_ID, SystemStreamHistory,
-    SystemStreamHistoryBounds, SystemStreamLineage, SystemStreamLineageCatalog,
+    SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamLineage, SystemStreamLineageCatalog,
 };
 
 use crate::{
@@ -19,7 +18,7 @@ use crate::{
     constants::{
         SYSTEM_STREAM_CATALOG_EPOCH_KEY as CATALOG_EPOCH_KEY,
         SYSTEM_STREAM_LINEAGE_PREFIX as LINEAGE_PREFIX, SYSTEM_STREAM_SCHEMA_KEY as SCHEMA_KEY,
-        SYSTEM_STREAM_SCOPE_KEY as SCOPE_KEY, SYSTEM_STREAM_SEQUENCE_PREFIX as SEQUENCE_PREFIX,
+        SYSTEM_STREAM_SCOPE_KEY as SCOPE_KEY,
     },
 };
 
@@ -45,14 +44,6 @@ pub(crate) struct LineageRow {
     pub sealed_after_offset: Option<u64>,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct SequenceRow {
-    pub scope_id: String,
-    pub generation: u64,
-    pub shard_id: String,
-    pub next_offset: u64,
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaRow {
@@ -62,7 +53,10 @@ struct SchemaRow {
 
 /// Install the authority bootstrap only on an empty store.
 /// Existing data is validated rather than overwritten.
-pub(crate) async fn initialize_system_stream<A: KvAttempt>(attempt: &mut A) -> StorageResult<()> {
+pub(crate) async fn initialize_system_stream<A: KvAttempt>(
+    attempt: &mut A,
+    initial_stream_lineages: storage_types::InitialStreamLineages,
+) -> StorageResult<()> {
     let [scope, epoch] = attempt
         .get_batch(
             vec![SCOPE_KEY.to_vec(), CATALOG_EPOCH_KEY.to_vec()],
@@ -75,16 +69,11 @@ pub(crate) async fn initialize_system_stream<A: KvAttempt>(attempt: &mut A) -> S
         if epoch.is_some() {
             return Err(unavailable());
         }
-        let mut rows = initial_rows()?;
-        if attempt.native_read_version().await?.is_some() {
-            for change in &mut rows {
-                if let KvMutation::Put { key, value } = change
-                    && key.starts_with(SEQUENCE_PREFIX)
-                {
-                    *value = vec![0; 12];
-                }
-            }
-        }
+        let rows = initial_rows(initial_stream_lineages)?;
+        attempt
+            .root_attempt()
+            .native_record_catalog_change()
+            .await?;
         attempt.stage(rows)?;
     }
     let schema = attempt
@@ -92,15 +81,19 @@ pub(crate) async fn initialize_system_stream<A: KvAttempt>(attempt: &mut A) -> S
         .await?
         .ok_or_else(unavailable)?;
     let schema: SchemaRow = storage_serde::from_bytes(&schema)?;
-    if schema.version != storage_types::SYSTEM_STREAM_SCOPE_VERSION || schema.record_format != 5 {
+    if schema.version != storage_types::SYSTEM_STREAM_SCOPE_VERSION
+        || schema.record_format != STREAM_ENTRY_RECORD_FORMAT
+    {
         return Err(unavailable());
     }
     capture_high(attempt).await?;
     Ok(())
 }
 
-fn initial_rows() -> StorageResult<Vec<KvMutation>> {
-    let scope = SystemStreamScope::try_new(uuid::Uuid::new_v4().to_string(), 1)
+fn initial_rows(
+    initial_stream_lineages: storage_types::InitialStreamLineages,
+) -> StorageResult<Vec<KvMutation>> {
+    let scope = SystemStreamScope::try_new(storage_types::ambient::uuid_v4().to_string(), 1)
         .map_err(|_| unavailable())?;
     let scope_id = scope.scope_id().as_str().to_owned();
     let rows = [
@@ -115,151 +108,92 @@ fn initial_rows() -> StorageResult<Vec<KvMutation>> {
         (
             SCHEMA_KEY.to_vec(),
             storage_serde::to_bytes(&SchemaRow {
-                record_format: 5,
+                record_format: STREAM_ENTRY_RECORD_FORMAT,
                 version: scope.version(),
             })?,
         ),
         (CATALOG_EPOCH_KEY.to_vec(), 1u64.to_be_bytes().to_vec()),
-        (
-            segmented_key(LINEAGE_PREFIX, DYNAMO_SYSTEM_LINEAGE_ID)?,
-            storage_serde::to_bytes(&LineageRow {
+    ];
+    let mut rows = rows.into_iter().collect::<Vec<_>>();
+    let catalog = SystemStreamLineageCatalog::initial_roots(scope, initial_stream_lineages)
+        .map_err(|_| unavailable())?;
+    for lineage in catalog.iter() {
+        rows.push((
+            segmented_key(LINEAGE_PREFIX, lineage.lineage_id().as_str())?,
+            encode_lineage(&LineageRow {
                 scope_id: scope_id.clone(),
                 generation: 1,
-                shard_id: DYNAMO_SYSTEM_SHARD_ID.to_owned(),
-                lineage_id: DYNAMO_SYSTEM_LINEAGE_ID.to_owned(),
+                shard_id: lineage.shard_id().as_str().to_owned(),
+                lineage_id: lineage.lineage_id().as_str().to_owned(),
                 parent_lineage_id: None,
                 sealed: false,
                 initial_sequence: NonZeroU64::MIN,
                 sealed_after_offset: None,
             })?,
-        ),
-        (
-            segmented_key(SEQUENCE_PREFIX, DYNAMO_SYSTEM_SHARD_ID)?,
-            storage_serde::to_bytes(&SequenceRow {
-                scope_id,
-                generation: 1,
-                shard_id: DYNAMO_SYSTEM_SHARD_ID.to_owned(),
-                next_offset: 1,
-            })?,
-        ),
-    ];
+        ));
+    }
     Ok(rows
         .into_iter()
         .map(|(key, value)| KvMutation::Put { key, value })
         .collect())
 }
 
-/// Capture a stream frontier with protected sequence rows. The catalog epoch
-/// fences topology changes; ordinary writers advance only their selected
-/// shard sequence.
+/// Capture a stream frontier from the native snapshot and protected catalog.
 pub async fn capture_high<A: KvAttempt>(attempt: &mut A) -> StorageResult<SystemStreamCheckpoint> {
     let (_, history) = read_history_protected(attempt).await?;
     history.capture_high().map_err(|_| unavailable())
 }
 
-/// Confirm that the requested frontier remains reachable in protected history.
-pub(crate) async fn validate_frontier<A: KvAttempt>(
-    attempt: &mut A,
-    current: &SystemStreamCheckpoint,
-    through: &SystemStreamCheckpoint,
-) -> StorageResult<()> {
-    read_history_protected(attempt)
-        .await?
-        .1
-        .plan_page(current, through, 1)
-        .map_err(|_| StorageEnum::HistoryUnavailable)?;
-    Ok(())
+/// Load only protected immutable routing facts; snapshot bounds stay in full
+/// history.
+/// The keys and ranges `read_writer_routes` reads, for a cached-route
+/// conflict without a read.
+pub(crate) fn writer_route_keys() -> StorageResult<(Vec<Vec<u8>>, Vec<crate::KvRange>)> {
+    Ok((
+        vec![SCOPE_KEY.to_vec()],
+        vec![prefix_range(LINEAGE_PREFIX)?],
+    ))
 }
 
-/// Protect and advance the selected logical sequence in this native attempt.
-/// History discovery is a snapshot; the selected point read validates its
-/// offset and establishes the native write conflict without locking shards
-/// chosen by unrelated writers.
-pub(crate) struct KvSystemWriteState {
-    history: SystemStreamHistory,
-    sequences: Vec<(Vec<u8>, SequenceRow)>,
-    native_ordinal: u16,
-    is_commit_ordered: bool,
-}
-
-impl KvSystemWriteState {
-    pub(crate) fn new((_, history): (u64, SystemStreamHistory)) -> Self {
-        Self {
-            is_commit_ordered: history.uses_commit_versionstamps(),
-            history,
-            sequences: Vec::new(),
-            native_ordinal: 0,
-        }
-    }
-
-    pub(crate) async fn reserve<A: KvAttempt>(
-        &mut self,
-        attempt: &A,
-        routing_key: &[u8],
-    ) -> StorageResult<(SystemStreamScope, SystemStreamPosition)> {
-        let scope = self.history.as_ref().source_scope().clone();
-        if self.is_commit_ordered {
-            let ordinal = self.native_ordinal;
-            self.native_ordinal = ordinal.checked_add(1).ok_or_else(unavailable)?;
-            return Ok((
-                scope,
-                self.history.pending_commit_position(routing_key, ordinal)?,
-            ));
-        }
-        let allocation = self.history.reserve_write(routing_key)?;
-        let key = segmented_key(SEQUENCE_PREFIX, allocation.position.shard_id().as_str())?;
-        if let Some((_, row)) = self.sequences.iter_mut().find(|(known, _)| known == &key) {
-            if row.next_offset != allocation.expected_offset.get() {
-                return Err(unavailable());
-            }
-            row.next_offset = allocation.next_offset.get();
-            return Ok((scope, allocation.position));
-        }
-        let bytes = attempt
-            .get(&key, ReadProtection::Conflict)
-            .await?
-            .ok_or_else(unavailable)?;
-        let row: SequenceRow = storage_serde::from_bytes(&bytes).map_err(|_| unavailable())?;
-        if row.scope_id != scope.scope_id().as_str()
-            || row.generation != scope.generation()
-            || row.shard_id != allocation.position.shard_id().as_str()
-            || row.next_offset != allocation.expected_offset.get()
-        {
-            return Err(unavailable());
-        }
-        let row = SequenceRow {
-            next_offset: allocation.next_offset.get(),
-            ..row
-        };
-        self.sequences.push((key, row));
-        Ok((scope, allocation.position))
-    }
-
-    pub(crate) fn drain_mutations(&mut self) -> StorageResult<Vec<KvMutation>> {
-        let mut mutations = Vec::new();
-        mutations
-            .try_reserve_exact(self.sequences.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        for (key, row) in self.sequences.drain(..) {
-            mutations.push(KvMutation::Put {
-                key,
-                value: storage_serde::to_bytes(&row)?,
-            });
-        }
-        Ok(mutations)
-    }
-}
-
-/// Decode the KV authority keyspace into the shared validated history model.
-/// SQL reads different rows into that same model; its lineage and sequence
-/// validation and writer selection live in `stream-provider`.
-pub(crate) async fn read_history<A: KvAttempt>(
+pub(crate) async fn read_writer_routes<A: KvAttempt>(
     attempt: &A,
-) -> StorageResult<(u64, SystemStreamHistory)> {
-    let (epoch, history) =
-        read_history_with_protection(attempt, ReadProtection::Conflict, ReadProtection::Snapshot)
-            .await?;
-    Ok((epoch, history))
+) -> StorageResult<std::sync::Arc<SystemStreamLineageCatalog>> {
+    let (values, pages) = try_join(
+        attempt.get_batch(vec![SCOPE_KEY.to_vec()], ReadProtection::Conflict),
+        attempt.scan_batch(
+            vec![prefix_range(LINEAGE_PREFIX)?],
+            ReadProtection::Conflict,
+        ),
+    )
+    .await?;
+    let mut values = values.into_iter();
+    let bytes = values.next().flatten().ok_or_else(unavailable)?;
+    if values.next().is_some() {
+        return Err(unavailable());
+    }
+    let scope = decode_scope(&bytes)?;
+    let mut pages = pages.into_iter();
+    let page = pages.next().ok_or_else(unavailable)?;
+    if pages.next().is_some()
+        || page.more
+        || page.entries.len() > SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES
+    {
+        return Err(unavailable());
+    }
+    let lineages = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            decode_lineage_metadata(
+                &scope,
+                &entry.key,
+                decode_stored_lineage(attempt, &entry.value)?,
+            )
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(std::sync::Arc::new(
+        SystemStreamLineageCatalog::try_new(scope, lineages).map_err(|_| unavailable())?,
+    ))
 }
 
 pub(crate) async fn read_history_protected<A: KvAttempt>(
@@ -271,17 +205,6 @@ pub(crate) async fn read_history_protected<A: KvAttempt>(
     Ok((epoch, history))
 }
 
-/// Keep catalog and private hold observations in the caller's
-/// protected attempt. The shared history model owns all trim decisions.
-/// Discovery needs one coherent read snapshot but does not commit a write.
-pub(crate) async fn read_history_for_catalog<A: KvAttempt>(
-    attempt: &A,
-) -> StorageResult<SystemStreamHistory> {
-    read_history_with_protection(attempt, ReadProtection::Snapshot, ReadProtection::Snapshot)
-        .await
-        .map(|(_, history)| history)
-}
-
 pub(crate) async fn read_page_start<A: KvAttempt>(
     attempt: &A,
     protection: ReadProtection,
@@ -291,8 +214,6 @@ pub(crate) async fn read_page_start<A: KvAttempt>(
 }
 
 /// Read one page snapshot while protecting only the catalog identity.
-/// Sequence and lineage rows advance on ordinary writes; they are read from
-/// the attempt snapshot so a busy stream does not abort every page read.
 pub(crate) async fn read_page_start_snapshot<A: KvAttempt>(
     attempt: &A,
     protection: ReadProtection,
@@ -308,18 +229,19 @@ async fn read_history_with_protection<A: KvAttempt>(
     sequence_protection: ReadProtection,
 ) -> StorageResult<(u64, SystemStreamHistory)> {
     let keys = vec![CATALOG_EPOCH_KEY.to_vec(), SCOPE_KEY.to_vec()];
+    let ranges = vec![prefix_range(LINEAGE_PREFIX)?];
     let ((values, pages), native_version) = try_join(
         try_join(
             attempt.get_batch(keys, catalog_protection),
-            attempt.scan_batch(
-                vec![
-                    prefix_range(LINEAGE_PREFIX)?,
-                    prefix_range(SEQUENCE_PREFIX)?,
-                ],
-                sequence_protection,
-            ),
+            attempt.scan_batch(ranges, sequence_protection),
         ),
-        attempt.native_read_version(),
+        async {
+            if is_versionstamped(attempt) {
+                attempt.native_read_version().await
+            } else {
+                attempt.native_snapshot_sequence().await
+            }
+        },
     )
     .await?;
     let mut values = values.into_iter();
@@ -338,68 +260,36 @@ async fn read_history_with_protection<A: KvAttempt>(
     }
 
     let scope_bytes = scope_bytes.ok_or_else(unavailable)?;
-    let row: ScopeRow = storage_serde::from_bytes(&scope_bytes).map_err(|_| unavailable())?;
-    let scope = SystemStreamScope::try_new_versioned(row.version, row.scope_id, row.generation)
-        .map_err(|_| unavailable())?;
+    let scope = decode_scope(&scope_bytes)?;
 
-    let [lineages, sequences] = pages.try_into().map_err(|_| unavailable())?;
-    let lineages = decode_rows::<LineageRow>(lineages)?;
-    let mut commit_frontiers = Vec::new();
-    let sequences = if native_version.is_some() {
-        if sequences.more {
+    let mut pages = pages.into_iter();
+    let page = pages.next().ok_or_else(unavailable)?;
+    if page.more || page.entries.len() > SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES {
+        return Err(unavailable());
+    }
+    let lineages = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let row = decode_stored_lineage(attempt, &entry.value)?;
+            Ok((entry.key, row))
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let history = if is_versionstamped(attempt) {
+        if pages.next().is_some() {
             return Err(unavailable());
         }
-        sequences
-            .entries
-            .into_iter()
-            .map(|entry| {
-                let (key, bytes) = (entry.key, entry.value);
-                let stamp: [u8; 12] = bytes.as_slice().try_into().map_err(|_| unavailable())?;
-                let lineage = lineages
-                    .iter()
-                    .find(|(_, lineage)| {
-                        segmented_key(SEQUENCE_PREFIX, &lineage.shard_id)
-                            .is_ok_and(|expected| expected == key)
-                    })
-                    .ok_or_else(unavailable)?;
-                let lineage = &lineage.1;
-                let position =
-                    SystemStreamPosition::try_new(&lineage.shard_id, &lineage.lineage_id, "0")
-                        .map_err(|_| unavailable())?
-                        .with_versionstamp(stamp)
-                        .map_err(|_| unavailable())?;
-                commit_frontiers.push(position);
-                let native_high =
-                    u64::from_be_bytes(stamp[..8].try_into().map_err(|_| unavailable())?)
-                        .checked_add(1)
-                        .ok_or_else(unavailable)?;
-                let next_offset = lineage
-                    .sealed_after_offset
-                    .unwrap_or(native_high.max(lineage.initial_sequence.get()));
-                Ok((
-                    key,
-                    SequenceRow {
-                        scope_id: lineage.scope_id.clone(),
-                        generation: lineage.generation,
-                        shard_id: lineage.shard_id.clone(),
-                        next_offset,
-                    },
-                ))
-            })
-            .collect::<StorageResult<Vec<_>>>()?
+        decode_native_history(scope, lineages, native_version.ok_or_else(unavailable)?)?
     } else {
-        decode_rows::<SequenceRow>(sequences)?
-    };
-    let history = decode_history(scope, lineages, sequences)?;
-    let history = if native_version.is_some() {
-        history.with_commit_ordering(commit_frontiers)
-    } else {
-        history
+        if pages.next().is_some() {
+            return Err(unavailable());
+        }
+        decode_sparse_history(scope, lineages, native_version.ok_or_else(unavailable)?)?
     };
     Ok((epoch, history))
 }
 
-fn prefix_range(prefix: &[u8]) -> StorageResult<KvRange> {
+pub(crate) fn prefix_range(prefix: &[u8]) -> StorageResult<KvRange> {
     let mut end = prefix.to_vec();
     *end.last_mut().ok_or_else(unavailable)? += 1;
     Ok(KvRange {
@@ -412,62 +302,27 @@ fn prefix_range(prefix: &[u8]) -> StorageResult<KvRange> {
     })
 }
 
-fn decode_rows<T: serde::de::DeserializeOwned>(
-    page: crate::KvRangePage,
-) -> StorageResult<Vec<(Vec<u8>, T)>> {
-    if page.more || page.entries.len() > SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES {
-        return Err(unavailable());
-    }
-    page.entries
-        .into_iter()
-        .map(|entry| {
-            let row = storage_serde::from_bytes(&entry.value).map_err(|_| unavailable())?;
-            Ok((entry.key, row))
-        })
-        .collect()
+fn decode_scope(bytes: &[u8]) -> StorageResult<SystemStreamScope> {
+    let row: ScopeRow = storage_serde::from_bytes(bytes).map_err(|_| unavailable())?;
+    SystemStreamScope::try_new_versioned(row.version, row.scope_id, row.generation)
+        .map_err(|_| unavailable())
 }
 
-fn decode_history(
-    scope: SystemStreamScope,
-    lineages: Vec<(Vec<u8>, LineageRow)>,
-    sequences: Vec<(Vec<u8>, SequenceRow)>,
-) -> StorageResult<SystemStreamHistory> {
-    let mut by_shard = HashMap::with_capacity(sequences.len());
-    for (key, row) in sequences {
-        if row.scope_id != scope.scope_id().as_str()
-            || row.generation != scope.generation()
-            || key != segmented_key(SEQUENCE_PREFIX, &row.shard_id)?
-            || by_shard
-                .insert(row.shard_id.clone(), row.next_offset)
-                .is_some()
-        {
-            return Err(unavailable());
-        }
-    }
-    let mut catalog = Vec::with_capacity(lineages.len());
-    let mut bounds = Vec::with_capacity(lineages.len());
-    for (key, row) in lineages {
-        let (lineage, bound) = decode_lineage(&scope, key, row, &by_shard)?;
-        catalog.push(lineage);
-        bounds.push(bound);
-    }
-    if by_shard.keys().any(|shard| {
-        !catalog
-            .iter()
-            .any(|lineage| lineage.shard_id().as_str() == shard)
-    }) {
+fn decode_stored_lineage<A: KvAttempt>(attempt: &A, bytes: &[u8]) -> StorageResult<LineageRow> {
+    let row = decode_lineage_row(bytes)?;
+    if (is_versionstamped(attempt) && row.sealed != (bytes.first() == Some(&NATIVE_SEALED_LINEAGE)))
+        || (!is_versionstamped(attempt) && bytes.first() != Some(&ORDINARY_LINEAGE))
+    {
         return Err(unavailable());
     }
-    let catalog = SystemStreamLineageCatalog::try_new(scope, catalog).map_err(|_| unavailable())?;
-    SystemStreamHistory::try_new(catalog, bounds).map_err(|_| unavailable())
+    Ok(row)
 }
 
-fn decode_lineage(
+fn decode_lineage_metadata(
     scope: &SystemStreamScope,
-    key: Vec<u8>,
+    key: &[u8],
     row: LineageRow,
-    by_shard: &HashMap<String, u64>,
-) -> StorageResult<(SystemStreamLineage, SystemStreamHistoryBounds)> {
+) -> StorageResult<SystemStreamLineage> {
     if row.scope_id != scope.scope_id().as_str()
         || row.generation != scope.generation()
         || key != segmented_key(LINEAGE_PREFIX, &row.lineage_id)?
@@ -478,6 +333,21 @@ fn decode_lineage(
     {
         return Err(unavailable());
     }
+    SystemStreamLineage::try_new(
+        row.shard_id,
+        row.lineage_id,
+        row.parent_lineage_id,
+        row.sealed,
+    )
+    .map_err(|_| unavailable())
+}
+
+fn decode_lineage(
+    scope: &SystemStreamScope,
+    key: Vec<u8>,
+    row: LineageRow,
+    by_shard: &HashMap<String, u64>,
+) -> StorageResult<(SystemStreamLineage, SystemStreamHistoryBounds)> {
     let next_sequence = by_shard
         .get(&row.shard_id)
         .copied()
@@ -487,16 +357,11 @@ fn decode_lineage(
         .sealed_after_offset
         .map(|value| NonZeroU64::new(value).ok_or_else(unavailable))
         .transpose()?;
-    let lineage = SystemStreamLineage::try_new(
-        row.shard_id,
-        row.lineage_id,
-        row.parent_lineage_id,
-        row.sealed,
-    )
-    .map_err(|_| unavailable())?;
+    let initial_sequence = row.initial_sequence;
+    let lineage = decode_lineage_metadata(scope, &key, row)?;
     let bounds = SystemStreamHistoryBounds {
         lineage_id: lineage.lineage_id().clone(),
-        initial_sequence: row.initial_sequence,
+        initial_sequence,
         next_sequence,
         sealed_after,
     };
@@ -514,4 +379,134 @@ pub(crate) fn segmented_key(prefix: &[u8], value: &str) -> StorageResult<Vec<u8>
 
 fn unavailable() -> StorageError {
     StorageEnum::HistoryUnavailable.into()
+}
+
+const STREAM_ENTRY_RECORD_FORMAT: u8 = 8;
+pub(crate) const ORDINARY_LINEAGE: u8 = 0;
+pub(crate) const NATIVE_SEALED_LINEAGE: u8 = 1;
+
+fn is_versionstamped<A: KvAttempt>(attempt: &A) -> bool {
+    matches!(
+        attempt.backend_engine(),
+        storage_common::diagnostics::NativeEngine::FoundationDb
+    )
+}
+
+pub(crate) fn encode_lineage(row: &LineageRow) -> StorageResult<Vec<u8>> {
+    let mut bytes = vec![ORDINARY_LINEAGE];
+    bytes.extend(storage_serde::to_bytes(row)?);
+    Ok(bytes)
+}
+
+pub(crate) fn encode_native_sealed_lineage(row: &LineageRow) -> StorageResult<Vec<u8>> {
+    if !row.sealed || row.sealed_after_offset.is_some() {
+        return Err(unavailable());
+    }
+    let mut bytes = vec![NATIVE_SEALED_LINEAGE];
+    bytes.extend_from_slice(&crate::constants::KV_VERSIONSTAMP_PLACEHOLDER);
+    bytes.extend(storage_serde::to_bytes(row)?);
+    Ok(bytes)
+}
+
+pub(crate) fn decode_lineage_row(bytes: &[u8]) -> StorageResult<LineageRow> {
+    let (&tag, body) = bytes.split_first().ok_or_else(unavailable)?;
+    match tag {
+        ORDINARY_LINEAGE => storage_serde::from_bytes(body).map_err(|_| unavailable()),
+        NATIVE_SEALED_LINEAGE => {
+            let stamp: [u8; 10] = body
+                .get(..10)
+                .ok_or_else(unavailable)?
+                .try_into()
+                .map_err(|_| unavailable())?;
+            let version = u64::from_be_bytes(stamp[..8].try_into().map_err(|_| unavailable())?);
+            let end = version.checked_add(1).ok_or_else(unavailable)?;
+            let mut row: LineageRow =
+                storage_serde::from_bytes(&body[10..]).map_err(|_| unavailable())?;
+            if !row.sealed || row.sealed_after_offset.is_some() || end < row.initial_sequence.get()
+            {
+                return Err(unavailable());
+            }
+            row.sealed_after_offset = Some(end);
+            Ok(row)
+        }
+        _ => Err(unavailable()),
+    }
+}
+
+pub(crate) fn decode_native_history(
+    scope: SystemStreamScope,
+    lineages: Vec<(Vec<u8>, LineageRow)>,
+    version: u64,
+) -> StorageResult<SystemStreamHistory> {
+    let next = version.checked_add(1).ok_or_else(unavailable)?;
+    let mut by_shard = HashMap::with_capacity(lineages.len());
+    let mut frontiers = Vec::with_capacity(lineages.len());
+    let next_sequence = NonZeroU64::new(next).ok_or_else(unavailable)?;
+    for (_, row) in &lineages {
+        let high = stream_provider::lineage_frontier_high(
+            row.initial_sequence,
+            next_sequence,
+            row.sealed_after_offset,
+            next,
+        )?;
+        if by_shard.insert(row.shard_id.clone(), high + 1).is_some() {
+            return Err(unavailable());
+        }
+        frontiers.push(
+            SystemStreamPosition::try_new(
+                &row.shard_id,
+                &row.lineage_id,
+                format!("{high:020}-vsffffffff"),
+            )
+            .map_err(|_| unavailable())?,
+        );
+    }
+    let mut catalog = Vec::with_capacity(lineages.len());
+    let mut bounds = Vec::with_capacity(lineages.len());
+    for (key, row) in lineages {
+        let (lineage, bound) = decode_lineage(&scope, key, row, &by_shard)?;
+        catalog.push(lineage);
+        bounds.push(bound);
+    }
+    let catalog = SystemStreamLineageCatalog::try_new(scope, catalog).map_err(|_| unavailable())?;
+    Ok(SystemStreamHistory::try_new(catalog, bounds)
+        .map_err(|_| unavailable())?
+        .with_commit_ordering(frontiers, NonZeroU64::new(next).ok_or_else(unavailable)?))
+}
+
+pub(crate) fn decode_sparse_history(
+    scope: SystemStreamScope,
+    lineages: Vec<(Vec<u8>, LineageRow)>,
+    sequence: u64,
+) -> StorageResult<SystemStreamHistory> {
+    let next = sequence.checked_add(1).ok_or_else(unavailable)?;
+    let mut by_shard = HashMap::with_capacity(lineages.len());
+    let mut frontiers = Vec::with_capacity(lineages.len());
+    let next_sequence = NonZeroU64::new(next).ok_or_else(unavailable)?;
+    for (_, row) in &lineages {
+        let high = stream_provider::lineage_frontier_high(
+            row.initial_sequence,
+            next_sequence,
+            row.sealed_after_offset,
+            next,
+        )?;
+        if by_shard.insert(row.shard_id.clone(), high + 1).is_some() {
+            return Err(unavailable());
+        }
+        frontiers.push(
+            SystemStreamPosition::try_new(&row.shard_id, &row.lineage_id, format!("{high:020}"))
+                .map_err(|_| unavailable())?,
+        );
+    }
+    let mut catalog = Vec::with_capacity(lineages.len());
+    let mut bounds = Vec::with_capacity(lineages.len());
+    for (key, row) in lineages {
+        let (lineage, bound) = decode_lineage(&scope, key, row, &by_shard)?;
+        catalog.push(lineage);
+        bounds.push(bound);
+    }
+    let catalog = SystemStreamLineageCatalog::try_new(scope, catalog).map_err(|_| unavailable())?;
+    Ok(SystemStreamHistory::try_new(catalog, bounds)
+        .map_err(|_| unavailable())?
+        .with_sparse_numeric_ordering(frontiers, NonZeroU64::new(next).ok_or_else(unavailable)?))
 }

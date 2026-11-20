@@ -7,12 +7,12 @@ use super::{
     frame_write::{BoundedSerialization, FrameBuffer},
 };
 
-pub(super) struct EncodedFrame {
+pub struct EncodedFrame {
     pub raw_bytes: u32,
     pub packed: Vec<u8>,
 }
 
-pub(super) fn encode(value: &impl Serialize, limit: usize) -> TransportResult<EncodedFrame> {
+pub fn encode(value: &impl Serialize, limit: usize) -> TransportResult<EncodedFrame> {
     let limit = limit.min(u32::MAX as usize);
     let encoder = ZlibEncoder::new(FrameBuffer::new(limit), Compression::fast());
     let mut writer = BoundedSerialization::new(encoder, limit);
@@ -25,14 +25,14 @@ pub(super) fn encode(value: &impl Serialize, limit: usize) -> TransportResult<En
     })
 }
 
-pub(super) fn decode<T: DeserializeOwned>(packed: Vec<u8>, raw_bytes: u32) -> TransportResult<T> {
+pub fn decode<T: DeserializeOwned>(packed: Vec<u8>, raw_bytes: u32) -> TransportResult<T> {
     let mut reader = std::io::BufReader::new(FrameReader::new(&packed, raw_bytes));
     let value = serde_json::from_reader(&mut reader).map_err(|_| TransportError::Frame)?;
     reader.get_ref().require_complete()?;
     Ok(value)
 }
 
-pub(super) fn serialized_length(value: &impl Serialize, limit: usize) -> TransportResult<usize> {
+pub fn serialized_length(value: &impl Serialize, limit: usize) -> TransportResult<usize> {
     let mut writer = BoundedSerialization::new(std::io::sink(), limit);
     serde_json::to_writer(&mut writer, value).map_err(classify_json_error)?;
     Ok(writer.into_parts().0)

@@ -1,4 +1,4 @@
-use super::{WireItem, WireItemKeyAttributes};
+use super::WireItem;
 use crate::{AttributeMap, AttributeValue, KeyAttributes};
 
 #[test]
@@ -26,27 +26,6 @@ fn given_conflicting_or_invalid_numeric_image_when_keys_are_verified_then_verifi
         let image = WireItem::dynamo_json(data.to_vec());
         assert!(image.has_verified_keys(&key).is_err());
     }
-}
-
-#[test]
-fn given_equivalent_split_key_when_keys_are_verified_then_numeric_bytes_and_representation_survive()
-{
-    let key = KeyAttributes::from_iter([("pk".into(), AttributeValue::N("100".into()))]);
-    let image = WireItem::local_split(
-        WireItemKeyAttributes::new("pk".into(), AttributeValue::N("1e2".into()), None, None),
-        Some(WireItemKeyAttributes::new(
-            "pk".into(),
-            AttributeValue::N("100.0".into()),
-            None,
-            None,
-        )),
-        Some(br#"{ "pk":{"N":"100E0"}, "payload": {"S":"value"} }"#.to_vec()),
-    );
-    let before = serde_json::to_vec(&image).unwrap();
-
-    assert!(image.has_verified_keys(&key).unwrap());
-    assert_eq!(serde_json::to_vec(&image).unwrap(), before);
-    assert!(matches!(image, WireItem::LocalSplit { .. }));
 }
 
 #[test]

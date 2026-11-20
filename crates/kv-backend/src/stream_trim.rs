@@ -1,160 +1,72 @@
 //! Bounded ordered SystemStream record scans on the caller's KV attempt.
 
-use std::{future::Future, num::NonZeroU32};
+use std::num::NonZeroU32;
 
 use storage_types::{
     ReadProtection, StorageError, StorageResult, SystemStreamPosition, storage_serde,
 };
 use stream_provider::{
-    MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS, SystemStreamTrimAttempt, SystemStreamTrimOperationId,
-    SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest, SystemStreamTrimRecord,
+    MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS, SystemStreamTrimOperationId, SystemStreamTrimPageReceipt,
+    SystemStreamTrimRecord,
 };
 
 use crate::{
     KvAttempt, KvMutation, KvRange,
-    catalog::KvCatalogAttempt,
-    constants::{
-        STREAM_READ_BYTES, SYSTEM_STREAM_RECORD_PREFIX, SYSTEM_STREAM_TRIM_RECEIPT_PREFIX,
-    },
+    constants::{STREAM_READ_BYTES, SYSTEM_STREAM_TRIM_RECEIPT_PREFIX},
     range::prefix_upper_bound,
     stream_write::key_layout::record_key,
 };
 
-impl<A: KvAttempt> SystemStreamTrimAttempt for KvCatalogAttempt<'_, A> {
-    fn read_trim_receipts(
-        &mut self,
-        request: &SystemStreamTrimPageRequest,
-    ) -> impl Future<
-        Output = StorageResult<(
-            Option<SystemStreamTrimPageReceipt>,
-            Option<SystemStreamTrimPageReceipt>,
-        )>,
-    > + Send {
-        read_receipts(self.attempt, request)
-    }
-
-    fn scan_trim_records(
-        &mut self,
-        after: Option<&SystemStreamPosition>,
-    ) -> impl Future<Output = StorageResult<(Vec<SystemStreamTrimRecord>, bool)>> + Send {
-        scan_records(self.attempt, after)
-    }
-
-    fn apply_trim_page(
-        &mut self,
-        selected: &[SystemStreamTrimRecord],
-        receipt: &SystemStreamTrimPageReceipt,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        apply_page(self.attempt, selected, receipt)
-    }
-}
-
-async fn apply_page<A: KvAttempt>(
+pub(crate) async fn apply_page<A: KvAttempt>(
     attempt: &mut A,
     selected: &[SystemStreamTrimRecord],
+    frontiers: &[SystemStreamPosition],
     receipt: &SystemStreamTrimPageReceipt,
 ) -> StorageResult<()> {
-    let mut frontiers = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
-    let mut mutations = Vec::with_capacity(selected.len() * 3);
+    let mut mutations = Vec::with_capacity(selected.len() + frontiers.len() + 1);
     for record in selected {
-        let key = crate::stream_write::key_layout::retired_key(&record.position);
-        let offset = match record.position.offset().versionstamp() {
+        mutations.push(KvMutation::Delete {
+            key: record_key(&record.position)?,
+        });
+    }
+    // Selection starts strictly after the frontiers observed in this same
+    // protected attempt, so each lane's maximum advances its marker.
+    for position in frontiers {
+        let offset = match position.offset().versionstamp() {
             Some(stamp) => stamp.to_vec(),
-            None => record
-                .position
+            None => position
                 .offset()
                 .order()
                 .map_err(|_| invalid_record())?
                 .to_be_bytes()
                 .to_vec(),
         };
-        frontiers
-            .entry(key)
-            .and_modify(|current| {
-                if *current < offset {
-                    *current = offset.clone();
-                }
-            })
-            .or_insert(offset);
-        mutations.push(KvMutation::Delete {
-            key: record_key(&record.position)?,
+        mutations.push(KvMutation::Put {
+            key: crate::stream_write::key_layout::retired_key(position),
+            value: offset,
         });
-        if let Some(history) = record.table_history_id {
-            mutations.push(KvMutation::Delete {
-                key: crate::stream_write::key_layout::table_record_key(history, &record.position)?,
-            });
-        }
     }
-    store_retired_offsets(attempt, frontiers, &mut mutations).await?;
     attempt.stage(mutations)?;
     write_receipt(attempt, receipt)
 }
 
-async fn store_retired_offsets<A: KvAttempt>(
-    attempt: &A,
-    frontiers: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
-    mutations: &mut Vec<KvMutation>,
-) -> StorageResult<()> {
-    if frontiers.is_empty() {
-        return Ok(());
-    }
-    let values = attempt
-        .get_batch(
-            frontiers.keys().cloned().collect(),
-            ReadProtection::Conflict,
-        )
-        .await?;
-    if values.len() != frontiers.len() {
-        return Err(invalid_record());
-    }
-    for ((key, next), current) in frontiers.into_iter().zip(values) {
-        if current
-            .as_ref()
-            .is_some_and(|current| current.len() != next.len())
-        {
-            return Err(invalid_record());
-        }
-        if current.as_ref().is_none_or(|current| *current < next) {
-            mutations.push(KvMutation::Put { key, value: next });
-        }
-    }
-    Ok(())
-}
-
-pub(crate) async fn read_receipts<A: KvAttempt>(
+pub(crate) async fn load_receipts<A: KvAttempt>(
     attempt: &mut A,
-    request: &SystemStreamTrimPageRequest,
-) -> StorageResult<(
-    Option<SystemStreamTrimPageReceipt>,
-    Option<SystemStreamTrimPageReceipt>,
-)> {
-    let sequence = request.continuation().map_or(0, |cursor| cursor.sequence());
-    let mut keys = vec![receipt_key(request.operation_id(), sequence)?];
-    if let Some(previous) = sequence.checked_sub(1) {
-        keys.push(receipt_key(request.operation_id(), previous)?);
-    }
-    let values = attempt.get_batch(keys, ReadProtection::Conflict).await?;
-    if values.len() != if sequence == 0 { 1 } else { 2 } {
-        return Err(StorageError::internal(
-            "KV SystemStream trim receipt count differs",
-        ));
-    }
-    let mut values = values.into_iter();
-    let current = decode_receipt(
-        values.next().ok_or_else(invalid_receipt)?,
-        request,
-        sequence,
-    )?;
-    let predecessor = if sequence == 0 {
-        None
-    } else {
-        decode_receipt(
-            values.next().ok_or_else(invalid_receipt)?,
-            request,
-            sequence - 1,
-        )?
-    };
-    Ok((current, predecessor))
+    operation: &SystemStreamTrimOperationId,
+    sequences: &[u64],
+) -> StorageResult<storage_types::Exact<Option<SystemStreamTrimPageReceipt>>> {
+    let keys = sequences
+        .iter()
+        .map(|sequence| receipt_key(operation, *sequence))
+        .collect::<StorageResult<Vec<_>>>()?;
+    let values = attempt
+        .get_batch_exact(keys, ReadProtection::Conflict)
+        .await?;
+    values.try_map(|bytes| {
+        bytes
+            .map(|bytes| storage_serde::from_bytes(&bytes))
+            .transpose()
+    })
 }
 
 pub(crate) fn write_receipt<A: KvAttempt>(
@@ -177,23 +89,6 @@ fn receipt_key(operation: &SystemStreamTrimOperationId, sequence: u64) -> Storag
     Ok(key)
 }
 
-fn decode_receipt(
-    bytes: Option<Vec<u8>>,
-    request: &SystemStreamTrimPageRequest,
-    sequence: u64,
-) -> StorageResult<Option<SystemStreamTrimPageReceipt>> {
-    bytes
-        .map(|bytes| {
-            let receipt: SystemStreamTrimPageReceipt = storage_serde::from_bytes(&bytes)?;
-            if receipt.operation_id != *request.operation_id() || receipt.input_sequence != sequence
-            {
-                return Err(invalid_receipt());
-            }
-            Ok(receipt)
-        })
-        .transpose()
-}
-
 fn invalid_receipt() -> StorageError {
     StorageError::internal("KV SystemStream trim receipt is invalid")
 }
@@ -202,52 +97,51 @@ fn invalid_record() -> StorageError {
     StorageError::internal("KV SystemStream trim record is invalid")
 }
 
+/// A snapshot scan, so appends at the live tail do not conflict with the
+/// page. Records are written once under a unique position and never rewritten,
+/// so a delete needs no conflict read of its key. Selection takes only records
+/// at or below the publication boundary of this attempt's own read version, and
+/// every such record is visible to the same snapshot, so the retired frontier
+/// never passes a record the page did not see. Concurrent trims conflict on the
+/// retired frontier keys, which the attempt reads under conflict.
 pub(crate) async fn scan_records<A: KvAttempt>(
     attempt: &mut A,
-    after: Option<&SystemStreamPosition>,
+    starts: &[SystemStreamPosition],
 ) -> StorageResult<(Vec<SystemStreamTrimRecord>, bool)> {
-    let prefix = SYSTEM_STREAM_RECORD_PREFIX;
-    let begin = if let Some(position) = after {
-        let mut key = record_key(position)?;
-        key.push(0);
-        key
-    } else {
-        prefix.to_vec()
-    };
-    let end = prefix_upper_bound(prefix).ok_or_else(|| {
-        StorageError::internal("KV SystemStream record prefix has no upper bound")
-    })?;
-    let page = attempt
-        .scan(
-            KvRange {
-                entry_bounds: None,
-                begin,
-                end,
-                reverse: false,
-                limit: NonZeroU32::new(
-                    u32::try_from(MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS + 1).map_err(|_| {
-                        StorageError::internal("SystemStream trim scan limit is invalid")
-                    })?,
-                )
-                .ok_or_else(|| StorageError::internal("SystemStream trim scan limit is zero"))?,
-                max_bytes: STREAM_READ_BYTES,
-            },
-            ReadProtection::Conflict,
-        )
-        .await?;
-    let more = page.more || page.entries.len() > MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS;
-    let records = page
-        .entries
-        .into_iter()
-        .take(MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS)
-        .map(|entry| {
-            let record = crate::stream_write::record::decode_record(&entry.key, &entry.value)?;
-            Ok(SystemStreamTrimRecord {
-                position: record.position().clone(),
-                created_at: record.created_at(),
-                table_history_id: record.table_history_id(),
-            })
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
-    Ok((records, more))
+    let mut records = Vec::new();
+    for start in starts {
+        let prefix = crate::stream_write::key_layout::record_prefix(start);
+        let mut begin = record_key(start)?;
+        begin.push(0);
+        let end = prefix_upper_bound(&prefix).ok_or_else(invalid_record)?;
+        let remaining = MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS + 1 - records.len();
+        let page = attempt
+            .scan(
+                KvRange {
+                    entry_bounds: None,
+                    begin,
+                    end,
+                    reverse: false,
+                    limit: NonZeroU32::new(u32::try_from(remaining).map_err(|_| invalid_record())?)
+                        .ok_or_else(invalid_record)?,
+                    max_bytes: STREAM_READ_BYTES,
+                },
+                ReadProtection::Snapshot,
+            )
+            .await?;
+        let more = page.more;
+        for entry in page.entries {
+            let position = crate::stream_write::record::decode_position(start, &entry.key)?;
+            let reference = crate::stream_write::record::FeedReference::decode(&entry.value)?;
+            records.push(SystemStreamTrimRecord {
+                position,
+                created_at: reference.created_at,
+            });
+        }
+        if more || records.len() > MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS {
+            records.truncate(MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS);
+            return Ok((records, true));
+        }
+    }
+    Ok((records, false))
 }

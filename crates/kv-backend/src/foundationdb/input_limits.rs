@@ -39,14 +39,14 @@ impl NativeInputLimits {
             .checked_add(key_bytes)
             .is_none_or(|bytes| bytes > maximum)
         {
-            return Err(InfrastructureResultKind::NativeCapacityRejected.into());
+            return Err(storage_types::AttemptFailure::CAPACITY.into());
         }
         Ok(())
     }
 
     pub(super) fn value(value: &[u8]) -> StorageResult<()> {
         if value.len() > FOUNDATIONDB_NATIVE_VALUE_BYTES {
-            return Err(InfrastructureResultKind::NativeCapacityRejected.into());
+            return Err(storage_types::AttemptFailure::CAPACITY.into());
         }
         Ok(())
     }
@@ -65,7 +65,8 @@ impl NativeInputLimits {
                 KvMutation::Delete { key } | KvMutation::DeleteUnchunked { key } => {
                     self.point(key)?
                 }
-                KvMutation::DeleteRange { begin, end } => self.range(begin, end)?,
+                KvMutation::DeleteRange { begin, end }
+                | KvMutation::ClearUnchunkedRange { begin, end } => self.range(begin, end)?,
             }
         }
         Ok(())
@@ -107,7 +108,7 @@ impl NativeInputLimits {
             .checked_add(std::mem::size_of::<u32>())
             .is_none_or(|bytes| bytes > FOUNDATIONDB_NATIVE_VALUE_BYTES)
         {
-            return Err(InfrastructureResultKind::NativeCapacityRejected.into());
+            return Err(storage_types::AttemptFailure::CAPACITY.into());
         }
         Ok(())
     }

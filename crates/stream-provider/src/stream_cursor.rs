@@ -1,43 +1,60 @@
 //! Cursor decisions share one native attempt with catalog and stream rows.
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
-use storage_common::retry::retry_native_conflicts;
-use storage_types::{AttemptMode, SemanticDecision, StorageError, StreamItemId};
+use storage_types::{SemanticDecision, StorageError, StorageResult, StreamItemId};
 
 use crate::{
-    CursorName, CursorPage, CursorPosition, StreamAttempt, StreamCursor, StreamError, StreamItem,
-    StreamPage, StreamPort, StreamResult, StreamRowKind, StreamValidationKind,
-    constants::STREAM_WRITE_RETRY, validate_limit,
+    CursorName, CursorPage, CursorPosition, StreamAddress, StreamAttempt, StreamCursor,
+    StreamError, StreamItem, StreamPage, StreamPort, StreamResult, StreamValidationKind,
+    constants::{CURSOR_PAGE_READ, STREAM_POINT_READ, STREAM_WRITE},
+    validate_limit,
 };
+
+struct CreateCursorInput {
+    stream: StreamAddress,
+    cursor_name: CursorName,
+    position: CursorPosition,
+    captured_at: storage_types::TimestampMillis,
+}
 
 pub(crate) async fn create_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
     position: CursorPosition,
 ) -> StreamResult<()> {
+    crate::validation::validate_cursor_name(&cursor_name)?;
     let captured_at = port.now();
-    retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
-        let stream = stream.clone();
-        let cursor_name = cursor_name.clone();
-        port.with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                crate::StreamCursorOperation::load(attempt, stream)
-                    .await?
-                    .create(cursor_name, position, captured_at)
-                    .await?
-                    .into_result()
-            })
-        })
+    let input = Arc::new(CreateCursorInput {
+        stream,
+        cursor_name,
+        position,
+        captured_at,
+    });
+    port.run(STREAM_WRITE, input, |attempt, input, _| {
+        Box::pin(create_cursor_in_attempt(attempt, input))
     })
     .await
     .map_err(StreamError::from_storage_error)
 }
 
+/// One try: the stream's cursor family under its catalog row, then the new
+/// cursor.
+async fn create_cursor_in_attempt<A: StreamAttempt>(
+    attempt: &mut A,
+    input: &CreateCursorInput,
+) -> StorageResult<()> {
+    crate::StreamCursorOperation::load(attempt, input.stream.clone())
+        .await?
+        .create(input.cursor_name.clone(), input.position, input.captured_at)
+        .await?
+        .into_result()
+}
+
 pub(crate) async fn get_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
 ) -> StreamResult<Option<StreamCursor>> {
     load_cursor(port, stream, cursor_name).await
@@ -45,102 +62,141 @@ pub(crate) async fn get_cursor<P: StreamPort>(
 
 pub(crate) async fn load_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
 ) -> StreamResult<Option<StreamCursor>> {
-    port.with_stream_attempt(AttemptMode::ReadOnly, move |attempt| {
-        Box::pin(async move {
-            // Catalog validation and cursor read share one native attempt.
-            crate::stream_kind::resolve_stream_layout(attempt, &stream).await?;
-            attempt.read_cursor(&stream, &cursor_name).await
-        })
-    })
+    port.with_attempt(
+        STREAM_POINT_READ.start(port.attempt_deadlines()),
+        move |attempt| {
+            Box::pin(async move {
+                // Catalog resolution and cursor read share one native attempt.
+                let (stream, _) = crate::stream_kind::resolve_stream(attempt, &stream).await?;
+                attempt.read_cursor(&stream, &cursor_name).await
+            })
+        },
+    )
     .await
     .map_err(StreamError::from_storage_error)
 }
 
 pub(crate) async fn delete_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
 ) -> StreamResult<()> {
     remove_cursor(port, stream, cursor_name).await
 }
 
+struct CursorInput {
+    stream: StreamAddress,
+    cursor_name: CursorName,
+}
+
 pub(crate) async fn remove_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
 ) -> StreamResult<()> {
-    retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
-        let stream = stream.clone();
-        let cursor_name = cursor_name.clone();
-        port.with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                crate::StreamCursorOperation::load(attempt, stream)
-                    .await?
-                    .delete(&cursor_name)
-                    .await?
-                    .into_result()
-            })
-        })
+    let input = Arc::new(CursorInput {
+        stream,
+        cursor_name,
+    });
+    port.run(STREAM_WRITE, input, |attempt, input, _| {
+        Box::pin(remove_cursor_in_attempt(attempt, input))
     })
     .await
     .map_err(StreamError::from_storage_error)
 }
 
+/// One try: the stream's cursor family, then the cursor delete.
+async fn remove_cursor_in_attempt<A: StreamAttempt>(
+    attempt: &mut A,
+    input: &CursorInput,
+) -> StorageResult<()> {
+    crate::StreamCursorOperation::load(attempt, input.stream.clone())
+        .await?
+        .delete(&input.cursor_name)
+        .await?
+        .into_result()
+}
+
+struct AdvanceCursorInput {
+    stream: StreamAddress,
+    cursor_name: CursorName,
+    to_item_id: StreamItemId,
+}
+
 pub(crate) async fn advance_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
     to_item_id: StreamItemId,
 ) -> StreamResult<()> {
-    retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
-        let stream = stream.clone();
-        let cursor_name = cursor_name.clone();
-        port.with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                crate::StreamCursorOperation::load(attempt, stream)
-                    .await?
-                    .advance(&cursor_name, to_item_id)
-                    .await?
-                    .into_result()
-            })
-        })
+    let input = Arc::new(AdvanceCursorInput {
+        stream,
+        cursor_name,
+        to_item_id,
+    });
+    port.run(STREAM_WRITE, input, |attempt, input, _| {
+        Box::pin(advance_cursor_in_attempt(attempt, input))
     })
     .await
     .map_err(StreamError::from_storage_error)
+}
+
+/// One try: the stream's cursor family, then the cursor advance.
+async fn advance_cursor_in_attempt<A: StreamAttempt>(
+    attempt: &mut A,
+    input: &AdvanceCursorInput,
+) -> StorageResult<()> {
+    crate::StreamCursorOperation::load(attempt, input.stream.clone())
+        .await?
+        .advance(&input.cursor_name, input.to_item_id)
+        .await?
+        .into_result()
+}
+
+struct ReadCursorInput {
+    stream: StreamAddress,
+    cursor_name: CursorName,
+    limit: u32,
 }
 
 /// Reading advances the cursor atomically, so two consumers cannot both
 /// commit the same page from one cursor position.
 pub(crate) async fn read_from_cursor<P: StreamPort>(
     port: &P,
-    stream: StreamRowKind,
+    stream: StreamAddress,
     cursor_name: CursorName,
     limit: u32,
 ) -> StreamResult<CursorPage> {
     validate_limit(limit)?;
-    retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
-        let stream = stream.clone();
-        let cursor_name = cursor_name.clone();
-        port.with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move {
-                crate::StreamCursorOperation::load(attempt, stream)
-                    .await?
-                    .read(
-                        &cursor_name,
-                        NonZeroU32::new(limit).ok_or_else(|| {
-                            StorageError::internal("validated stream cursor limit is zero")
-                        })?,
-                    )
-                    .await?
-                    .into_result()
-            })
-        })
+    let input = Arc::new(ReadCursorInput {
+        stream,
+        cursor_name,
+        limit,
+    });
+    port.run(CURSOR_PAGE_READ, input, |attempt, input, _| {
+        Box::pin(read_cursor_in_attempt(attempt, input))
     })
     .await
     .map_err(StreamError::from_storage_error)
+}
+
+/// One try: the stream's cursor family, then the page read and cursor advance.
+async fn read_cursor_in_attempt<A: StreamAttempt>(
+    attempt: &mut A,
+    input: &ReadCursorInput,
+) -> StorageResult<CursorPage> {
+    crate::StreamCursorOperation::load(attempt, input.stream.clone())
+        .await?
+        .read(
+            &input.cursor_name,
+            NonZeroU32::new(input.limit)
+                .ok_or_else(|| StorageError::internal("validated stream cursor limit is zero"))?,
+        )
+        .await?
+        .into_result()
 }
 
 pub fn accept_cursor_creation(

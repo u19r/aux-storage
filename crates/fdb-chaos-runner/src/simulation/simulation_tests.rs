@@ -27,7 +27,12 @@ fn given_long_paths_when_simulator_runs_then_short_options_preserve_exact_filesy
     fs::create_dir_all(&root).unwrap();
     let library = root.join("long-library-segment/".repeat(12));
     fs::create_dir_all(&library).unwrap();
-    fs::write(library.join("library-marker"), "exact library").unwrap();
+    let library_file = format!(
+        "{}aux_storage_fdb_chaos{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    fs::write(library.join(&library_file), "exact library").unwrap();
     let executable = root.join("simulator 'stub'");
     fs::write(
         &executable,
@@ -75,14 +80,26 @@ printf 'stderr evidence\n' >&2
             .expect("path value must have a single-line assignment");
         assert_eq!(line, format!("{key} = \"{expected}\""));
     }
-    assert_eq!(
-        fs::canonicalize(artifact_dir.join("workload-library")).unwrap(),
-        fs::canonicalize(&library).unwrap()
+    let pinned = artifact_dir.join("workload-library").join(&library_file);
+    assert!(!fs::symlink_metadata(&pinned).unwrap().is_symlink());
+    assert_eq!(fs::read_to_string(&pinned).unwrap(), "exact library");
+    let rerun = fs::read_to_string(artifact_dir.join("rerun.sh")).unwrap();
+    let recorded = rerun
+        .split_whitespace()
+        .skip_while(|word| *word != "--expect-library-sha256")
+        .nth(1)
+        .expect("rerun pins the library hash")
+        .to_string();
+    assert_eq!(recorded.len(), 64);
+    assert!(
+        fs::read_to_string(artifact_dir.join("trace-digest.txt"))
+            .unwrap()
+            .starts_with("fdb chaos trace digest: ")
     );
-    assert_eq!(
-        fs::read_to_string(artifact_dir.join("workload-library/library-marker")).unwrap(),
-        "exact library"
-    );
+    let mut mismatch = CliArgs::parse(std::iter::empty()).unwrap();
+    mismatch.library_path = library.display().to_string();
+    mismatch.expect_library_sha256 = Some("0".repeat(64));
+    assert!(super::pin_workload_library(&mismatch, &artifact_dir).is_err());
     assert_eq!(
         fs::read_to_string(artifact_dir.join("subprocess-directory.txt"))
             .unwrap()
@@ -177,6 +194,7 @@ fn materialization_keeps_runner_controls_out_of_reserved_simulation_options() {
         artifact_root: PathBuf::from("run-artifacts/fdb-chaos"),
         library_path: "target/release".to_string(),
         library_name: "aux_storage_fdb_chaos".to_string(),
+        expect_library_sha256: None,
     };
 
     materialize_test_file(&args, &destination).expect("materialize simulator workload");
@@ -224,6 +242,7 @@ fn materialization_does_not_add_read_sequence_options_to_other_workloads() {
         artifact_root: PathBuf::from("run-artifacts/fdb-chaos"),
         library_path: "target/release".to_string(),
         library_name: "aux_storage_fdb_chaos".to_string(),
+        expect_library_sha256: None,
     };
 
     materialize_test_file(&args, &destination).expect("materialize simulator workload");
@@ -234,4 +253,51 @@ fn materialization_does_not_add_read_sequence_options_to_other_workloads() {
     assert!(!workload.contains_key("readSequenceBuggify"));
 
     fs::remove_dir_all(root).expect("remove materialization test directory");
+}
+
+#[test]
+fn given_raw_database_workload_when_materialized_then_native_tenants_are_disabled_and_other_settings_survive()
+ {
+    let root = std::env::temp_dir().join(format!(
+        "fdb-raw-context-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("input.toml");
+    let output = root.join("output.toml");
+    let template = "[configuration]\nallowDefaultTenant = false\ntenantModes = \
+                    [\"optional\"]\n[[test]]\ntestTitle = \"raw \
+                    database\"\n[[test.workload]]\ntestName = \"External\"\n";
+    fs::write(&input, template).unwrap();
+    let mut args = CliArgs::parse(std::iter::empty()).unwrap();
+    args.test_file = input.clone();
+    materialize_test_file(&args, &output).unwrap();
+    let rendered: toml::Table = toml::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    assert_eq!(
+        rendered["configuration"]["allowDefaultTenant"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        rendered["configuration"]["tenantModes"].as_array().unwrap()[0].as_str(),
+        Some("optional")
+    );
+    fs::write(&input, template.replace("allowDefaultTenant = false\n", "")).unwrap();
+    materialize_test_file(&args, &output).unwrap();
+    let rendered: toml::Table = toml::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    assert_eq!(
+        rendered["configuration"]["allowDefaultTenant"].as_bool(),
+        Some(false)
+    );
+    fs::write(
+        &input,
+        template.replace("allowDefaultTenant = false", "allowDefaultTenant = true"),
+    )
+    .unwrap();
+    let error = materialize_test_file(&args, &output).unwrap_err();
+    assert!(error.contains("allowDefaultTenant must be false"));
+    fs::remove_dir_all(root).unwrap();
 }

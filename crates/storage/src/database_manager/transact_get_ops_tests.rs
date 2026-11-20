@@ -14,13 +14,11 @@ use crate::{AdmissionConfig, DatabaseManager, DatabaseManagerRuntimeOptions, Put
 async fn transact_get_same_name_replacement_uses_cold_native_metadata() {
     let database_path = crate::storage_test_support_tests::unique_path("transact-get-replacement");
     let config = StorageConfig {
+        initial_stream_lineages: None,
         backend_type: StorageBackend::SQLite,
         connection_string: Some(database_path.to_string_lossy().into_owned()),
         file_path: None,
-        sqlite: Some(SqliteSettings {
-            force_file_backed_database: true,
-            ..SqliteSettings::default()
-        }),
+        sqlite: Some(SqliteSettings {}),
         postgres: None,
         turso: None,
         rocksdb: None,
@@ -119,18 +117,104 @@ async fn transact_get_same_name_replacement_uses_cold_native_metadata() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn transact_get_projection_selecting_nothing_leaves_slot_empty() {
+    let database_path =
+        crate::storage_test_support_tests::unique_path("transact-get-empty-projection");
+    let config = StorageConfig {
+        initial_stream_lineages: None,
+        backend_type: StorageBackend::SQLite,
+        connection_string: Some(database_path.to_string_lossy().into_owned()),
+        file_path: None,
+        sqlite: Some(SqliteSettings {}),
+        postgres: None,
+        turso: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    };
+    let table = TableName::new("transact_get_empty_projection");
+    let database = DatabaseManager::new_for_test_with_config(config)
+        .await
+        .expect("create test database manager");
+    database
+        .create_table(&CreateTableRequest::new(
+            table.clone(),
+            vec![AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            }],
+            vec![KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            }],
+            BillingMode::PayPerRequest,
+        ))
+        .await
+        .expect("create table");
+    for pk in ["empty", "row"] {
+        database
+            .put_item(
+                PutItemInput::builder()
+                    .table_name(table.clone())
+                    .item(HashMap::from([
+                        ("pk".to_string(), AttributeValue::S(pk.to_string())),
+                        (
+                            "tags".to_string(),
+                            AttributeValue::L(vec![
+                                AttributeValue::S("a".to_string()),
+                                AttributeValue::S("b".to_string()),
+                            ]),
+                        ),
+                    ]))
+                    .build(),
+            )
+            .await
+            .expect("write row");
+    }
+    // One operation per item: DynamoDB rejects two on the same key.
+    let member = |pk: &str, projection: &str| TransactGetItem {
+        get: TransactGetRequest {
+            table_name: table.clone(),
+            key: KeyAttributes::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]),
+            projection_expression: Some(projection.to_string()),
+            expression_attribute_names: None,
+        },
+    };
+
+    let response = database
+        .transact_get_items(TransactGetItemsRequest {
+            transact_items: vec![member("empty", "absent"), member("row", "tags[1]")],
+            return_consumed_capacity: None,
+        })
+        .await
+        .expect("transact get");
+
+    assert!(response.responses[0].item.is_none());
+    let projected = response.responses[1]
+        .item
+        .as_ref()
+        .expect("projected row")
+        .to_attribute_map()
+        .expect("decode projected row");
+    assert_eq!(projected.len(), 1);
+    assert_eq!(
+        projected.get("tags"),
+        Some(&AttributeValue::L(vec![AttributeValue::S("b".to_string())]))
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn transact_get_uses_one_admitted_snapshot_for_its_read_wave() {
     let database_path =
         crate::storage_test_support_tests::unique_path("transact-get-admission-wave");
     let database = DatabaseManager::new_with_config_and_runtime_options(
         StorageConfig {
+            initial_stream_lineages: None,
             backend_type: StorageBackend::SQLite,
             connection_string: Some(database_path.to_string_lossy().into_owned()),
             file_path: None,
-            sqlite: Some(SqliteSettings {
-                force_file_backed_database: true,
-                ..SqliteSettings::default()
-            }),
+            sqlite: Some(SqliteSettings {}),
             postgres: None,
             turso: None,
             rocksdb: None,

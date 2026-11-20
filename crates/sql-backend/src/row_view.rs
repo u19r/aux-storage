@@ -42,7 +42,6 @@ impl TryFrom<SqlValueRef<'_>> for SqlValue {
     type Error = storage_types::StorageError;
 
     fn try_from(value: SqlValueRef<'_>) -> Result<Self, Self::Error> {
-        use storage_types::InfrastructureResultKind::NativeCapacityRejected;
         Ok(match value {
             SqlValueRef::Null => Self::Null,
             SqlValueRef::Integer(value) => Self::Integer(value),
@@ -52,7 +51,7 @@ impl TryFrom<SqlValueRef<'_>> for SqlValue {
                 let mut owned = String::new();
                 owned
                     .try_reserve_exact(value.len())
-                    .map_err(|_| NativeCapacityRejected)?;
+                    .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
                 owned.push_str(value);
                 Self::Text(owned)
             }
@@ -60,7 +59,7 @@ impl TryFrom<SqlValueRef<'_>> for SqlValue {
                 let mut owned = Vec::new();
                 owned
                     .try_reserve_exact(value.len())
-                    .map_err(|_| NativeCapacityRejected)?;
+                    .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
                 owned.extend_from_slice(value);
                 Self::Blob(owned)
             }
@@ -76,7 +75,7 @@ impl TryFrom<Vec<SqlValueRef<'_>>> for crate::SqlRow {
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(row.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for value in row {
             cells.push(SqlValue::try_from(value)?);
         }

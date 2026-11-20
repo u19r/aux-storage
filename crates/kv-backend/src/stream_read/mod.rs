@@ -1,13 +1,6 @@
-mod history_entry;
+#[cfg(all(test, feature = "rocksdb"))]
+mod baseline_tests;
 mod history_index;
-mod history_metadata;
-#[cfg(all(
-    test,
-    feature = "fault-injection",
-    any(feature = "rocksdb", feature = "foundationdb")
-))]
-mod history_metadata_tests;
-mod history_namespace;
 pub(crate) mod range;
 mod read;
 pub(crate) mod row;

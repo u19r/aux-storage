@@ -30,6 +30,10 @@ pub(super) struct StreamReclamationFixtureTarget {
     pub cutoff_timestamp: TimestampMillis,
 }
 
+#[cfg_attr(
+    not(any(feature = "foundationdb", feature = "rocksdb")),
+    expect(dead_code, reason = "queue reclamation contracts run on KV providers")
+)]
 pub(super) struct QueueReclamationFixtureTarget {
     pub queue_url: String,
     pub message_id: MessageId,

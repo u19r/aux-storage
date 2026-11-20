@@ -39,7 +39,7 @@ pub(super) async fn read_expiration_index<A: KvAttempt>(
     let more = page.more;
     let mut rows = Vec::new();
     rows.try_reserve_exact(page.entries.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
     for entry in page.entries {
         if !entry.value.is_empty() {
             return Err(StorageError::internal(

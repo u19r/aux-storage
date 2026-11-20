@@ -216,12 +216,7 @@ async fn given_expired_and_replaced_items_when_expiration_runs_then_only_expired
         let mut complete = false;
         let mut advanced = 0;
         for _ in 0..16 {
-            let step = observe(
-                store
-                    .expiration_repository
-                    .advance_expiration(request.clone()),
-            )
-            .await;
+            let step = observe(store.maintenance.advance_expiration(request.clone())).await;
             step.assert_no_warning_or_error();
             match step.result.unwrap() {
                 StepResult::Advanced(()) => advanced += 1,
@@ -240,12 +235,7 @@ async fn given_expired_and_replaced_items_when_expiration_runs_then_only_expired
 
         for replay in [false, true] {
             if replay {
-                let step = observe(
-                    store
-                        .expiration_repository
-                        .advance_expiration(request.clone()),
-                )
-                .await;
+                let step = observe(store.maintenance.advance_expiration(request.clone())).await;
                 step.assert_no_warning_or_error();
                 step.result
                     .expect("completed expiration job can be replayed");
@@ -325,7 +315,7 @@ async fn given_recreated_table_with_same_ttl_generation_when_old_sweep_runs_then
             store.operations.update_time_to_live(serde_json::from_value(json!({
                 "TableName": table, "TimeToLiveSpecification": {"AttributeName": "ttl", "Enabled": true}
             })).unwrap()).await.unwrap();
-            let policy = store.ttl_sweep_repository.read_ttl_sweep_policy(&table).await.unwrap().unwrap();
+            let policy = store.maintenance.read_ttl_sweep_policy(&table).await.unwrap().unwrap();
             let command = TtlSweepPageCommand::try_new(policy, TtlSweepPageInput::try_new("ttl", store.now(), 10, None).unwrap(), store.now()).unwrap();
             if incarnation == 0 {
                 stale = Some(command);
@@ -339,11 +329,11 @@ async fn given_recreated_table_with_same_ttl_generation_when_old_sweep_runs_then
             assert!(stale.expected_policy_generation == command.expected_policy_generation);
             assert_ne!(stale.target.history_id, command.target.history_id);
             let stale: TtlSweepPageCommand = serde_json::from_slice(&serde_json::to_vec(&stale).unwrap()).unwrap();
-            let error = store.ttl_sweep_repository.execute_ttl_sweep_page(stale).await.err().expect("old table ID must be rejected");
+            let error = store.maintenance.execute_ttl_sweep_page(stale).await.err().expect("old table ID must be rejected");
             assert!(matches!(error.to_enum(), storage_types::StorageEnum::ConditionalCheckFailed));
             let item = store.operations.get_item(GetItemRequest::try_from(json!({"TableName": table, "Key": {"pk": {"S": "new"}}})).unwrap()).await.unwrap();
             assert!(item.item.is_some(), "stale command deleted a replacement-table item");
-            let page = store.ttl_sweep_repository.execute_ttl_sweep_page(command).await.unwrap();
+            let page = store.maintenance.execute_ttl_sweep_page(command).await.unwrap();
             assert_eq!(page.deleted_items, 1, "fresh accepted ID must remain usable");
         }
     }).catch_unwind().await;
@@ -381,7 +371,7 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
                 .unwrap();
         }
         let config = store
-            .ttl_sweep_repository
+            .maintenance
             .read_ttl_sweep_policy(&table)
             .await
             .unwrap()
@@ -393,14 +383,14 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
         )
         .unwrap();
         let page = store
-            .ttl_sweep_repository
+            .maintenance
             .execute_ttl_sweep_page(first.clone())
             .await
             .unwrap();
         assert_eq!(page.deleted_items, 1);
         assert!(page.next_cursor.is_some());
         let stale = store
-            .ttl_sweep_repository
+            .maintenance
             .execute_ttl_sweep_page(first.clone())
             .await;
         let Err(error) = stale else {
@@ -420,7 +410,7 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
             )
             .unwrap();
             let page = store
-                .ttl_sweep_repository
+                .maintenance
                 .execute_ttl_sweep_request(storage_common::TtlSweepRequest {
                     table_name: command.target.table_name,
                     input: command.input,
@@ -432,8 +422,14 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
         }
         assert_eq!(deleted, 3);
         for _ in 0..2 {
+            let previous = store
+                .maintenance
+                .read_ttl_sweep_policy(&table)
+                .await
+                .unwrap()
+                .unwrap();
             let empty = store
-                .ttl_sweep_repository
+                .maintenance
                 .execute_ttl_sweep_request(storage_common::TtlSweepRequest {
                     table_name: table.clone(),
                     input: TtlSweepPageInput::try_new("ttl", cutoff, 1, None).unwrap(),
@@ -442,6 +438,21 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
                 .unwrap();
             assert_eq!(empty.deleted_items, 0);
             assert!(empty.next_cursor.is_none());
+            let next = store
+                .maintenance
+                .read_ttl_sweep_policy(&table)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                next.config.checkpoint.revision,
+                previous.config.checkpoint.revision.checked_next().unwrap()
+            );
+            assert!(next.config.checkpoint.cursor.is_none());
+            assert_ne!(
+                storage_types::storage_serde::to_bytes(&previous.config.checkpoint).unwrap(),
+                storage_types::storage_serde::to_bytes(&next.config.checkpoint).unwrap()
+            );
         }
         for key in ["a", "b", "c", "live"] {
             let response = store
@@ -462,10 +473,7 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
         }))
         .unwrap();
         store.operations.update_time_to_live(disable).await.unwrap();
-        let stale = store
-            .ttl_sweep_repository
-            .execute_ttl_sweep_page(first)
-            .await;
+        let stale = store.maintenance.execute_ttl_sweep_page(first).await;
         let Err(error) = stale else {
             panic!("stale TTL command succeeded");
         };
@@ -476,6 +484,53 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
     })
     .catch_unwind()
     .await;
+    store.finish().await;
+    if let Err(panic) = outcome {
+        resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn given_ttl_metadata_named_customer_keys_when_items_are_written_then_queries_and_expiration_work()
+ {
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        for key_name in ["__aux_ttl_key", "--aux-ttl-key"] {
+            let table = super::test_support::unique_table_name();
+            store.operations.create_table(serde_json::from_value(json!({
+                "TableName": table, "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": key_name, "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": key_name, "KeyType": "HASH"}]
+            })).unwrap()).await.unwrap();
+            store.operations.update_time_to_live(serde_json::from_value(json!({
+                "TableName": table, "TimeToLiveSpecification": {"AttributeName": "ttl", "Enabled": true}
+            })).unwrap()).await.unwrap();
+            let item = json!({key_name: {"S": "due"}, "ttl": {"N": "1"}});
+            store.operations.put_item(PutItemRequest::try_from(json!({
+                "TableName": table, "Item": item
+            })).unwrap()).await.unwrap();
+            let key = json!({key_name: {"S": "due"}});
+            let read = store.operations.get_item(GetItemRequest::try_from(json!({
+                "TableName": table, "Key": key
+            })).unwrap()).await.unwrap();
+            assert_eq!(serde_json::to_value(read).unwrap(), json!({"Item": item}));
+            let query = store.operations.query(storage_types::QueryRequest::try_from(json!({
+                "TableName": table, "KeyConditionExpression": "#key = :value",
+                "ExpressionAttributeNames": {"#key": key_name},
+                "ExpressionAttributeValues": {":value": {"S": "due"}}
+            })).unwrap()).await.unwrap();
+            assert_eq!(serde_json::to_value(query).unwrap()["Items"], json!([item]));
+            let page = store.maintenance.execute_ttl_sweep_request(storage_common::TtlSweepRequest {
+                table_name: table.clone(),
+                input: storage_common::TtlSweepPageInput::try_new("ttl", store.now(), 10, None).unwrap(),
+            }).await.unwrap();
+            assert_eq!(page.deleted_items, 1);
+            let read = store.operations.get_item(GetItemRequest::try_from(json!({
+                "TableName": table, "Key": key
+            })).unwrap()).await.unwrap();
+            assert_eq!(serde_json::to_value(read).unwrap(), json!({}));
+        }
+    }).catch_unwind().await;
     store.finish().await;
     if let Err(panic) = outcome {
         resume_unwind(panic);

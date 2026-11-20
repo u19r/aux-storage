@@ -2,7 +2,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 #[cfg(feature = "sqlite")]
-use storage_provider::{StorageBackend, StorageConnectionConfig, StorageConnectionRegistry};
+use storage_provider::{StorageBackend, StorageConfig, StorageConnectionRegistry};
 #[cfg(feature = "sqlite")]
 use storage_types::{
     AttributeDefinition, CreateGlobalSecondaryIndex, CreateTableRequest, KeyAttributeType,
@@ -79,10 +79,13 @@ fn only_explicit_capacity_and_service_pressure_is_retryable_pressure() {
         }
         .into(),
         StorageEnum::RequestLimitExceeded.into(),
-        StorageEnum::AwsService {
-            code: Some("ThrottlingException".to_string()),
-            message: "throttled".to_string(),
-        }
+        storage_types::AttemptFailure::Unavailable(storage_types::NativeUnavailable::Deadline(
+            storage_types::AttemptPhase::Statement,
+        ))
+        .into(),
+        storage_types::AttemptFailure::Unavailable(
+            storage_types::NativeUnavailable::ConnectionLost,
+        )
         .into(),
     ] {
         assert!(is_admission_pressure(&error));
@@ -91,6 +94,12 @@ fn only_explicit_capacity_and_service_pressure_is_retryable_pressure() {
 
 #[test]
 fn generic_provider_failures_are_not_reclassified_as_pressure() {
+    assert!(!is_admission_pressure(&StorageError::commit_unknown(
+        "lost"
+    )));
+    assert!(!is_admission_pressure(
+        &storage_types::AttemptFailure::CAPACITY.into()
+    ));
     assert!(!is_admission_pressure(&StorageError::internal(
         "provider failure"
     )));
@@ -108,6 +117,29 @@ fn generic_provider_failures_are_not_reclassified_as_pressure() {
         }
         .into()
     ));
+    // Remote AWS codes arrive typed (storage-remote `classify_error_response`);
+    // an untyped code string is not pressure.
+    assert!(!is_admission_pressure(
+        &StorageEnum::AwsService {
+            code: Some("ThrottlingException".to_string()),
+            message: "x".to_string(),
+        }
+        .into()
+    ));
+}
+
+#[test]
+fn given_conflict_or_in_progress_when_classified_then_retryable_but_not_pressure() {
+    for error in [
+        StorageError::logical_conflict("test conflict"),
+        StorageEnum::TransactionInProgress {
+            message: "x".to_string(),
+        }
+        .into(),
+    ] {
+        assert_eq!(error.class(), storage_types::ErrorClass::Retryable);
+        assert!(!is_admission_pressure(&error));
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -144,7 +176,8 @@ async fn synthetic_default_routes_to_a_named_physical_default() {
         default_connection_id: "primary".to_string(),
         connections: HashMap::from([(
             "primary".to_string(),
-            StorageConnectionConfig {
+            StorageConfig {
+                initial_stream_lineages: None,
                 backend_type: StorageBackend::SQLite,
                 connection_string: Some(":memory:".to_string()),
                 file_path: None,

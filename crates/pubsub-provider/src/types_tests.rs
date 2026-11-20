@@ -1,22 +1,9 @@
 use std::str::FromStr as _;
 
-use super::{DeliveryRecordKind, DeliveryStatus, DeliveryTarget};
+use super::{DeliveryRecordKind, DeliveryTarget};
 
 #[test]
 fn delivery_wire_values_round_trip_through_common_traits() {
-    for (status, wire) in [
-        (DeliveryStatus::Pending, "pending"),
-        (DeliveryStatus::Delivered, "delivered"),
-        (
-            DeliveryStatus::AcceptedByCustomSender,
-            "accepted_by_custom_sender",
-        ),
-        (DeliveryStatus::RetryScheduled, "retry_scheduled"),
-        (DeliveryStatus::Failed, "failed"),
-    ] {
-        assert_eq!(status.to_string(), wire);
-        assert_eq!(DeliveryStatus::from_str(wire).unwrap(), status);
-    }
     for (target, wire) in [
         (DeliveryTarget::BuiltIn, "built_in"),
         (DeliveryTarget::CustomSender, "custom_sender"),

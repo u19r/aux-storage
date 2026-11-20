@@ -7,25 +7,28 @@ use crate::types::{
     KeyAttributes, StorageError, StorageResult, TableName, TryFromWireItem, VecMap, WireItem,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub(super) enum PointReadEntry {
     Hit(Arc<PointReadImage>),
     Miss,
 }
 
-#[derive(Debug)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum PointReadLookup<'a> {
     Hit(&'a WireItem),
     Miss,
     NotRequested,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct PointReadStore {
     inner: Arc<PointReadStoreData>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 struct PointReadStoreData {
     entries: VecMap<String, PointReadEntry>,
     _plan_budget: Option<OwnedSemaphorePermit>,
@@ -72,7 +75,7 @@ impl PointReadStore {
     }
 }
 
-#[derive(Debug)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub(super) struct PointReadImage {
     item: WireItem,
     _budget: OwnedSemaphorePermit,

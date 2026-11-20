@@ -26,3 +26,17 @@ fn smoke_profiles_keep_descriptor_shape() {
     assert!(profile_integer_overrides("smoke", "table_atomicity").is_empty());
     assert!(profile_integer_overrides("smoke", "queue_visibility").is_empty());
 }
+
+#[test]
+fn given_soak_profiles_when_new_workloads_requested_then_overrides_exist() {
+    for workload in ["queue_claim", "queue_dead_letter", "table_recreate"] {
+        assert!(
+            !profile_integer_overrides("local-soak", workload).is_empty(),
+            "{workload}"
+        );
+        assert!(
+            profile_integer_overrides("smoke", workload).is_empty(),
+            "{workload}"
+        );
+    }
+}

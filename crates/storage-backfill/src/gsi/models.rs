@@ -2,9 +2,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use storage_common::TtlIndexKey;
 use storage_types::{
-    AttributeValue, GlobalSecondaryIndex, IndexName, IndexerDeclaration, ItemRevision,
-    KeyAttributes, StoredTableInfo, SystemStreamCheckpoint, TableName, WireItem,
-    maintenance::TargetIncarnation,
+    AttributeValue, GlobalSecondaryIndex, IndexName, IndexerDeclaration, KeyAttributes,
+    StoredTableInfo, SystemStreamCheckpoint, TableName, WireItem, maintenance::TargetIncarnation,
 };
 
 use super::{GsiBuildPhase, GsiRecordError};
@@ -22,7 +21,7 @@ pub struct GsiProjectionLifecycle {
     pub(super) writable_targets: Vec<GsiBuildTarget>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct GsiBuild<Cursor> {
     pub target: GsiBuildTarget,
     pub state: GsiState<Cursor>,
@@ -52,32 +51,25 @@ pub struct GsiStateRecord {
     pub state: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GsiState<Cursor> {
-    Scanning(GsiScanning<Cursor>),
-    CatchingUp(GsiCatchingUp),
+    Filling(GsiScanning<Cursor>),
+    Building(GsiNativeBuilding),
     Active(GsiActive),
-    Blocked(GsiBlocked),
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GsiNativeBuilding {
+    pub low: SystemStreamCheckpoint,
+    /// An interrupted native index must be removed before the new build starts.
+    pub retired: Option<TargetIncarnation>,
 }
 
 pub type GsiScanning<Cursor> = crate::ScanProgress<SystemStreamCheckpoint, Cursor>;
-pub type GsiCatchingUp = crate::TailProgress<SystemStreamCheckpoint>;
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GsiActive {
     pub cursor: SystemStreamCheckpoint,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-pub struct GsiBlocked {
-    pub reason: GsiFailureReason,
-    pub retained_from: SystemStreamCheckpoint,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-pub enum GsiFailureReason {
-    HistoryUnavailable,
-    ProjectionConflict,
 }
 
 impl<Cursor: Serialize> TryFrom<&GsiState<Cursor>> for GsiStateRecord {
@@ -94,10 +86,9 @@ impl<Cursor: Serialize> TryFrom<&GsiState<Cursor>> for GsiStateRecord {
 impl<Cursor> From<&GsiState<Cursor>> for &'static str {
     fn from(state: &GsiState<Cursor>) -> Self {
         match state {
-            GsiState::Scanning(_) => "scanning",
-            GsiState::CatchingUp(_) => "catching-up",
+            GsiState::Filling(_) => "filling",
+            GsiState::Building(_) => "building",
             GsiState::Active(_) => "active",
-            GsiState::Blocked(_) => "blocked",
         }
     }
 }
@@ -125,33 +116,10 @@ impl<Cursor: serde::de::DeserializeOwned> TryFrom<GsiRecord> for GsiBuild<Cursor
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GsiPageLimit(usize);
 
-#[derive(PartialEq, Eq)]
-pub enum GsiReadRequest<Cursor> {
-    Scan {
-        after: Option<Cursor>,
-        limit: GsiPageLimit,
-    },
-    CatchUp {
-        after: SystemStreamCheckpoint,
-        through: SystemStreamCheckpoint,
-        limit: GsiPageLimit,
-    },
-    InspectActivation {
-        required_from: SystemStreamCheckpoint,
-        through: SystemStreamCheckpoint,
-    },
-}
-
-pub enum GsiObservation<Cursor> {
-    Scan(GsiScanObservation<Cursor>),
-    Stream(GsiStreamObservation),
-    Activation(GsiActivationObservation),
-}
-
 pub struct GsiScanObservation<Cursor> {
     pub expected_after: Option<Cursor>,
     pub end: GsiScanPageEnd<Cursor>,
-    pub projections: Vec<GsiBuildProjectionObservation>,
+    pub projections: GsiProjectionWriteBatch,
 }
 
 /// Provider-decoded base-table page before any projection decisions are made.
@@ -162,46 +130,10 @@ pub struct GsiScanSourcePage<Cursor> {
     pub items: Vec<GsiScannedSourceItem>,
 }
 
-pub type GsiScanPageEnd<Cursor> = crate::ScanPageEnd<Cursor, SystemStreamCheckpoint>;
-
-pub struct GsiStreamObservation {
-    pub expected_cursor: SystemStreamCheckpoint,
-    /// Closed stream frontier used for this page. Catch-up supplies the build's
-    /// fixed high boundary; continuing projection observes the current tail.
-    pub through: SystemStreamCheckpoint,
-    pub end: GsiStreamPageEnd,
-    pub projections: Vec<GsiBuildProjectionObservation>,
-}
-
-/// Provider-decoded SystemStream page before referenced images are interpreted.
-pub struct GsiStreamSourcePage {
-    pub table: storage_types::BoundTableInfo,
-    pub end: GsiStreamPageEnd,
-    pub candidates: Vec<GsiStreamCandidate>,
-}
-
-pub struct GsiStreamCandidate {
-    pub history: stream_provider::ResolvedItemHistory,
-}
-
-pub type GsiStreamPageEnd = crate::TailPageEnd<SystemStreamCheckpoint>;
-
-pub struct GsiActivationObservation {
-    pub target_incarnation: TargetIncarnation,
-    pub projected_through: SystemStreamCheckpoint,
-}
+pub type GsiScanPageEnd<Cursor> = crate::ScanPageEnd<Cursor, ()>;
 
 /// Durable provider state needed to decide whether activation is safe.
-pub struct GsiActivationState {
-    pub target_incarnation: TargetIncarnation,
-    pub projected_through: SystemStreamCheckpoint,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-pub struct GsiProjection<Key> {
-    pub item_version: ItemRevision,
-    pub projection: Option<Key>,
-}
+pub struct GsiActivationState;
 
 #[derive(Clone, PartialEq)]
 pub struct GsiProjectionKey {
@@ -237,61 +169,13 @@ impl GsiProjectedRow {
 pub struct GsiScannedSourceItem {
     pub item: WireItem,
     pub indexers: Vec<String>,
-    pub revision: ItemRevision,
-}
-
-pub enum GsiSourceProjection {
-    Missing {
-        item_version: ItemRevision,
-        /// Destination row removed by a stream mutation. A base-table scan
-        /// has no previous destination row and therefore leaves this empty.
-        previous_key: Option<Box<GsiProjectionKey>>,
-    },
-    Present {
-        item_version: ItemRevision,
-        row: Box<GsiProjectedRow>,
-    },
-}
-
-pub struct GsiBuildProjectionObservation {
-    /// Projection derived from the immutable source item or stream mutation.
-    pub source: GsiSourceProjection,
-    /// Version and physical key currently stored by the destination.
-    pub current: Option<GsiProjection<GsiProjectionKey>>,
-}
-
-/// Destination projection state required to decide one source observation.
-pub struct GsiProjectionStateRead<'a> {
-    pub source_ordinal: usize,
-    pub key: &'a GsiProjectionKey,
-}
-
-/// Complete provider input for one batched destination-state read.
-pub struct GsiProjectionStateReadBatch<'a> {
-    pub table: &'a StoredTableInfo,
-    pub target: &'a GsiBuildTarget,
-    pub sources: &'a [GsiSourceProjection],
-    pub reads: &'a [GsiProjectionStateRead<'a>],
-}
-
-pub(super) enum GsiBuildProjectionChange {
-    IgnoreStale,
-    Replay,
-    Replace {
-        remove: Option<Box<GsiProjectionKey>>,
-        write: Option<Box<GsiProjectedRow>>,
-        item_version: ItemRevision,
-    },
-    FailClosed(GsiFailureReason),
 }
 
 pub struct GsiProjectionWrite {
     /// Exact physical projection row affected by this write.
     pub key: GsiProjectionKey,
-    /// Final row value, or no value when the physical row is a tombstone.
+    /// Final projection value, or no value to clear the entry.
     pub row: Option<GsiProjectedRow>,
-    /// Source-item version used by provider-native conditional persistence.
-    pub item_version: ItemRevision,
 }
 
 /// Provider-ready projection writes with at most one final write per physical
@@ -312,7 +196,6 @@ pub struct GsiWriteRequest<'a> {
     pub old_item: Option<&'a WireItem>,
     pub new_item: Option<&'a WireItem>,
     pub indexers: &'a [String],
-    pub source_version: ItemRevision,
 }
 
 #[derive(PartialEq)]
@@ -339,18 +222,6 @@ pub enum GsiWriteAction<'a> {
 
 pub type GsiIndexWriteActions<'a> = SmallVec<[GsiWriteAction<'a>; 2]>;
 
-#[derive(PartialEq, Eq)]
-pub enum GsiProjectionChange<Key> {
-    IgnoreStale,
-    Replay,
-    Replace {
-        remove: Option<Key>,
-        write: Option<Key>,
-        item_version: ItemRevision,
-    },
-    FailClosed(GsiFailureReason),
-}
-
 pub enum GsiChange<Cursor> {
     Persist {
         projections: GsiProjectionWriteBatch,
@@ -372,6 +243,10 @@ impl TryFrom<usize> for GsiPageLimit {
 }
 
 impl GsiPageLimit {
+    pub const fn halved(self) -> Self {
+        Self(if self.0 > 1 { self.0 / 2 } else { 1 })
+    }
+
     #[must_use]
     pub const fn including_lookahead(self) -> u32 {
         self.0 as u32 + 1

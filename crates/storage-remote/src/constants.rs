@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use metrics_facade::CounterMetric;
 
 pub const MAX_REMOTE_RETRIES: usize = 5;
@@ -14,6 +16,13 @@ pub const RETRY_TOKEN_REFILL_PER_SECOND: u64 = 10;
 pub const MAX_RETRY_AFTER_SECS: u64 = 60;
 pub const MIN_RETRY_ATTEMPT_BUDGET_MS: u64 = 1;
 pub const MAX_SCHEDULED_JOB_REDIRECT_HOPS: usize = 4;
+/// Longest default connect timeout: a connect that fails ends well before the
+/// request deadline, so it is a known-not-sent failure that fails over.
+pub const MAX_DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Idle pooled connections close before common peer idle closes (hyper 30 s
+/// header read, load balancers 60 s), so a write rarely meets a connection
+/// its peer already closed, which answers an unknown outcome.
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub const AWS_SERVICE_NAME: &str = "dynamodb";
 pub const REMOTE_STORAGE_REQUEST_BYTES_TOTAL_METRIC: CounterMetric =

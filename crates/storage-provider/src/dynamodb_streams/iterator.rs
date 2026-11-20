@@ -5,6 +5,15 @@ use storage_types::{
 
 use crate::constants::DYNAMODB_STREAM_ITERATOR_VERSION;
 
+const INVALID_SEQUENCE_MESSAGE: &str = "Invalid SequenceNumber for the shard";
+const SEQUENCE_NUMBER_NULL_MESSAGE: &str =
+    "One or more parameter values were invalid: SequenceNumber cannot be null";
+
+/// A shard iterator the stream never issued: malformed, or naming no shard.
+pub(super) fn invalid_shard_iterator() -> StorageError {
+    StorageError::raw_validation("Invalid ShardIterator")
+}
+
 pub(super) struct StreamIterator {
     pub stream_arn: String,
     pub shard_id: String,
@@ -38,7 +47,7 @@ impl StreamIterator {
     pub(super) fn decode(value: &str) -> StorageResult<Self> {
         let parts = value.split('|').collect::<Vec<_>>();
         if parts.len() != 4 || parts[0] != DYNAMODB_STREAM_ITERATOR_VERSION {
-            return Err(storage_types::StorageEnum::TrimmedDataAccess.into());
+            return Err(invalid_shard_iterator());
         }
         Ok(Self {
             stream_arn: parts[1].to_string(),
@@ -64,22 +73,22 @@ pub(super) fn validate_streams_page_limit(limit: Option<u32>, max: u32) -> Stora
 
 pub struct GetDynamoShardIterator {
     request: storage_types::GetShardIteratorRequest,
-    target: storage_types::TableHistoryTarget,
+    table_name: storage_types::TableName,
 }
 
 impl TryFrom<storage_types::GetShardIteratorRequest> for GetDynamoShardIterator {
     type Error = StorageError;
     fn try_from(request: storage_types::GetShardIteratorRequest) -> StorageResult<Self> {
-        let target = storage_types::TableHistoryTarget::try_from(request.stream_arn.as_str())?;
+        let table_name = storage_types::stream_arn_table_name(request.stream_arn.as_str())?;
         match request.shard_iterator_type.as_str() {
             "TRIM_HORIZON" | "LATEST" => {}
             "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {
                 request
                     .sequence_number
                     .as_deref()
-                    .ok_or_else(|| StorageError::raw_validation("SequenceNumber is required"))?
+                    .ok_or_else(|| StorageError::raw_validation(SEQUENCE_NUMBER_NULL_MESSAGE))?
                     .parse::<TableStreamSequence>()
-                    .map_err(|_| StorageError::raw_validation("Invalid sequence number"))?;
+                    .map_err(|_| StorageError::raw_validation(INVALID_SEQUENCE_MESSAGE))?;
             }
             _ => {
                 return Err(StorageError::raw_validation(
@@ -88,28 +97,31 @@ impl TryFrom<storage_types::GetShardIteratorRequest> for GetDynamoShardIterator 
                 ));
             }
         }
-        Ok(Self { request, target })
+        Ok(Self {
+            request,
+            table_name,
+        })
     }
 }
 
 impl super::DynamoStreamRead for GetDynamoShardIterator {
     type Response = storage_types::GetShardIteratorResponse;
-    fn target(&self) -> &storage_types::TableHistoryTarget {
-        &self.target
+    fn table_name(&self) -> &storage_types::TableName {
+        &self.table_name
     }
     fn stream_arn(&self) -> &str {
         &self.request.stream_arn
     }
-    async fn read<A: crate::dynamo_table_stream::DynamoTableStreamAttempt>(
-        self,
+    async fn read<A: crate::maintenance::StreamRetentionPort>(
+        &self,
         attempt: &mut A,
         table: &storage_types::BoundTableInfo,
         _now: storage_types::TimestampMillis,
     ) -> StorageResult<Self::Response> {
         let state = crate::table_history_read::TableHistoryReadState::load(attempt, table).await?;
         state.select_lanes(Some(&self.request.shard_id))?;
-        let request = self.request;
-        let iterator = StreamIterator::new(request.stream_arn, request.shard_id);
+        let request = &self.request;
+        let iterator = StreamIterator::new(request.stream_arn.clone(), request.shard_id.clone());
         let iterator = match request.shard_iterator_type.as_str() {
             "LATEST" => {
                 let lanes = state.select_lanes(Some(&iterator.shard_id))?;
@@ -156,7 +168,7 @@ fn sequence_position(
     after: bool,
 ) -> StorageResult<storage_types::SystemStreamPosition> {
     let sequence = sequence
-        .ok_or_else(|| StorageError::raw_validation("SequenceNumber is required"))?
+        .ok_or_else(|| StorageError::raw_validation(SEQUENCE_NUMBER_NULL_MESSAGE))?
         .parse::<TableStreamSequence>()?;
     let key = if after {
         Some(sequence.native_key())
@@ -164,21 +176,23 @@ fn sequence_position(
         sequence.native_key().predecessor()
     };
     let offset = match key {
-        None => lane.origin.offset().clone(),
+        // No record sits at or before the zero sequence, so it is not this
+        // shard's.
+        None => return Err(StorageError::raw_validation(INVALID_SEQUENCE_MESSAGE)),
         Some(key) if lane.through.offset().versionstamp().is_some() => lane
             .origin
             .with_versionstamp(*key.as_bytes())
-            .map_err(|_| StorageError::raw_validation("Invalid sequence number"))?
+            .map_err(|_| StorageError::raw_validation(INVALID_SEQUENCE_MESSAGE))?
             .offset()
             .clone(),
         Some(key) => {
             if key.as_bytes()[..4] != [0; 4] {
-                return Err(StorageError::raw_validation("Invalid sequence number"));
+                return Err(StorageError::raw_validation(INVALID_SEQUENCE_MESSAGE));
             }
             let mut bytes = [0; 8];
             bytes.copy_from_slice(&key.as_bytes()[4..]);
             storage_types::SystemStreamOffset::try_new(u64::from_be_bytes(bytes).to_string())
-                .map_err(|_| StorageError::raw_validation("Invalid sequence number"))?
+                .map_err(|_| StorageError::raw_validation(INVALID_SEQUENCE_MESSAGE))?
         }
     };
     let position = storage_types::SystemStreamPosition::try_new(
@@ -186,6 +200,6 @@ fn sequence_position(
         lane.lane.lineage_id().as_str(),
         offset.as_str(),
     )
-    .map_err(|_| StorageError::raw_validation("Invalid sequence number"))?;
+    .map_err(|_| StorageError::raw_validation(INVALID_SEQUENCE_MESSAGE))?;
     Ok(position)
 }

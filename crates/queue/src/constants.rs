@@ -1,26 +1,32 @@
 use std::time::Duration;
 
-/// Default SQS visibility timeout when a receive request omits
-/// `VisibilityTimeout`.
-pub(crate) const DEFAULT_VISIBILITY_TIMEOUT_SECS: u32 = 30;
-
 /// SQS long-poll wait time is capped at 20 seconds.
 pub(crate) const MAX_RECEIVE_WAIT_TIME_SECS: u32 = 20;
 
-/// Sleep between local empty receive retries while the long-poll budget
-/// remains.
-pub(crate) const EMPTY_RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Age at which waiting receives refresh their shared read-only probe of one
+/// queue. It bounds the delay for messages committed by another process.
+pub(crate) const RECEIVE_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Short backoff after a storage transaction conflict during receive.
-pub(crate) const RECEIVE_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// Shortest time after a queue's previous probe at which a change of its wake
+/// slot opens the next probe (hot-slot bound).
+pub(crate) const RECEIVE_WAKE_SPACING: Duration = Duration::from_millis(200);
 
-/// Number of storage transaction conflict retries for one receive call.
-pub(crate) const RECEIVE_CONFLICT_RETRY_ATTEMPTS: usize = 3;
+/// Base pause after a claim returns empty but not drained (it lost a conflict
+/// or skipped a locked row while due messages remain). Jitter adds up to the
+/// same amount.
+pub(crate) const EMPTY_CLAIM_BACKOFF: Duration = Duration::from_millis(10);
 
-pub(crate) const DEFAULT_DELAY_SECONDS: u32 = 0;
-pub(crate) const DEFAULT_MAXIMUM_MESSAGE_SIZE: u32 = 1048576;
-pub(crate) const DEFAULT_MESSAGE_RETENTION_PERIOD: u32 = 345600;
-pub(crate) const DEFAULT_RECEIVE_WAIT_TIME_SECONDS: u32 = 0;
+/// Default bound on receives that wait at the same time in one process. A
+/// receive over the bound returns its empty result at once.
+pub(crate) const DEFAULT_MAX_WAITING_RECEIVES: usize = 10_000;
+
+/// Queue wait states without waiters are swept when the registry reaches this
+/// size, and then at twice the retained size.
+pub(crate) const RECEIVE_WAIT_SWEEP_FLOOR: usize = 256;
+
+/// A queue wait state without waiters is retained this long after its latest
+/// observation so that busy queues keep their observation between receives.
+pub(crate) const RECEIVE_WAIT_RETENTION: Duration = Duration::from_secs(60);
 
 pub(crate) const DEFAULT_JOB_VISIBILITY_TIMEOUT_SECS: u32 = 30;
 pub(crate) const DEFAULT_MAXIMUM_JOB_WORKERS: u32 = 4;

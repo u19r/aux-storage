@@ -12,9 +12,9 @@ async fn given_sqlite_startup_when_factory_initializes_then_system_tables_exist_
  {
     let features = config::Features {
         backends: config::Backends {
+            initial_stream_lineages: Some(storage_types::InitialStreamLineages::FOUR),
             sqlite: Some(config::SqliteBackendConfig {
                 db_path: ":memory:".to_string(),
-                immediate_gsi_consistency: false,
             }),
             turso: None,
             postgres: None,
@@ -25,12 +25,24 @@ async fn given_sqlite_startup_when_factory_initializes_then_system_tables_exist_
         ..config::Features::default()
     };
 
-    let manager = crate::startup::database_manager_from_features(
-        &features,
-        crate::DatabaseManagerRuntimeOptions::default(),
-    )
-    .await
-    .expect("native sqlite startup");
+    let root = config::RootConfig {
+        features,
+        ..config::RootConfig::default()
+    };
+    let manager = crate::startup::RuntimeConfig::from_file(&root)
+        .expect("file translation")
+        .open()
+        .await
+        .expect("native sqlite startup");
+
+    let scope = manager.get_system_stream_scope_for_control().await.unwrap();
+    let page = manager
+        .get_system_stream_page_for_control(
+            stream_provider::SystemStreamPageRequest::try_new(scope, None, 100).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.issued_checkpoint().checkpoint().frontier().len(), 4);
 
     for table_name in [
         crate::Tables::sys_namespaces(),
@@ -51,14 +63,13 @@ async fn given_sqlite_startup_when_factory_initializes_then_system_tables_exist_
     );
 }
 
-#[cfg(feature = "turso")]
 #[test]
 fn turso_backend_maps_to_turso_storage_config() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: None,
         turso: Some(config::TursoBackendConfig {
             db_path: "turso-main.db".to_string(),
-            immediate_gsi_consistency: true,
         }),
         postgres: None,
         rocksdb: None,
@@ -76,39 +87,13 @@ fn turso_backend_maps_to_turso_storage_config() {
         storage_cfg.connection_string.as_deref(),
         Some("turso-main.db")
     );
-    assert!(
-        storage_cfg
-            .turso
-            .as_ref()
-            .is_some_and(|settings| settings.immediate_gsi_consistency)
-    );
-}
-
-#[cfg(not(feature = "turso"))]
-#[test]
-fn turso_backend_requires_turso_feature() {
-    let backends = config::Backends {
-        sqlite: None,
-        turso: Some(config::TursoBackendConfig {
-            db_path: "turso-main.db".to_string(),
-            immediate_gsi_consistency: false,
-        }),
-        postgres: None,
-        rocksdb: None,
-        foundationdb: None,
-        remote: None,
-    };
-
-    let err = storage_config_from_backends(&backends).expect_err("missing turso feature");
-
-    assert!(err.to_string().contains(
-        "configuration selects turso backend but binary was built without turso support"
-    ));
+    assert!(storage_cfg.turso.is_some());
 }
 
 #[test]
 fn remote_backend_propagates_settings() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: None,
         turso: None,
         postgres: None,
@@ -118,7 +103,6 @@ fn remote_backend_propagates_settings() {
             endpoint_urls: vec!["http://127.0.0.1:8123".to_string()],
             region: None,
             tls: false,
-            default_storage_mode: config::RemoteDefaultStorageMode::Dedicated,
             credentials: None,
             timeout_overrides: Some(config::RemoteTimeoutOverrides {
                 connect_timeout_ms: Some(150),
@@ -157,11 +141,11 @@ fn remote_backend_propagates_settings() {
 }
 
 #[test]
-fn sqlite_backend_propagates_the_immediate_gsi_consistency_rule() {
+fn sqlite_backend_maps_path_to_sqlite_storage_config() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: Some(config::SqliteBackendConfig {
             db_path: "storage.db".to_string(),
-            immediate_gsi_consistency: true,
         }),
         turso: None,
         postgres: None,
@@ -174,25 +158,19 @@ fn sqlite_backend_propagates_the_immediate_gsi_consistency_rule() {
 
     assert!(matches!(storage_cfg.backend_type, StorageBackend::SQLite));
     assert_eq!(storage_cfg.connection_string.as_deref(), Some("storage.db"));
-    assert!(
-        storage_cfg
-            .sqlite
-            .expect("sqlite settings")
-            .immediate_gsi_consistency
-    );
+    assert!(storage_cfg.sqlite.is_some());
 }
 
 #[test]
-fn postgres_backend_propagates_pool_tls_and_consistency_settings_without_connecting() {
+fn postgres_backend_propagates_pool_and_tls_settings_without_connecting() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: None,
         turso: None,
         postgres: Some(config::PostgresBackendConfig {
             dsn: "postgres://localhost/aux_storage".to_string(),
             max_pool_size: 7,
-            background_max_pool_size: 2,
             tls: false,
-            immediate_gsi_consistency: true,
         }),
         rocksdb: None,
         foundationdb: None,
@@ -210,18 +188,18 @@ fn postgres_backend_propagates_pool_tls_and_consistency_settings_without_connect
     assert_eq!(postgres.dsn, "postgres://localhost/aux_storage");
     assert_eq!(postgres.max_pool_size, 7);
     assert!(!postgres.tls);
-    assert!(postgres.immediate_gsi_consistency);
 }
 
 #[test]
-fn rocksdb_backend_propagates_path_and_consistency_settings_without_opening_the_store() {
+fn rocksdb_backend_propagates_path_without_opening_the_store() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: None,
         turso: None,
         postgres: None,
         rocksdb: Some(config::RocksdbBackendConfig {
             db_path: "rocks-storage".to_string(),
-            immediate_gsi_consistency: true,
+            ..Default::default()
         }),
         foundationdb: None,
         remote: None,
@@ -234,17 +212,13 @@ fn rocksdb_backend_propagates_path_and_consistency_settings_without_opening_the_
         storage_cfg.connection_string.as_deref(),
         Some("rocks-storage")
     );
-    assert!(
-        storage_cfg
-            .rocksdb
-            .expect("rocksdb settings")
-            .immediate_gsi_consistency
-    );
+    assert!(storage_cfg.rocksdb.is_some());
 }
 
 #[test]
 fn remote_backend_uses_static_credentials_when_the_config_supplies_them() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: None,
         turso: None,
         postgres: None,
@@ -254,14 +228,12 @@ fn remote_backend_uses_static_credentials_when_the_config_supplies_them() {
             endpoint_urls: vec!["http://127.0.0.1:8123".to_string()],
             region: Some("us-east-1".to_string()),
             tls: true,
-            default_storage_mode: config::RemoteDefaultStorageMode::Dedicated,
             credentials: Some(config::RemoteCredentialsConfig {
                 r#static: Some(config::RemoteStaticCredentialsConfig {
                     access_key: "access".to_string(),
                     secret_key: "secret".to_string(),
                     session_token: Some("session".to_string()),
                 }),
-                instance_keys: None,
             }),
             timeout_overrides: None,
         }),
@@ -285,6 +257,7 @@ fn remote_backend_uses_static_credentials_when_the_config_supplies_them() {
 #[test]
 fn remote_backend_rejects_an_endpointless_remote_configuration_before_runtime_startup() {
     let backends = config::Backends {
+        initial_stream_lineages: None,
         sqlite: None,
         turso: None,
         postgres: None,
@@ -294,7 +267,6 @@ fn remote_backend_rejects_an_endpointless_remote_configuration_before_runtime_st
             endpoint_urls: vec![],
             region: Some("us-east-1".to_string()),
             tls: true,
-            default_storage_mode: config::RemoteDefaultStorageMode::Dedicated,
             credentials: None,
             timeout_overrides: None,
         }),
@@ -310,9 +282,9 @@ fn remote_backend_rejects_an_endpointless_remote_configuration_before_runtime_st
 fn storage_registry_uses_the_default_backend_when_no_named_connections_are_configured() {
     let features = config::Features {
         backends: config::Backends {
+            initial_stream_lineages: None,
             sqlite: Some(config::SqliteBackendConfig {
                 db_path: "default.db".to_string(),
-                immediate_gsi_consistency: false,
             }),
             turso: None,
             postgres: None,
@@ -341,9 +313,9 @@ fn storage_registry_uses_named_connections_and_preserves_the_declared_default() 
                 (
                     "tenant_a".to_string(),
                     config::Backends {
+                        initial_stream_lineages: None,
                         sqlite: Some(config::SqliteBackendConfig {
                             db_path: "tenant-a.db".to_string(),
-                            immediate_gsi_consistency: false,
                         }),
                         turso: None,
                         postgres: None,
@@ -355,9 +327,9 @@ fn storage_registry_uses_named_connections_and_preserves_the_declared_default() 
                 (
                     "tenant_b".to_string(),
                     config::Backends {
+                        initial_stream_lineages: None,
                         sqlite: Some(config::SqliteBackendConfig {
                             db_path: "tenant-b.db".to_string(),
-                            immediate_gsi_consistency: true,
                         }),
                         turso: None,
                         postgres: None,
@@ -391,9 +363,9 @@ fn storage_registry_rejects_a_default_connection_that_is_not_declared() {
             connections: HashMap::from([(
                 "tenant_a".to_string(),
                 config::Backends {
+                    initial_stream_lineages: None,
                     sqlite: Some(config::SqliteBackendConfig {
                         db_path: "tenant-a.db".to_string(),
-                        immediate_gsi_consistency: false,
                     }),
                     turso: None,
                     postgres: None,
@@ -412,4 +384,25 @@ fn storage_registry_rejects_a_default_connection_that_is_not_declared() {
     assert!(format!("{error}").contains(
         "default connection 'missing' missing in features.storage_connections.connections"
     ));
+}
+
+#[test]
+fn given_provider_lineage_defaults_when_connection_override_is_resolved_then_policy_is_shared() {
+    use storage_types::InitialStreamLineages;
+    for (backend, expected) in [
+        (StorageBackend::SQLite, 1),
+        (StorageBackend::Turso, 1),
+        (StorageBackend::RocksDB, 1),
+        (StorageBackend::Postgres, 4),
+        (StorageBackend::FoundationDb, 4),
+    ] {
+        assert_eq!(backend.default_initial_stream_lineages().get(), expected);
+    }
+    let mut backends = config::Backends::sqlite_default();
+    backends.initial_stream_lineages = Some(InitialStreamLineages::FOUR);
+    let config = storage_config_from_backends(&backends).unwrap();
+    assert_eq!(
+        config.initial_stream_lineages,
+        Some(InitialStreamLineages::FOUR)
+    );
 }

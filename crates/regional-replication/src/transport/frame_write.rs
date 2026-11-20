@@ -1,21 +1,21 @@
 //! Raw JSON counts and compressed output enforce independent frame allowances.
 use std::io::{self, Write};
 
-pub(super) struct BoundedSerialization<W> {
+pub struct BoundedSerialization<W> {
     writer: W,
     bytes: usize,
     limit: usize,
 }
 
 impl<W> BoundedSerialization<W> {
-    pub(super) fn new(writer: W, limit: usize) -> Self {
+    pub fn new(writer: W, limit: usize) -> Self {
         Self {
             writer,
             bytes: 0,
             limit,
         }
     }
-    pub(super) fn into_parts(self) -> (usize, W) {
+    pub fn into_parts(self) -> (usize, W) {
         (self.bytes, self.writer)
     }
 }
@@ -36,13 +36,13 @@ impl<W: Write> Write for BoundedSerialization<W> {
     }
 }
 
-pub(super) struct FrameBuffer {
+pub struct FrameBuffer {
     bytes: Vec<u8>,
     limit: usize,
 }
 
 impl FrameBuffer {
-    pub(super) fn new(limit: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
             limit,

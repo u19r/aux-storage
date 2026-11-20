@@ -1,30 +1,11 @@
 use crate::{
-    AttributeMap, IndexName, KeyAttributes, StorageError, StorageResult, StoredTableInfo,
-    TableName, WriteRequest, serde_types::validate_query_fields,
+    AttributeMap, IndexName, StorageError, StorageResult, TableName,
+    serde_types::validate_query_fields,
 };
 
-#[derive(Debug, Clone)]
-pub enum PreparedBatchOperation {
-    Put {
-        table_name: TableName,
-        table_info: StoredTableInfo,
-        write_request: WriteRequest,
-        key_attributes: KeyAttributes,
-        non_key_attributes: AttributeMap,
-        full_item: AttributeMap,
-        indexers: Option<Vec<String>>,
-    },
-    Delete {
-        table_name: TableName,
-        table_info: StoredTableInfo,
-        write_request: WriteRequest,
-        key: KeyAttributes,
-        existing_item: Option<AttributeMap>,
-    },
-}
-
 /// Request object for `scan_table` operation
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct ScanTableRequest {
     pub table_name: TableName,
     pub index_name: Option<IndexName>,
@@ -35,7 +16,8 @@ pub struct ScanTableRequest {
 
 /// Request object for `query_table` operation and its Aux remote source-page
 /// transport.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields)]
 pub struct QueryTableRequest {
     pub table_name: TableName,
@@ -54,7 +36,7 @@ impl QueryTableRequest {
     pub fn validate_for_dynamodb(&self) -> StorageResult<()> {
         validate_query_fields(
             &self.table_name,
-            &self.key_condition_expression,
+            Some(&self.key_condition_expression),
             None,
             self.projection_expression.as_deref(),
             self.expression_attribute_names.as_ref(),

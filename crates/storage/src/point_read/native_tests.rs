@@ -23,14 +23,20 @@ async fn given_native_sqlite_tables_when_point_source_reads_then_isolated_hits_a
     verify_point_reads(db).await;
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(all(feature = "postgres", feature = "test-support"))]
 #[tokio::test]
 #[ignore = "requires TEST_POSTGRES_DSN for an owned Postgres fixture"]
 async fn given_native_postgres_tables_when_point_source_reads_then_isolated_hits_absence_and_new_writes_are_visible()
  {
+    let base = std::env::var("TEST_POSTGRES_DSN").expect("owned Postgres DSN");
+    let (dsn, schema) =
+        sql_backend::postgres::test_schema::isolated_test_dsn(&base, "storage_point_read");
+    sql_backend::postgres::test_schema::create_test_schema(&dsn, &schema)
+        .await
+        .unwrap();
     let mut config = remote_config(crate::provider::StorageBackend::Postgres);
     config.postgres = Some(crate::provider::PostgresSettings {
-        dsn: std::env::var("TEST_POSTGRES_DSN").expect("owned Postgres DSN"),
+        dsn,
         tls: false,
         ..Default::default()
     });
@@ -47,7 +53,6 @@ async fn given_native_foundationdb_tables_when_point_source_reads_then_isolated_
         cluster_file: Some(std::env::var("TEST_FDB_CLUSTER_FILE").expect("owned FDB cluster")),
         subspace_prefix: Some(format!("tests/point-source/{}/", unique_suffix())),
         cache_read_version_ms: 0,
-        immediate_gsi_consistency: true,
         ..Default::default()
     });
     verify_point_reads(open_database(config).await).await;
@@ -56,6 +61,7 @@ async fn given_native_foundationdb_tables_when_point_source_reads_then_isolated_
 #[cfg(any(feature = "postgres", feature = "foundationdb"))]
 fn remote_config(backend_type: crate::provider::StorageBackend) -> crate::provider::StorageConfig {
     crate::provider::StorageConfig {
+        initial_stream_lineages: None,
         backend_type,
         connection_string: None,
         file_path: None,

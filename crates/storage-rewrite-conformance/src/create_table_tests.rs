@@ -31,7 +31,7 @@ async fn given_new_table_when_created_then_description_listing_and_item_round_tr
         created.assert_no_warning_or_error();
         let description = created.result.unwrap().table_description;
         assert_eq!(description.table_name, table);
-        assert_eq!(description.table_status, TableStatus::Active);
+        assert_eq!(description.table_status, TableStatus::Creating);
 
         let stored = store
             .operations
@@ -49,9 +49,12 @@ async fn given_new_table_when_created_then_description_listing_and_item_round_tr
             })
             .await
             .unwrap();
+        // AWS P13: only the status differs; the create answers CREATING.
+        let mut created = serde_json::to_value(&description).unwrap();
+        created["TableStatus"] = json!("ACTIVE");
         assert_eq!(
             serde_json::to_value(&described.table).unwrap(),
-            serde_json::to_value(&description).unwrap(),
+            created,
             "create and describe must show the same table"
         );
         let listed = store
@@ -116,16 +119,20 @@ async fn given_table_with_gsi_when_created_then_active_index_is_described_and_qu
         let description = created.result.unwrap().table_description;
         let indexes = description.global_secondary_indexes.as_ref().unwrap();
         assert_eq!(indexes.len(), 1);
-        assert_eq!(
-            serde_json::to_value(&indexes[0]).unwrap(),
-            json!({
-                "IndexName": "ByGroup",
-                "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
-                "Projection": {"ProjectionType": "ALL"},
-                "IndexStatus": "ACTIVE",
-                "Backfilling": false
-            })
-        );
+        let index_arn = format!("{}/index/ByGroup", description.table_arn);
+        // AWS P13: the CreateTable response shows the index CREATING without
+        // `Backfilling`; DescribeTable then shows it ACTIVE. Capacity is
+        // intentionally unsupported, so no `ProvisionedThroughput`.
+        let mut expected = json!({
+            "IndexName": "ByGroup",
+            "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+            "IndexStatus": "CREATING",
+            "IndexSizeBytes": 0,
+            "ItemCount": 0,
+            "IndexArn": index_arn
+        });
+        assert_eq!(serde_json::to_value(&indexes[0]).unwrap(), expected);
 
         let described = store
             .operations
@@ -134,9 +141,10 @@ async fn given_table_with_gsi_when_created_then_active_index_is_described_and_qu
             })
             .await
             .unwrap();
+        expected["IndexStatus"] = json!("ACTIVE");
         assert_eq!(
             serde_json::to_value(described.table.global_secondary_indexes).unwrap(),
-            serde_json::to_value(description.global_secondary_indexes).unwrap(),
+            json!([expected]),
         );
 
         let query = QueryRequest::try_from(json!({

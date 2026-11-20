@@ -45,7 +45,8 @@ impl ReadSequenceNodeId {
 }
 
 /// A graph node with one DynamoDB-shaped read operation.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 #[builder(field_defaults(default))]
 pub struct ReadSequenceNode {
@@ -99,7 +100,8 @@ impl ReadSequenceNode {
     }
 }
 
-#[derive(Debug, Clone, ToSchema)]
+#[derive(Clone, ToSchema)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum ReadSequenceNodeOperation {
     Get(Box<GetItemRequest>),
     BatchGet(Box<BatchGetItemRequest>),

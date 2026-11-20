@@ -53,6 +53,7 @@ async fn given_two_tables_and_an_unrelated_item_when_a_mixed_batch_writes_then_i
             .expect("valid seed item");
             store.operations.put_item(put).await.expect("seed item");
         }
+        store.wait_until_changes_are_readable().await;
         let before = super::cdc_stream_tests::system_records(&store, 10)
             .await
             .unwrap();
@@ -101,7 +102,8 @@ async fn given_two_tables_and_an_unrelated_item_when_a_mixed_batch_writes_then_i
             );
         }
 
-        let rows = super::cdc_stream_tests::system_records(&store, 1)
+        store.wait_until_changes_are_readable().await;
+        let rows = super::cdc_stream_tests::system_records_with_count(&store, 1, 4)
             .await
             .unwrap();
         assert_eq!(rows.len(), 4, "two seed and two batch changes");
@@ -112,8 +114,21 @@ async fn given_two_tables_and_an_unrelated_item_when_a_mixed_batch_writes_then_i
                 .len(),
             4
         );
-        let tables = rows[2..]
+        let new_rows = rows
             .iter()
+            .filter(|row| {
+                !before
+                    .iter()
+                    .any(|previous| previous.system_position == row.system_position)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            new_rows.len(),
+            2,
+            "exactly the two mixed-batch changes are new"
+        );
+        let tables = new_rows
+            .into_iter()
             .map(|row| row.source_table_name.as_ref().unwrap())
             .collect::<Vec<_>>();
         assert!(tables.contains(&&table_a));

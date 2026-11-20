@@ -1,17 +1,16 @@
 use std::{collections::HashMap, hint::black_box};
 
 use alloc_counter::AllocationGuard;
-use storage_common::{DEFAULT_QUERY_LIMIT, DEFAULT_SCAN_LIMIT, MAX_QUERY_LIMIT};
 use storage_types::{
     AttributeDefinition, AttributeValue, ExclusiveStartKey, IndexName, ItemKey, KeyAttributeType,
     KeyAttributes, KeySchemaElement, KeyType, MaxIndexers, QueryRequest, QueryTableRequest,
-    ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName, TableStatus,
-    TimestampMillis, subset_expression_attribute_names_for_expression,
+    StorageResult, StoredTableInfo, TableName, TableStatus, TimestampMillis,
+    subset_expression_attribute_names_for_expression,
 };
 
 use crate::provider::provider_helpers::{
-    build_query_request_view, build_scan_request, error_label, exclusive_start_key_from_string,
-    extract_operation, remote_key_to_page_token,
+    build_query_request_view, exclusive_start_key_from_string, extract_operation,
+    remote_key_to_page_token,
 };
 
 fn build_query_request(request: &QueryTableRequest) -> QueryRequest {
@@ -24,10 +23,7 @@ fn build_query_request(request: &QueryTableRequest) -> QueryRequest {
             request.expression_attribute_names.as_ref(),
         ))
         .expression_attribute_values(request.expression_attribute_values.clone())
-        .limit(Some(
-            storage_common::normalize_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)
-                .expect("valid query limit"),
-        ))
+        .limit(request.limit)
         .scan_index_forward(request.scan_index_forward)
         .build();
     remote_request.exclusive_start_key = request
@@ -68,20 +64,14 @@ fn table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        stream_enabled_at: None,
         table_stream_duration: Default::default(),
         deletion_protection_enabled: false,
     }
 }
 
 #[test]
-fn build_scan_and_query_request_when_consistent_read_is_set_then_preserve_it() {
-    let scan_request = ScanTableRequest {
-        table_name: TableName::new("tenant_t1"),
-        index_name: Some(IndexName::new("by_status")),
-        limit: Some(25),
-        exclusive_start_key: Some("cursor-1".to_string()),
-        consistent_read: true,
-    };
+fn build_query_request_when_consistent_read_is_set_then_preserve_it() {
     let query_request = QueryTableRequest {
         table_name: TableName::new("tenant_t1"),
         index_name: Some(IndexName::new("by_status")),
@@ -99,16 +89,8 @@ fn build_scan_and_query_request_when_consistent_read_is_set_then_preserve_it() {
         consistent_read: true,
     };
 
-    let remote_scan = build_scan_request(&scan_request).expect("valid scan limit");
     let remote_query = build_query_request(&query_request);
 
-    assert_eq!(remote_scan.consistent_read, Some(true));
-    assert_eq!(remote_scan.index_name, Some(IndexName::new("by_status")));
-    assert_eq!(remote_scan.limit, Some(25));
-    assert!(matches!(
-        remote_scan.exclusive_start_key,
-        Some(ExclusiveStartKey::Token(ref token)) if token == "cursor-1"
-    ));
     assert_eq!(remote_query.consistent_read, Some(true));
     assert_eq!(remote_query.index_name, Some(IndexName::new("by_status")));
     assert_eq!(remote_query.limit, Some(10));
@@ -138,23 +120,6 @@ fn build_scan_and_query_request_when_consistent_read_is_set_then_preserve_it() {
 fn extract_operation_when_target_has_namespace_then_returns_final_segment() {
     assert_eq!(extract_operation("DynamoDB_20120810.Query"), "Query");
     assert_eq!(extract_operation("Scan"), "Scan");
-}
-
-#[test]
-fn given_unknown_commit_when_labeling_then_returns_stable_redacted_category() {
-    let ambiguous = StorageError::sync_submission_ambiguous(
-        Some("proposal-secret".to_string()),
-        "request body secret",
-    );
-
-    assert_eq!(error_label(&ambiguous), "sync_submission_ambiguous");
-}
-
-#[test]
-fn given_idempotent_parameter_mismatch_when_labeling_then_uses_stable_category() {
-    let mismatch = StorageError::idempotent_parameter_mismatch();
-
-    assert_eq!(error_label(&mismatch), "idempotent_parameter_mismatch");
 }
 
 #[test]
@@ -259,29 +224,15 @@ fn given_projection_only_aliases_when_query_view_is_built_then_only_key_aliases_
     assert_eq!(json.get("ProjectionExpression"), None);
     assert_eq!(json.get("FilterExpression"), None);
     assert_eq!(json.get("Select"), None);
-    assert_eq!(json["Limit"], 100);
+    assert_eq!(
+        json.get("Limit"),
+        None,
+        "the remote service applies its own page limit"
+    );
     assert_eq!(
         json["ExpressionAttributeNames"],
         serde_json::json!({"#pk": "partition_key"})
     );
-}
-
-#[test]
-fn given_unbounded_scan_when_request_is_built_then_default_limit_is_sent() {
-    let request = ScanTableRequest {
-        table_name: TableName::new("remote-scan-table"),
-        index_name: None,
-        limit: None,
-        exclusive_start_key: None,
-        consistent_read: false,
-    };
-
-    let remote = build_scan_request(&request).expect("scan view should validate limit");
-
-    assert_eq!(remote.limit, Some(DEFAULT_SCAN_LIMIT));
-    assert!(remote.projection_expression.is_none());
-    assert!(remote.filter_expression.is_none());
-    assert!(remote.select.is_none());
 }
 
 fn representative_query_request() -> QueryTableRequest {

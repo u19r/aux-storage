@@ -22,7 +22,8 @@ pub enum ItemKeyEnum {
 
 err_context!(ItemKeyError, ItemKeyEnum);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct TableKey {
     pub table_name: TableName,
     pub hash_key: AttributeValue,
@@ -62,7 +63,8 @@ impl TableKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct IndexKey {
     pub table_name: TableName,
     pub index_id: IndexName,
@@ -120,7 +122,8 @@ impl IndexKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct IndexKeyPrefix {
     pub table_name: TableName,
     pub index_id: IndexName,
@@ -150,7 +153,8 @@ impl IndexKeyPrefix {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum ItemKey {
     Table(TableKey),
     Index(IndexKey),
@@ -618,21 +622,13 @@ pub(crate) fn keys_for_schema(
 ) -> Result<(AttributeValue, Option<AttributeValue>), ItemKeyError> {
     let mut hash_key = None;
     let mut range_key = None;
-    for key_element in key_schema {
-        let Some(attr_value) = item.get_attribute_value(&key_element.attribute_name) else {
-            return Err(ItemKeyEnum::Validation(format!(
-                "Missing key attribute: {}",
-                key_element.attribute_name
-            )))?;
-        };
-
-        match key_element.key_type {
-            KeyType::Hash => {
-                hash_key = Some(attr_value.clone());
-            }
-            KeyType::Range => {
-                range_key = Some(attr_value.clone());
-            }
+    for entry in crate::schema_key_values(key_schema, item) {
+        let (element, value) = entry.map_err(|missing| {
+            ItemKeyEnum::Validation(format!("Missing key attribute: {}", missing.name))
+        })?;
+        match element.key_type {
+            KeyType::Hash => hash_key = Some(value.clone()),
+            KeyType::Range => range_key = Some(value.clone()),
         }
     }
     let hash_key =

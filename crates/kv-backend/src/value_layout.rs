@@ -5,8 +5,8 @@ use storage_types::{StorageError, StorageResult};
 use crate::{
     KvAttempt, KvEntry, KvMutation, KvRangePage, ReadProtection,
     constants::{
-        KV_CHUNK_BYTES, KV_CHUNK_HEADER_BYTES, KV_CHUNK_KEY_FAMILY, KV_CHUNK_KEY_OVERHEAD,
-        KV_MAX_VALUE_BYTES, KV_VALUE_CHUNKED_TAG, KV_VALUE_INLINE_TAG,
+        KV_CHUNK_BYTES, KV_CHUNK_HEADER_BYTES, KV_CHUNK_KEY_OVERHEAD, KV_MAX_VALUE_BYTES,
+        KV_VALUE_CHUNKED_TAG, KV_VALUE_INLINE_TAG,
     },
     value_hydration::resolve_values,
 };
@@ -118,6 +118,10 @@ impl<K: AsRef<[u8]>> ChunkAddress<K> {
         Ok(Self { key, length })
     }
 
+    pub(crate) fn key(&self) -> &[u8] {
+        self.key.as_ref()
+    }
+
     pub(crate) fn chunk_key(&self, number: usize) -> StorageResult<Vec<u8>> {
         encode_chunk_key(self.key.as_ref(), self.length, number)
     }
@@ -126,7 +130,7 @@ impl<K: AsRef<[u8]>> ChunkAddress<K> {
         let begin = chunk_prefix(self.key.as_ref(), self.length)?;
         let mut end = Vec::new();
         end.try_reserve_exact(begin.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         end.extend_from_slice(&begin);
         while let Some(byte) = end.pop() {
             if byte != u8::MAX {
@@ -150,19 +154,9 @@ fn encode_chunk_key(key: &[u8], length: u16, number: usize) -> StorageResult<Vec
     Ok(physical)
 }
 
+/// The owner key selects the chunk home; see `table_key_layout`.
 pub(crate) fn chunk_prefix(key: &[u8], key_length: u16) -> StorageResult<Vec<u8>> {
-    let bytes = key
-        .len()
-        .checked_add(KV_CHUNK_KEY_OVERHEAD)
-        .ok_or_else(|| StorageError::internal("KV chunk address length overflowed"))?;
-    let mut prefix = Vec::new();
-    prefix
-        .try_reserve_exact(bytes)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    prefix.extend_from_slice(KV_CHUNK_KEY_FAMILY);
-    prefix.extend_from_slice(&key_length.to_be_bytes());
-    prefix.extend_from_slice(key);
-    Ok(prefix)
+    crate::table_key_layout::chunk_prefix(key, usize::from(key_length))
 }
 
 pub(crate) async fn load_value_heads<A: KvAttempt + ?Sized>(
@@ -171,10 +165,10 @@ pub(crate) async fn load_value_heads<A: KvAttempt + ?Sized>(
     protection: ReadProtection,
     allowance: crate::KvValueAllowance,
 ) -> StorageResult<Vec<Option<Vec<u8>>>> {
-    #[cfg(feature = "fault-injection")]
     if let Some(error) = attempt.fault_probe().and_then(|probe| {
         probe.fail(crate::KvFaultCall {
             operation: crate::KvFaultOperation::GetBatch,
+            mutations: 0,
         })
     }) {
         return Err(error);
@@ -182,11 +176,49 @@ pub(crate) async fn load_value_heads<A: KvAttempt + ?Sized>(
     let raw = attempt
         .native_get_batch(keys, protection, allowance)
         .await?;
-    #[cfg(feature = "fault-injection")]
     let raw = if let Some(probe) = attempt.fault_probe() {
         probe.alter_get_batch(
             crate::KvFaultCall {
                 operation: crate::KvFaultOperation::GetBatch,
+                mutations: 0,
+            },
+            raw,
+        )
+    } else {
+        raw
+    };
+    if raw.len() != keys.len() {
+        return Err(StorageError::internal(
+            "native KV batch returned the wrong count",
+        ));
+    }
+    Ok(raw)
+}
+
+/// `load_value_heads` with one protection per key (W3 C8); the fault probe
+/// sees one `GetBatch` call.
+pub(crate) async fn load_value_heads_mixed<A: KvAttempt + ?Sized>(
+    attempt: &A,
+    keys: &[Vec<u8>],
+    protections: &[ReadProtection],
+    allowance: crate::KvValueAllowance,
+) -> StorageResult<Vec<Option<Vec<u8>>>> {
+    if let Some(error) = attempt.fault_probe().and_then(|probe| {
+        probe.fail(crate::KvFaultCall {
+            operation: crate::KvFaultOperation::GetBatch,
+            mutations: 0,
+        })
+    }) {
+        return Err(error);
+    }
+    let raw = attempt
+        .native_get_batch_mixed(keys, protections, allowance)
+        .await?;
+    let raw = if let Some(probe) = attempt.fault_probe() {
+        probe.alter_get_batch(
+            crate::KvFaultCall {
+                operation: crate::KvFaultOperation::GetBatch,
+                mutations: 0,
             },
             raw,
         )
@@ -213,10 +245,10 @@ pub(crate) async fn load_page<A: KvAttempt + ?Sized>(
     layout: PageValueLayout,
 ) -> StorageResult<KvRangePage> {
     let result = async {
-        #[cfg(feature = "fault-injection")]
         if let Some(error) = attempt.fault_probe().and_then(|probe| {
             probe.fail(crate::KvFaultCall {
                 operation: crate::KvFaultOperation::Scan,
+                mutations: 0,
             })
         }) {
             return Err(error);
@@ -391,10 +423,10 @@ pub(crate) async fn load_range_heads<A: KvAttempt + ?Sized>(
     ranges: Vec<crate::KvRange>,
     protection: ReadProtection,
 ) -> StorageResult<Vec<KvRangePage>> {
-    #[cfg(feature = "fault-injection")]
     if let Some(error) = attempt.fault_probe().and_then(|probe| {
         probe.fail(crate::KvFaultCall {
             operation: crate::KvFaultOperation::ScanBatch,
+            mutations: 0,
         })
     }) {
         return Err(error);

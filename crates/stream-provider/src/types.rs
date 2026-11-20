@@ -31,7 +31,8 @@ impl SubscriptionDestination {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SubscriptionMessage {
     pub subscription_id: String,
     pub message_id: String,
@@ -82,7 +83,8 @@ pub struct Stream {
     pub created_at: TimestampMillis,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct StreamItem {
     pub id: StreamItemId,
     pub stream_name: Option<StreamName>,
@@ -131,14 +133,16 @@ pub enum StreamPartitioningMode {
     KeyOrdered,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct StreamPage {
     pub items: Vec<StreamItem>,
     pub last_evaluated_key: Option<StreamItemId>,
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct CursorPage {
     pub items: Vec<StreamItem>,
     pub cursor_position: StreamItemId,

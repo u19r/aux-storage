@@ -1,41 +1,63 @@
-use storage_types::{StorageEnum, StorageError};
+use storage_common::native_outcome::NativeCommitError;
+use storage_types::{
+    AttemptFailure, CapacityKind, NativeCallPhase, NativeCause, NativeCode, NativeEngine,
+    StorageError,
+};
+
+fn cause(error: &turso::Error, phase: NativeCallPhase) -> NativeCause {
+    NativeCause {
+        engine: NativeEngine::Turso,
+        code: NativeCode::Named(code_name(error)),
+        phase,
+    }
+}
+
+/// A fixed name of the native error; never its message.
+fn code_name(error: &turso::Error) -> &'static str {
+    match error {
+        turso::Error::ToSqlConversionFailure(_) => "ToSqlConversionFailure",
+        turso::Error::QueryReturnedNoRows => "QueryReturnedNoRows",
+        turso::Error::ConversionFailure(_) => "ConversionFailure",
+        turso::Error::Error(message) if message == "Write-write conflict" => "WriteWriteConflict",
+        turso::Error::Error(message) if message.starts_with("Conflict: ") => "Conflict",
+        turso::Error::Error(message) if message == "Out of memory" => "OutOfMemory",
+        turso::Error::Error(message) if message == "string or blob too big" => "TooBig",
+        turso::Error::Error(_) => "Error",
+        turso::Error::Misuse(_) => "Misuse",
+        turso::Error::Constraint(_) => "Constraint",
+        turso::Error::Readonly(_) => "Readonly",
+        turso::Error::DatabaseFull(_) => "DatabaseFull",
+        turso::Error::NotAdb(_) => "NotAdb",
+        turso::Error::Corrupt(_) => "Corrupt",
+        turso::Error::IoError(_, _) => "IoError",
+        turso::Error::BatchStatementFailed { .. } => "BatchStatementFailed",
+        turso::Error::BatchRollbackFailed { .. } => "BatchRollbackFailed",
+        turso::Error::Busy(_) => "Busy",
+        turso::Error::BusySnapshot(_) => "BusySnapshot",
+        turso::Error::Interrupt(_) => "Interrupt",
+    }
+}
 
 pub(super) fn map_driver_error(error: turso::Error) -> StorageError {
     let error = unwrap_statement_error(error);
     if is_aborted_conflict(&error) {
-        return StorageEnum::TransactionConflict {
-            message: "Turso transaction aborted".to_owned(),
+        return StorageError::native_conflict(cause(&error, NativeCallPhase::Statement));
+    }
+    if is_capacity_rejection(&error) {
+        return AttemptFailure::Capacity {
+            kind: CapacityKind::NativeLimit,
+            code: NativeCode::Named(code_name(&error)),
         }
         .into();
     }
-    if is_capacity_rejection(&error) {
-        return storage_types::InfrastructureResultKind::NativeCapacityRejected.into();
-    }
     match error {
         turso::Error::BatchRollbackFailed { .. } => {
-            unknown_settlement("Turso batch rollback was not acknowledged")
+            StorageError::commit_unknown("Turso batch rollback was not acknowledged")
         }
-        other => {
-            let code = match other {
-                turso::Error::ToSqlConversionFailure(_) => "ToSqlConversionFailure",
-                turso::Error::QueryReturnedNoRows => "QueryReturnedNoRows",
-                turso::Error::ConversionFailure(_) => "ConversionFailure",
-                turso::Error::Error(_) => "Error",
-                turso::Error::Misuse(_) => "Misuse",
-                turso::Error::Constraint(_) => "Constraint",
-                turso::Error::Readonly(_) => "Readonly",
-                turso::Error::DatabaseFull(_) => "DatabaseFull",
-                turso::Error::NotAdb(_) => "NotAdb",
-                turso::Error::Corrupt(_) => "Corrupt",
-                turso::Error::IoError(_, _) => "IoError",
-                turso::Error::BatchStatementFailed { .. } => "BatchStatementFailed",
-                turso::Error::BatchRollbackFailed { .. } => "BatchRollbackFailed",
-                turso::Error::Busy(_)
-                | turso::Error::BusySnapshot(_)
-                | turso::Error::Interrupt(_) => "TransactionConflict",
-            };
-            StorageError::internal(&format!("Turso native operation failed ({code})"))
-        }
+        other => StorageError::internal(&format!(
+            "Turso native operation failed ({})",
+            code_name(&other)
+        )),
     }
 }
 
@@ -48,11 +70,16 @@ fn unwrap_statement_error(mut error: turso::Error) -> turso::Error {
     }
 }
 
-pub(super) fn map_commit_error(error: turso::Error) -> StorageError {
+/// A failed COMMIT: only an engine conflict proves that nothing committed.
+pub(super) fn commit_error(error: turso::Error) -> NativeCommitError {
+    let error = unwrap_statement_error(error);
     if is_aborted_conflict(&error) {
-        return map_driver_error(error);
+        return NativeCommitError::Conflict(cause(&error, NativeCallPhase::Commit));
     }
-    unknown_settlement("Turso commit was not acknowledged")
+    NativeCommitError::Unproven {
+        reason: "Turso commit was not acknowledged",
+        cause: Some(cause(&error, NativeCallPhase::Commit)),
+    }
 }
 
 fn is_aborted_conflict(error: &turso::Error) -> bool {
@@ -66,10 +93,6 @@ fn is_aborted_conflict(error: &turso::Error) -> bool {
         }
         _ => false,
     }
-}
-
-pub(super) fn unknown_settlement(message: &'static str) -> StorageError {
-    StorageError::sync_submission_ambiguous(None, message)
 }
 
 fn is_capacity_rejection(error: &turso::Error) -> bool {

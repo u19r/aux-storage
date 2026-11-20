@@ -1,8 +1,9 @@
 //! Retention state and conditional marker completion on one KV attempt.
 
 use storage_provider::{
-    StreamRetentionFinishRecord, StreamTrimDueMarker, StreamTrimStateRecord, StreamTrimStateWrite,
-    maintenance::StreamRetentionFinish, table_retention_scope_id,
+    StreamTrimDueMarker, StreamTrimStateRecord, StreamTrimStateWrite,
+    maintenance::{PreparedRetentionFinish, RetentionStateWrite},
+    table_retention_scope_id,
 };
 use storage_types::{StorageError, StorageResult, storage_serde};
 
@@ -27,16 +28,18 @@ pub(crate) async fn delete_table_retention<A: KvAttempt>(
         ReadProtection::Conflict,
     )
     .await?;
-    let [state]: [Option<storage_provider::StreamTrimState>; 1] = states
-        .try_into()
-        .map_err(|_| StorageError::internal("KV table retention read count differs"))?;
+    // One scope in, one state out.
+    let state: Option<storage_provider::StreamTrimState> = states.into_iter().next().flatten();
     let mut changes = vec![KvMutation::Delete {
-        key: key_layout::state_key(&scope),
+        key: key_layout::require_state_key(&scope)?,
     }];
-    if let Some(marker) = state.and_then(|state| state.scheduled_marker()) {
-        changes.push(KvMutation::Delete {
-            key: key_layout::due_key(&marker),
-        });
+    if let Some((key, _)) = state
+        .as_ref()
+        .map(key_layout::derived_due_entry)
+        .transpose()?
+        .flatten()
+    {
+        changes.push(KvMutation::Delete { key });
     }
     attempt.stage(changes)
 }
@@ -52,14 +55,14 @@ pub(crate) fn stream_retention_mutations(
             "KV retention scope has another table identity",
         ));
     }
-    let state_key = key_layout::state_key(&write.state.scope);
+    let state_key = key_layout::require_state_key(&write.state.scope)?;
     let mut changes = vec![KvMutation::Put {
         key: state_key,
         value: storage_serde::to_bytes(&write.state)?,
     }];
     if let Some(marker) = write.replaced_marker {
         changes.push(KvMutation::Delete {
-            key: key_layout::due_key(&marker),
+            key: key_layout::due_key(&marker)?,
         });
     }
     if let Some(marker) = write.next_marker {
@@ -69,46 +72,40 @@ pub(crate) fn stream_retention_mutations(
             ));
         }
         changes.push(KvMutation::Put {
-            key: key_layout::due_key(&marker),
-            value: storage_serde::to_bytes(&marker)?,
+            key: key_layout::due_key(&marker)?,
+            value: key_layout::due_value(&marker),
         });
     }
     Ok(changes)
 }
 
-pub(crate) async fn finish_stream_trim_markers<A: KvAttempt>(
+/// Read each marker and expected state with conflict protection, then stage
+/// the delete of each marker that is present with the same payload and whose
+/// state matches. One `get_batch`.
+pub(crate) async fn delete_stream_trim_markers<A: KvAttempt>(
     attempt: &mut A,
-    finishes: Vec<StreamRetentionFinish>,
-) -> StorageResult<()> {
-    let prepared = finishes
-        .into_iter()
-        .map(PreparedFinish::try_from)
-        .collect::<StorageResult<Vec<_>>>()?;
-    let mut keys = prepared
+    finishes: &[PreparedRetentionFinish],
+) -> StorageResult<storage_types::Exact<bool>> {
+    let mut keys = finishes
         .iter()
         .map(|finish| key_layout::due_key(&finish.marker))
-        .collect::<Vec<_>>();
-    let state_count = prepared
-        .iter()
-        .filter(|finish| finish.record.expected_state_blob.is_some())
-        .count();
+        .collect::<StorageResult<Vec<_>>>()?;
     keys.extend(
-        prepared
+        finishes
             .iter()
             .filter(|finish| finish.record.expected_state_blob.is_some())
-            .map(|finish| key_layout::state_key(&finish.marker.scope)),
+            .map(|finish| key_layout::require_state_key(&finish.marker.scope))
+            .collect::<StorageResult<Vec<_>>>()?,
     );
-    let values = attempt.get_batch(keys, ReadProtection::Conflict).await?;
-    if values.len() != prepared.len() + state_count {
-        return Err(StorageError::internal(
-            "KV stream trim finish read count differs",
-        ));
-    }
+    let values = attempt
+        .get_batch_exact(keys, ReadProtection::Conflict)
+        .await?;
     let mut values = values.into_iter();
-    let due_values = values.by_ref().take(prepared.len()).collect::<Vec<_>>();
+    let due_values = values.by_ref().take(finishes.len()).collect::<Vec<_>>();
     let mut state_values = values;
-    let mut changes = Vec::new();
-    for (finish, due_value) in prepared.into_iter().zip(due_values) {
+    let mut completed = Vec::with_capacity(finishes.len());
+    let mut deletes = Vec::new();
+    for (finish, due_value) in finishes.iter().zip(due_values) {
         let state_matches = match &finish.record.expected_state_blob {
             Some(expected) => {
                 state_values
@@ -120,76 +117,49 @@ pub(crate) async fn finish_stream_trim_markers<A: KvAttempt>(
             None => true,
         };
         if let Some(bytes) = due_value.as_ref()
-            && bytes != &finish.marker_blob
+            && bytes != &key_layout::due_value(&finish.marker)
         {
             return Err(StorageError::internal(
                 "KV stream trim marker payload differs",
             ));
         }
-        if finish.record.state_write.is_some() && (due_value.is_none() || !state_matches) {
-            return Err(storage_types::StorageEnum::TransactionConflict {
-                message: "Table retention authority changed before cleanup completion".to_owned(),
-            }
-            .into());
+        let deleted = due_value.is_some() && state_matches;
+        if deleted {
+            deletes.push(KvMutation::Delete {
+                key: key_layout::due_key(&finish.marker)?,
+            });
         }
-        if due_value.is_some() && state_matches {
-            append_completion(&mut changes, finish)?;
-        }
+        completed.push(deleted);
     }
-    if changes.is_empty() {
-        Ok(())
-    } else {
-        attempt.stage(changes)
+    if !deletes.is_empty() {
+        attempt.stage(deletes)?;
     }
+    storage_types::Exact::try_new(finishes.len(), completed)
 }
 
-struct PreparedFinish {
-    marker: StreamTrimDueMarker,
-    marker_blob: Vec<u8>,
-    record: StreamRetentionFinishRecord,
-}
-
-impl TryFrom<StreamRetentionFinish> for PreparedFinish {
-    type Error = StorageError;
-
-    fn try_from(finish: StreamRetentionFinish) -> StorageResult<Self> {
-        let marker = finish.marker.clone();
-        let marker_blob = storage_serde::to_bytes(&marker)?;
-        let record: StreamRetentionFinishRecord = finish.try_into()?;
-        if !record.valid_update {
-            return Err(StorageError::internal(
-                "stream trim finish has an invalid state update",
-            ));
-        }
-        Ok(Self {
-            marker,
-            marker_blob,
-            record,
-        })
-    }
-}
-
-fn append_completion(changes: &mut Vec<KvMutation>, finish: PreparedFinish) -> StorageResult<()> {
-    changes.push(KvMutation::Delete {
-        key: key_layout::due_key(&finish.marker),
-    });
-    if let Some(write) = finish.record.state_write {
+/// Stage each state put and its next marker put.
+pub(crate) fn store_stream_trim_states<A: KvAttempt>(
+    attempt: &mut A,
+    states: Vec<RetentionStateWrite>,
+) -> StorageResult<()> {
+    let mut changes = Vec::new();
+    for RetentionStateWrite { scope, record } in states {
         let StreamTrimStateRecord {
             state_blob,
             next_marker,
             ..
-        } = write;
+        } = record;
         changes.push(KvMutation::Put {
-            key: key_layout::state_key(&finish.marker.scope),
+            key: key_layout::require_state_key(&scope)?,
             value: state_blob,
         });
         if let Some(next) = next_marker {
             let marker: StreamTrimDueMarker = next.try_into()?;
             changes.push(KvMutation::Put {
-                key: key_layout::due_key(&marker),
-                value: storage_serde::to_bytes(&marker)?,
+                key: key_layout::due_key(&marker)?,
+                value: key_layout::due_value(&marker),
             });
         }
     }
-    Ok(())
+    attempt.stage(changes)
 }

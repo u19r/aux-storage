@@ -1,32 +1,21 @@
-use std::time::Duration;
-
 use config::Tracing;
-use storage_provider::StorageConfig;
+use storage_provider::{StorageBackend, StorageConnectionRegistry};
 use storage_types::{StorageError, StorageResult};
 use tracing_subscriber::EnvFilter;
 
-pub(crate) fn storage_config_from_backends(
-    backends: &config::Backends,
-) -> StorageResult<StorageConfig> {
-    storage::startup::storage_config_from_backends(backends)
-}
-
-pub(crate) fn ensure_backend_matches(backends: &config::Backends) -> StorageResult<()> {
-    if backends.remote.is_some() {
-        return Err(StorageError::internal(
-            &"storage-api does not support remote backend in standalone mode".to_string(),
+/// storage-api serves local stores only; a remote connection is a client of
+/// another storage-api.
+pub(crate) fn require_local_connections(registry: &StorageConnectionRegistry) -> StorageResult<()> {
+    if registry
+        .connections
+        .values()
+        .any(|connection| matches!(connection.backend_type, StorageBackend::Remote))
+    {
+        return Err(StorageError::validation(
+            "storage-api does not support remote storage connections",
         ));
     }
-
-    storage::startup::ensure_backend_matches(backends)
-        .map_err(|message| StorageError::internal(&message))
-}
-
-pub(crate) fn shutdown_grace_period() -> Duration {
-    std::env::var("APP_SHUTDOWN_GRACE_SECONDS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map_or_else(|| Duration::from_secs(5), Duration::from_secs)
+    Ok(())
 }
 
 pub(crate) fn resolve_filter(tracing_cfg: &Tracing) -> (EnvFilter, FilterSource) {

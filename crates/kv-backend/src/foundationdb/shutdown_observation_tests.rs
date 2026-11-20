@@ -1,5 +1,7 @@
 use std::{fs, sync::Arc, time::Instant};
 
+use storage_types::{AttemptPlan, DeadlineClass};
+
 use super::shutdown_observation::{
     ObservationControl, ObservationPhase, ReleaseObservation, RetainedContexts,
 };
@@ -98,6 +100,7 @@ fn given_native_runtime_when_shutdown_is_requested_then_tail_work_is_observed_be
             let first = Arc::new(
                 FoundationDbBackend::initialize(FoundationDbOptions {
                     cluster_file: Some(&cluster),
+                    attempt_deadlines: storage_types::AttemptDeadlines::default(),
                     ..Default::default()
                 })
                 .await
@@ -105,6 +108,7 @@ fn given_native_runtime_when_shutdown_is_requested_then_tail_work_is_observed_be
             );
             let second = FoundationDbBackend::initialize(FoundationDbOptions {
                 cluster_file: Some(&cluster),
+                attempt_deadlines: storage_types::AttemptDeadlines::default(),
                 ..Default::default()
             })
             .await
@@ -113,15 +117,19 @@ fn given_native_runtime_when_shutdown_is_requested_then_tail_work_is_observed_be
             signal.recv().await;
             for index in 0..3 {
                 first
-                    .with_attempt(AttemptMode::ReadWrite, move |attempt| {
-                        Box::pin(async move {
-                            attempt.native_stage(vec![KvMutation::PutUnchunked {
-                                key: format!("shutdown-tail-{index}").into_bytes(),
-                                value: b"owned-test".to_vec(),
-                            }])?;
-                            Ok(())
-                        })
-                    })
+                    .with_attempt(
+                        AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::Write)
+                            .start(first.attempt_deadlines()),
+                        move |attempt| {
+                            Box::pin(async move {
+                                attempt.native_stage(vec![KvMutation::PutUnchunked {
+                                    key: format!("shutdown-tail-{index}").into_bytes(),
+                                    value: b"owned-test".to_vec(),
+                                }])?;
+                                Ok(())
+                            })
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -132,20 +140,24 @@ fn given_native_runtime_when_shutdown_is_requested_then_tail_work_is_observed_be
             let (sender, receiver) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 background
-                    .with_attempt(AttemptMode::ReadOnly, move |attempt| {
-                        Box::pin(async move {
-                            let _ = attempt
-                                .native_get(
-                                    b"shutdown-tail-0",
-                                    crate::ReadProtection::Snapshot,
-                                    crate::KvValueAllowance::for_unqualified_values(1),
-                                )
-                                .await?;
-                            let _ = sender.send(());
-                            std::future::pending::<()>().await;
-                            Ok(())
-                        })
-                    })
+                    .with_attempt(
+                        AttemptPlan::new(AttemptMode::ReadOnly, DeadlineClass::PointRead)
+                            .start(background.attempt_deadlines()),
+                        move |attempt| {
+                            Box::pin(async move {
+                                let _ = attempt
+                                    .native_get(
+                                        b"shutdown-tail-0",
+                                        crate::ReadProtection::Snapshot,
+                                        crate::KvValueAllowance::for_unqualified_values(1),
+                                    )
+                                    .await?;
+                                let _ = sender.send(());
+                                std::future::pending::<()>().await;
+                                Ok(())
+                            })
+                        },
+                    )
                     .await
                     .unwrap();
             });
@@ -162,4 +174,75 @@ fn given_native_runtime_when_shutdown_is_requested_then_tail_work_is_observed_be
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[test]
+#[ignore = "controller; requires owned FDB (run through just fdb-shutdown-observation)"]
+fn given_shutdown_child_when_controller_releases_then_observation_is_ready_and_child_exits_cleanly()
+{
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::Duration,
+    };
+
+    let cluster = std::env::var("FDB_CLUSTER_FILE").expect("owned cluster");
+    let observation = tempfile::tempdir().unwrap();
+    let marker = tempfile::tempdir().unwrap();
+    let started = marker.path().join("child-started");
+    let nonce = uuid::Uuid::new_v4();
+    let config = serde_json::json!({ "directory": observation.path(), "nonce": nonce });
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "given_native_runtime_when_shutdown_is_requested_then_tail_work_is_observed_before_network_stop",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env("FDB_CLUSTER_FILE", &cluster)
+        .env("AUXFN_FDB_SHUTDOWN_OBSERVATION", config.to_string())
+        .env("AUXFN_FDB_SHUTDOWN_CHILD_STARTED", &started)
+        .env_remove("AUXFN_FDB_SHUTDOWN_CHILD_PANIC")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let wait_for = |what: &str, ready: &dyn Fn() -> bool, child: &mut std::process::Child| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited before {what}"
+            );
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for("started marker", &|| started.exists(), &mut child);
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let ready = observation.path().join("ready.json");
+    wait_for("ready marker", &|| ready.exists(), &mut child);
+    let ready: serde_json::Value = serde_json::from_slice(&fs::read(&ready).unwrap()).unwrap();
+    assert_eq!(ready["nonce"], serde_json::json!(nonce));
+    assert_eq!(ready["pid"], serde_json::json!(pid));
+    assert!(ready["contexts"].as_u64().unwrap() >= 2);
+    fs::write(
+        observation.path().join("release.json"),
+        serde_json::to_vec(&serde_json::json!({ "nonce": nonce, "pid": pid })).unwrap(),
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

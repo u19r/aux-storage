@@ -23,7 +23,7 @@ impl KvRange {
             .len()
             .checked_add(self.end.len())
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .ok_or(storage_types::AttemptFailure::CAPACITY)?;
         settlement.charge_data(bytes)
     }
 
@@ -46,7 +46,7 @@ impl KvRange {
     ) -> storage_types::StorageResult<Self> {
         let mut end = Vec::new();
         end.try_reserve_exact(begin.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         end.extend_from_slice(&begin);
         let end = increment_prefix(end)
             .ok_or_else(|| storage_types::StorageError::internal("KV prefix has no upper bound"))?;
@@ -109,10 +109,10 @@ impl TryFrom<(&[u8], &[u8])> for KvEntry {
         let mut owned_value = Vec::new();
         owned_key
             .try_reserve_exact(key.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         owned_value
             .try_reserve_exact(value.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         owned_key.extend_from_slice(key);
         owned_value.extend_from_slice(value);
         Ok(Self::new(owned_key, owned_value))
@@ -161,7 +161,7 @@ impl KvRangeBuffer {
         }
         self.entries
             .try_reserve(1)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         let entry = KvEntry::try_from((key, value))?;
         self.bytes = self.bytes.saturating_add(bytes);
         self.entries.push(entry);

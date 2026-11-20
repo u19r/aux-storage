@@ -10,49 +10,53 @@ version = "0.1.0"
 [lib]
 doctest = false
 
-[[bin]]
-name = "pubsub"
-path = "src/main/mod.rs"
-required-features = ["server"]
-
 [features]
-default = ["sqlite", "server"]
-server = ["dep:axum", "dep:clap", "dep:tracing-subscriber", "dep:uuid"]
-sqlite = ["dep:sql-backend", "sql-backend/sqlite", "queue/sqlite"]
-turso = ["dep:sql-backend", "sql-backend/turso", "queue/turso"]
-postgres = ["dep:sql-backend", "sql-backend/postgres", "queue/postgres"]
-rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "queue/rocksdb"]
-foundationdb = ["dep:kv-backend", "kv-backend/foundationdb", "queue/foundationdb"]
+test-support = [
+    "http-error/test-support",
+    "pubsub-provider/test-support",
+    "queue-provider/test-support",
+    "storage-types/test-support",
+    "stream-provider/test-support",
+]
+default = ["sqlite"]
+sqlite = ["sql-backend/sqlite", "queue/sqlite"]
+turso = ["sql-backend/turso", "queue/turso"]
+postgres = ["sql-backend/postgres", "queue/postgres"]
+rocksdb = ["kv-backend/rocksdb", "queue/rocksdb"]
+foundationdb = ["kv-backend/foundationdb", "queue/foundationdb"]
 
 [dependencies]
-async-trait = { workspace = true }
-axum = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
 config = { path = "../config" }
 futures-util = { workspace = true }
 http-error = { path = "../http-error" }
 http-request = { workspace = true }
-kv-backend = { path = "../kv-backend", optional = true, default-features = false }
-metrics-facade = { workspace = true }
+metrics = { workspace = true }
 pubsub-provider = { path = "../pubsub-provider" }
 queue = { path = "../queue", default-features = false }
 queue-provider = { path = "../queue-provider" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-types = { path = "../storage-types" }
 stream-provider = { path = "../stream-provider" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true }
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
+anyhow = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sns = { workspace = true }
-tempfile = { workspace = true }
+http-error = { path = "../http-error", features = ["test-support"] }
+kv-backend = { path = "../kv-backend", default-features = false }
+pubsub-provider = { path = "../pubsub-provider", features = ["test-support"] }
+queue-provider = { path = "../queue-provider", features = ["test-support"] }
+quint-connect = { workspace = true }
+sql-backend = { path = "../sql-backend", default-features = false, features = ["test-support"] }
+storage-types = { path = "../storage-types", features = ["test-support"] }
+stream-provider = { path = "../stream-provider", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

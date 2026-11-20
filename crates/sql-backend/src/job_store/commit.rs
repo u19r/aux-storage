@@ -5,7 +5,7 @@ use storage_provider::{
         AtomicCommit, JobCommitError, execute_commit, run_native_job_attempt, settle_native_commit,
     },
 };
-use storage_types::{AttemptMode, StorageError};
+use storage_types::{AttemptMode, AttemptPlan, DeadlineClass, StorageError};
 
 use super::{SqlRawOrderedJobStore, store::decode_many};
 use crate::{
@@ -36,14 +36,18 @@ async fn commit_once<B: SqlBackend + 'static>(
         store.admission.get().cloned(),
         move |slot| async move {
             backend
-                .with_attempt(AttemptMode::ReadWrite, move |attempt| {
-                    Box::pin(async move {
-                        let mut commit = SqlJobCommit { attempt, engine };
-                        slot.preserve(
-                            execute_commit(&mut commit, &transaction, max_value_bytes).await,
-                        )
-                    })
-                })
+                .with_attempt(
+                    AttemptPlan::new(AttemptMode::ReadWrite, DeadlineClass::BackgroundPage)
+                        .start(backend.attempt_deadlines()),
+                    move |attempt| {
+                        Box::pin(async move {
+                            let mut commit = SqlJobCommit { attempt, engine };
+                            slot.preserve(
+                                execute_commit(&mut commit, &transaction, max_value_bytes).await,
+                            )
+                        })
+                    },
+                )
                 .await
         },
     )
@@ -63,9 +67,8 @@ impl<A: SqlAttempt> AtomicCommit for SqlJobCommit<'_, A> {
         checks: &[Check],
     ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
         let mut keys = Vec::new();
-        keys.try_reserve_exact(checks.len()).map_err(|_| {
-            StorageError::from(storage_types::InfrastructureResultKind::NativeCapacityRejected)
-        })?;
+        keys.try_reserve_exact(checks.len())
+            .map_err(|_| StorageError::from(storage_types::AttemptFailure::CAPACITY))?;
         keys.extend(checks.iter().map(|check| check.key().clone()));
         let max_bytes = POINT_READ_BYTES
             .get()
@@ -90,7 +93,7 @@ impl<A: SqlAttempt> AtomicCommit for SqlJobCommit<'_, A> {
         let mut statements = Vec::new();
         statements
             .try_reserve_exact(mutations.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            .map_err(|_| storage_types::AttemptFailure::CAPACITY)?;
         for mutation in mutations {
             statements.push(match mutation {
                 Mutation::Put(key, value) => {
@@ -99,6 +102,11 @@ impl<A: SqlAttempt> AtomicCommit for SqlJobCommit<'_, A> {
                 Mutation::Delete(key) => {
                     super::sql_statements::delete(self.engine, key.as_bytes())?
                 }
+                Mutation::ClearEffectReceipts(group) => super::sql_statements::delete_range(
+                    self.engine,
+                    group.prefix().as_bytes(),
+                    group.end().as_bytes(),
+                )?,
             });
         }
         if !statements.is_empty() {

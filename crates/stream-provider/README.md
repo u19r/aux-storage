@@ -6,25 +6,24 @@ contracts. Concrete storage providers implement the
 
 ## User streams
 
-Call `initialize_stream` before using a provider. `create_stream` takes a `UserStreamName`,
-an optional `DurationSeconds` retention value, and a `StreamPartitioningMode`; it returns
-the physical `StreamName` used by append and read operations. `get_stream` and
-`delete_stream` take the logical `UserStreamName`.
+`create_stream` takes a `UserStreamName`, an optional `DurationSeconds` retention and a
+`StreamPartitioningMode`, validates the name (1–255 bytes, alphanumeric first and last character,
+`_ - .` between) and the TTL (1 second to 1 year) before any I/O, and returns the internal `StreamName`.
+`get_stream`, `delete_stream` and `append_item` take the `UserStreamName`. Payloads are 1 byte to 1 MiB.
 
-`append_item` takes a `StreamName`, borrowed item bytes, and an optional partition key,
-and returns a `StreamItemId`. `read_forward` and `read_backward` take an optional exclusive
-`StreamItemId` boundary and a limit from 1 through 1,000. Forward reads return oldest items
-first; backward reads return newest items first. Treat returned continuation identifiers
-as provider-owned boundaries.
+Cursor and page operations take a `StreamAddress`: `User(UserStreamName)` resolves the catalog row by name
+on the operation's own native attempt; `Internal(StreamName)` addresses a user stream's internal id or a
+table-history stream. `read_forward` and `read_backward` take an optional exclusive `StreamItemId` and a
+limit from 1 through 1,000.
 
 ## Cursors
 
-Cursor operations use typed `CursorName` and `StreamName` values. `create_cursor` starts a
-cursor at a `CursorPosition`. `read_from_cursor` reads a page without advancing it;
-call `advance_cursor` only after the consumer has durably handled the page.
+`create_cursor` validates the `CursorName` (1–64 bytes, alphanumeric first and last character, `_ -`
+between) and starts the cursor at a `CursorPosition`. `read_from_cursor` reads a page and advances the cursor
+in the same attempt; `advance_cursor` moves it forward to an existing item.
 
-Protected bootstrap cursors use separate typed operations. Generic cursor reads, advances,
-and deletion do not authorize changes to protected bootstrap state.
+The library entry for user streams is `storage::DatabaseManager` (`create_user_stream` and the other
+`*_user_stream*` methods), one admitted operation per call over the default connection.
 
 ## Logical history and retained images
 

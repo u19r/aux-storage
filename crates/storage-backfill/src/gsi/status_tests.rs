@@ -20,16 +20,9 @@ fn target() -> GsiBuildTarget {
 #[test]
 fn given_persisted_build_phases_when_reading_status_then_payloads_are_not_materialized() {
     for (tag, label, phase, writable, queryable) in [
-        ("Scanning", "scanning", GsiBuildPhase::Scanning, true, false),
-        (
-            "CatchingUp",
-            "catching-up",
-            GsiBuildPhase::CatchingUp,
-            true,
-            false,
-        ),
+        ("Filling", "filling", GsiBuildPhase::Filling, true, false),
+        ("Building", "building", GsiBuildPhase::Building, true, false),
         ("Active", "active", GsiBuildPhase::Active, true, true),
-        ("Blocked", "blocked", GsiBuildPhase::Blocked, false, false),
     ] {
         // Cursor/checkpoint semantics belong to maintenance, not foreground
         // reads.
@@ -57,7 +50,7 @@ fn given_real_serialized_build_when_reading_status_then_existing_format_is_compa
     let bytes = storage_serde::to_bytes(&build).unwrap();
     let status: GsiBuildStatus = storage_serde::from_bytes(&bytes).unwrap();
     assert!(status.target == build.target);
-    assert_eq!(status.phase, GsiBuildPhase::Scanning);
+    assert_eq!(status.phase, GsiBuildPhase::Filling);
     let lifecycle = GsiProjectionLifecycle::try_from(vec![status]).unwrap();
     assert!(lifecycle.writable_targets() == [build.target]);
 }

@@ -1,21 +1,19 @@
 use std::{future::Future, num::NonZeroUsize};
 
-use async_trait::async_trait;
-use storage_common::{MAX_TTL_SWEEP_PAGE_LIMIT, retry::retry_native_conflicts};
+use storage_common::MAX_TTL_SWEEP_PAGE_LIMIT;
 use storage_types::{
     Revision, StorageError, StorageResult,
     maintenance::{StepResult, TargetIncarnation, TaskProgress},
 };
 
 use super::{
-    ExpirationAttempt, ExpirationCandidateBatch, ExpirationChange, ExpirationCurrentObservation,
+    ExpirationCandidateBatch, ExpirationChange, ExpirationCurrentObservation,
     ExpirationCurrentRead, ExpirationDeletionBatch, ExpirationEvaluation, ExpirationPagePlan,
-    ExpirationPageWrite, ExpirationPort, ExpirationPosition, ExpirationProgress,
-    ExpirationProgressWrite, ExpirationRequest, ExpirationScanDecision, ExpirationScanPage,
-    ExpirationScanRead, ExpirationStart, ExpirationTarget, ExpirationTargetDecision,
-    ExpirationTargetRead, ExpirationWrite,
+    ExpirationPageWrite, ExpirationPosition, ExpirationProgress, ExpirationProgressWrite,
+    ExpirationRequest, ExpirationScanDecision, ExpirationScanPage, ExpirationScanRead,
+    ExpirationStart, ExpirationTarget, ExpirationTargetDecision, ExpirationTargetRead,
+    ExpirationWrite,
 };
-use crate::{DYNAMO_WRITE_RETRY, DynamoPort};
 
 pub trait ExpirationTransaction {
     fn advance_expiration(
@@ -89,60 +87,6 @@ pub trait ExpirationTransaction {
         &mut self,
         write: ExpirationPageWrite,
     ) -> impl Future<Output = StorageResult<StepResult<()>>>;
-}
-
-#[async_trait]
-pub trait ExpirationRepository: Send + Sync {
-    async fn advance_expiration(&self, request: ExpirationRequest)
-    -> StorageResult<StepResult<()>>;
-
-    /// Trim one page of expired transact-write receipts; `None` ends the pass.
-    async fn trim_transact_receipts_page(
-        &self,
-        after: Option<String>,
-        limit: std::num::NonZeroU32,
-    ) -> StorageResult<Option<String>>;
-}
-
-#[async_trait]
-impl<P: DynamoPort> ExpirationRepository for P
-where for<'native> P::Attempt<'native>: ExpirationPort
-{
-    async fn advance_expiration(
-        &self,
-        request: ExpirationRequest,
-    ) -> StorageResult<StepResult<()>> {
-        let bindings = crate::RequestTableBindings::default();
-        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
-            let bindings = bindings.clone();
-            let request = request.clone();
-            self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(async move {
-                    ExpirationAttempt::new(attempt, bindings)
-                        .advance_expiration(&request)
-                        .await
-                })
-            })
-        })
-        .await
-    }
-
-    async fn trim_transact_receipts_page(
-        &self,
-        after: Option<String>,
-        limit: std::num::NonZeroU32,
-    ) -> StorageResult<Option<String>> {
-        let at = self.now();
-        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
-            let after = after.clone();
-            self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-                Box::pin(async move {
-                    super::trim_transact_receipts_page(attempt, after.as_deref(), limit, at).await
-                })
-            })
-        })
-        .await
-    }
 }
 
 impl ExpirationEvaluation {

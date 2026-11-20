@@ -1,87 +1,14 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Serialize, ser::SerializeMap};
 use storage_types::{
-    AttributeValueLookup, ItemStreamVersion, KeyAttributes, StorageError, StorageResult,
-    SystemStreamSourceTableName, TableName, TimestampMillis, WireItem,
-    normalize_key_attribute_value_for_write,
+    AttributeValueLookup, KeyAttributes, StorageError, StorageResult, SystemStreamSourceTableName,
+    TableName, WireItem, normalize_key_attribute_value_for_write,
 };
-
-/// Backend-neutral inputs for one logical SystemStream record.
-///
-/// Both KV and SQL name the same effect inputs once, here: the logical table,
-/// its key schema, both images, declarations, versioning, and provenance.
-/// Physical pointer rows stay backend-private; only the logical effect
-/// travels through this shape.
-pub struct LogicalSystemStreamMutationInput<'a> {
-    pub history_id: storage_types::TableHistoryId,
-    pub route: &'a DynamoMutationRoute,
-    pub item: Option<storage_types::VerifiedWireItem>,
-    pub old_item: Option<&'a storage_types::VerifiedWireItem>,
-    pub previous_version: Option<ItemStreamVersion>,
-    pub indexers: &'a [String],
-    pub item_stream_version: ItemStreamVersion,
-
-    pub created_at: TimestampMillis,
-    pub user_identity: Option<storage_types::StreamUserIdentity>,
-}
-
-/// Backend-neutral logical mutation retaining validated wire images without
-/// decoding maps.
-#[derive(Clone, Debug)]
-pub struct LogicalSystemStreamMutation {
-    pub history_id: storage_types::TableHistoryId,
-    pub source_table_name: SystemStreamSourceTableName,
-    pub key: KeyAttributes,
-    pub item: Option<WireItem>,
-    pub predecessor_payload_bytes: Option<usize>,
-    pub previous_version: Option<ItemStreamVersion>,
-    pub item_stream_version: ItemStreamVersion,
-    pub indexers: Vec<String>,
-
-    pub created_at: TimestampMillis,
-    pub user_identity: Option<storage_types::StreamUserIdentity>,
-}
-
-impl TryFrom<LogicalSystemStreamMutationInput<'_>> for LogicalSystemStreamMutation {
-    type Error = StorageError;
-
-    fn try_from(input: LogicalSystemStreamMutationInput<'_>) -> StorageResult<Self> {
-        if input.old_item.is_some() != input.previous_version.is_some()
-            || input.previous_version.is_some_and(|previous| {
-                previous.get() == 0 || previous >= input.item_stream_version
-            })
-        {
-            return Err(StorageError::internal("Invalid exact stream predecessor"));
-        }
-        let key = input.route.key.clone();
-        let predecessor_payload_bytes = input
-            .old_item
-            .map(|item| item.dynamo_json_bytes().map(|bytes| bytes.len()))
-            .transpose()?;
-        if input.item.is_none() && input.previous_version.is_none() {
-            return Err(StorageError::internal(
-                "Deletion history requires its exact predecessor",
-            ));
-        }
-        Ok(Self {
-            history_id: input.history_id,
-            source_table_name: input.route.source_table_name.clone(),
-            item: input.item.map(WireItem::from),
-            predecessor_payload_bytes,
-            previous_version: input.previous_version,
-            key,
-            item_stream_version: input.item_stream_version,
-            indexers: input.indexers.to_vec(),
-
-            created_at: input.created_at,
-            user_identity: input.user_identity,
-        })
-    }
-}
 
 /// Validated routing facts prepared before entering the writer.
 pub struct DynamoMutationRoute {
-    key: KeyAttributes,
-    source_table_name: SystemStreamSourceTableName,
+    pub(crate) key: KeyAttributes,
+    pub(crate) source_table_name: SystemStreamSourceTableName,
     routing_key: Vec<u8>,
 }
 
@@ -121,7 +48,7 @@ fn normalized_route_key(key: &KeyAttributes) -> KeyAttributes {
 }
 
 /// Canonical routing bytes for one logical mutation: source table plus
-/// key-schema-ordered key attributes. Shared so KV and SQL route the same
+/// normalized partition key. Shared so KV and SQL route the same
 /// logical write to the same lineage.
 pub fn canonical_route_key(
     source_table_name: &SystemStreamSourceTableName,
@@ -161,9 +88,31 @@ impl<L: AttributeValueLookup> Serialize for CanonicalKeyRef<'_, L> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
         let mut map = serializer.serialize_map(None)?;
-        for key in self.key_schema {
+        for key in self
+            .key_schema
+            .iter()
+            .filter(|key| key.key_type == storage_types::KeyType::Hash)
+        {
             if let Some(value) = self.attributes.get_attribute_value(&key.attribute_name) {
-                map.serialize_entry(&key.attribute_name, value)?;
+                match value {
+                    storage_types::AttributeValue::N(number) => {
+                        let canonical = storage_types::canonical_dynamodb_number(number)
+                            .map_err(serde::ser::Error::custom)?;
+                        map.serialize_entry(
+                            &key.attribute_name,
+                            &storage_types::AttributeValue::N(canonical),
+                        )?;
+                    }
+                    storage_types::AttributeValue::B(binary) => {
+                        let bytes = storage_types::dynamodb_binary::decode_base64_string(binary)
+                            .map_err(serde::ser::Error::custom)?;
+                        map.serialize_entry(
+                            &key.attribute_name,
+                            &storage_types::AttributeValue::B(STANDARD.encode(bytes)),
+                        )?;
+                    }
+                    _ => map.serialize_entry(&key.attribute_name, value)?,
+                }
             }
         }
         map.end()

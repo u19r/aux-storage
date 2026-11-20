@@ -3,17 +3,18 @@ use std::{sync::Arc, time::Duration};
 use scheduled_bg_jobs::{ExecutionContext, HandlerFuture, JobHandler, JobOutcome, Timestamp};
 use storage_types::{StorageError, StorageResult, TimestampMillis};
 
-use super::{StreamDurationTrimConfig, StreamDurationTrimWorker, StreamRetentionRepository};
+use super::{StreamDurationTrimConfig, StreamDurationTrimWorker};
+use crate::maintenance::MaintenanceOperations;
 
 pub struct RetentionHandler {
-    repository: Arc<dyn StreamRetentionRepository + Send + Sync>,
+    repository: Arc<dyn MaintenanceOperations>,
     interval: Duration,
     page_config: StreamDurationTrimConfig,
 }
 
 impl RetentionHandler {
     pub fn try_new(
-        repository: Arc<dyn StreamRetentionRepository + Send + Sync>,
+        repository: Arc<dyn MaintenanceOperations>,
         interval: Duration,
         page_config: StreamDurationTrimConfig,
     ) -> StorageResult<Self> {

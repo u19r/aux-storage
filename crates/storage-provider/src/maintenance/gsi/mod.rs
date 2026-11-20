@@ -3,23 +3,22 @@ mod catalog;
 mod execution;
 mod handler;
 mod models;
+mod native_index;
 mod observation;
-#[cfg(test)]
-mod observation_model_tests;
-#[cfg(test)]
-mod observation_test_support;
-#[cfg(test)]
-mod observation_tests;
+
 mod port;
 mod repository;
 mod transaction;
 
 pub use handler::GsiBuildHandler;
-pub use models::{GsiBuildAdvance, GsiBuildRequest, GsiTransition};
-pub use port::{GsiPort, GsiScanSource};
-pub use repository::{
-    GsiBuildRepository, GsiBuildTransaction, GsiCandidateRead, GsiLifecycleRepository,
+pub use models::{GsiBuildAdvance, GsiBuildRequest, GsiTransition, PrimaryTtlMetadata};
+pub use native_index::{
+    NativeGsiFill, NativeGsiPage, NativeGsiProgress, NativeGsiRow, NativeGsiRowVersion,
+    NativeGsiTransition, NativeIndexAction, NativeIndexState, NativeIndexWork,
 };
+pub use port::{GsiPort, GsiScanSource};
+pub(crate) use repository::gsi_build_in_attempt;
+pub use repository::{GsiBuildTransaction, GsiCandidateRead};
 
 mod scope;
 pub use scope::{GsiTargetAdmission, OrdinaryGsiBuild};
