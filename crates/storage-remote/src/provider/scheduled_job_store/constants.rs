@@ -18,3 +18,5 @@ pub(crate) const MAX_RANGE_BYTES: usize = 262_144;
 pub(crate) const MAX_TRANSACTION_DURATION: Duration = Duration::from_secs(30);
 pub(crate) const MAX_BATCH_GET_ATTEMPTS: usize = 4;
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 4;
+pub(crate) const BOOTSTRAP_UNAVAILABLE_WINDOW: Duration = Duration::from_secs(120);
+pub(crate) const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(1);

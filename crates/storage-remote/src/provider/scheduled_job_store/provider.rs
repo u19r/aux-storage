@@ -1,6 +1,7 @@
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -33,20 +34,6 @@ impl RemoteRawOrderedJobStore {
             provider: Arc::new(provider),
             capabilities: remote_capabilities()?,
         })
-    }
-
-    async fn verify_table(&self) -> Result<(), RawOrderedJobStoreError> {
-        let response = self
-            .provider
-            .invoke::<_, storage_types::DescribeTableResponse>(
-                "DynamoDB_20120810.DescribeTable",
-                &storage_types::DescribeTableRequest {
-                    table_name: job_table(),
-                },
-            )
-            .await
-            .map_err(RawOrderedJobStoreError::Backend)?;
-        validate_job_table(&response.table)
     }
 }
 
@@ -166,14 +153,8 @@ impl RawOrderedJobStore for RemoteRawOrderedJobStore {
     }
 
     async fn bootstrap(&self) -> Result<(), RawOrderedJobStoreError> {
-        let table = job_table();
         ensure_http_endpoint(&self.provider)?;
-        ensure_job_table(&self.provider, &table).await?;
-        self.provider
-            .wait_for_table_active(&table)
-            .await
-            .map_err(RawOrderedJobStoreError::Backend)?;
-        self.verify_table().await
+        bootstrap_job_table(&self.provider, BOOTSTRAP_UNAVAILABLE_WINDOW).await
     }
 
     async fn get(&self, key: StoreKey) -> Result<Option<Bytes>, RawOrderedJobStoreError> {
@@ -200,6 +181,52 @@ impl RawOrderedJobStore for RemoteRawOrderedJobStore {
     ) -> Result<CommitOutcome, RawOrderedJobStoreError> {
         commit::run(Arc::clone(&self.provider), transaction).await
     }
+}
+
+/// Storage may still be starting when its clients start, so a retryable failure
+/// repeats the whole bootstrap until `window` has passed. Any other failure,
+/// such as a malformed job table, returns at once.
+pub(crate) async fn bootstrap_job_table(
+    provider: &RemoteStorageProvider,
+    window: Duration,
+) -> Result<(), RawOrderedJobStoreError> {
+    let deadline = Instant::now() + window;
+    let mut attempt = 0_u32;
+    loop {
+        match bootstrap_job_table_once(provider).await {
+            Err(RawOrderedJobStoreError::Backend(error))
+                if error.class().is_retryable() && Instant::now() < deadline =>
+            {
+                attempt += 1;
+                tracing::warn!(
+                    attempt,
+                    "scheduled job store bootstrap found storage unavailable; retrying"
+                );
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(BOOTSTRAP_RETRY_DELAY.min(remaining)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn bootstrap_job_table_once(
+    provider: &RemoteStorageProvider,
+) -> Result<(), RawOrderedJobStoreError> {
+    let table = job_table();
+    ensure_job_table(provider, &table).await?;
+    provider
+        .wait_for_table_active(&table)
+        .await
+        .map_err(RawOrderedJobStoreError::Backend)?;
+    let response = provider
+        .invoke::<_, storage_types::DescribeTableResponse>(
+            "DynamoDB_20120810.DescribeTable",
+            &storage_types::DescribeTableRequest { table_name: table },
+        )
+        .await
+        .map_err(RawOrderedJobStoreError::Backend)?;
+    validate_job_table(&response.table)
 }
 
 pub(crate) async fn ensure_job_table(

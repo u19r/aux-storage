@@ -15,7 +15,7 @@ use storage_types::{DescribeTableRequest, ErrorClass, TableName};
 
 use super::{
     constants::MAX_TRANSACTION_DURATION,
-    provider::{apply_default_timeout, connect_timeout_for, ensure_job_table},
+    provider::{apply_default_timeout, bootstrap_job_table, connect_timeout_for, ensure_job_table},
 };
 
 fn settings(timeouts: Option<RemoteTimeoutOverrides>) -> RemoteStorageSettings {
@@ -458,4 +458,51 @@ async fn given_job_table_create_that_always_answers_unknown_when_table_stays_abs
     }
     create.assert_calls_async(3).await;
     assert!(describe.calls_async().await >= 3);
+}
+
+fn describe_table_mock<'a>(
+    server: &'a MockServer,
+    status: u16,
+    error_type: &str,
+) -> httpmock::Mock<'a> {
+    let body = serde_json::json!({
+        "__type": format!("com.amazonaws.dynamodb.v20120810#{error_type}"),
+        "message": "describe table"
+    })
+    .to_string();
+    server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "DynamoDB_20120810.DescribeTable");
+        then.status(status).body(body);
+    })
+}
+
+#[tokio::test]
+async fn given_storage_that_stays_unavailable_when_bootstrapping_then_it_retries_until_the_window_ends()
+ {
+    let server = MockServer::start_async().await;
+    let describe = describe_table_mock(&server, 503, "ServiceUnavailable");
+    let provider = provider_on(&server).await;
+
+    let result = bootstrap_job_table(&provider, Duration::from_millis(1_500)).await;
+
+    let Err(RawOrderedJobStoreError::Backend(error)) = result else {
+        panic!("unavailable storage must fail once the window ends");
+    };
+    assert!(error.class().is_retryable(), "{error}");
+    assert!(describe.calls() >= 2, "bootstrap was not repeated");
+}
+
+#[tokio::test]
+async fn given_a_non_retryable_failure_when_bootstrapping_then_it_returns_without_waiting() {
+    let server = MockServer::start_async().await;
+    let describe = describe_table_mock(&server, 400, "ValidationException");
+    let provider = provider_on(&server).await;
+    let started = std::time::Instant::now();
+
+    let result = bootstrap_job_table(&provider, Duration::from_secs(60)).await;
+
+    assert!(matches!(result, Err(RawOrderedJobStoreError::Backend(_))));
+    assert_eq!(describe.calls(), 1);
+    assert!(started.elapsed() < Duration::from_secs(10));
 }

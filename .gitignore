@@ -29,3 +29,6 @@ deploy-artifacts/
 # OpenTofu provider cache; campaign state stays under run-artifacts.
 terraform/**/.terraform/
 terraform/**/*.tfstate*
+
+# Local publication outputs from `just publish`
+publication.json*
