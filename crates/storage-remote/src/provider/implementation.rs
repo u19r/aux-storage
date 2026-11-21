@@ -1083,9 +1083,15 @@ fn deadline_failure(possibly_dispatched: bool) -> AttemptError {
     })
 }
 
+/// A transport failure that no hop could have sent never reached storage, so it
+/// is reported as unavailable and any caller may repeat the operation.
 fn merge_redirect_dispatch(mut error: AttemptError, possibly_dispatched: bool) -> AttemptError {
-    if possibly_dispatched && error.dispatch_status == HttpRequestDispatchStatus::NotDispatched {
-        error.dispatch_status = HttpRequestDispatchStatus::PossiblyDispatched;
+    if error.dispatch_status == HttpRequestDispatchStatus::NotDispatched {
+        if possibly_dispatched {
+            error.dispatch_status = HttpRequestDispatchStatus::PossiblyDispatched;
+        } else {
+            error.error = StorageError::service_unavailable(1);
+        }
     }
     error
 }

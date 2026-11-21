@@ -506,3 +506,31 @@ async fn given_a_non_retryable_failure_when_bootstrapping_then_it_returns_withou
     assert_eq!(describe.calls(), 1);
     assert!(started.elapsed() < Duration::from_secs(10));
 }
+
+#[tokio::test]
+async fn given_storage_that_refuses_connections_when_bootstrapping_then_it_retries_until_the_window_ends()
+ {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind free port")
+        .local_addr()
+        .expect("local address")
+        .port();
+    let provider = crate::provider::implementation::RemoteStorageProvider::new(settings_for(
+        format!("http://127.0.0.1:{port}/"),
+    ))
+    .await
+    .expect("remote provider");
+    let window = Duration::from_millis(1_500);
+    let started = std::time::Instant::now();
+
+    let result = bootstrap_job_table(&provider, window).await;
+
+    let Err(RawOrderedJobStoreError::Backend(error)) = result else {
+        panic!("unreachable storage must fail once the window ends");
+    };
+    assert!(error.class().is_retryable(), "{error}");
+    assert!(
+        started.elapsed() >= window,
+        "bootstrap stopped before the window ended"
+    );
+}
