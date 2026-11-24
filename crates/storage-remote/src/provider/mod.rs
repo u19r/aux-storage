@@ -14,7 +14,8 @@ mod provider_helpers;
 
 mod scheduled_job_store;
 pub use scheduled_job_store::{
-    build_scheduled_job_store, connect_scheduled_job_store, connect_timeout_for,
+    build_scheduled_job_store, build_scheduled_job_store_with_token, connect_scheduled_job_store,
+    connect_scheduled_job_store_with_token, connect_timeout_for,
     validate_scheduled_job_http_endpoints,
 };
 

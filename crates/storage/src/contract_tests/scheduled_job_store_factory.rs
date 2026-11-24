@@ -416,6 +416,31 @@ async fn given_remote_backend_when_store_is_requested_then_manager_reports_unsup
 
 #[cfg(feature = "remote")]
 #[test]
+fn remote_scheduled_store_config_validates_and_redacts_the_internal_token() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let config =
+        RemoteScheduledJobStoreConfig::new(vec!["http://private-storage"], Duration::from_secs(5))
+            .expect("valid config")
+            .with_internal_service_token(token)
+            .expect("valid token");
+    let debug = format!("{config:?}");
+    assert!(debug.contains("has_internal_service_token: true"));
+    assert!(!debug.contains(token));
+
+    let base = || {
+        RemoteScheduledJobStoreConfig::new(vec!["http://private-storage"], Duration::from_secs(5))
+            .expect("valid config")
+    };
+    assert!(base().with_internal_service_token("short").is_err());
+    assert!(
+        base()
+            .with_internal_service_token("0123456789abcdef 123456789abcdef")
+            .is_err()
+    );
+}
+
+#[cfg(feature = "remote")]
+#[test]
 fn remote_scheduled_store_config_is_http_only_and_bounded() {
     let config = RemoteScheduledJobStoreConfig::new(
         vec!["http://private-storage", "http://private-storage-replica"],

@@ -82,7 +82,16 @@ fn validate_scheduled_job_http_endpoint(endpoint: &str) -> StorageResult<()> {
 pub async fn connect_scheduled_job_store(
     settings: storage_provider::RemoteStorageSettings,
 ) -> StorageResult<ScheduledJobStore> {
-    let store = build_scheduled_job_store(settings).await?;
+    connect_scheduled_job_store_with_token(settings, None).await
+}
+
+/// Like [`connect_scheduled_job_store`], sending `x-aux-internal-token` with
+/// every request when a token is given.
+pub async fn connect_scheduled_job_store_with_token(
+    settings: storage_provider::RemoteStorageSettings,
+    internal_service_token: Option<&str>,
+) -> StorageResult<ScheduledJobStore> {
+    let store = build_scheduled_job_store_with_token(settings, internal_service_token).await?;
     store.bootstrap().await.map_err(|error| {
         // `ScheduledJobStoreError` Display is a fixed category (bg-job-store
         // `error.rs`): no key or value.
@@ -94,11 +103,23 @@ pub async fn connect_scheduled_job_store(
 /// Builds an unbootstrapped scheduled-job store for an owner that controls
 /// initialization ordering, such as `DatabaseManager`.
 pub async fn build_scheduled_job_store(
+    settings: storage_provider::RemoteStorageSettings,
+) -> StorageResult<ScheduledJobStore> {
+    build_scheduled_job_store_with_token(settings, None).await
+}
+
+/// Like [`build_scheduled_job_store`], sending `x-aux-internal-token` with
+/// every request when a token is given.
+pub async fn build_scheduled_job_store_with_token(
     mut settings: storage_provider::RemoteStorageSettings,
+    internal_service_token: Option<&str>,
 ) -> StorageResult<ScheduledJobStore> {
     validate_http_settings(&settings)?;
     apply_default_timeout(&mut settings);
     let mut provider = RemoteStorageProvider::new(settings).await?;
+    if let Some(token) = internal_service_token {
+        provider = provider.with_internal_service_token(token)?;
+    }
     provider.enable_scheduled_job_http_redirects();
     scheduled_job_store(provider)
 }

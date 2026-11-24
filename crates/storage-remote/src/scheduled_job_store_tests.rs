@@ -190,6 +190,93 @@ async fn scheduled_store_connector_rejects_tls_settings_before_network_access() 
     assert!(error.to_string().contains("HTTP endpoint"));
 }
 
+const INTERNAL_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn scheduled_store_sends_the_internal_service_token_on_every_request() {
+    let server = MockServer::start_async().await;
+    let authorized = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.DescribeTable")
+                .header("x-aux-internal-token", INTERNAL_TOKEN);
+            then.status(200).json_body(serde_json::json!({
+                "Table": {
+                    "TableName": "job",
+                    "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("job").as_bytes()).to_string(),
+                    "CreationDateTime": 0,
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "sk", "AttributeType": "S"}
+                    ],
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "sk", "KeyType": "RANGE"}
+                    ],
+                    "TableArn": "arn:aws:dynamodb:local:table/job",
+                    "ItemCount": 0,
+                    "TableSizeBytes": 0,
+                    "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"}
+                }
+            }));
+        })
+        .await;
+
+    let result = crate::connect_scheduled_job_store_with_token(
+        RemoteStorageSettings {
+            endpoint_urls: vec![server.url("/")],
+            region: None,
+            tls: false,
+            credentials: RemoteCredentialStrategy::DefaultChain,
+            timeouts: None,
+        },
+        Some(INTERNAL_TOKEN),
+    )
+    .await;
+
+    assert!(result.is_ok(), "token-bearing connect must succeed");
+    assert!(authorized.calls_async().await >= 1);
+}
+
+#[tokio::test]
+async fn scheduled_store_without_a_token_sends_no_internal_header() {
+    let server = MockServer::start_async().await;
+    let leaked = server
+        .mock_async(|when, then| {
+            when.method(POST).header_exists("x-aux-internal-token");
+            then.status(500);
+        })
+        .await;
+    let _ = crate::connect_scheduled_job_store(RemoteStorageSettings {
+        endpoint_urls: vec![server.url("/")],
+        region: None,
+        tls: false,
+        credentials: RemoteCredentialStrategy::DefaultChain,
+        timeouts: None,
+    })
+    .await;
+
+    leaked.assert_calls_async(0).await;
+}
+
+#[tokio::test]
+async fn scheduled_store_rejects_a_token_that_is_not_a_header_value() {
+    let result = crate::build_scheduled_job_store_with_token(
+        RemoteStorageSettings {
+            endpoint_urls: vec!["http://private.example".to_string()],
+            region: None,
+            tls: false,
+            credentials: RemoteCredentialStrategy::DefaultChain,
+            timeouts: None,
+        },
+        Some("bad\ntoken"),
+    )
+    .await;
+
+    assert!(result.is_err());
+}
+
 #[tokio::test]
 async fn scheduled_store_connector_bootstraps_and_verifies_the_reserved_job_table() {
     let server = MockServer::start_async().await;

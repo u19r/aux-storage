@@ -127,6 +127,9 @@ impl AttemptError {
     }
 }
 
+/// Header the internal listener of the storage owner requires.
+pub(crate) const INTERNAL_TOKEN_HEADER: &str = "x-aux-internal-token";
+
 pub(super) fn signer_credentials(strategy: &RemoteCredentialStrategy) -> CredentialSource {
     match strategy {
         RemoteCredentialStrategy::DefaultChain => CredentialSource::DefaultChain,
@@ -156,6 +159,7 @@ pub struct RemoteStorageProvider {
     pub(crate) retry_budget: RetryTokenBucket,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) redirect_policy: RemoteRedirectPolicy,
+    pub(crate) internal_service_token: Option<HeaderValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,7 +307,32 @@ impl RemoteStorageProvider {
             retry_budget: RetryTokenBucket::new(),
             request_timeout,
             redirect_policy: RemoteRedirectPolicy::Disabled,
+            internal_service_token: None,
         })
+    }
+
+    /// Sends `x-aux-internal-token` on every request to the configured
+    /// endpoints. Only unsigned private-network endpoints accept it, and the
+    /// header is never forwarded to a redirect target on another origin.
+    pub(crate) fn with_internal_service_token(mut self, token: &str) -> StorageResult<Self> {
+        if self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.requires_signature)
+        {
+            return Err(StorageError::validation(
+                "an internal service token cannot be sent to signed AWS endpoints",
+            ));
+        }
+        let mut value = HeaderValue::from_str(token.trim()).map_err(|_| {
+            StorageError::validation("internal service token is not a valid header")
+        })?;
+        if value.as_bytes().is_empty() {
+            return Err(StorageError::validation("internal service token is empty"));
+        }
+        value.set_sensitive(true);
+        self.internal_service_token = Some(value);
+        Ok(self)
     }
 
     pub(crate) fn enable_scheduled_job_http_redirects(&mut self) {
@@ -915,6 +944,12 @@ impl RemoteStorageProvider {
                     .ok_or_else(|| attempt_internal("redirect base headers are missing"))?
                     .clone()
             };
+            let mut request_headers = request_headers;
+            if let Some(token) = self.internal_service_token.as_ref()
+                && request_url.origin() == endpoint.request_url.origin()
+            {
+                request_headers.insert(INTERNAL_TOKEN_HEADER, token.clone());
+            }
             let request = self
                 .client
                 .post(request_url.clone())

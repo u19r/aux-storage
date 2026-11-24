@@ -15,6 +15,7 @@ mod encoding_tests;
 mod read_tests;
 
 pub use provider::{
-    build_scheduled_job_store, connect_scheduled_job_store, connect_timeout_for,
+    build_scheduled_job_store, build_scheduled_job_store_with_token, connect_scheduled_job_store,
+    connect_scheduled_job_store_with_token, connect_timeout_for,
     validate_scheduled_job_http_endpoints,
 };

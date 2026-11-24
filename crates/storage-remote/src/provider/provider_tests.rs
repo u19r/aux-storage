@@ -42,6 +42,7 @@ fn provider_with_urls(urls: &[&str]) -> RemoteStorageProvider {
         retry_budget: RetryTokenBucket::new(),
         request_timeout: None,
         redirect_policy: super::provider_helpers::RemoteRedirectPolicy::Disabled,
+        internal_service_token: None,
     }
 }
 

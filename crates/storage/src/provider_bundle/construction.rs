@@ -30,6 +30,8 @@ use super::models::RemoteScheduledJobStoreConfig;
 use super::models::StoreKind;
 #[cfg(feature = "remote")]
 const MAX_REMOTE_SCHEDULED_JOB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "remote")]
+const MIN_INTERNAL_SERVICE_TOKEN_LEN: usize = 32;
 
 #[cfg(feature = "remote")]
 impl RemoteScheduledJobStoreConfig {
@@ -51,7 +53,23 @@ impl RemoteScheduledJobStoreConfig {
         Ok(Self {
             endpoint_urls,
             request_timeout,
+            internal_service_token: None,
         })
+    }
+
+    /// Sends the token as `x-aux-internal-token` on every request, for an
+    /// endpoint behind the storage owner's internal listener.
+    pub fn with_internal_service_token(mut self, token: impl Into<String>) -> StorageResult<Self> {
+        let token = token.into().trim().to_string();
+        if token.len() < MIN_INTERNAL_SERVICE_TOKEN_LEN
+            || !token.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(StorageError::validation(
+                "internal service token must be at least 32 printable characters",
+            ));
+        }
+        self.internal_service_token = Some(token);
+        Ok(self)
     }
 }
 
@@ -62,6 +80,10 @@ impl fmt::Debug for RemoteScheduledJobStoreConfig {
             .debug_struct("RemoteScheduledJobStoreConfig")
             .field("endpoint_count", &self.endpoint_urls.len())
             .field("request_timeout", &self.request_timeout)
+            .field(
+                "has_internal_service_token",
+                &self.internal_service_token.is_some(),
+            )
             .finish()
     }
 }
@@ -87,7 +109,11 @@ pub async fn connect_remote_scheduled_job_store(
             request_timeout_ms: Some(timeout_ms),
         }),
     };
-    storage_remote::connect_scheduled_job_store(settings).await
+    storage_remote::connect_scheduled_job_store_with_token(
+        settings,
+        config.internal_service_token.as_deref(),
+    )
+    .await
 }
 
 pub(crate) async fn open_store(

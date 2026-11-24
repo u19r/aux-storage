@@ -65,4 +65,5 @@ impl InitializedStore {
 pub struct RemoteScheduledJobStoreConfig {
     pub(super) endpoint_urls: Vec<String>,
     pub(super) request_timeout: Duration,
+    pub(super) internal_service_token: Option<String>,
 }
