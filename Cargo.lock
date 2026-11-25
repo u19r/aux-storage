@@ -79,7 +79,7 @@ dependencies = [
 [[package]]
 name = "alloc-counter"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "alloc-counter-macros",
  "serde",
@@ -89,7 +89,7 @@ dependencies = [
 [[package]]
 name = "alloc-counter-macros"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "quote",
  "syn 3.0.10",
@@ -319,7 +319,7 @@ dependencies = [
 [[package]]
 name = "aws-credentials"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "futures-util",
  "jiff",
@@ -530,7 +530,7 @@ dependencies = [
 [[package]]
 name = "aws-sigv4-signing"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "aws-credentials",
  "data-encoding",
@@ -841,7 +841,7 @@ dependencies = [
 [[package]]
 name = "bg-jobs"
 version = "0.2.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -855,7 +855,7 @@ dependencies = [
 [[package]]
 name = "bg-jobs-conformance"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "bg-jobs",
  "bytes",
@@ -864,7 +864,7 @@ dependencies = [
 [[package]]
 name = "bg-jobs-tokio"
 version = "0.2.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "bg-jobs",
  "tokio",
@@ -1074,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "buffered-writes"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2389,7 +2389,7 @@ dependencies = [
 [[package]]
 name = "http-request"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3308,7 +3308,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lru-ttl-cache"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "futures-util",
  "hashlink",
@@ -3417,7 +3417,7 @@ dependencies = [
 [[package]]
 name = "metrics-facade"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "buffered-writes",
  "http",
@@ -3736,7 +3736,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 [[package]]
 name = "opt-loop-probe"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a#1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a"
+source = "git+https://github.com/u19r/aux-common?rev=a05c48727bafe089fcd1d418e9ddad1c34c5e629#a05c48727bafe089fcd1d418e9ddad1c34c5e629"
 dependencies = [
  "mimalloc",
  "serde",

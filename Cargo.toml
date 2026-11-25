@@ -126,17 +126,17 @@ xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 
 ############################################
 # Shared crates are pinned to a public aux-common revision.
-alloc-counter = { package = "alloc-counter", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-aws-sigv4-signing = { package = "aws-sigv4-signing", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-http-request = { package = "http-request", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-lru-ttl-cache = { package = "lru-ttl-cache", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-metrics-facade = { package = "metrics-facade", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-opt-loop-probe = { package = "opt-loop-probe", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+alloc-counter = { package = "alloc-counter",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+aws-sigv4-signing = { package = "aws-sigv4-signing",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+http-request = { package = "http-request",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+lru-ttl-cache = { package = "lru-ttl-cache",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+metrics-facade = { package = "metrics-facade",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+opt-loop-probe = { package = "opt-loop-probe",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
 
 # Scheduled jobs use the shared aux-common contract; storage owns provider adapters.
-bg-jobs-tokio = { package = "bg-jobs-tokio", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-scheduled-bg-jobs = { package = "bg-jobs", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
-scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", git = "https://github.com/u19r/aux-common", rev = "1c20f49ffc0e76ca75d53c7afcc42a26bbbc2e5a" }
+bg-jobs-tokio = { package = "bg-jobs-tokio",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+scheduled-bg-jobs = { package = "bg-jobs",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
+scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance",   git = "https://github.com/u19r/aux-common",rev = "a05c48727bafe089fcd1d418e9ddad1c34c5e629"}
 
 ############################################
 # Local path dependencies
